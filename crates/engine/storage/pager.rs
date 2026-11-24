@@ -1144,9 +1144,13 @@ impl Page {
     pub fn recycle(mut page: PageRef, id: usize) -> Option<(PageRef, Option<Arc<Buffer>>)> {
         let buffer = {
             let inner = Arc::get_mut(&mut page)?.inner.get_mut();
-            let buffer = inner
-                .take_buffer()
-                .and_then(|mut buffer| Arc::get_mut(&mut buffer).is_some().then_some(buffer));
+            let mut buffer = inner.take_buffer();
+            if buffer
+                .as_mut()
+                .is_some_and(|buffer| Arc::get_mut(buffer).is_none())
+            {
+                buffer = None;
+            }
             *inner = PageInner::unloaded(id);
             inner.flags.store(PAGE_PLAIN, Ordering::Relaxed);
             buffer
@@ -2005,10 +2009,46 @@ pub struct Pager {
 /// start of the epoch under way and of the one before it. An epoch is as many fetches as the
 /// connection's cache holds pages, a turnover of the cache, so the share follows the latest one to
 /// two turnovers and leaves older fetches behind as the working set moves.
+///
+/// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): the share the planner
+/// reads is `standing`, the share of a closed epoch, replaced by a later epoch's only past the
+/// spread between epochs (`learned_costs::Batches`), as a learned weight is replaced. Between two
+/// such moves every plan is priced on one share, so plans don't follow its noise.
 #[derive(Debug, Clone, Copy, Default)]
 struct PageMissWindow {
     previous: (u64, u64),
     current: (u64, u64),
+    standing: Option<f64>,
+    batches: crate::translate::optimizer::learned_costs::Batches,
+}
+
+impl PageMissWindow {
+    /// The share the planner prices pages by at counts `now` (fetches, file reads): an epoch of
+    /// `epoch` fetches or more since the last one closes, and is judged against the standing share.
+    fn read(&mut self, now: (u64, u64), epoch: u64) -> Option<f64> {
+        if now.0.saturating_sub(self.current.0) >= epoch {
+            let closed = share(self.current, now);
+            self.previous = self.current;
+            self.current = now;
+            if let Some(closed) = closed {
+                let standing = self.standing;
+                let moved = self.batches.judge(standing, closed);
+                if moved {
+                    self.standing = Some(closed);
+                }
+                tracing::debug!(target: "amphora::join_search", closed, ?standing, moved, spread = ?self.batches.spread(), "the page-miss share's epoch closed");
+            }
+        }
+        self.standing.or_else(|| share(self.previous, now))
+    }
+}
+
+/// The share of the fetches between two counts (fetches, file reads) that read a file; None
+/// without a fetch between them.
+fn share(from: (u64, u64), to: (u64, u64)) -> Option<f64> {
+    let fetches = to.0.saturating_sub(from.0);
+    let reads = to.1.saturating_sub(from.1).min(fetches);
+    (fetches > 0).then(|| reads as f64 / fetches as f64)
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -4153,8 +4193,8 @@ impl Pager {
             return Ok((page, c));
         };
 
-        if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone(), group)?;
+        if let Some(frame) = wal.find_frame(page_idx as u64, frame_watermark)? {
+            let c = wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
@@ -4373,20 +4413,14 @@ impl Pager {
         self.page_file_reads.load(Ordering::Relaxed)
     }
 
+    /// Lane T13: the standing share once an epoch has closed; before that, the share so far.
     pub(crate) fn page_miss_ratio(&self) -> Option<f64> {
         let now = (
             self.page_fetches.load(Ordering::Relaxed),
             self.page_file_reads.load(Ordering::Relaxed),
         );
         let epoch = u64::try_from(self.cached_page_capacity().max(1)).unwrap_or(u64::MAX);
-        let mut window = self.page_miss_window.lock();
-        if now.0.saturating_sub(window.current.0) >= epoch {
-            window.previous = window.current;
-            window.current = now;
-        }
-        let fetches = now.0.saturating_sub(window.previous.0);
-        let reads = now.1.saturating_sub(window.previous.1).min(fetches);
-        (fetches > 0).then(|| reads as f64 / fetches as f64)
+        self.page_miss_window.lock().read(now, epoch)
     }
 
     /// Amphora (QT.5): the database's cost estimator, which this pager's page reads inform. Set
@@ -4780,14 +4814,14 @@ impl Pager {
         let page_no = u64::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
         let frame = wal.find_frame(page_no, None)?;
         if let (Some(base), Some(frame)) = (own_after, frame) {
-            if frame > base {
+            if frame.frame > base {
                 return Ok(None);
             }
         }
         let version = match frame {
             Some(frame) => Version::Frame {
-                generation: wal.connection_wal_pos().0,
-                frame,
+                generation: wal.frame_generation(frame),
+                frame: frame.frame,
             },
             None => Version::File,
         };
@@ -5907,11 +5941,14 @@ impl Pager {
         let state = self.checkpoint_state.read();
         let result = state.result.as_ref().expect("result should be set");
         let mode = state.mode.expect("mode should be set");
+        // A pass over the closing segment restarts nothing, so it publishes its backfill whatever
+        // its mode (decision 45).
         if result.wal_checkpoint_backfilled > 0
-            && !matches!(
-                mode,
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. }
-            )
+            && (result.closing.is_some()
+                || !matches!(
+                    mode,
+                    CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+                ))
         {
             // if we are using a custom codec, then we might have to read the whole page 1 so that
             // it can be decoded. Otherwise reading the header is enough.
@@ -5932,7 +5969,7 @@ impl Pager {
                 },
             };
         }
-        if matches!(mode, CheckpointMode::Truncate { .. }) {
+        if matches!(mode, CheckpointMode::Truncate { .. }) && result.closing.is_none() {
             CheckpointPhase::TruncateWalFile { clear_page_cache }
         } else {
             CheckpointPhase::Finalize { clear_page_cache }
@@ -6021,6 +6058,7 @@ impl Pager {
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
+                        && res.closing.is_none()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
@@ -6284,7 +6322,8 @@ impl Pager {
                     wal.publish_backfill(max_frame);
                     let next_phase = {
                         let state = self.checkpoint_state.read();
-                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {
+                        let closing = state.result.as_ref().is_some_and(|r| r.closing.is_some());
+                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) && !closing {
                             CheckpointPhase::TruncateWalFile { clear_page_cache }
                         } else {
                             CheckpointPhase::Finalize { clear_page_cache }
@@ -6325,6 +6364,13 @@ impl Pager {
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
+                    // A Restart or Truncate whose pass copied the closing segment did not restart
+                    // the log: the current segment isn't copied yet (decision 45).
+                    let not_restarted = res.closing.is_some()
+                        && matches!(
+                            state.mode,
+                            Some(CheckpointMode::Restart | CheckpointMode::Truncate { .. })
+                        );
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
                     state.lock_source = CheckpointLockSource::Acquire;
@@ -6341,6 +6387,9 @@ impl Pager {
                     // Release checkpoint guard
                     res.release_guard();
 
+                    if not_restarted {
+                        return Err(LimboError::Busy.into());
+                    }
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -7497,6 +7546,50 @@ mod tests {
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
 
+    /// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): do close epochs of
+    /// fetches whose shares sit within the spread between epochs, then read inside an epoch whose
+    /// every fetch missed, then close epochs the cache answered whole; expect the share the plans
+    /// read to stand at the first epoch's through all of the first two, and to move once, to the
+    /// warm share, on the third.
+    #[test]
+    fn t13_a_page_miss_share_within_its_measured_noise_keeps_the_standing_share() {
+        let epoch = 1_000;
+        let mut window = super::PageMissWindow::default();
+        let mut now = (0_u64, 0_u64);
+        let mut read = |window: &mut super::PageMissWindow, fetches: u64, reads: u64| {
+            now = (now.0 + fetches, now.1 + reads);
+            window.read(now, epoch)
+        };
+        assert_eq!(
+            read(&mut window, epoch, 500),
+            Some(0.5),
+            "the first epoch stands"
+        );
+        for reads in [520, 480, 510, 490, 505] {
+            assert_eq!(
+                read(&mut window, epoch, reads),
+                Some(0.5),
+                "an epoch {reads} of {epoch} within the noise moved the share"
+            );
+        }
+        assert_eq!(
+            read(&mut window, epoch - 1, epoch - 1),
+            Some(0.5),
+            "fetches inside an epoch moved the share"
+        );
+        assert_eq!(
+            read(&mut window, epoch + 1, 1),
+            Some(0.5),
+            "that epoch's share, 0.5, moved the share"
+        );
+        let warm: Vec<_> = (0..4).map(|_| read(&mut window, epoch, 0)).collect();
+        assert_eq!(
+            warm,
+            vec![Some(0.0); 4],
+            "the warm cache's share past the noise did not replace it once"
+        );
+    }
+
     /// CP-T1.8, T-T1.8.A6: a new page is all zeros even when the pool hands it a buffer an
     /// earlier page wrote. Do: take more pages than the test arena holds (so both the arena's
     /// slots and the temporary buffers are used), fill each with a pattern, drop them, and take
@@ -7663,7 +7756,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = wal_shared.current().read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             wal_shared,
@@ -7857,7 +7950,7 @@ mod ptrmap_tests {
                 .unwrap(),
         )
         .unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = wal_shared.current().read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             wal_shared,
@@ -8342,6 +8435,7 @@ mod checkpoint_phase_tests {
         conn.execute("commit").unwrap();
         assert!(
             db.shared_wal
+                .current()
                 .read()
                 .metadata
                 .max_frame

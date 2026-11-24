@@ -83,7 +83,9 @@ pub(super) fn emit_builds(
                 program,
                 Some(table_references),
                 key.get_build_expr(predicates),
-                key_reg + idx,
+                key_reg.checked_add(idx).ok_or_else(|| {
+                    crate::LimboError::InternalError("star join: a key register past usize".into())
+                })?,
                 &t_ctx.resolver,
             )?;
         }
@@ -145,7 +147,9 @@ pub(super) fn emit_probes(
                 program,
                 Some(table_references),
                 key.get_probe_expr(predicates),
-                key_reg + idx,
+                key_reg.checked_add(idx).ok_or_else(|| {
+                    crate::LimboError::InternalError("star join: a key register past usize".into())
+                })?,
                 &t_ctx.resolver,
             )?;
         }

@@ -377,6 +377,9 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     fence: Option<(u64, u64)>,
     /// The entries that wait are past a drive's page, not behind the commit fence.
     paged: bool,
+    /// The owner holds what is committed from its state machine (`Replica::hold_apply`): the
+    /// entries given to apply meanwhile wait behind the fence, and the fence's release waits too.
+    held: bool,
     /// The bytes of entries a drive applies at most, as the core counts them
     /// (`EntryRef::encoded_bytes`): its committed page (`max_committed_size_per_ready`), or one
     /// entry larger than it.
@@ -541,6 +544,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             conf_index: durable.index,
             fence: None,
             paged: false,
+            held: false,
             page,
             drive_applied: 0,
             reads: VecDeque::new(),
@@ -559,18 +563,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             heir_since: None,
             slow_disks: Vec::new(),
         };
-        // A log compacted before the restart serves a lagging member only by snapshot, and its
-        // image is what the compaction rule weighs the log against; a log never compacted is
-        // weighed against the image of what the member opened with, as its machine states it.
-        replica.imaged = if view.start.index > 0 {
-            let prepared = replica.prepare().map_err(|e| match e {
-                ReplicaError::Fenced(Cause::Machine(fatal)) => OpenError::Machine(fatal),
-                _ => OpenError::Core(hyper_raft::Error::Invariant("a snapshot at open")),
-            })?;
-            Some(prepared)
-        } else {
-            replica.machine.image_bytes()
-        };
+        // The compaction rule weighs the log against the image of what the member opened with,
+        // as its machine states it without making it. A log compacted before the restart serves
+        // a lagging member only by snapshot, prepared once the core first asks for one
+        // (`Replica::prepare_asked`): opening never images the whole state machine.
+        replica.imaged = replica.machine.image_bytes();
         replica
             .count_applied(view.start.index)
             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
@@ -630,6 +627,26 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// Committed entries that wait for the commit fence: the first and the last.
     pub fn behind_fence(&self) -> Option<(u64, u64)> {
         self.fence.filter(|_| !self.paged)
+    }
+
+    /// Holds what is committed from the state machine while `held`, its owner's reason beside
+    /// the commit fence's (Amphora's replication.md, "Decision (lane P6)": a caller's session runs
+    /// on a connection of its own, lent the database's one write lock). Committed entries given to
+    /// apply wait behind the fence, the core gives out no more (`RawNode::pause_apply`), and
+    /// everything else goes on: ticks, votes, appends and their writes. Lifted, what waits is
+    /// walked at the next drive as a range past a drive's page is, the commit fence's rule kept.
+    pub fn hold_apply(&mut self, held: bool) {
+        self.held = held;
+        if held {
+            self.node.pause_apply();
+        } else if self.fence.is_none() {
+            self.node.resume_apply();
+        }
+    }
+
+    /// Whether the owner holds what is committed from the state machine (`Replica::hold_apply`).
+    pub fn apply_held(&self) -> bool {
+        self.held
     }
 
     /// Writes out.
@@ -1631,6 +1648,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
             }
+            r.prepare_asked()?;
             r.release_reads(out);
             r.keep();
             r.settle();
@@ -1781,12 +1799,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// What the core may apply and send without a write, whatever the writes out
     /// (`RawNode::light_now`): a leader's appends when it proposes and what it commits when it
-    /// commits, a follower's held answers when it takes the entries (core step R-8). Without it
-    /// they wait for a write of the member's own to free a place for the next `Ready`.
+    /// commits, its read rounds and the reads they confirm, a follower's held answers when it
+    /// takes the entries (core step R-8) and its heartbeats' answers on a durable term and vote.
+    /// Without it they wait for a write of the member's own to free a place for the next `Ready`.
     fn take_light(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         let light = self.node.light_now(true);
         let mut light = self.must(light)?;
         self.emit(light.take_messages(), out);
+        for read in light.take_read_states() {
+            self.reads.push_back((read.index, read.request_ctx));
+        }
         if let Some((first, last)) = light.committed_range() {
             self.apply_range(first, last, out)?;
         }
@@ -2320,6 +2342,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 self.fence = Some((held, last));
                 Ok(())
             }
+            // Held as a range past a drive's page is: once the hold lifts, the next drive walks it
+            // by the walk's own rule, the commit fence included, and asks nothing more of it.
+            None if self.held => {
+                self.fence = Some((first, last));
+                self.paged = true;
+                self.node.pause_apply();
+                Ok(())
+            }
             None => self.apply_from(first, last, out),
         }
     }
@@ -2330,7 +2360,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let Some((first, last)) = self.fence else {
             return Ok(());
         };
-        if !self.paged && first > self.durable_commit() {
+        if self.held || (!self.paged && first > self.durable_commit()) {
             return Ok(());
         }
         self.fence = None;
@@ -2571,6 +2601,22 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let imaged = bytes(snapshot.data.len());
         self.node.store_mut().snapshot = Some(snapshot);
         Ok(imaged)
+    }
+
+    /// Prepares the snapshot the core asked for while none was prepared: a member that opened on
+    /// a compacted log holds none until then, and the core asks again once it is ready (its
+    /// `SnapshotTemporarilyUnavailable`). A log never compacted holds every entry a member lacks.
+    fn prepare_asked(&mut self) -> Result<(), ReplicaError> {
+        let store = self.node.store();
+        if !store.asked.replace(false) || store.snapshot.is_some() {
+            return Ok(());
+        }
+        let start = store.log.bounds().map(|(start, _)| start.index);
+        let start = start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+        if start > 0 {
+            self.prepare()?;
+        }
+        Ok(())
     }
 
     /// Makes the state machine's applied state durable and lets the log free what is before it,

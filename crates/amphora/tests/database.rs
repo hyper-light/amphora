@@ -11,7 +11,7 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora_api::{
     Cond, Consistency, Migration, Records, Refusal, Scan, Statement, Tx, Value, Write,
 };
@@ -82,7 +82,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
     {
         let db = Database::open(&path, until()).unwrap();
         let counted = Arc::clone(&calls);
-        let result: Result<(), Refusal> = db.call(until(), move |c| {
+        let result: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), move |c| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             c.execute_batch("CREATE TABLE discarded(x)")?;
             anyhow::bail!("application refused its transaction")
@@ -90,7 +90,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
         assert!(result.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let value = db
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 let count: i64 = c.query_row(
                     "SELECT count(*) FROM sqlite_schema WHERE name = 'discarded'",
                     [],
@@ -107,7 +107,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
             })
             .unwrap();
         assert_eq!(value, 42);
-        db.call(until(), |connection| {
+        db.call(until(), AnswerMax::fixed(), |connection| {
             assert_eq!(
                 connection
                     .prepare_cached("SELECT * FROM decisions")?
@@ -133,7 +133,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
     }
     let db = Database::open(&path, until()).unwrap();
     assert_eq!(
-        db.call(until(), |c| Ok(c.query_row(
+        db.call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
             "SELECT n FROM decisions",
             [],
             |r| r.get::<_, i64>(0usize)
@@ -693,7 +693,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
     let db = Database::open(&path, until()).unwrap();
     let records = db.namespace("server").unwrap();
     let at = db
-        .call(until(), |connection| {
+        .call(until(), AnswerMax::fixed(), |connection| {
             connection
                 .execute_batch("CREATE TABLE paired(n INTEGER); INSERT INTO paired VALUES (1)")?;
             let at = connection.records_commit(
@@ -714,7 +714,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
         })
         .unwrap();
     assert_eq!(records.try_wait("items", 0).unwrap(), Some(at));
-    let refused: Result<(), Refusal> = db.call(until(), |connection| {
+    let refused: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), |connection| {
         connection.execute("UPDATE paired SET n = 2", [])?;
         connection.records_commit(
             "server",
@@ -728,7 +728,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
     assert!(matches!(refused, Err(Refusal::Conflict { .. })));
     assert_eq!(records.head(until()).unwrap(), at);
     assert_eq!(
-        db.call(until(), |c| Ok(c.query_row(
+        db.call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
             "SELECT n FROM paired",
             [],
             |row| row.get::<_, i64>(0usize)
@@ -758,13 +758,13 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
 fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(&dir.path().join("queries.db"), until()).unwrap());
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t(n INTEGER); INSERT INTO t VALUES (1)")?;
         Ok(())
     })
     .unwrap();
     let count = |db: &Database| -> Result<i64, Refusal> {
-        db.query(until(), |c| {
+        db.query(until(), AnswerMax::fixed(), |c| {
             Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0usize))?)
         })
     };
@@ -775,7 +775,7 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.call(until(), move |c| {
+            db.call(until(), AnswerMax::fixed(), move |c| {
                 c.execute("INSERT INTO t VALUES (2)", [])?;
                 held.send(())?;
                 released.recv_timeout(guard)?;
@@ -792,10 +792,198 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     release.send(()).unwrap();
     writer.join().unwrap().unwrap();
     assert_eq!(count(&db).unwrap(), 2);
-    let wrote = db.query(until(), |c| {
+    let wrote = db.query(until(), AnswerMax::fixed(), |c| {
         c.execute("INSERT INTO t VALUES (3)", [])?;
         Ok(())
     });
     assert!(wrote.is_err(), "a query wrote: {wrote:?}");
     assert_eq!(count(&db).unwrap(), 2);
+}
+
+/// AUDIT 2026-11-23 §1, MB.1: a call answers within the bound it declared, and an answer past
+/// its declared bound is refused and rolled back, never committed.
+#[test]
+fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
+    use amphora::database::AnswerBytes;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("charged.db"), until()).unwrap();
+    db.call(until(), AnswerMax::fixed(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let write = |id: i64, answer: AnswerMax<String>| {
+        db.call(until(), answer, move |c| {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                vec![Value::Integer(id)],
+            )?;
+            Ok("y".repeat(100))
+        })
+    };
+    let answer = "y".repeat(100).answer_bytes();
+    assert_eq!(write(1, AnswerMax::bytes(answer)).unwrap().len(), 100);
+    assert!(matches!(
+        write(2, AnswerMax::bytes(answer - 1)),
+        Err(Refusal::TooLarge { .. })
+    ));
+    let ids = db
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
+            let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
+            let ids = s
+                .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .unwrap();
+    assert_eq!(ids, vec![1]);
+}
+
+/// Runs `future` on this thread, parked until its waker is woken; counts the wakes.
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> (T, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread, AtomicUsize);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.unpark();
+        }
+    }
+    let unpark = Arc::new(Unpark(std::thread::current(), AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&unpark));
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            return (value, unpark.1.load(Ordering::SeqCst));
+        }
+        std::thread::park();
+    }
+}
+
+fn ids(db: &Database) -> Vec<i64> {
+    db.call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
+        let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
+        let ids = s
+            .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    })
+    .unwrap()
+}
+
+/// Lane perf-A7: a call queued without blocking answers through its `Calling` once, and a second
+/// poll gets no second answer.
+#[test]
+fn a7_a_nowait_call_answers_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("nowait.db"), until()).unwrap();
+    db.call(until(), AnswerMax::fixed(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let calling: Vec<_> = (1..=3i64)
+        .map(|id| {
+            db.call_nowait(until(), AnswerMax::fixed(), move |c| {
+                c.execute(
+                    "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                    vec![Value::Integer(id)],
+                )?;
+                Ok(id * 10)
+            })
+            .unwrap()
+        })
+        .collect();
+    for (id, mut calling) in (1..=3i64).zip(calling) {
+        let (answer, wakes) = block_on(&mut calling);
+        assert_eq!(answer.unwrap(), id * 10);
+        assert!(wakes <= 1, "woken {wakes} times");
+        let (again, _) = block_on(&mut calling);
+        assert!(matches!(again, Err(Refusal::Unavailable(_))), "{again:?}");
+    }
+    assert_eq!(ids(&db), vec![1, 2, 3]);
+}
+
+/// Lane perf-A7: a call admission refuses is answered typed at once, and one past its declared
+/// answer is refused through its `Calling` and rolled back.
+#[test]
+fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
+    use amphora::database::AnswerBytes;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("refused.db"), until()).unwrap();
+    db.call(until(), AnswerMax::fixed(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let write = |id: i64, answer: AnswerMax<String>| {
+        db.call_nowait(until(), answer, move |c| {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                vec![Value::Integer(id)],
+            )?;
+            Ok("y".repeat(100))
+        })
+    };
+    assert!(matches!(
+        write(1, AnswerMax::bytes(usize::MAX)),
+        Err(Refusal::Full { .. })
+    ));
+    let past = Instant::now() - Duration::from_millis(1);
+    assert!(matches!(
+        db.call_nowait(past, AnswerMax::fixed(), |_| Ok(0i64)),
+        Err(Refusal::Timeout)
+    ));
+    let answer = "y".repeat(100).answer_bytes();
+    let (over, _) = block_on(write(2, AnswerMax::bytes(answer - 1)).unwrap());
+    assert!(matches!(over, Err(Refusal::TooLarge { .. })), "{over:?}");
+    let (fits, _) = block_on(write(3, AnswerMax::bytes(answer)).unwrap());
+    assert_eq!(fits.unwrap().len(), 100);
+    assert_eq!(ids(&db), vec![3]);
+}
+
+/// Lane perf-A8: 10,000 calls in flight at once, queued behind a held writer by a pool of one
+/// thread a core, are each admitted and each answered: the writer's queue refuses none for room
+/// (it held 4,096 before), its memory charge is its only bound.
+#[test]
+fn a8_ten_thousand_nowait_calls_in_flight_are_all_answered_none_refused_for_queue_room() {
+    const IN_FLIGHT: usize = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("in-flight.db"), until()).unwrap();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let holding = db
+        .call_nowait(until(), AnswerMax::fixed(), move |_| {
+            let _ = held.recv();
+            Ok(())
+        })
+        .unwrap();
+    let pool = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let submitted = Arc::new(Barrier::new(pool + 1));
+    let threads: Vec<_> = (0..pool)
+        .map(|t| {
+            let (db, submitted) = (db.clone(), Arc::clone(&submitted));
+            std::thread::spawn(move || {
+                let mine: Vec<usize> = (t..IN_FLIGHT).step_by(pool).collect();
+                let calling: Vec<_> = mine
+                    .iter()
+                    .map(|&n| {
+                        db.call_nowait(until(), AnswerMax::fixed(), move |_| Ok(n))
+                            .unwrap()
+                    })
+                    .collect();
+                submitted.wait();
+                mine.into_iter()
+                    .zip(calling)
+                    .map(|(n, calling)| block_on(calling).0.unwrap() == n)
+                    .filter(|&same| same)
+                    .count()
+            })
+        })
+        .collect();
+    submitted.wait();
+    release.send(()).unwrap();
+    block_on(holding).0.unwrap();
+    let answered: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(answered, IN_FLIGHT);
 }

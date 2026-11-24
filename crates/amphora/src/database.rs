@@ -74,23 +74,37 @@ CREATE INDEX IF NOT EXISTS __amphora_moved_stamps_order ON __amphora_moved_stamp
 const LIVE_MAX: u64 = 10_000_000;
 /// A request admitted to the writer's queue: what the request and its answer can hold
 /// ([`Admission::bytes_for`]), charged to the memory budget's room for queues (MB.1;
-/// replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1), refused
-/// `Full` at that room.
+/// replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1). With no
+/// room it waits for room until its deadline, woken only by charges given back
+/// ([`Store::charge_queue`]), and is refused `Full` past it; past the budget's whole limit it is
+/// refused `TooLarge` at once (lane perf-A19).
 struct Admission {
     bytes: Arc<AtomicUsize>,
     charged: usize,
     _charge: crate::memory::Charge,
 }
 impl Admission {
-    fn reserve(bytes: &Arc<AtomicUsize>, operation: &Operation) -> Result<Self, Refusal> {
-        let charged = Self::bytes_for(operation);
+    fn reserve(
+        store: &Store<Local>,
+        bytes: &Arc<AtomicUsize>,
+        operation: &Operation,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::charge(store, bytes, Self::bytes_for(operation), until)
+    }
+
+    fn fixed() -> usize {
+        std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>())
+    }
+
+    fn charge(
+        store: &Store<Local>,
+        bytes: &Arc<AtomicUsize>,
+        charged: usize,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
         let request = u64::try_from(charged).unwrap_or(u64::MAX);
-        let charge = crate::memory::process()
-            .take(crate::memory::Use::Queues, request)
-            .map_err(|refusal| match refusal {
-                Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
-                other => other,
-            })?;
+        let charge = store.charge_queue(request, until)?;
         bytes.fetch_add(charged, Ordering::AcqRel);
         Ok(Self {
             bytes: Arc::clone(bytes),
@@ -103,13 +117,16 @@ impl Admission {
     /// MB.1): its command and answer, the bytes it carries, and the most its answer can carry by
     /// the API's own bounds. A Records get answers one row (a key of at most `KEY_MAX`, a value of
     /// at most `VALUE_MAX`); a Records write, a head, a compaction's step and a holding answer a
-    /// revision or a fixed-size progress. The rest keep the full request bound, `REQUEST_MAX`:
-    /// SQL and scans answer up to `RESULT_MAX`/`SCAN_MAX` rows, an import's page and its
-    /// publication up to `REQUEST_MAX`, and a call's answer is whatever its closure returns,
-    /// which no API bound holds. Counts saturate: a sum past the address space is refused by the
-    /// budget, never wrapped.
+    /// revision or a fixed-size progress. A scan's page and a page of the changes feed hold at
+    /// most their limit's rows and `RESULT_MAX` bytes of keys and values ([`fits`], lane
+    /// perf-A6); an SQL batch carries its statements and parameters and answers a result per
+    /// statement, their rows' bytes at most `RESULT_MAX` (Ada, AUDIT §1: their real worst case,
+    /// lane perf-A5). The rest keep the full request bound, `REQUEST_MAX`: a migration, an import's
+    /// page and its publication up to `REQUEST_MAX`. A call is charged the bytes its caller declared
+    /// its answer holds ([`AnswerMax`], carried in `Operation::Call`). Counts saturate: a sum past the address space is
+    /// refused by the budget, never wrapped.
     fn bytes_for(operation: &Operation) -> usize {
-        let fixed = std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>());
+        let fixed = Self::fixed();
         let carried = match operation {
             Operation::Get(namespace, key, ..) => namespace
                 .len()
@@ -147,16 +164,68 @@ impl Admission {
             ) => namespace.len().saturating_mul(2),
             Operation::Mutation(Mutation::Holding(holding)) => holding.len(),
             Operation::Head => 0,
-            Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_))
-            | Operation::Scan(..)
-            | Operation::Changes(..)
-            | Operation::Call(_)
+            Operation::Scan(family, scan, _) => family
+                .len()
+                .saturating_add(scan.prefix.len())
+                .saturating_add(scan.after.as_ref().map_or(0, Vec::len))
+                .saturating_add(page_bytes::<Row>(scan.limit)),
+            Operation::Changes(family, _, limit) => {
+                family.len().saturating_add(page_bytes::<Change>(*limit))
+            }
+            Operation::Mutation(Mutation::Sql(statements)) => {
+                let request = statements.iter().fold(0usize, |n, statement| {
+                    statement.params.iter().fold(
+                        n.saturating_add(std::mem::size_of::<Statement>())
+                            .saturating_add(statement.sql.len()),
+                        |n, value| {
+                            n.saturating_add(std::mem::size_of::<Value>())
+                                .saturating_add(value_bytes(value))
+                        },
+                    )
+                });
+                let results = statements
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SqlResult>());
+                request
+                    .saturating_add(results)
+                    .saturating_add(api::RESULT_MAX)
+            }
+            Operation::Call(_, answer) | Operation::Query(_, answer) => *answer,
+            Operation::Mutation(Mutation::Migrate(_))
             | Operation::Import(_)
             | Operation::ImportProgress => api::REQUEST_MAX,
         };
         fixed.saturating_add(carried)
     }
 }
+
+/// Whether a page of `rows` rows carrying `bytes` bytes of keys and values takes one more row
+/// carrying `payload`. A scan's page and a page of the changes feed end at their limit's rows or
+/// at `RESULT_MAX` bytes, whichever comes first, and say that more follow, so the answer and what
+/// admission charges for it are bounded whatever the limit (Ada, AUDIT 2026-11-23 §1: the real
+/// worst case; lane perf-A6). A page's first row always fits, so a continued read advances: a
+/// key and value the API admits are far under `RESULT_MAX`.
+fn fits(rows: usize, bytes: usize, payload: usize, limit: usize) -> bool {
+    rows < limit && (rows == 0 || bytes.saturating_add(payload) <= api::RESULT_MAX)
+}
+
+/// The most a page of up to `limit` rows of `T` holds by [`fits`]: each row's envelope, and keys
+/// and values of at most `KEY_MAX` and `VALUE_MAX` a row up to `RESULT_MAX` in all.
+fn page_bytes<T>(limit: usize) -> usize {
+    let payload = limit
+        .saturating_mul(api::KEY_MAX.saturating_add(api::VALUE_MAX))
+        .min(api::RESULT_MAX);
+    limit
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_add(payload)
+}
+
+/// The bytes of column `n`'s blob, read in place (0 for a null), so a row past a page is weighed
+/// without being copied.
+fn blob_len(r: &amphora_engine::Row, n: usize) -> usize {
+    r.get_value(n).to_blob().map_or(0, <[u8]>::len)
+}
+
 /// The memory budget's room for queues now, what a full writer queue was refused at.
 fn queue_room() -> usize {
     crate::memory::process()
@@ -196,6 +265,8 @@ struct Shared {
     /// A backed-up writer's foreground, the calls it runs counted for its checks' pace
     /// (T-T1.12.C8).
     foreground: OnceLock<Arc<crate::backup::Foreground>>,
+    /// Records reads waiting for a reader (AUDIT 2.5).
+    reads: Reads,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
     _owner: Option<Owned>,
 }
@@ -259,8 +330,8 @@ pub(crate) struct Changed {
     locked_wakes: AtomicU64,
     /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
     /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
-    /// row's locks ([`ring`]). A row's entry lives while a get waits on it, so it
-    /// holds at most one entry per waiting get.
+    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits
+    /// on it, so it holds at most one entry per waiting get.
     lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
 }
 
@@ -301,10 +372,10 @@ pub enum LockedReads {
     Wait,
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
-    /// lane xgroup-sql-11: Wait's thundering herd at scale). A standalone writer rings the list when
-    /// it publishes the durable resolution, and every replica of a replicated group
-    /// rings its own lists as it applies the resolution, whichever process ran the step
-    /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
+    /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
+    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a
+    /// replicated group rings its own lists as it applies the resolution, whichever process ran
+    /// the step (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
 }
 
@@ -356,12 +427,349 @@ enum Operation {
     Scan(String, Scan, LockedReads),
     Changes(String, Rev, usize),
     Head,
-    Call(Mutex<Option<Call>>),
+    /// A call, and the bytes its caller declared its answer holds ([`AnswerMax`]): what admission
+    /// charges it, on a local writer and a replicated owner alike.
+    Call(Mutex<Option<Call>>, usize),
     Import(amphora_api::import::ImportPage),
     ImportProgress,
+    /// A replicated database's query ([`Database::query`]), and the bytes its answer holds: a
+    /// call whose writing statements are refused.
+    Query(Mutex<Option<Call>>, usize),
+}
+
+impl Operation {
+    /// Whether the operation may write. A replicated owner's barrier for one that can't asks its
+    /// leader for no write slot (CP-T1.8, lane V11).
+    fn writes(&self) -> bool {
+        match self {
+            Operation::Mutation(_) | Operation::Call(..) | Operation::Import(_) => true,
+            Operation::Get(..)
+            | Operation::Scan(..)
+            | Operation::Changes(..)
+            | Operation::Head
+            | Operation::ImportProgress
+            | Operation::Query(..) => false,
+        }
+    }
 }
 
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
+
+/// The most bytes a call's answer `R` holds in memory ([`AnswerBytes`]), declared by its caller
+/// (AUDIT 2026-11-23 §1, MB.1): the call is charged it at admission, to the memory budget's room
+/// for queues, and an answer past it is refused inside the call's transaction, before it
+/// commits, so the call rolls back. The only charge a call takes: lane perf-A8's A/B (r949)
+/// against a flat `REQUEST_MAX` and the answer's measured bytes, Ada's decision (lane perf-A9).
+pub struct AnswerMax<R> {
+    bytes: usize,
+    answer: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<R> Clone for AnswerMax<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for AnswerMax<R> {}
+
+impl<R> std::fmt::Debug for AnswerMax<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AnswerMax").field(&self.bytes).finish()
+    }
+}
+
+impl<R> AnswerMax<R> {
+    /// An answer of at most `bytes`, a bound the caller derives from what it reads: a count of
+    /// rows, or the API's own bound on a result (`RESULT_MAX`).
+    #[must_use]
+    pub const fn bytes(bytes: usize) -> Self {
+        Self {
+            bytes,
+            answer: std::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.bytes
+    }
+}
+
+impl<R: FixedAnswer> AnswerMax<R> {
+    /// An answer whose type holds nothing on the heap: its type's own size, exactly what it
+    /// holds.
+    #[must_use]
+    pub const fn fixed() -> Self {
+        Self::bytes(std::mem::size_of::<R>())
+    }
+}
+
+/// The bytes an answer holds in memory, inline and on the heap, checked against the bound its
+/// call declared ([`AnswerMax`]).
+pub trait AnswerBytes {
+    fn answer_bytes(&self) -> usize;
+}
+
+/// An answer that holds nothing on the heap, so its bytes are its type's size
+/// ([`AnswerMax::fixed`]).
+pub trait FixedAnswer: AnswerBytes {}
+
+macro_rules! inline_answer {
+    ($($t:ty),*) => {$(
+        impl AnswerBytes for $t {
+            fn answer_bytes(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+        }
+        impl FixedAnswer for $t {}
+    )*};
+}
+inline_answer!(
+    (),
+    bool,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    f64,
+    Duration
+);
+
+impl AnswerBytes for String {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.capacity())
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Vec<T> {
+    fn answer_bytes(&self) -> usize {
+        let spare = self
+            .capacity()
+            .saturating_sub(self.len())
+            .saturating_mul(std::mem::size_of::<T>());
+        self.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(spare),
+            |n, item| n.saturating_add(item.answer_bytes()),
+        )
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Option<T> {
+    fn answer_bytes(&self) -> usize {
+        let outer = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>());
+        outer.saturating_add(
+            self.as_ref()
+                .map_or(std::mem::size_of::<T>(), T::answer_bytes),
+        )
+    }
+}
+
+impl<T: FixedAnswer> FixedAnswer for Option<T> {}
+
+macro_rules! tuple_answer {
+    ($($name:ident . $index:tt),+) => {
+        impl<$($name: AnswerBytes),+> AnswerBytes for ($($name,)+) {
+            fn answer_bytes(&self) -> usize {
+                let padding = std::mem::size_of::<Self>()
+                    $(.saturating_sub(std::mem::size_of::<$name>()))+;
+                padding $(.saturating_add(self.$index.answer_bytes()))+
+            }
+        }
+        impl<$($name: FixedAnswer),+> FixedAnswer for ($($name,)+) {}
+    };
+}
+tuple_answer!(A.0, B.1);
+tuple_answer!(A.0, B.1, C.2);
+tuple_answer!(A.0, B.1, C.2, D.3);
+
+impl<T: AnswerBytes, const N: usize> AnswerBytes for [T; N] {
+    fn answer_bytes(&self) -> usize {
+        let inline =
+            std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>().saturating_mul(N));
+        self.iter()
+            .fold(inline, |n, item| n.saturating_add(item.answer_bytes()))
+    }
+}
+
+impl<T: FixedAnswer, const N: usize> FixedAnswer for [T; N] {}
+
+impl AnswerBytes for Value {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Value::Text(s) => s.capacity(),
+            Value::Blob(b) => b.capacity(),
+            _ => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
+impl<T: AnswerBytes, E: AnswerBytes> AnswerBytes for Result<T, E> {
+    fn answer_bytes(&self) -> usize {
+        let (inline, held) = match self {
+            Ok(value) => (std::mem::size_of::<T>(), value.answer_bytes()),
+            Err(error) => (std::mem::size_of::<E>(), error.answer_bytes()),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_sub(inline)
+            .saturating_add(held)
+    }
+}
+
+impl<T: FixedAnswer, E: FixedAnswer> FixedAnswer for Result<T, E> {}
+
+impl AnswerBytes for Refusal {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Refusal::Conflict { family, key, .. } => {
+                family.capacity().saturating_add(key.capacity())
+            }
+            Refusal::TooLarge { what, .. } => what.capacity(),
+            Refusal::Invalid { what, why } | Refusal::Serialization { what, why } => {
+                what.capacity().saturating_add(why.capacity())
+            }
+            Refusal::Unavailable(text) | Refusal::Fenced(text) => text.capacity(),
+            Refusal::Full { .. }
+            | Refusal::Compacted { .. }
+            | Refusal::Ahead { .. }
+            | Refusal::Timeout
+            | Refusal::UnknownOutcome
+            | Refusal::NotLeader { .. } => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
+impl AnswerBytes for Row {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.capacity())
+    }
+}
+
+impl AnswerBytes for api::Page {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(heap_bytes(&self.rows))
+    }
+}
+
+impl AnswerBytes for api::Change {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.as_ref().map_or(0, Vec::capacity))
+    }
+}
+
+impl AnswerBytes for api::import::ImportProgress {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.cursor.capacity())
+    }
+}
+
+/// The bytes `value` holds on the heap: its [`AnswerBytes`] past its own inline size, for an
+/// answer type that holds it as a field.
+pub(crate) fn heap_bytes<T: AnswerBytes>(value: &T) -> usize {
+    value
+        .answer_bytes()
+        .saturating_sub(std::mem::size_of::<T>())
+}
+
+/// `value`, the answer of a call that declared `answer`; past it, refused, so the session that
+/// made it rolls back.
+fn within<R: AnswerBytes>(value: R, answer: AnswerMax<R>) -> Result<R, Refusal> {
+    api::bound("call answer bytes", value.answer_bytes(), answer.bytes)?;
+    Ok(value)
+}
+
+/// What one run of a [`Database::query_waiting`] session holds: its answer as declared, or the
+/// cross-group key of the row it met under a lock, trimmed: a transaction's key, at most `KEY_MAX`
+/// (each passes `api::key` in `coordinator::validate`).
+fn met_max<R>(answer: AnswerMax<R>) -> AnswerMax<Result<R, Vec<u8>>> {
+    let outer = std::mem::size_of::<Result<R, Vec<u8>>>();
+    let read = outer
+        .saturating_sub(std::mem::size_of::<R>())
+        .saturating_add(answer.get());
+    AnswerMax::bytes(read.max(outer.saturating_add(api::KEY_MAX)))
+}
+
+/// A call queued by [`Database::call_nowait`]: a future of its answer, woken once, when the
+/// call has committed or with why it won't.
+#[must_use = "a call's answer comes only through its Calling"]
+pub struct Calling<R> {
+    slot: Arc<Mutex<Slot<R>>>,
+}
+
+enum Slot<R> {
+    Waiting(Option<std::task::Waker>),
+    Answered(Result<R, Refusal>),
+    Taken,
+}
+
+impl<R> std::future::Future for Calling<R> {
+    type Output = Result<R, Refusal>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut slot = match locked(&self.slot) {
+            Ok(slot) => slot,
+            Err(error) => return std::task::Poll::Ready(Err(error)),
+        };
+        match std::mem::replace(&mut *slot, Slot::Taken) {
+            Slot::Waiting(waker) => {
+                let waker = match waker {
+                    Some(waker) if waker.will_wake(cx.waker()) => waker,
+                    _ => cx.waker().clone(),
+                };
+                *slot = Slot::Waiting(Some(waker));
+                std::task::Poll::Pending
+            }
+            Slot::Answered(answer) => std::task::Poll::Ready(answer),
+            Slot::Taken => {
+                std::task::Poll::Ready(Err(unavailable("this call's answer was already taken")))
+            }
+        }
+    }
+}
+
+/// The writer's side of a [`Calling`]: answers it once, `UnknownOutcome` if the store drops it
+/// unanswered, so no caller waits on a call nobody will answer.
+struct Answerer<R>(Option<Arc<Mutex<Slot<R>>>>);
+
+impl<R> Answerer<R> {
+    fn answer(&mut self, answer: Result<R, Refusal>) {
+        let Some(slot) = self.0.take() else {
+            return;
+        };
+        let waker = match locked(&slot) {
+            Ok(mut slot) => match std::mem::replace(&mut *slot, Slot::Answered(answer)) {
+                Slot::Waiting(waker) => waker,
+                Slot::Answered(_) | Slot::Taken => None,
+            },
+            Err(_) => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<R> Drop for Answerer<R> {
+    fn drop(&mut self) {
+        self.answer(Err(Refusal::UnknownOutcome));
+    }
+}
 
 enum Answer {
     Done,
@@ -401,6 +809,11 @@ fn admission_refusal(error: store::Refused) -> Refusal {
     match error {
         store::Refused::Full => Refusal::Full {
             limit: queue_room(),
+        },
+        store::Refused::TooLarge { size, limit } => Refusal::TooLarge {
+            what: "memory for a database batch".into(),
+            size: usize::try_from(size).unwrap_or(usize::MAX),
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
         },
         store::Refused::Timeout => Refusal::Timeout,
         store::Refused::Disk => Refusal::Fenced("writer disk failed; reopen after recovery".into()),
@@ -709,6 +1122,245 @@ where
         return Err(Refusal::Timeout.into());
     }
     done
+}
+/// Where a Records read went ([`read_records`]).
+enum ReadRoute {
+    /// Answered on a reader.
+    Answered(Result<Answer, Refusal>),
+    /// The writer's to answer, the operation handed back: anything but a Records read, a read
+    /// while a restore is unfinished (the writer knows whether it is the restore), or while the
+    /// store has no reader to lend.
+    Writer(Operation),
+}
+
+/// A Records read waiting for a reader ([`Reads`]): what it asks and, once read, its answer.
+struct WaitingRead {
+    namespace: String,
+    operation: Mutex<Option<Operation>>,
+    claim: Option<Application>,
+    until: Instant,
+    slot: Mutex<ReadSlot>,
+    read: Condvar,
+}
+
+/// Where a waiting read is.
+#[derive(Default)]
+struct ReadSlot {
+    /// Read: its answer, or None when the writer must answer it.
+    answer: Option<Option<Result<Answer, Refusal>>>,
+    /// Readers that stopped handed the reads still waiting to it, each its place among the
+    /// readers: it reads them, once a hand-over, before it answers, even once its own read is
+    /// answered (another reader may take it meanwhile). Counted: two readers may hand over to the
+    /// same first waiting read before it wakes, and neither place is lost.
+    leads: usize,
+}
+
+/// The Records reads waiting for a reader, and how many readers are reading them (AUDIT 2.5). A
+/// read that finds fewer reading than the store has readers reads, taking every read waiting
+/// with it into one read transaction, as the writer takes every queued write into one commit; one
+/// that finds them all reading waits to be taken. A reader whose own read is answered stops after
+/// its batch, handing what still waits to the first waiting (so no caller reads for others
+/// without end), and one that finds none waiting stops: while reads wait, one of their callers
+/// reads.
+#[derive(Default)]
+struct Reads {
+    queue: Mutex<ReadQueue>,
+}
+
+#[derive(Default)]
+struct ReadQueue {
+    waiting: Vec<Arc<WaitingRead>>,
+    reading: usize,
+}
+
+/// A Records read (get, scan, changes, head) answered on a reader beside the writer (AUDIT 2.5):
+/// no writer transaction, no group log entry, no flush of its own. It keeps the writer path's
+/// guarantees: it reads once every write handed over before it is committed (read-your-writes,
+/// the order a writer batch gave it), on a snapshot taken after that, and answers once what it
+/// read is durable, as an answer given after its batch's flush was. Reads waiting together share
+/// one read transaction on one reader ([`Reads`]).
+fn read_records(
+    store: &Store<Local>,
+    reads: &Reads,
+    namespace: &str,
+    operation: Operation,
+    claim: &Option<Application>,
+    until: Instant,
+) -> Result<ReadRoute, Refusal> {
+    if !matches!(
+        operation,
+        Operation::Get(..) | Operation::Scan(..) | Operation::Changes(..) | Operation::Head
+    ) {
+        return Ok(ReadRoute::Writer(operation));
+    }
+    store.committed(None, until).map_err(admission_refusal)?;
+    let mine = Arc::new(WaitingRead {
+        namespace: namespace.to_owned(),
+        operation: Mutex::new(Some(operation)),
+        claim: claim.clone(),
+        until,
+        slot: Mutex::new(ReadSlot::default()),
+        read: Condvar::new(),
+    });
+    let reader = {
+        let mut queue = locked(&reads.queue)?;
+        queue.waiting.push(Arc::clone(&mine));
+        let reader = queue.reading < store.readers();
+        if reader {
+            queue.reading = queue.reading.saturating_add(1);
+        }
+        reader
+    };
+    if reader {
+        read_waiting(store, reads, &mine)?;
+    }
+    let answer = loop {
+        let mut slot = locked(&mine.slot)?;
+        if slot.leads > 0 {
+            slot.leads = slot.leads.saturating_sub(1);
+            drop(slot);
+            read_waiting(store, reads, &mine)?;
+            continue;
+        }
+        if let Some(answer) = slot.answer.take() {
+            break answer;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(slot);
+            return read_late(store, reads, &mine);
+        }
+        drop(
+            mine.read
+                .wait_timeout(slot, left)
+                .map_err(|_| unavailable("a database response lock was poisoned"))?,
+        );
+    };
+    let Some(result) = answer else {
+        let operation = locked(&mine.operation)?
+            .take()
+            .ok_or_else(|| unavailable("a read was handed to the writer without its operation"))?;
+        return Ok(ReadRoute::Writer(operation));
+    };
+    match store.sync(until) {
+        Ok(()) => Ok(ReadRoute::Answered(result)),
+        Err(store::Refused::Timeout) => Err(Refusal::Timeout),
+        Err(_) => Err(Refusal::UnknownOutcome),
+    }
+}
+
+/// A read whose deadline passed while it waited: it leaves the queue (nothing was written: it is
+/// refused for its deadline), unless it was handed the reads still waiting, which it reads first.
+fn read_late(
+    store: &Store<Local>,
+    reads: &Reads,
+    mine: &Arc<WaitingRead>,
+) -> Result<ReadRoute, Refusal> {
+    let lead = {
+        let mut queue = locked(&reads.queue)?;
+        queue.waiting.retain(|w| !Arc::ptr_eq(w, mine));
+        // A hand-over is made under the queue's lock: none comes after this.
+        std::mem::take(&mut locked(&mine.slot)?.leads)
+    };
+    for _ in 0..lead {
+        read_waiting(store, reads, mine)?;
+    }
+    Err(Refusal::Timeout)
+}
+
+/// Reads the reads waiting, a batch of one read transaction at a time, until none waits or
+/// `mine` is answered; then stops reading, handing what still waits to the first of it. Every
+/// read it took is answered, whatever happens to its batch.
+fn read_waiting(store: &Store<Local>, reads: &Reads, mine: &WaitingRead) -> Result<(), Refusal> {
+    loop {
+        let batch = {
+            let mut queue = locked(&reads.queue)?;
+            let answered = locked(&mine.slot)?.answer.is_some();
+            match queue.waiting.first() {
+                None => {
+                    queue.reading = queue.reading.saturating_sub(1);
+                    return Ok(());
+                }
+                Some(next) if answered => {
+                    let mut slot = locked(&next.slot)?;
+                    slot.leads = slot.leads.saturating_add(1);
+                    drop(slot);
+                    next.read.notify_all();
+                    return Ok(());
+                }
+                Some(_) => std::mem::take(&mut queue.waiting),
+            }
+        };
+        let answers = read_batch(store, &batch);
+        let mut answers = match answers {
+            Ok(Some(answers)) => answers.into_iter().map(Some).collect::<Vec<_>>(),
+            Ok(None) => batch.iter().map(|_| None).collect(),
+            Err(refusal) => batch.iter().map(|_| Some(Err(refusal.clone()))).collect(),
+        }
+        .into_iter();
+        for waiting in &batch {
+            let answer = answers
+                .next()
+                .unwrap_or_else(|| Some(Err(unavailable("a read went unanswered"))));
+            if let Ok(mut slot) = waiting.slot.lock() {
+                slot.answer = Some(answer);
+            }
+            waiting.read.notify_all();
+        }
+    }
+}
+
+/// `batch` read in one read transaction on a reader: each read's answer, in order; None when the
+/// writer must answer them (a restore unfinished, or no reader now).
+fn read_batch(
+    store: &Store<Local>,
+    batch: &[Arc<WaitingRead>],
+) -> Result<Option<Vec<Result<Answer, Refusal>>>, Refusal> {
+    let until = batch
+        .iter()
+        .map(|w| w.until)
+        .max()
+        .unwrap_or_else(Instant::now);
+    store
+        .read_committed(
+            until,
+            |db| {
+                db.query_transaction(|db| {
+                    if restore::incomplete(db)? {
+                        return Ok(None);
+                    }
+                    let mut answers = Vec::with_capacity(batch.len());
+                    for waiting in batch {
+                        answers.push(read_one(db, waiting));
+                    }
+                    Ok(Some(answers))
+                })
+            },
+            |_| Ok(None),
+        )
+        .map_err(|e| match e.downcast_ref::<store::Refused>() {
+            Some(store_refused) => admission_refusal(*store_refused),
+            None => refused(&e),
+        })
+}
+
+/// One read of a batch, on the batch's snapshot, its own deadline and claim checked.
+fn read_one(db: &mut Db, waiting: &WaitingRead) -> Result<Answer, Refusal> {
+    if Instant::now() >= waiting.until {
+        return Err(Refusal::Timeout);
+    }
+    let operation = locked(&waiting.operation)?;
+    let Some(operation) = operation.as_ref() else {
+        return Err(unavailable("a read was taken without its operation"));
+    };
+    let _deadline = db.deadline(waiting.until);
+    let result = application::check(db, waiting.claim.as_ref(), operation)
+        .and_then(|()| apply(db, &waiting.namespace, operation))
+        .unwrap_or_else(|e| Err(refused(&e)));
+    if result.is_err() && Instant::now() >= waiting.until {
+        return Err(Refusal::Timeout);
+    }
+    result
 }
 /// A read's answer and the time it was answered at (replication.md, "Follower reads at a closed
 /// time"): the state it read is its group's at that time, every write at it or before and none
@@ -1403,6 +2055,7 @@ impl Database {
                         admitted: Arc::new(AtomicUsize::new(0)),
                         stamps: OnceLock::new(),
                         foreground: OnceLock::new(),
+                        reads: Reads::default(),
                         _owner: Some(owner),
                     }),
                 })
@@ -1488,6 +2141,8 @@ impl Database {
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
+                // Every request is admitted by its charge to the memory budget's room for queues
+                // (MB.1), so its store charges its commands nothing more (`Local::row_bytes`).
                 writer: Writer::Local(
                     Store::start(Local { db, restoring }, store::Config::default())
                         .map_err(unavailable)?,
@@ -1497,6 +2152,7 @@ impl Database {
                 admitted: Arc::new(AtomicUsize::new(0)),
                 stamps: OnceLock::new(),
                 foreground: OnceLock::new(),
+                reads: Reads::default(),
                 _owner: owner,
             }),
         };
@@ -1541,12 +2197,14 @@ impl Database {
     /// Runs one adaptive SQL session atomically on the writer. The closure runs exactly once;
     /// an error rolls back the session, and a successful answer waits for the durable callback.
     /// A caller whose deadline expires after submission must treat the outcome as unknown.
-    pub fn call<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// `answer`: the most bytes its answer holds, charged at admission; an answer past it rolls
+    /// the call back, refused ([`AnswerMax`]).
+    pub fn call<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_session(until, f).map(|(value, _)| value)
+        self.call_session(until, answer, f).map(|(value, _)| value)
     }
 
     /// [`Database::call`], answered with its write's own session token (replication.md,
@@ -1556,7 +2214,29 @@ impl Database {
     /// else writes. A session keeps the latest of its tokens (`Token::after`). None standalone,
     /// for an attached client (whose reads all see every write) and for a session that wrote
     /// nothing.
-    pub fn call_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    pub fn call_session<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        self.session(until, answer.bytes, move |connection| {
+            Ok(within(f(connection)?, answer)?)
+        })
+    }
+
+    /// One SQL session on the writer, or on an attached client's owner. `answer`: the bytes its
+    /// answer is declared to hold, charged at admission ([`AnswerMax`]).
+    fn session<R, F>(
+        &self,
+        until: Instant,
+        answer: usize,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
@@ -1568,7 +2248,7 @@ impl Database {
                 .map(|value| (value, None))
                 .map_err(Refusal::from);
         }
-        database.call_db_session(until, move |db| {
+        database.call_db_session(until, answer, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
@@ -1576,12 +2256,66 @@ impl Database {
         })
     }
 
+    /// [`Database::call`] without blocking its caller (lane perf-A7): admitted and queued at
+    /// once, its answer handed to the returned [`Calling`], a future woken once the call has
+    /// committed or with why it won't, so a pool of a few threads holds any number of calls in
+    /// flight. Admission refuses here, typed: past the budget's room for queues (`Full`), the only
+    /// bound on the writer's queue (lane perf-A8). Only a local owner queues a call with no
+    /// thread waiting on it: an attached client or a replicated database is refused here
+    /// ([`Database::call`] answers there). A dropped [`Calling`] leaves the call to run and
+    /// commit.
+    pub fn call_nowait<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<Calling<R>, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let call: Call = Box::new(move |db| {
+            let mut connection = crate::sql::Connection::new(db);
+            let value = within(f(&mut connection)?, answer)?;
+            connection.finish()?;
+            Ok(Box::new(value) as Box<dyn Any + Send>)
+        });
+        let slot = Arc::new(Mutex::new(Slot::Waiting(None)));
+        let mut answerer = Answerer(Some(Arc::clone(&slot)));
+        self.submit_local(
+            "",
+            Operation::Call(Mutex::new(Some(call)), answer.bytes),
+            until,
+            Instant::now(),
+            move |result: Result<Answer, Refusal>| {
+                answerer.answer(result.and_then(|answer| {
+                    match answer {
+                        Answer::Called(v) => v
+                            .downcast::<R>()
+                            .map(|v| *v)
+                            .map_err(|_| unavailable("wrong SQL session answer")),
+                        _ => Err(unavailable("wrong SQL session answer")),
+                    }
+                }));
+            },
+        )?;
+        Ok(Calling { slot })
+    }
+
     /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
     /// (`__amphora_*`): for a cross-group transaction's steps (CP-T1.10, `crate::xgroup`). An
     /// attached client is refused: its closure can't cross to the owner.
-    pub(crate) fn call_internal<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    pub(crate) fn call_internal<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
@@ -1591,7 +2325,8 @@ impl Database {
                 "an attached client can't run Amphora's own SQL; run it on the owner",
             ));
         }
-        let (value, write) = database.call_db_session(until, f)?;
+        let (value, write) =
+            database.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))?;
         if let (Writer::Replicated { client, .. }, Some(write)) = (&database.shared.writer, write) {
             // A follower can answer on the group's commit before its own apply. The step's
             // subsequent clock read must cover the applied entry, including any HLC lift.
@@ -1605,21 +2340,89 @@ impl Database {
         Ok(value)
     }
 
-    fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// [`Database::call_internal`] for a cross-group step, `f` answering its value and the
+    /// cross-group keys of the rows whose locks it dropped: once the step commits here, those
+    /// rows' waiter lists are rung ([`LockedReads::WaitOnLock`]) before its answer is handed
+    /// over, whether or not its caller still waits for it. A step answered too late for its
+    /// caller (`UnknownOutcome`) has dropped its locks all the same, and the step sent again finds
+    /// none left to drop, so a ring left to the caller never came (T-T1.10.W7, T-T1.10.W11). A
+    /// replicated group rings once answered, as its replicas ring their own lists on applying it
+    /// (`ring_unlocked`). A row no get waits on rings no one.
+    pub(crate) fn call_internal_ringing<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<(R, Vec<Vec<u8>>)>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
-        F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
     {
-        self.call_db_session(until, f).map(|(value, _)| value)
+        let database = self.resolve(until)?;
+        if !matches!(database.shared.writer, Writer::Local(_)) {
+            let (value, dropped) = database.call_internal(until, answer, f)?;
+            ring(&database.shared.changed, &dropped)?;
+            return Ok(value);
+        }
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let call: Call = Box::new(move |db| {
+            let value = within(f(db)?, answer)?;
+            Ok(Box::new(value) as Box<dyn Any + Send>)
+        });
+        let changed = Arc::clone(&database.shared.changed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        database.submit_local(
+            "",
+            Operation::Call(Mutex::new(Some(call)), answer.get()),
+            until,
+            until,
+            move |result| {
+                let answer = result.and_then(|answer| match answer {
+                    Answer::Called(v) => v
+                        .downcast::<(R, Vec<Vec<u8>>)>()
+                        .map_err(|_| unavailable("wrong SQL session answer"))
+                        .and_then(|v| {
+                            let (value, dropped) = *v;
+                            ring(&changed, &dropped).map(|()| value)
+                        }),
+                    _ => Err(unavailable("wrong SQL session answer")),
+                });
+                // A caller whose deadline elapsed no longer waits; its rows were rung all the same.
+                let _ = tx.send(answer);
+            },
+        )?;
+        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_| Refusal::UnknownOutcome)?
     }
 
-    fn call_db_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    /// A call on the owner's own session. `answer`: the most bytes its answer holds, charged at
+    /// admission; an answer past it rolls the call back, refused ([`AnswerMax`]).
+    fn call_db<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    {
+        self.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))
+            .map(|(value, _)| value)
+    }
+
+    /// `answer`: the bytes the call's answer is declared to hold, charged at admission
+    /// ([`AnswerMax`]).
+    fn call_db_session<R, F>(
+        &self,
+        until: Instant,
+        answer: usize,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
-        match self.submit_session("", Operation::Call(Mutex::new(Some(call))), until)? {
+        let operation = Operation::Call(Mutex::new(Some(call)), answer);
+        match self.resolve(until)?.submit_selected("", operation, until)? {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -1630,36 +2433,86 @@ impl Database {
 
     /// Runs one read-only SQL session on a reader beside the writer (docs/design/store.md,
     /// decision 33): it sees what was committed when it began, waits for neither the writer nor a
-    /// flush, and writes nothing, its writing statements refused. A remote or replicated database
-    /// runs it as a [`Database::call`].
-    pub fn query<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// flush, and writes nothing, its writing statements refused. A replicated database runs it
+    /// past its group's barrier, on its replica's applied state, its writing statements refused
+    /// as here; its barrier asks the leader for no write slot (CP-T1.8, lane V11). An attached
+    /// client runs it as a [`Database::call`]. `answer`: the most bytes its answer holds, derived
+    /// from what it reads, charged at admission where it runs as a replicated query or a call; an
+    /// answer past it is refused ([`AnswerMax`]).
+    pub fn query<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        let store = match &database.shared.writer {
+            Writer::Local(store) => store,
+            Writer::Replicated { .. } => {
+                let query: Call = Box::new(move |db| {
+                    let mut connection = crate::sql::Connection::new(db);
+                    let value = within(f(&mut connection)?, answer)?;
+                    connection.finish()?;
+                    Ok(Box::new(value) as Box<dyn Any + Send>)
+                });
+                let operation = Operation::Query(Mutex::new(Some(query)), answer.get());
+                return match database.submit_selected("", operation, until)? {
+                    (Answer::Called(value), _) => value
+                        .downcast::<R>()
+                        .map(|value| *value)
+                        .map_err(|_| unavailable("wrong SQL query answer")),
+                    _ => Err(unavailable("wrong SQL query answer")),
+                };
+            }
+            Writer::Client(_) => {
+                return database
+                    .session(until, answer.get(), move |c| Ok(within(f(c)?, answer)?))
+                    .map(|(value, _)| value);
+            }
+        };
+        database.query_reader(store, until, Some(answer.get()), move |c| {
+            Ok(within(f(c)?, answer)?)
+        })
+    }
+
+    /// [`Database::query`] on a local store: on a reader, on this thread, charged nothing; or, while
+    /// the store has no reader to lend, queued on the writer and so charged at admission as a
+    /// queued request is (MB.1): its job, its session, and `answer`, the bytes its answer declared
+    /// ([`AnswerMax`]; none from [`Database::query_local`] and [`Database::query_closed`], which
+    /// declare none).
+    fn query_reader<R, F>(
+        &self,
+        store: &Store<Local>,
+        until: Instant,
+        answer: Option<usize>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
-        let database = self.resolve(until)?;
-        let Writer::Local(store) = &database.shared.writer else {
-            return database.call(until, f);
-        };
-        let _in_flight = database
+        let _in_flight = self
             .shared
             .foreground
             .get()
             .map(crate::backup::Foreground::call);
-        // The store runs the session on a reader, or on the writer while it has none to lend.
         let session = Arc::new(Mutex::new(Some(f)));
-        let on_writer = Arc::clone(&session);
-        let claim = database.application.clone();
-        let on_writer_claim = claim.clone();
-        store
-            .read_committed(
-                until,
-                |reader| run_query(reader, until, claim.as_ref(), &session),
-                move |engine| {
-                    run_query(&mut engine.db, until, on_writer_claim.as_ref(), &on_writer)
-                },
-            )
-            .map_err(|e| refused(&e))
+        let claim = self.application.clone();
+        if let Some(read) = store.on_reader(until, |reader| {
+            run_query(reader, until, claim.as_ref(), &session)
+        }) {
+            return read.map_err(|e| refused(&e));
+        }
+        let job =
+            move |engine: &mut Local| run_query(&mut engine.db, until, claim.as_ref(), &session);
+        let _admission = Admission::charge(
+            store,
+            &self.shared.admitted,
+            std::mem::size_of_val(&job)
+                .saturating_add(std::mem::size_of::<Mutex<Option<F>>>())
+                .saturating_add(answer.unwrap_or(0)),
+            until,
+        )?;
+        store.run(until, job).map_err(|e| refused(&e))
     }
 
     /// [`Database::query`] for a session whose Records reads wait on a held cross-group lock
@@ -1668,13 +2521,19 @@ impl Database {
     /// [`LockedReads::WaitOnLock`] its Records get of a row under a lock is refused, the row
     /// noted, and once the session ends the read waits as a get does and runs the session again,
     /// on a snapshot past the resolution; so `f` may run more than once and answers from its last
-    /// run only. Under [`LockedReads::Committed`] it is [`Database::query`].
-    pub fn query_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// run only. Under [`LockedReads::Committed`] it is [`Database::query`]. `answer`: what
+    /// [`Database::query`] declares.
+    pub fn query_waiting<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
-        self.session_waiting(false, until, f)
+        self.session_waiting(Some(answer), until, f)
     }
 
     /// [`Database::query_waiting`] as a local read ([`Database::query_local`]): on a replica, on
@@ -1683,42 +2542,50 @@ impl Database {
     /// xgroup-sql-12).
     pub fn query_local_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
-        self.session_waiting(true, until, f)
+        self.session_waiting(None, until, f)
     }
 
-    /// The session of [`Database::query_waiting`] (`local`: of [`Database::query_local_waiting`]).
-    fn session_waiting<R, F>(&self, local: bool, until: Instant, f: F) -> Result<R, Refusal>
+    /// The session of [`Database::query_waiting`], at the leader's latest commit with the bound
+    /// it declared (`latest`; none: of [`Database::query_local_waiting`]).
+    fn session_waiting<R, F>(
+        &self,
+        latest: Option<AnswerMax<R>>,
+        until: Instant,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
         let reads = LockedReads::of(self.shared.changed.locked_reads.load(Ordering::Acquire));
         if reads == LockedReads::Committed {
-            return if local {
-                self.query_local(until, f)
-            } else {
-                self.query(until, f)
+            return match latest {
+                Some(answer) => self.query(until, answer, f),
+                None => self.query_local(until, f),
             };
         }
         let database = self.resolve(until)?;
         let f = Arc::new(f);
+        let latest = latest.map(met_max);
         database.wait_locked(reads, until, || {
             let f = Arc::clone(&f);
             let run = move |c: &mut crate::sql::Connection<'_>| {
                 let watch = session::Watch::begin();
                 let answer = (*f)(c);
                 match watch.met() {
-                    Some(row) => Ok(Err(row)),
+                    Some(mut row) => {
+                        row.shrink_to_fit();
+                        Ok(Err(row))
+                    }
                     None => answer.map(Ok),
                 }
             };
-            if local {
-                database.query_local(until, run)
-            } else {
-                database.query(until, run)
+            match latest {
+                Some(answer) => database.query(until, answer, run),
+                None => database.query_local(until, run),
             }
         })
     }
@@ -1747,7 +2614,7 @@ impl Database {
                 .for_application(database.application.clone())
                 .query_local(until, f)
                 .map_err(Refusal::from),
-            Writer::Local(_) => database.query(until, f),
+            Writer::Local(store) => database.query_reader(store, until, None, f),
         }
     }
 
@@ -1782,10 +2649,10 @@ impl Database {
                 "closed-time read",
                 "an attached client's waits for the wire's next version",
             )),
-            Writer::Local(_) => {
+            Writer::Local(store) => {
                 let micros = replicated::wall_micros()?;
                 database
-                    .query(until, f)
+                    .query_reader(store, until, None, f)
                     .map(|value| ClosedRead { value, micros })
             }
         }
@@ -1870,27 +2737,29 @@ impl Database {
     ///   the log; with one, on this replica once it has applied the token, waiting only while it
     ///   is behind and redirected to [`Database::query`] past its measured apply lag.
     ///
-    /// Answers alike in both modes for every session that carries its tokens.
+    /// Answers alike in both modes for every session that carries its tokens. `answer`: what
+    /// [`Database::query`] declares, for a read at the leader's latest commit.
     pub fn query_session<R, F>(
         &self,
         mode: ReadMode,
         token: Option<Token>,
         until: Instant,
+        answer: AnswerMax<R>,
         f: F,
     ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
         let (ReadMode::Session, Some(token)) = (mode, token) else {
             return match mode {
-                ReadMode::Latest => self.query(until, f),
+                ReadMode::Latest => self.query(until, answer, f),
                 ReadMode::Session => self.query_local(until, f),
             };
         };
         let database = self.resolve(until)?;
         let Writer::Replicated { client, .. } = &database.shared.writer else {
-            return self.query(until, f);
+            return self.query(until, answer, f);
         };
         let session = Mutex::new(Some(f));
         let claim = database.application.as_ref();
@@ -1907,7 +2776,7 @@ impl Database {
                 let f = locked(&session)?
                     .take()
                     .ok_or_else(|| api::invalid("SQL query", "was already executed"))?;
-                self.query(until, f)
+                self.query(until, answer, f)
             }
         }
     }
@@ -2023,11 +2892,11 @@ impl Database {
 
     /// [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): a locked read waits on the
     /// waiter list of the row it met, rung only by a resolution that drops that row's locks
-    /// ([`ring`]). It joins the list and tries once more before it first waits
-    /// there, so a resolution between its try and joining isn't missed; from then on the list's
-    /// ring count, read before each try, says whether one landed since. Meeting another row, it
-    /// moves to that row's list the same way. It leaves its list however it ends. It is counted
-    /// waiting ([`Database::locked_waits`]) as it first blocks.
+    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it
+    /// first waits there, so a resolution between its try and joining isn't missed; from then on
+    /// the list's ring count, read before each try, says whether one landed since. Meeting another
+    /// row, it moves to that row's list the same way. It leaves its list however it ends. It is
+    /// counted waiting ([`Database::locked_waits`]) as it first blocks.
     fn wait_on_lock<T>(
         &self,
         until: Instant,
@@ -2216,7 +3085,7 @@ impl Database {
             self.namespace(namespace)?.compact(*before, until)?;
             return Ok((Answer::Done, None));
         }
-        let store = match &self.shared.writer {
+        match &self.shared.writer {
             Writer::Replicated { client, .. } => {
                 return client
                     .submit(
@@ -2227,7 +3096,7 @@ impl Database {
                     )
                     .map(|answered| (answered.answer, answered.token));
             }
-            Writer::Local(store) => store,
+            Writer::Local(_) => {}
             Writer::Client(backend) => {
                 return remote::submit(
                     &backend.client.for_application(self.application.clone()),
@@ -2237,20 +3106,67 @@ impl Database {
                 )
                 .map(|answer| (answer, None));
             }
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.submit_local(namespace, operation, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
+        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
+                    Refusal::UnknownOutcome
+                }
+            })?
+            .map(|answer| (answer, None))
+    }
+
+    /// Admits `operation` to the local writer's queue, waiting for room in it until `room_until`,
+    /// and hands `reply` its answer once durable, or why it won't be, on the store's notifier
+    /// thread. Refused here, `reply` is dropped untold: the refusal is the answer.
+    fn submit_local(
+        &self,
+        namespace: &str,
+        operation: Operation,
+        until: Instant,
+        room_until: Instant,
+        reply: impl FnOnce(Result<Answer, Refusal>) + Send + 'static,
+    ) -> Result<(), Refusal> {
+        let Writer::Local(store) = &self.shared.writer else {
+            return Err(api::invalid(
+                "call_nowait",
+                "only a local owner queues a call without blocking; call answers here",
+            ));
         };
-        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
+        let admission = Admission::reserve(store, &self.shared.admitted, &operation, room_until)?;
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
-        let _in_flight = self
+        let in_flight = self
             .shared
             .foreground
             .get()
             .map(crate::backup::Foreground::call);
+        let operation = match read_records(
+            store,
+            &self.shared.reads,
+            namespace,
+            operation,
+            &self.application,
+            until,
+        )? {
+            ReadRoute::Answered(answer) => {
+                drop(admission);
+                drop(in_flight);
+                reply(answer);
+                return Ok(());
+            }
+            ReadRoute::Writer(operation) => operation,
+        };
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
             || matches!(
                 &operation,
                 Operation::Mutation(Mutation::Compact { .. } | Mutation::CompactStep { .. })
             );
-        let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(_));
+        let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(..));
         let publish = match &operation {
             Operation::Mutation(Mutation::Records { namespace, tx }) if !tx.writes.is_empty() => {
                 let mut families = BTreeMap::new();
@@ -2267,12 +3183,11 @@ impl Database {
                 Mutation::Compact { namespace, .. } | Mutation::CompactStep { namespace, .. },
             ) => Some(Publish::Compact(namespace.clone())),
             Operation::Import(_) => Some(Publish::Imported(namespace.into())),
-            Operation::Call(_) => Some(Publish::Call),
+            Operation::Call(..) => Some(Publish::Call),
             _ => None,
         };
         let answer: Reply = Arc::new(Mutex::new(None));
         let publication = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::sync_channel(1);
         let changed = Arc::clone(&self.shared.changed);
         store
             .put_then(
@@ -2284,9 +3199,8 @@ impl Database {
                     publication: Arc::clone(&publication),
                     until,
                 }],
-                until,
+                room_until,
                 move |done| {
-                    let _admission = admission;
                     let mut result = match done {
                         Ok(()) => locked(&answer)
                             .and_then(|mut r| {
@@ -2359,14 +3273,6 @@ impl Database {
                             result = Err(error);
                         }
                     }
-                    // After durability, independently of the caller receiving the result. An
-                    // idempotent resolution retried after a lost reply has no locks left to drop.
-                    if let Ok(Answer::Called(value)) = &result
-                        && let Some(step) = value.downcast_ref::<crate::xgroup::sql::AppliedStep>()
-                        && let Err(error) = ring(&changed, &step.dropped)
-                    {
-                        result = Err(error);
-                    }
                     if wake && result.is_ok() {
                         match locked(&changed.generation) {
                             Ok(mut generation) => {
@@ -2388,18 +3294,15 @@ impl Database {
                             Err(error) => result = Err(error),
                         }
                     }
-                    // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                    let _ = tx.send(result);
+                    // Its charge and its count in flight end before its answer is handed over,
+                    // so a caller holding the answer holds no charge but its answer's.
+                    drop(admission);
+                    drop(in_flight);
+                    reply(result);
                 },
             )
-            .map_err(admission_refusal)?;
-        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
-            .map_err(|e| match e {
-                mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
-                    Refusal::UnknownOutcome
-                }
-            })?
-            .map(|answer| (answer, None))
+            .map(|_| ())
+            .map_err(admission_refusal)
     }
 }
 
@@ -2729,6 +3632,11 @@ impl Engine for Local {
     fn key(_: &Command) -> &str {
         "database"
     }
+    /// None of its own: a command is charged at its admission ([`Admission`]), what it carries
+    /// and what its answer can hold, until it is answered, its time in the writer's queue within.
+    fn row_bytes(_: &Command) -> usize {
+        0
+    }
     /// A Records transaction routes by every key its conditions and writes name, and a get by
     /// its key, each as its row key ([`reshard::row_key`] of the namespace, family and key), so a
     /// transaction stays within one group (CP-T1.9; docs/design/reshard.md, decision "The routing
@@ -2762,7 +3670,7 @@ impl Engine for Local {
         if rows.iter().any(|r| {
             matches!(
                 r.operation,
-                Operation::Call(_) | Operation::Mutation(Mutation::CompactStep { .. })
+                Operation::Call(..) | Operation::Mutation(Mutation::CompactStep { .. })
             )
         }) {
             for row in rows {
@@ -2796,7 +3704,7 @@ impl Engine for Local {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
                         let result = (|| match &row.operation {
-                            Operation::Call(call) => {
+                            Operation::Call(call, _) => {
                                 let f = locked(call)?.take().ok_or_else(|| {
                                     anyhow::anyhow!("SQL session was already executed")
                                 })?;
@@ -3038,7 +3946,7 @@ fn apply(
             return import::progress(db, namespace)
                 .map(|progress| Ok(Answer::ImportProgress(progress)));
         }
-        Operation::Call(_) => {
+        Operation::Call(..) | Operation::Query(..) => {
             return Err(anyhow::anyhow!(
                 "SQL session reached replayable command dispatch"
             ));
@@ -3197,8 +4105,14 @@ fn apply(
             if let Some(upper) = &upper {
                 params.push(blob(upper)?);
             }
-            let mut rows = Vec::new();
+            let (mut rows, mut carried, mut more) = (Vec::new(), 0usize, false);
             db.query(query, params, |r| {
+                let payload = blob_len(r, 0).saturating_add(blob_len(r, 2));
+                if !fits(rows.len(), carried, payload, scan.limit) {
+                    more = true;
+                    return Ok(false);
+                }
+                carried = carried.saturating_add(payload);
                 rows.push(Row {
                     key: bytes(r, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
                     rev: rev(r, 1)?,
@@ -3206,8 +4120,6 @@ fn apply(
                 });
                 Ok(true)
             })?;
-            let more = rows.len() > scan.limit;
-            rows.truncate(scan.limit);
             // A scan of the latest rows waiting on a held lock (T-T1.10.W10) looks for one in
             // the range its page covers: to its last row when it stopped short, else the whole.
             if *locks != LockedReads::Committed && at == head {
@@ -3228,6 +4140,8 @@ fn apply(
                     return Ok(Ok(Answer::Locked(row)));
                 }
             }
+            // Grown one push at a time, the list holds the bytes admission charged once trimmed.
+            rows.shrink_to_fit();
             Ok(Ok(Answer::Page(Page { rows, more })))
         }
         Operation::Changes(f, after, limit) => {
@@ -3243,21 +4157,26 @@ fn apply(
                     head,
                 })));
             }
-            let mut changes = Vec::new();
-            db.query("SELECT rev, key, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev > ?3 ORDER BY rev, seq LIMIT ?4", [text(namespace), text(f), integer(*after)?, integer(u64::try_from(*limit)?.checked_add(1).ok_or_else(|| anyhow::anyhow!("limit overflow"))?)?], |r| { changes.push(Change { rev: rev(r, 0)?, key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?, value: bytes(r, 2)? }); Ok(true) })?;
-            if changes.len() > *limit {
-                // The cursor is a revision, so a page must never cut a transaction's revision.
-                // Otherwise advancing to its last change would silently skip the remaining keys.
-                let next = changes.get(*limit).map(|c| c.rev);
-                changes.truncate(*limit);
-                if changes.last().map(|c| c.rev) == next {
-                    changes.retain(|c| Some(c.rev) != next);
-                    if changes.is_empty() {
-                        return Ok(Err(api::invalid(
-                            "change limit",
-                            "a transaction does not fit; request up to TX_MAX changes",
-                        )));
-                    }
+            let (mut changes, mut carried, mut next) = (Vec::new(), 0usize, None);
+            db.query("SELECT rev, key, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev > ?3 ORDER BY rev, seq LIMIT ?4", [text(namespace), text(f), integer(*after)?, integer(u64::try_from(*limit)?.checked_add(1).ok_or_else(|| anyhow::anyhow!("limit overflow"))?)?], |r| {
+                let payload = blob_len(r, 1).saturating_add(blob_len(r, 2));
+                if !fits(changes.len(), carried, payload, *limit) {
+                    next = Some(rev(r, 0)?);
+                    return Ok(false);
+                }
+                carried = carried.saturating_add(payload);
+                changes.push(Change { rev: rev(r, 0)?, key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?, value: bytes(r, 2)? });
+                Ok(true)
+            })?;
+            // The cursor is a revision, so a page must never cut a transaction's revision.
+            // Otherwise advancing to its last change would silently skip the remaining keys.
+            if next.is_some() && changes.last().map(|c| c.rev) == next {
+                changes.retain(|c| Some(c.rev) != next);
+                if changes.is_empty() {
+                    return Ok(Err(api::invalid(
+                        "change limit",
+                        "a transaction does not fit; request up to TX_MAX changes",
+                    )));
                 }
             }
             Ok(Ok(Answer::Changes(Changes { changes, head })))
@@ -3267,7 +4186,8 @@ fn apply(
         }
         Operation::Import(_)
         | Operation::ImportProgress
-        | Operation::Call(_)
+        | Operation::Call(..)
+        | Operation::Query(..)
         | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_) | Mutation::Holding(_)) => {
             Err(anyhow::anyhow!(
                 "SQL operation reached the Records dispatch"
@@ -3283,6 +4203,13 @@ fn snapshot(at: Consistency, head: Rev, horizon: Rev) -> Result<Rev, Refusal> {
         Consistency::Snapshot(r) if r < horizon => Err(Refusal::Compacted { asked: r, horizon }),
         Consistency::Snapshot(r) => Ok(r),
     }
+}
+/// Whether a Records row has a value at `at` (its newest version by then is no deletion), as
+/// [`get`] would say by answering one, without copying the value out (AUDIT 4.2).
+fn live_at(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<bool> {
+    let mut live = false;
+    db.query("SELECT value IS NOT NULL FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { live = r.get::<i64>(0).map_err(unavailable)? != 0; Ok(false) })?;
+    Ok(live)
 }
 fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<Option<Row>> {
     let mut out = None;
@@ -3450,7 +4377,7 @@ fn commit(
     }
     let mut live = live;
     for ((family, key), (_, w)) in &final_writes {
-        let before = get(db, ns, family, key, head)?.is_some();
+        let before = live_at(db, ns, family, key, head)?;
         match (before, matches!(w, Write::Put { .. })) {
             (false, true) => {
                 live = live
@@ -3627,6 +4554,183 @@ mod owner_table {
 mod admission_charge {
     use super::*;
 
+    /// Lane perf-A19 (AUDIT 2026-11-23 §1, MB.1): a request admitted to a database waits for room
+    /// until its own deadline, woken by another's charge given back, never refused at once. Do: with
+    /// the memory budget's whole limit held by another charge, send a call whose deadline is an
+    /// hour off; once its wait is counted, give that charge back. Expect: the call committed, one
+    /// wait counted on the writer's store, and nothing held once it answers.
+    #[test]
+    fn a19_admission_waits_for_room_woken_by_another_charge_given_back() {
+        use crate::memory::Use;
+        use crate::memory::tests::{BUDGET, Fed, budget};
+        let far = Instant::now() + Duration::from_secs(3600);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("wait.db"), far).unwrap();
+        let Writer::Local(store) = &database.shared.writer else {
+            panic!("a local writer");
+        };
+        let fed = Fed::new(Some(1 << 30), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let other = budget.take(Use::Queues, 1 << 30).unwrap();
+        let (sending, on_sender) = (database.clone(), Arc::clone(&budget));
+        let sender = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_sender));
+            sending.call(far, AnswerMax::fixed(), |c| {
+                c.execute_batch("CREATE TABLE t(v)")?;
+                Ok(())
+            })
+        });
+        while store.counters().room_waits == 0 && !sender.is_finished() {
+            std::thread::yield_now();
+        }
+        assert_eq!(store.counters().room_waits, 1);
+        drop(other);
+        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert_eq!(store.counters().room_waits, 1);
+        assert_eq!(budget.held(Use::Queues), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1 (lane perf-A12): the answers of `call_db` and `call_internal`'s
+    /// callers (cross-group steps, restores, online changes, floor raises) count their heap, so
+    /// a call answering one can declare a bound its answer is held to.
+    #[test]
+    fn a12_call_db_answers_count_their_heap() {
+        let refusal = Refusal::Invalid {
+            what: "ab".to_owned(),
+            why: "cde".to_owned(),
+        };
+        assert_eq!(refusal.answer_bytes(), std::mem::size_of::<Refusal>() + 5);
+        let failed: Result<u64, Refusal> = Err(refusal);
+        assert_eq!(
+            failed.answer_bytes(),
+            std::mem::size_of::<Result<u64, Refusal>>() + 5
+        );
+        let held: Result<String, Refusal> = Ok(String::with_capacity(7));
+        assert_eq!(
+            held.answer_bytes(),
+            std::mem::size_of::<Result<String, Refusal>>() + 7
+        );
+        let progress = api::import::ImportProgress {
+            source: "src".to_owned(),
+            cursor: vec![1, 2],
+            done: false,
+        };
+        assert_eq!(
+            progress.answer_bytes(),
+            std::mem::size_of_val(&progress) + 5
+        );
+        let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
+        let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
+        let locked = crate::xgroup::Reply::Locked {
+            reads: reads.clone(),
+        };
+        assert_eq!(locked.answer_bytes(), std::mem::size_of_val(&locked) + heap);
+        let resolved = crate::xgroup::Reply::Resolved;
+        assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
+        let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
+        assert_eq!(
+            committed.answer_bytes(),
+            std::mem::size_of_val(&committed) + heap
+        );
+        let stepped = online::Stepped::Public {
+            held: Duration::from_millis(1),
+        };
+        assert_eq!(stepped.answer_bytes(), std::mem::size_of_val(&stepped));
+    }
+
+    /// Do: a group's own scan at its worst case, `limit` rows each at the largest key and value,
+    /// so its page fills every byte of keys and values admission charged it. Expect: the page
+    /// holds no more than its charge, its list trimmed rather than grown by `push` past `limit`
+    /// rows (AUDIT 2026-11-23 §1; lane perf-A14).
+    #[test]
+    fn a14_a_group_scan_at_its_worst_case_holds_what_admission_charged() {
+        let until = || Instant::now() + Duration::from_secs(120);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("records.db"), until()).unwrap();
+        let records = database.namespace("ns").unwrap();
+        let limit = 5u8;
+        let writes = (0..limit)
+            .map(|k| Write::Put {
+                family: "f".into(),
+                key: vec![k; api::KEY_MAX],
+                value: vec![7; api::VALUE_MAX],
+            })
+            .collect();
+        records
+            .commit(
+                Tx {
+                    conds: Vec::new(),
+                    writes,
+                },
+                until(),
+            )
+            .unwrap();
+        let limit = usize::from(limit);
+        let page = records
+            .scan(
+                "f",
+                Scan {
+                    prefix: Vec::new(),
+                    after: None,
+                    limit,
+                    at: Consistency::Linearizable,
+                },
+                until(),
+            )
+            .unwrap();
+        assert_eq!(page.rows.len(), limit);
+        let charged = page_bytes::<Row>(limit);
+        assert!(
+            heap_bytes(&page) <= charged,
+            "{} > {charged}",
+            heap_bytes(&page)
+        );
+    }
+
+    /// Do: a query at its worst case, the most blobs it reads (its `LIMIT`) each as large as
+    /// any written, collected into a list sized to them, its bound derived from that read; then
+    /// the same read declaring a byte less. Expect: the first answers, holding exactly what it
+    /// declared; the second is refused, typed (AUDIT 2026-11-23 §1, MB.1; lane perf-A14).
+    #[test]
+    fn a14_a_query_at_its_worst_case_answers_within_its_declared_bound() {
+        const ROWS: usize = 3;
+        const BLOB: usize = 100;
+        let until = || Instant::now() + Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("query.db"), until()).unwrap();
+        database
+            .call(until(), AnswerMax::fixed(), |c| {
+                c.execute_batch("CREATE TABLE t(v BLOB NOT NULL)")?;
+                for _ in 0..ROWS {
+                    c.execute(
+                        "INSERT INTO t VALUES (?1)",
+                        vec![Value::Blob(vec![7; BLOB])],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let declared =
+            std::mem::size_of::<Vec<Vec<u8>>>() + ROWS * (std::mem::size_of::<Vec<u8>>() + BLOB);
+        let read = |answer: AnswerMax<Vec<Vec<u8>>>| {
+            database.query(until(), answer, |c| {
+                let mut s = c.prepare("SELECT v FROM t LIMIT 3")?;
+                let mut blobs = Vec::with_capacity(ROWS);
+                for blob in s.query_map(Vec::<Value>::new(), |row| row.get::<_, Vec<u8>>(0usize))? {
+                    blobs.push(blob?);
+                }
+                Ok(blobs)
+            })
+        };
+        let blobs = read(AnswerMax::bytes(declared)).unwrap();
+        assert_eq!(blobs.len(), ROWS);
+        assert_eq!(blobs.answer_bytes(), declared);
+        assert!(matches!(
+            read(AnswerMax::bytes(declared - 1)),
+            Err(Refusal::TooLarge { .. })
+        ));
+    }
+
     fn put(value: usize) -> Operation {
         Operation::Mutation(Mutation::Records {
             namespace: "ns".into(),
@@ -3645,10 +4749,12 @@ mod admission_charge {
     }
 
     /// Do: size the admission charge of a Records get, small and largest Records writes, a head,
-    /// and a call, an SQL batch and a scan. Expect: a get charged its one row's bound (a
-    /// largest key and value) and no more; a write charged what it carries, its value counted
-    /// byte for byte; a head its command alone; a call, SQL and a scan, whose answers no tighter
-    /// bound holds, the full `REQUEST_MAX` as before (AUDIT 2026-11-23 §1, MB.1).
+    /// a call, SQL batches and scans. Expect: a get charged its one row's bound (a largest key
+    /// and value) and no more; a write charged what it carries, its value counted byte for byte;
+    /// a head its command alone; a call, whose answer no API bound holds, the full `REQUEST_MAX`;
+    /// a scan and a page of changes their limit's rows' envelopes and keys and values at their
+    /// largest up to `RESULT_MAX` (lane perf-A6); an SQL batch what it carries and a result per
+    /// statement on top of `RESULT_MAX` (AUDIT 2026-11-23 §1, MB.1; lane perf-A5).
     #[test]
     fn mb1_a_request_is_charged_what_it_and_its_answer_can_hold() {
         let fixed = std::mem::size_of::<Command>() + std::mem::size_of::<Answer>();
@@ -3666,22 +4772,149 @@ mod admission_charge {
         assert_eq!(largest - small, api::VALUE_MAX - 100);
         assert_eq!(Admission::bytes_for(&Operation::Head), fixed);
         let call: Call = Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>));
-        for unbounded in [
-            Operation::Call(Mutex::new(Some(call))),
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            Operation::Scan(
+        let declared = AnswerMax::<[u64; 3]>::fixed().get();
+        assert_eq!(
+            Admission::bytes_for(&Operation::Call(Mutex::new(Some(call)), declared)),
+            fixed + declared,
+            "a call is charged the bytes its caller declared, not the request bound"
+        );
+        let row = std::mem::size_of::<Row>();
+        let scan = |limit| {
+            Admission::bytes_for(&Operation::Scan(
                 "ns".into(),
                 Scan {
-                    prefix: Vec::new(),
+                    prefix: b"p".to_vec(),
                     after: None,
-                    limit: 1,
+                    limit,
                     at: Consistency::Linearizable,
                 },
                 LockedReads::Committed,
-            ),
-        ] {
-            assert_eq!(Admission::bytes_for(&unbounded), fixed + api::REQUEST_MAX);
+            ))
+        };
+        assert_eq!(
+            scan(1),
+            fixed + 3 + row + api::KEY_MAX + api::VALUE_MAX,
+            "a one-row page at its largest"
+        );
+        assert_eq!(
+            scan(api::SCAN_MAX),
+            fixed + 3 + api::SCAN_MAX * row + api::RESULT_MAX,
+            "the largest page: its rows' envelopes and RESULT_MAX, not 1000 largest rows (~1 GiB)"
+        );
+        let changes = |limit| Admission::bytes_for(&Operation::Changes("ns".into(), 0, limit));
+        let change = std::mem::size_of::<Change>();
+        assert_eq!(
+            changes(1),
+            fixed + 2 + change + api::KEY_MAX + api::VALUE_MAX
+        );
+        assert_eq!(
+            changes(api::SCAN_MAX),
+            fixed + 2 + api::SCAN_MAX * change + api::RESULT_MAX
+        );
+        let empty = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(Vec::new())));
+        assert_eq!(empty, fixed + api::RESULT_MAX);
+        let one = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(vec![Statement {
+            sql: "SELECT ?1".into(),
+            params: vec![Value::Blob(vec![0; 1000])],
+        }])));
+        assert_eq!(
+            one - empty,
+            std::mem::size_of::<Statement>()
+                + "SELECT ?1".len()
+                + std::mem::size_of::<Value>()
+                + 1000
+                + std::mem::size_of::<SqlResult>(),
+            "a statement's text and parameters byte for byte, and its result's envelope"
+        );
+    }
+
+    /// Do: write 40 rows of `VALUE_MAX` values (40 MiB, five transactions of eight), then scan
+    /// them and read their changes at the largest limit, continuing from each page. Expect: the
+    /// first page of each ends before its limit, at `RESULT_MAX` bytes of keys and values, and
+    /// says more follow; no page carries more than that or cuts a transaction's revision; every
+    /// row is reached once, in order, by continuing, so the charge's `RESULT_MAX` bounds every
+    /// page (AUDIT 2026-11-23 §1; lane perf-A6).
+    #[test]
+    fn a6_a_page_ends_at_result_max_and_continuing_reaches_every_row() {
+        let until = || Instant::now() + Duration::from_secs(120);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("records.db"), until()).unwrap();
+        let records = database.namespace("ns").unwrap();
+        let keys: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'k', i]).collect();
+        for tx in keys.chunks(8) {
+            let writes = tx
+                .iter()
+                .map(|key| Write::Put {
+                    family: "f".into(),
+                    key: key.clone(),
+                    value: vec![7; api::VALUE_MAX],
+                })
+                .collect();
+            records
+                .commit(
+                    Tx {
+                        conds: Vec::new(),
+                        writes,
+                    },
+                    until(),
+                )
+                .unwrap();
         }
+        let (mut cursor, mut scanned, mut pages) = (None, Vec::new(), 0);
+        loop {
+            let page = records
+                .scan(
+                    "f",
+                    Scan {
+                        prefix: Vec::new(),
+                        after: cursor.clone(),
+                        limit: api::SCAN_MAX,
+                        at: Consistency::Linearizable,
+                    },
+                    until(),
+                )
+                .unwrap();
+            let carried: usize = page.rows.iter().map(|r| r.key.len() + r.value.len()).sum();
+            assert!(carried <= api::RESULT_MAX, "{carried}");
+            assert!(!page.rows.is_empty());
+            pages += 1;
+            cursor = page.rows.last().map(|r| r.key.clone());
+            scanned.extend(page.rows.into_iter().map(|r| r.key));
+            assert_eq!(page.more, scanned.len() < keys.len(), "exact continuation");
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(scanned, keys);
+        assert!(
+            pages > 1,
+            "a page of 40 MiB ended at RESULT_MAX, before its limit"
+        );
+        let (mut after, mut changed, mut pages) = (0, Vec::new(), 0);
+        loop {
+            let page = records.changes("f", after, api::SCAN_MAX, until()).unwrap();
+            let Some(last) = page.changes.last() else {
+                break;
+            };
+            let carried: usize = page
+                .changes
+                .iter()
+                .map(|c| c.key.len() + c.value.as_ref().map_or(0, Vec::len))
+                .sum();
+            assert!(carried <= api::RESULT_MAX, "{carried}");
+            assert_eq!(page.changes.len() % 8, 0, "whole transactions only");
+            after = last.rev;
+            pages += 1;
+            changed.extend(page.changes.into_iter().map(|c| c.key));
+            if after >= page.head {
+                break;
+            }
+        }
+        assert_eq!(changed, keys);
+        assert!(
+            pages > 1,
+            "a page of changes ended at RESULT_MAX, before its limit"
+        );
     }
 }
 
@@ -4239,5 +5472,133 @@ mod group_holding {
             engine.holding().unwrap(),
             Some(postcard::to_allocvec(&held).unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod records_reads {
+    use super::*;
+
+    /// Do: size a store's readers for machines of 1 to 64 cores and of 1 GiB to 1 TiB, and one
+    /// that says nothing. Expect: one a core while a quarter of memory holds that many readers'
+    /// 8 MiB caches, fewer when it doesn't, never none (AUDIT 2.5: no picked reader count).
+    #[test]
+    fn audit_2_5_readers_are_sized_from_cores_and_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(store::reader_room(Some(32), Some(64 * GIB)), 32);
+        assert_eq!(store::reader_room(Some(1), Some(1024 * GIB)), 1);
+        // A quarter of 128 MiB is 32 MiB: four 8 MiB caches, though there are 64 cores.
+        assert_eq!(store::reader_room(Some(64), Some(128 << 20)), 4);
+        // The page pool's floor (16 MiB) holds two.
+        assert_eq!(store::reader_room(Some(64), Some(1 << 20)), 2);
+        assert_eq!(store::reader_room(Some(8), None), 8);
+        assert_eq!(store::reader_room(None, None), 1);
+        assert_eq!(store::reader_room(Some(0), Some(0)), 1);
+    }
+
+    fn put(key: &[u8], value: &[u8]) -> Tx {
+        Tx {
+            conds: Vec::new(),
+            writes: vec![Write::Put {
+                family: "f".into(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+        }
+    }
+
+    /// Do: from many more threads than the store has readers, each commit a key and get it at
+    /// once, over and over, so reads wait for readers and share their read transactions. Expect:
+    /// every get answers the value its own commit just wrote, at its revision or later
+    /// (read-your-writes on readers batched together, AUDIT 2.5), and none is refused.
+    #[test]
+    fn audit_2_5_batched_reads_see_their_callers_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = || Instant::now() + Duration::from_secs(60);
+        let db = Database::open(&dir.path().join("r.db"), until()).unwrap();
+        let ns = db.namespace("t").unwrap();
+        let clients = 4 * match &db.shared.writer {
+            Writer::Local(store) => store.readers(),
+            _ => panic!("a local database"),
+        };
+        std::thread::scope(|s| {
+            for c in 0..clients {
+                let ns = &ns;
+                s.spawn(move || {
+                    let key = format!("k{c}").into_bytes();
+                    for round in 0..20u32 {
+                        let value = round.to_le_bytes();
+                        let at = ns.commit(put(&key, &value), until()).unwrap();
+                        let row = ns
+                            .get("f", &key, Consistency::Linearizable, until())
+                            .unwrap()
+                            .expect("the row just written");
+                        assert_eq!(row.value, value, "client {c} round {round}");
+                        assert!(row.rev >= at, "client {c} round {round}");
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            locked(&db.shared.reads.queue).unwrap().reading,
+            0,
+            "every reader stopped once none waited"
+        );
+    }
+
+    /// Do: release 8x as many gets as the store has readers at once, so readers finish their
+    /// batches together and hand their places to the same first waiting reads; a quarter of them
+    /// with deadlines short enough to run out while waiting, so some leave with places handed to
+    /// them. Fifty rounds. Expect: after every round no read waits and no reader is counted (each
+    /// hand-over gives back exactly one place, AUDIT 2.5), every get either answers the row or is
+    /// refused for its deadline, and a get afterwards still finds a reader.
+    #[test]
+    fn audit_2_5_readers_finishing_together_lose_no_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = || Instant::now() + Duration::from_secs(60);
+        let db = Database::open(&dir.path().join("r.db"), until()).unwrap();
+        let ns = db.namespace("t").unwrap();
+        ns.commit(put(b"k", b"v"), until()).unwrap();
+        let clients = 8 * match &db.shared.writer {
+            Writer::Local(store) => store.readers(),
+            _ => panic!("a local database"),
+        };
+        let start = std::sync::Barrier::new(clients);
+        for round in 0..50 {
+            std::thread::scope(|s| {
+                for c in 0..clients {
+                    let (ns, start) = (&ns, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        let deadline = if c % 4 == 0 {
+                            Instant::now() + Duration::from_micros(200)
+                        } else {
+                            until()
+                        };
+                        match ns.get("f", b"k", Consistency::Linearizable, deadline) {
+                            Ok(row) => assert_eq!(
+                                row.expect("the row").value,
+                                b"v",
+                                "round {round} client {c}"
+                            ),
+                            Err(refusal) => assert!(
+                                c % 4 == 0 && matches!(refusal, Refusal::Timeout),
+                                "round {round} client {c}: {refusal:?}"
+                            ),
+                        }
+                    });
+                }
+            });
+            let queue = locked(&db.shared.reads.queue).unwrap();
+            assert!(
+                queue.waiting.is_empty(),
+                "round {round}: no read left waiting"
+            );
+            assert_eq!(queue.reading, 0, "round {round}: every place given back");
+        }
+        let row = ns
+            .get("f", b"k", Consistency::Linearizable, until())
+            .unwrap();
+        assert_eq!(row.expect("the row").value, b"v");
     }
 }

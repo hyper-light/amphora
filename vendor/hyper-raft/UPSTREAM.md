@@ -3,9 +3,13 @@
 The crates Focal's bus is built on (`vendor/focal-bus`), at hyper-raft's `main`.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `d5d5f8f66368bb8a08822518dd45d257e95e2dbf` (2026-11-06), MIT (`LICENSE`): hyper-raft's `main` with the
-  leader's commit count by quorum (R-8, `Raft::commit_stats`; Amphora's replicated class's metrics, kiln goal
-  8f0f29ac), which was Amphora's patch 0006 until upstream took it. The pin before was `4d72e19` (2026-10-28),
+  `7d1c7be3ca3f9e63eb03d54881e21fb2e60989f4` (2026-11-23), MIT (`LICENSE`): upstream's `d5d5f8f` (2026-11-06,
+  hyper-raft's `main` with the leader's commit count by quorum, R-8, `Raft::commit_stats`; Amphora's replicated
+  class's metrics, kiln goal 8f0f29ac, which was Amphora's patch 0006 until upstream took it) plus one commit,
+  a compacted log's snapshot prepared when the core first asks (Amphora's AUDIT §7.6), which was Amphora's
+  patch 0008 until upstream took it on its branch `amphora/audit-7.6-image-on-ask`, merged into upstream's
+  `main` (lane U1). The pin stays on that commit rather than `main`'s head so as to take nothing else of
+  upstream's with it. The pin before was `d5d5f8f`; before that `4d72e19` (2026-10-28),
   hyper-raft's `main` since its `main` and `fate-commit` lines met (the merge `7d5e536`). Focal's exact
   `f8052a5` base originally used `25cf889`; its recorded compatibility patch adapts the bus to this shared pin.
 - **What is here:** upstream's root manifest and the fifteen crates, whole, at upstream's paths:
@@ -33,6 +37,17 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 | `crates/hyper-raft/src/{raft,progress,fast,read,lib}.rs`, `crates/hyper-durable/src/replica.rs` | `Raft::grow_members` raises the most members a configuration may name (the tracker's, the fast votes' and the pending reads' bound with it), never lowers it; `Config::stated_members` (`StatedMembers`, `None` by default) is the owner's reader of a bound its entries state, which the core folds in as it takes entries, at open as after, before the configurations they change take effect; `Replica::grow_members` passes the raise through, additive | hyper-raft stops a member handed a configuration past the members it was opened for, so a group that grows needs its bound to grow at every member: Amphora states the bound once in its log and raises it ahead of a change that passes it (Amphora's docs/design/replication.md, "The member bound stated once per group"; QB.1, lane constants-21) | `0006-qb-1-the-member-bound-stated-in-the-owners-log.patch` |
 
 | `crates/hyper-durable/src/replica.rs` | `Replica::quiet`: the owner's quiet period in force, read back, additive | Amphora sets its quiet period from its learned election timeout as its pace moves (`Replica::set_quiet`; Amphora's docs/design/replication.md, QB.1, lane constants-21), and its test reads it back | `0007-qb-1-the-owners-quiet-period-read-back.patch` |
+| `crates/hyper-raft/src/{node,raft,tests}.rs`, `crates/hyper-durable/src/replica.rs`, `crates/hyper-raft/tests/support/{lagged,mod}.rs` | `RawNode::light_now` asks the round for the reads waiting (`Raft::ask_reads`) and gives the reads confirmed since the last `Ready` (`LightReady::read_states`), which `Replica::take_light` takes; under `Config::answer_beats_now` (off by default, as raft-rs's rule), a member whose term and vote are durable (the term and vote durable now kept by `Raft`, `durable_vote`) answers a heartbeat at once, beside the held answers, its position the durable end of its log (none where that end's term reads 0, a snapshot restored and not yet durable), its commit the durable one and its incarnation as every answer states it (`Raft::answer_beat_now`); the core's tests take the held answers a `Ready` gives, keep the default rule and hold the new one under the option; the tests' `Settings::answer_beats_now` sets it, the lagged harness turns it on, and its oracle holds a heartbeat answer's position of its own term to the disk | A write's ReadIndex barrier waited on two log flushes: the leader's read round and its confirmation left only with a `Ready`, which its write out held back at Amphora's depth 1, and a follower's heartbeat answer only with no write out. Neither change promises more: the reads' rule is ReadIndex's, and a heartbeat answer states nothing its disk doesn't hold, so its leader never counts a position past that member's durable log. The early answer is an owner's option, off by default, so the core in raft-rs's settings agrees with raft-rs (`tests/differential.rs`); Amphora's replicated owner turns it on (Amphora's lanes V3 to V5, AC-T1.8.3; bench/records/2026-11-23-adacachy2-perf-commits.md) | `0009-v3-reads-confirmed-and-heartbeats-answered-without-a-write.patch` |
+| `crates/hyper-durable/src/replica.rs` | `Replica::hold_apply` and `Replica::apply_held`: the owner's hold on what is committed, one more reason for the commit fence's range to wait (`apply_range` opens the fence while held, `release_fence` waits while held, and once lifted the next drive walks the range as one past a drive's page, the commit fence's rule kept), additive | Amphora runs a caller's session on a connection of its own, lent the database's one write lock, while its owner goes on ticking, voting and appending, so a session longer than an election timeout no longer costs the group its leader (Amphora's docs/design/replication.md, "Decision (lane P6)", CP-T1.13) | `0010-cp-t1-13-the-owner-s-apply-hold-beside-the-commit-fence.patch` |
+
+Change `0009` is general, not Amphora's alone, but stays in this series for now (lane U1, 2026-11-23). It
+goes upstream only on two conditions: both halves opt-in and off by default there (the early heartbeat answer
+already is, `Config::answer_beats_now`; the reads confirmed without a `Ready` are not yet, and another user of
+hyper-raft that doesn't call `RawNode::light_now` through `Replica::take_light` would lose them), so that
+upstream's default answers, its read hand-back and its differential test against raft-rs are unchanged; and a
+replication ladder A/B that shows its gain. Lane V6's ladder showed none at 1 writer and a probable loss at 32
+replicated writers (16.0 to 13.2 commits/s, p 0.016; bench/records/2026-11-23-adacachy2-perf-commits.md), so it
+waits for lane V7 to explain that loss.
 
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft

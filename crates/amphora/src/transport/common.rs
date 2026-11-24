@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -169,6 +169,15 @@ fn stepped_answer(
             .transpose()
             .map_err(|_| Refusal::UnknownOutcome)?;
         Ok(Answer::Stepped { reply, latest })
+    }
+}
+/// `response` as a peer that agreed on `version` decodes it: [`Refusal::Serialization`] only from
+/// [`VERSION_SERIALIZATION`], before it the `Invalid` it was (local-owner-transport.md, "Version 10").
+fn spoken(version: u32, response: Response) -> Response {
+    if version >= VERSION_SERIALIZATION {
+        response
+    } else {
+        response.map_err(Refusal::without_serialization)
     }
 }
 
@@ -421,6 +430,9 @@ impl Node {
 pub struct Nodes {
     endpoints: std::collections::BTreeMap<crate::reshard::NodeId, Endpoint>,
     dial: Option<Arc<super::network::Dial>>,
+    /// The version each node agreed on as it was last greeted: one for each node of `endpoints` at
+    /// most.
+    agreed: Arc<Mutex<std::collections::BTreeMap<crate::reshard::NodeId, u32>>>,
 }
 /// Where a node is reached: its loopback endpoint's path, or its network address and the name its
 /// certificate carries.
@@ -441,6 +453,7 @@ impl Nodes {
                 .map(|(node, path)| (node, Endpoint::Local(path)))
                 .collect(),
             dial: None,
+            agreed: Arc::default(),
         }
     }
 
@@ -461,6 +474,7 @@ impl Nodes {
         Ok(Self {
             endpoints,
             dial: Some(Arc::new(super::network::Dial::new(credentials)?)),
+            agreed: Arc::default(),
         })
     }
 
@@ -471,20 +485,61 @@ impl Nodes {
         request: Request,
         until: Instant,
     ) -> Result<Answer, Error> {
+        let heard = |version: u32| {
+            self.versions()?.insert(node, version);
+            Ok(())
+        };
         match (self.endpoints.get(&node), &self.dial) {
             (Some(Endpoint::Local(path)), _) => Client {
                 path: path.clone(),
                 application: None,
             }
-            .request(request, until),
+            .request_heard(request, until, heard),
             (Some(Endpoint::Network { address, name }), Some(dial)) => {
-                super::network::request(dial, *address, name, request, until)
+                super::network::request(dial, *address, name, request, until, heard)
             }
             _ => Err(unavailable(format_args!("no endpoint known for node {}", node.0)).into()),
         }
     }
+
+    fn versions(
+        &self,
+    ) -> Result<MutexGuard<'_, std::collections::BTreeMap<crate::reshard::NodeId, u32>>, Refusal>
+    {
+        self.agreed
+            .lock()
+            .map_err(|_| unavailable("the nodes' agreed versions' lock was poisoned"))
+    }
 }
 impl Nodes {
+    /// Refuses a transaction across groups one of whose participants is on `node`, unless that
+    /// speaks the version that finishes it ([`VERSION_FINISHES`]): asked before any lock is taken
+    /// (T-T1.9.R30; xgroup.md, "Over the transport"). The version is the one its last greeting
+    /// agreed on; a node not greeted yet, or too old then, is greeted again.
+    pub(crate) fn finishes(
+        &self,
+        node: crate::reshard::NodeId,
+        until: Instant,
+    ) -> Result<(), Refusal> {
+        let spoken = self.versions()?.get(&node).copied();
+        if spoken >= Some(VERSION_FINISHES) {
+            return Ok(());
+        }
+        self.request(node, Request::Probe, until)
+            .map_err(Refusal::from)?;
+        match self.versions()?.get(&node) {
+            Some(version) if *version >= VERSION_FINISHES => Ok(()),
+            version => Err(api::invalid(
+                "cross-group transaction",
+                &format!(
+                    "node {} speaks version {}, and finishing a transaction across groups takes version {VERSION_FINISHES}: nothing was locked",
+                    node.0,
+                    version.copied().unwrap_or(VERSION_MIN)
+                ),
+            )),
+        }
+    }
+
     /// One step of a transaction across groups on group `here`, whose owner is `node`'s endpoint
     /// (CP-T1.10; xgroup.md, "Over the transport"): one authenticated connection and one request,
     /// as a pull is. `carried` is the newest commit stamp the coordinator heard of; the answer
@@ -788,9 +843,20 @@ impl Client {
         Ok((stream, version))
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
+        self.request_heard(request, until, |_| Ok(()))
+    }
+    /// [`Client::request`], the version its greeting agreed on told to `heard` before the request
+    /// goes out.
+    fn request_heard(
+        &self,
+        request: Request,
+        until: Instant,
+        heard: impl FnOnce(u32) -> Result<(), Refusal>,
+    ) -> Result<Answer, Error> {
         // Encoded before connecting: a request too large for a frame never opens a connection.
         encode(&request, FRAME_MAX)?;
         let (mut stream, version) = self.greet(until)?;
+        heard(version)?;
         exchange(&mut stream, request, version, until)
     }
     fn compact_step(
@@ -1104,6 +1170,7 @@ fn compact_step_on(
 fn session(
     connection: &mut crate::sql::Connection<'_>,
     stream: &mut Stream,
+    version: u32,
     until: Instant,
 ) -> anyhow::Result<()> {
     write(stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
@@ -1147,7 +1214,7 @@ fn session(
                 })
             }
         };
-        let response = sql_response(response);
+        let response = spoken(version, sql_response(response));
         write(stream, &response, until)?;
         // SQL errors can be handled by application savepoints; transport failures abort.
     }
@@ -1389,17 +1456,17 @@ fn serve(
         let local = matches!(request, Request::LocalSession);
         let mut final_stream = stream.try_clone().map_err(unavailable)?;
         let run = move |connection: &mut crate::sql::Connection<'_>| {
-            session(connection, &mut stream, until)
+            session(connection, &mut stream, version, until)
         };
         // A local read runs read-only on this owner's own state, asking no leader (replication.md,
         // "A local read on a replica"); a session otherwise is a call on its writer.
         let result = if local {
             database.query_local(until, run)
         } else {
-            database.call(until, run)
+            database.call(until, crate::database::AnswerMax::fixed(), run)
         }
         .map(|()| Answer::Done);
-        return write(&mut final_stream, &result, until);
+        return write(&mut final_stream, &spoken(version, result), until);
     }
     let watch_batch = matches!(&request, Request::WatchBatch(_));
     let result = match request {
@@ -1459,6 +1526,7 @@ fn serve(
         | Request::Pull(_)
         | Request::Blob(_) => Err(unavailable("unexpected session")),
     };
+    let result = spoken(version, result);
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
             Ok(encoded) => encoded,
@@ -1762,13 +1830,18 @@ mod tests {
     /// the first. Expect: the second answered; the gap from the end to its answer printed.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "passes run alone (5 of 5 on adacachy2); failed once beside transport::common's suite, not yet explained (perf-I2)"]
     fn audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back() {
-        const TEST: &str =
-            "transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back";
+        const TEST: &str = "transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back";
         if std::env::var_os("AMPHORA_AUDIT6_EMFILE").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture", "--include-ignored", "--test-threads", "1"])
+                .args([
+                    "--exact",
+                    TEST,
+                    "--nocapture",
+                    "--include-ignored",
+                    "--test-threads",
+                    "1",
+                ])
                 .env("AMPHORA_AUDIT6_EMFILE", "1")
                 .status()
                 .unwrap();
@@ -1819,14 +1892,28 @@ mod tests {
         // The budget reads the lowered limit and counts what is open now, while it can.
         let budget = crate::descriptors::process().unwrap();
         drop(budget.take("a connection", 0).unwrap());
-        let _first = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
-        let mut second = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
+        // Both clients' sockets made before the first connects: Linux's accept reserves its
+        // descriptor before it waits for a connection, so a listener back in accept after taking
+        // the first would otherwise hold the last number and refuse the second's socket
+        // (EMFILE) whenever it ran ahead of this thread (perf-I3: the module-run failure).
+        let client =
+            || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let (first, second) = (client(), client());
+        first.connect_timeout(&address.into(), HANG).unwrap();
+        second.connect_timeout(&address.into(), HANG).unwrap();
+        let (_first, mut second) = (
+            std::net::TcpStream::from(first),
+            std::net::TcpStream::from(second),
+        );
         second.set_read_timeout(Some(HANG)).unwrap();
         // The listener meets the limit: its accept refused while the first is held, it waits
         // for the budget's give-back.
         let deadline = until();
         while budget.waiting() == 0 {
-            assert!(Instant::now() < deadline, "the listener never waited at the limit");
+            assert!(
+                Instant::now() < deadline,
+                "the listener never waited at the limit"
+            );
             std::thread::yield_now();
         }
         let mut byte = [0];
@@ -1835,7 +1922,10 @@ mod tests {
         second.read_exact(&mut byte).unwrap();
         let gap = ended.elapsed();
         assert_eq!(byte, [1]);
-        println!("audit6 emfile: answered {}us after the first ended", gap.as_micros());
+        println!(
+            "audit6 emfile: answered {}us after the first ended",
+            gap.as_micros()
+        );
         drop(owner);
     }
 
@@ -2281,6 +2371,48 @@ mod tests {
 
     /// The rolling upgrade's greeting (local-owner-transport.md, "Negotiated versions"): the
     /// version both ends use is the newest both speak, and none in common is refused.
+    /// T-T1.8.W1, the wire's half of the stale-base refusal's type (local-owner-transport.md,
+    /// "Version 10"). Do: answer a Serialization refusal and a malformed request's Invalid at
+    /// version 9 and at 10. Expect: at 10 each as it is; at 9 the Serialization as the Invalid it
+    /// was, its text unchanged, and the Invalid as it is.
+    #[test]
+    fn a_peer_before_version_10_is_sent_serialization_as_invalid() {
+        let stale = || Refusal::Serialization {
+            what: "prepared transaction".into(),
+            why: "the database advanced since preparation".into(),
+        };
+        let malformed = || api::invalid("transaction", "no writes");
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION, Err(stale())).err(),
+            Some(stale())
+        );
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION, Err(malformed())).err(),
+            Some(malformed())
+        );
+        let old = spoken(VERSION_SERIALIZATION - 1, Err(stale()))
+            .err()
+            .unwrap();
+        assert_eq!(
+            old,
+            Refusal::Invalid {
+                what: "prepared transaction".into(),
+                why: "the database advanced since preparation".into(),
+            }
+        );
+        assert_eq!(old.to_string(), stale().to_string());
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION - 1, Err(malformed())).err(),
+            Some(malformed())
+        );
+        // A version-9 peer decodes what it is sent.
+        let bytes = postcard::to_allocvec(&spoken(VERSION_MIN, Err(stale()))).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<Response>(&bytes),
+            Ok(Err(Refusal::Invalid { .. }))
+        ));
+    }
+
     #[test]
     fn negotiated_versions_take_the_newest_both_speak() {
         assert_eq!(agree(VERSION_MIN, VERSION_MIN).unwrap(), VERSION_MIN);
@@ -2306,6 +2438,187 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// T-T1.9.R30 (the coordinator's decision of 2026-11-24 on mixed versions; xgroup.md, "Over the
+    /// transport"): a transaction across groups starts only where every participant speaks the
+    /// version that finishes it. Do: group 0 here and group 1 on a version-8 owner, which answers
+    /// the coordinator's scan and a probe; under both protocols a transaction writing a key in each,
+    /// then a lock step sent to that owner alone, then a transaction in group 0 alone. Expect: the
+    /// first refused, group 0 holding no lock and the owner sent nothing but the scan and the probe;
+    /// the lock step refused before it goes out; the last committed.
+    #[test]
+    fn t_t1_9_r30_a_participant_too_old_to_finish_is_refused_before_any_lock() {
+        use crate::xgroup::{
+            Answer as Told, Cluster, Envelope, Member, Protocol, Reply, Step, Txn,
+        };
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("v8");
+            std::fs::File::create(&path).unwrap();
+            let owner = endpoint::bind(&path).unwrap();
+            let token = owner.token;
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            owner
+                .name_port(listener.local_addr().unwrap().port())
+                .unwrap();
+            let v8 = thread::spawn(move || {
+                let mut sent = Vec::new();
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
+                    assert_eq!(hello.version, 8, "a version-8 owner takes only 8");
+                    let nonce = [6; 32];
+                    let proof = auth::proof(&token, true, &hello, &nonce, None).unwrap();
+                    write_auth(&mut stream, &Challenge { nonce, proof }, until()).unwrap();
+                    let proof: [u8; 32] = read_limit(&mut stream, until(), 256).unwrap();
+                    auth::verify(&token, false, &hello, &nonce, None, &proof).unwrap();
+                    write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until()).unwrap();
+                    let answer = match read::<Request, _>(&mut stream, until()) {
+                        Ok(Request::Step { envelope, .. }) => match envelope.step {
+                            Step::Scan { .. } => {
+                                sent.push("scan");
+                                Answer::Stepped {
+                                    reply: Reply::Open {
+                                        txns: Vec::new(),
+                                        more: false,
+                                    },
+                                    latest: None,
+                                }
+                            }
+                            _ => {
+                                sent.push("another step");
+                                continue;
+                            }
+                        },
+                        Ok(Request::Probe) => {
+                            sent.push("probe");
+                            Answer::Done
+                        }
+                        Ok(_) => {
+                            sent.push("another request");
+                            continue;
+                        }
+                        Err(_) => {
+                            sent.push("nothing");
+                            continue;
+                        }
+                    };
+                    write(&mut stream, &Ok::<_, Refusal>(answer), until()).unwrap();
+                }
+                sent
+            });
+            let local =
+                crate::database::Database::open(&directory.path().join("g0.db"), until()).unwrap();
+            crate::xgroup::sql::prepare(&local, until()).unwrap();
+            let node = crate::reshard::NodeId(1);
+            let nodes = Arc::new(Nodes::new([(node, path)]));
+            let members = vec![
+                Member::Local(local.clone()),
+                Member::Node {
+                    nodes: Arc::clone(&nodes),
+                    node,
+                },
+            ];
+            let route = Arc::new(|key: &[u8]| u32::from(key[0]));
+            let cluster = Cluster::open_members(members, route, 1, protocol, 1, until()).unwrap();
+            let puts = |keys: &[u8]| Txn {
+                reads: Vec::new(),
+                writes: keys.iter().map(|k| (vec![*k], Some(vec![9]))).collect(),
+                conds: Vec::new(),
+            };
+            let refused = cluster.transact(puts(&[0, 1]), until());
+            assert!(
+                matches!(&refused, Err(Refusal::Invalid { what, why })
+                    if what == "cross-group transaction" && why.contains("takes version 9")),
+                "{protocol:?}: {refused:?}"
+            );
+            let held = local
+                .call_internal(
+                    until(),
+                    crate::database::AnswerMax::fixed(),
+                    |db| -> anyhow::Result<i64> {
+                        let mut held = 0;
+                        db.query("SELECT count(*) FROM __amphora_xg_lock", [], |row| {
+                            held = row.get::<i64>(0)?;
+                            Ok(false)
+                        })?;
+                        Ok(held)
+                    },
+                )
+                .unwrap();
+            assert_eq!(held, 0, "{protocol:?}");
+            let lock = Envelope {
+                coordinator: 1,
+                epoch: 1,
+                floor: None,
+                step: Step::Lock {
+                    txn: crate::xgroup::TxnId {
+                        coordinator: 1,
+                        epoch: 1,
+                        seq: 9,
+                    },
+                    anchor: 1,
+                    reads: Vec::new(),
+                    writes: vec![(vec![1], Some(vec![9]))],
+                    stage: None,
+                },
+            };
+            assert!(matches!(
+                nodes.step(node, 1, 0, lock, until()),
+                Err(Error::Refused(Refusal::Invalid { what, .. })) if what == "owner request"
+            ));
+            assert!(matches!(
+                cluster.transact(puts(&[0]), until()),
+                Ok(Told::Committed { .. })
+            ));
+            assert_eq!(v8.join().unwrap(), ["scan", "probe", "nothing"]);
+            drop(cluster);
+            drop(owner);
+        }
+    }
+
+    /// The wire's answers and requests a transaction across groups rides in keep their numbers
+    /// (local-owner-transport.md, "Versions"): the lock's vote rides where its clock did.
+    #[test]
+    fn t_t1_9_r30_the_transports_frames_keep_their_wire_numbers() {
+        let envelope = crate::xgroup::Envelope {
+            coordinator: 1,
+            epoch: 2,
+            floor: None,
+            step: crate::xgroup::Step::Begin,
+        };
+        let step = Request::Step {
+            here: 3,
+            carried: 4,
+            envelope,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&step).unwrap(),
+            [13, 3, 4, 1, 2, 0, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Request::Blob(BlobOp::ObjectMax)).unwrap(),
+            [14, 0]
+        );
+        let reply = crate::xgroup::Reply::Locked { reads: Vec::new() };
+        assert_eq!(
+            postcard::to_allocvec(&Answer::Stepped {
+                reply: reply.clone(),
+                latest: Some(5),
+            })
+            .unwrap(),
+            [21, 2, 0, 1, 5]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Answer::SteppedClosed {
+                reply,
+                latest: Some(5),
+                closed: Some(6),
+            })
+            .unwrap(),
+            [23, 2, 0, 1, 5, 1, 6]
+        );
     }
 
     /// The frames of version 8 as its peers wrote them: Hello alone, Challenge alone.

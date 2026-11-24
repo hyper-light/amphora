@@ -324,6 +324,10 @@ mod tests {
             &row.0
         }
 
+        fn row_bytes(row: &Self::Row) -> usize {
+            std::mem::size_of::<Self::Row>().saturating_add(row.0.capacity())
+        }
+
         fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
             for (k, v) in rows {
                 self.rows.insert(k.clone(), *v);

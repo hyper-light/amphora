@@ -164,6 +164,7 @@ pub(super) fn attach(
             admitted: Arc::new(AtomicUsize::new(0)),
             stamps: std::sync::OnceLock::new(),
             foreground: std::sync::OnceLock::new(),
+            reads: super::Reads::default(),
             _owner: None,
         }),
     })
@@ -512,7 +513,7 @@ pub(super) fn submit(
                 .map(Answer::Migrated)
                 .map_err(Refusal::from);
         }
-        Operation::Call(_) => {
+        Operation::Call(..) | Operation::Query(..) => {
             return Err(api::invalid(
                 "SQL session",
                 "client calls must use the public SQL session before capturing the closure",
@@ -546,7 +547,9 @@ pub(super) fn submit(
             Ok(Answer::Done)
         }
         Operation::ImportProgress => records.import_state(until).map(Answer::ImportProgress),
-        Operation::Call(_) | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
+        Operation::Call(..)
+        | Operation::Query(..)
+        | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
             Err(api::invalid("client operation", "unexpected dispatch"))
         }
         // A group's holding is its own engine's (CP-T1.9), never a remote client's to send.

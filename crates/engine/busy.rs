@@ -48,12 +48,13 @@ impl LockRelease {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Holds `waker` for the next release after `seen`: true. False when one came already: try
-    /// again now.
-    pub fn wait(&self, seen: u64, waker: &Waker) -> bool {
+    /// Holds `waker` for the next release after `seen` by anyone but this thread's own `step`:
+    /// true. False when one came already: try again now.
+    pub fn wait(&self, seen: u64, step: &OwnReleases, waker: &Waker) -> bool {
+        let own = step.count(self);
         let mut wakers = self.wakers.lock();
         self.armed.store(true, Ordering::SeqCst);
-        if self.generation.load(Ordering::SeqCst) != seen {
+        if self.generation.load(Ordering::SeqCst) != seen.wrapping_add(own) {
             self.armed.store(!wakers.is_empty(), Ordering::SeqCst);
             return false;
         }
@@ -63,18 +64,60 @@ impl LockRelease {
         true
     }
 
-    /// Each statement owns its registration even when two statements share a task.
-    pub(crate) fn subscribe(self: &Arc<Self>, seen: u64, waker: &Waker) -> Option<ReleaseWait> {
+    /// Each statement owns its registration even when two statements share a task (T-QB.1.13).
+    pub(crate) fn subscribe(
+        self: &Arc<Self>,
+        seen: u64,
+        step: &OwnReleases,
+        waker: &Waker,
+    ) -> Option<ReleaseWait> {
         let waker = Waker::from(Arc::new(StatementWake(waker.clone())));
-        self.wait(seen, &waker).then(|| ReleaseWait {
+        self.wait(seen, step, &waker).then(|| ReleaseWait {
             release: Arc::clone(self),
             waker,
         })
     }
 
+    /// Starts counting the releases this thread makes of this log's locks, for a step that will
+    /// [`Self::wait`] on the others'.
+    pub fn own_releases(&self) -> OwnReleases {
+        let key = self.key();
+        let inert = OwnReleases {
+            base: 0,
+            restore: None,
+        };
+        OWN.try_with(|own| {
+            let (held, made) = own.get();
+            if held == key {
+                OwnReleases {
+                    base: made,
+                    restore: None,
+                }
+            } else {
+                own.set((key, 0));
+                OwnReleases {
+                    base: 0,
+                    restore: Some((held, made)),
+                }
+            }
+        })
+        .unwrap_or(inert)
+    }
+
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     /// A lock was released: wakes every statement waiting.
     pub fn notify(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        let key = self.key();
+        let _ = OWN.try_with(|own| {
+            let (held, made) = own.get();
+            if held == key {
+                own.set((held, made.wrapping_add(1)));
+            }
+        });
         if !self.armed.load(Ordering::SeqCst) {
             return;
         }
@@ -89,10 +132,6 @@ impl LockRelease {
     }
 }
 
-/// A blocked write upgrade. A cross-process WAL has no local notification for it.
-#[derive(Debug)]
-pub(crate) struct WriteLockWait(pub Option<(Arc<LockRelease>, u64)>);
-
 struct StatementWake(Waker);
 
 impl Wake for StatementWake {
@@ -101,7 +140,8 @@ impl Wake for StatementWake {
     }
 }
 
-/// Dropping a pending step relinquishes its task, even if the lock holder never releases.
+/// Dropping a pending step relinquishes its task, even if the lock holder never releases
+/// (T-QB.1.13).
 #[derive(Debug)]
 pub(crate) struct ReleaseWait {
     release: Arc<LockRelease>,
@@ -115,6 +155,47 @@ impl Drop for ReleaseWait {
         self.release
             .armed
             .store(!wakers.is_empty(), Ordering::SeqCst);
+    }
+}
+
+crate::thread::thread_local! {
+    /// The log whose releases this thread is counting (its [`LockRelease`]'s address, 0: none),
+    /// and how many it has made since it began counting.
+    static OWN: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Amphora (lane perf-A5, fixing lane constants-22's wait): the releases one step makes itself of
+/// the log it may wait on. A write busy on another connection's write lock ends the read
+/// transaction its failed upgrade began, and that release moves the count it read before trying;
+/// counted as anyone's, its wait found a release every time and tried again at once, a spin
+/// for as long as the other held the lock. Its own releases never free what it waits for, so the
+/// wait counts only the others'. A step inside a step on the same log shares the outer's count;
+/// one on another log counts its own and gives the outer's back when it ends.
+pub struct OwnReleases {
+    base: u64,
+    restore: Option<(usize, u64)>,
+}
+
+impl OwnReleases {
+    /// This thread's releases of `release` since [`LockRelease::own_releases`].
+    fn count(&self, release: &LockRelease) -> u64 {
+        OWN.try_with(|own| {
+            let (held, made) = own.get();
+            if held == release.key() {
+                made.wrapping_sub(self.base)
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0)
+    }
+}
+
+impl Drop for OwnReleases {
+    fn drop(&mut self) {
+        if let Some(outer) = self.restore {
+            let _ = OWN.try_with(|own| own.set(outer));
+        }
     }
 }
 
@@ -241,7 +322,11 @@ impl BusyHandlerState {
         self.invocation_count = self.invocation_count.saturating_add(1);
         self.timeout = now;
         let left = max_duration.saturating_sub(now.duration_since(first));
-        (!left.is_zero()).then_some(left)
+        if left.is_zero() {
+            None
+        } else {
+            Some(left)
+        }
     }
 
     /// Get the current timeout instant
@@ -339,13 +424,14 @@ mod tests {
         let waker = Waker::from(std::sync::Arc::clone(&count));
         let seen = release.generation();
         release.notify();
+        let step = release.own_releases();
         assert!(
-            !release.wait(seen, &waker),
+            !release.wait(seen, &step, &waker),
             "a release since `seen`: try again now"
         );
         let seen = release.generation();
-        assert!(release.wait(seen, &waker));
-        assert!(release.wait(seen, &waker));
+        assert!(release.wait(seen, &step, &waker));
+        assert!(release.wait(seen, &step, &waker));
         assert_eq!(release.wakers.lock().len(), 1, "one waker held once");
         release.notify();
         assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -363,24 +449,63 @@ mod tests {
         let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
         let task = std::sync::Arc::downgrade(&count);
         let waker = Waker::from(count);
+        let step = release.own_releases();
         let seen = release.generation();
-        let first = release.subscribe(seen, &waker).unwrap();
-        let second = release.subscribe(seen, &waker).unwrap();
+        let first = release.subscribe(seen, &step, &waker).unwrap();
+        let second = release.subscribe(seen, &step, &waker).unwrap();
         drop(first);
         assert_eq!(
             release.wakers.lock().len(),
             1,
             "the other statement still waits"
         );
-        release.notify();
+        std::thread::scope(|s| {
+            s.spawn(|| release.notify());
+        });
         assert_eq!(task.upgrade().unwrap().0.load(Ordering::SeqCst), 1);
         drop(second);
-        let pending = release.subscribe(release.generation(), &waker).unwrap();
+        let pending = release
+            .subscribe(release.generation(), &step, &waker)
+            .unwrap();
         drop(waker);
         drop(pending);
         assert!(
             task.upgrade().is_none(),
             "the abandoned wait kept its task alive"
+        );
+    }
+
+    /// Lane perf-A5 (the db test constants_22 spun forever on this): a busy write's own releases
+    /// (the read transaction its failed upgrade ends) never end its wait, and another thread's
+    /// release still does. A step on another log inside it gives the outer's count back.
+    #[test]
+    fn a5_a_steps_own_releases_never_end_its_wait() {
+        let release = LockRelease::default();
+        let waker = Waker::from(std::sync::Arc::new(Count(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let step = release.own_releases();
+        let seen = release.generation();
+        release.notify();
+        assert!(
+            release.wait(seen, &step, &waker),
+            "its own release: it waits for another's"
+        );
+        let other = LockRelease::default();
+        let inner = other.own_releases();
+        other.notify();
+        drop(inner);
+        release.notify();
+        assert!(
+            release.wait(seen, &step, &waker),
+            "its own releases still counted after a step on another log"
+        );
+        std::thread::scope(|s| {
+            s.spawn(|| release.notify());
+        });
+        assert!(
+            !release.wait(seen, &step, &waker),
+            "another thread's release since `seen`: try again now"
         );
     }
 

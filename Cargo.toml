@@ -10,6 +10,7 @@ resolver = "3"
 amphora-engine-ext = { path = "crates/engine-ext" }
 amphora-engine-macros = { path = "crates/engine-macros" }
 amphora-engine-parser = { path = "crates/engine-parser" }
+amphora-pg-catalog = { path = "crates/pg-catalog" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"
@@ -93,6 +94,7 @@ inherits = "release"
 [patch.crates-io]
 hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
 hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
+hyper-rt = { path = "vendor/hyper-raft/crates/hyper-rt" }
 hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
 hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }

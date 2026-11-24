@@ -20,7 +20,7 @@ use super::{
     Envelope, GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId,
     apply,
 };
-use crate::database::{Database, Token};
+use crate::database::{AnswerBytes, AnswerMax, Database, Token};
 use crate::db::Db;
 
 /// The tables a group keeps for transactions across groups. The data a transaction reads and
@@ -301,7 +301,8 @@ pub(crate) struct SqlTablet<'a> {
     db: &'a mut Db,
     /// Each namespace's revision this step writes its Records rows at, and the next row's place.
     revs: BTreeMap<String, (amphora_api::Rev, u64)>,
-    /// Records keys to publish when this step commits (T-T1.10.W9).
+    /// The Records rows whose locks this step dropped, by key: once it commits, their waiter
+    /// lists are rung (`Database::call_internal_ringing`, `LockedReads::WaitOnLock`; T-T1.10.W9).
     dropped: Vec<Vec<u8>>,
 }
 
@@ -336,12 +337,18 @@ pub(crate) fn keep_lock_stamp(db: &Db, txn: TxnId, at: u64) -> anyhow::Result<()
     )
 }
 
-/// A group's private writer result. The durable callback publishes the released rows even if
-/// the coordinator has stopped waiting for this answer (T-T1.10.W9–W11).
-pub(crate) struct AppliedStep {
+/// What a step answered in its group's writer: its reply, and the transaction whose locks it took,
+/// whose vote is read once the step has applied here (T-T1.9.R30).
+struct AppliedStep {
     reply: Reply,
     locked: Option<TxnId>,
-    pub(crate) dropped: Vec<Vec<u8>>,
+}
+
+impl AnswerBytes for AppliedStep {
+    fn answer_bytes(&self) -> usize {
+        let beside = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<Reply>());
+        self.reply.answer_bytes().saturating_add(beside)
+    }
 }
 
 impl AppliedStep {
@@ -356,14 +363,24 @@ impl AppliedStep {
     }
 }
 
-fn apply_step(db: &mut Db, here: GroupId, envelope: &Envelope) -> anyhow::Result<AppliedStep> {
+/// Applies one step on a group's database, and answers the Records rows whose locks it dropped.
+fn apply_step(
+    db: &mut Db,
+    here: GroupId,
+    envelope: &Envelope,
+) -> anyhow::Result<(AppliedStep, Vec<Vec<u8>>)> {
     let mut tablet = SqlTablet::new(db);
-    let reply = apply(here, &mut tablet, envelope)?;
-    Ok(AppliedStep {
-        locked: tablet.db.pending_lock(),
-        reply,
-        dropped: tablet.dropped,
-    })
+    let mut reply = apply(here, &mut tablet, envelope)?;
+    // Grown one push at a time, the lists hold the bytes the step declared once trimmed
+    // (`step_answer`).
+    reply.trim();
+    let locked = tablet.db.pending_lock();
+    let mut dropped = tablet.dropped;
+    dropped.shrink_to_fit();
+    for key in &mut dropped {
+        key.shrink_to_fit();
+    }
+    Ok((AppliedStep { reply, locked }, dropped))
 }
 
 impl Tablet for SqlTablet<'_> {
@@ -728,7 +745,7 @@ pub enum Member {
 /// Makes a group's tables for transactions across groups, if it hasn't them: the node that owns a
 /// group does it before it serves steps over the transport.
 pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
-    group.call_internal(until, |db| db.exec(SCHEMA))
+    group.call_internal(until, AnswerMax::fixed(), |db| db.exec(SCHEMA))
 }
 
 /// Serve the owner's step using the same clock as a local participant (AC-T1.10.1, T-T1.10.W4).
@@ -771,7 +788,8 @@ fn local_step(
     {
         carried.fetch_max(*at, Ordering::AcqRel);
     }
-    let applied = step(group, carried, until, move |db| {
+    let answer = step_answer(&envelope);
+    let applied = step(group, carried, until, answer, move |db| {
         apply_step(db, here, &envelope)
     })?;
     applied.answer(group, until)
@@ -1167,7 +1185,13 @@ impl Cluster {
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         conditioned(&txn)?;
         let began = Instant::now();
-        let _touched = self.touched(&txn);
+        // Every participant speaks the version that finishes it, or nothing is locked anywhere.
+        for group in self.touched(&txn) {
+            let member = usize::try_from(group).ok().and_then(|i| self.groups.get(i));
+            if let Some(Member::Node { nodes, node }) = member {
+                nodes.finishes(*node, until)?;
+            }
+        }
         let (answer, answered) = mpsc::sync_channel(1);
         self.inputs
             .send(Input::Begin { txn, until, answer })
@@ -1258,8 +1282,14 @@ impl Cluster {
         };
         match one.and_then(|i| self.groups.get(i)) {
             Some(Member::Local(group)) => {
-                let answer = step(group, &self.carried, until, move |db| {
-                    one_group(&mut SqlTablet::new(db), &txn)
+                let declared = commit_answer(&txn);
+                let answer = step(group, &self.carried, until, declared, move |db| {
+                    one_group(&mut SqlTablet::new(db), &txn).map(|mut answer| {
+                        if let Answer::Committed { reads, .. } = &mut answer {
+                            super::trim_reads(reads);
+                        }
+                        (answer, Vec::new())
+                    })
                 });
                 self.stamped(answer, &touched, until)
             }
@@ -1479,18 +1509,71 @@ impl Drop for Cluster {
 /// backed up or replicated here make no stamps and carry none. The stamps are the cross-group
 /// clock's, in microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and
 /// the tokens: a backed-up group's writer clock, a replicated group's closed time
-/// (`Database::observe_clock`, `Database::cross_clock`).
-fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
+/// (`Database::observe_clock`, `Database::cross_clock`). `f` answers the step's reply and the
+/// rows whose locks it dropped, whose waiter lists the group rings once the step commits
+/// (`Database::call_internal_ringing`); `answer` holds both at their most.
+fn step<R, F>(
+    group: &Database,
+    carried: &AtomicU64,
+    until: Instant,
+    answer: AnswerMax<(R, Vec<Vec<u8>>)>,
+    f: F,
+) -> Result<R, Refusal>
 where
-    R: Send + 'static,
-    F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    R: AnswerBytes + Send + 'static,
+    F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
 {
     group.observe_clock(until, carried.load(Ordering::Acquire))?;
-    let reply = group.call_internal(until, f)?;
+    let reply = group.call_internal_ringing(until, answer, f)?;
     if let Some(latest) = group.cross_clock(until)? {
         carried.fetch_max(latest, Ordering::AcqRel);
     }
     Ok(reply)
+}
+
+/// The most bytes a step's answer holds (AUDIT 2026-11-23 §1), from its envelope, its lists
+/// trimmed ([`apply_step`]): its reply at the most that step answers, and the Records keys whose
+/// locks it dropped, at most the transaction's own (`coordinator::validate`: `TX_MAX` keys of at
+/// most `KEY_MAX` bytes). A lock step answers each key it reads with a value of at most
+/// `VALUE_MAX`, its real worst case, or the one key a conflict or a condition names.
+fn step_answer(envelope: &Envelope) -> AnswerMax<(AppliedStep, Vec<Vec<u8>>)> {
+    let reply = match &envelope.step {
+        super::Step::Scan { .. } => {
+            amphora_api::SCAN_MAX.saturating_mul(std::mem::size_of::<(TxnId, GroupId)>())
+        }
+        super::Step::Lock { reads, .. } | super::Step::LockIf { reads, .. } => {
+            reads_bytes(reads).max(amphora_api::KEY_MAX)
+        }
+        _ => amphora_api::TX_MAX.saturating_mul(std::mem::size_of::<GroupId>()),
+    };
+    let dropped = amphora_api::TX_MAX
+        .saturating_mul(std::mem::size_of::<Vec<u8>>().saturating_add(amphora_api::KEY_MAX));
+    AnswerMax::bytes(
+        std::mem::size_of::<(AppliedStep, Vec<Vec<u8>>)>()
+            .saturating_add(reply)
+            .saturating_add(dropped),
+    )
+}
+
+/// The most bytes the reads of `keys` hold: each entry, its key and a value of at most
+/// `VALUE_MAX`.
+fn reads_bytes(keys: &[Vec<u8>]) -> usize {
+    let entry = std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>();
+    keys.iter().fold(0usize, |n, key| {
+        n.saturating_add(entry)
+            .saturating_add(key.len())
+            .saturating_add(amphora_api::VALUE_MAX)
+    })
+}
+
+/// The most bytes a one-group transaction's answer holds, its reads trimmed: each key it reads
+/// with a value of at most `VALUE_MAX`, or the one key a conflict or a condition names; it drops
+/// no locks.
+fn commit_answer(txn: &Txn) -> AnswerMax<(Answer, Vec<Vec<u8>>)> {
+    AnswerMax::bytes(
+        std::mem::size_of::<(Answer, Vec<Vec<u8>>)>()
+            .saturating_add(reads_bytes(&txn.reads).max(amphora_api::KEY_MAX)),
+    )
 }
 
 /// A step held to be sent again: its group, transaction, envelope and the refusals of it so far.
@@ -1915,6 +1998,52 @@ impl Driver {
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Err(refusal.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod answers {
+    use super::*;
+
+    /// AUDIT 2026-11-23 §1, lane perf-A13: a lock step's reply at its real worst case, each key it
+    /// reads at `KEY_MAX` with a value of `VALUE_MAX`, its list grown a push at a time and trimmed
+    /// as `apply_step` trims it, holds exactly the bytes its step declares for its reads.
+    #[test]
+    fn a13_lock_reply_at_its_worst_case_holds_what_its_step_declares() {
+        let keys: Vec<Vec<u8>> = (0u8..3).map(|k| vec![k; amphora_api::KEY_MAX]).collect();
+        let mut reads = Vec::new();
+        for key in &keys {
+            reads.push((key.clone(), Some(vec![0u8; amphora_api::VALUE_MAX])));
+        }
+        let mut reply = Reply::Locked { reads };
+        reply.trim();
+        assert_eq!(
+            reply.answer_bytes(),
+            std::mem::size_of::<Reply>() + reads_bytes(&keys)
+        );
+        let envelope = Envelope {
+            coordinator: 1,
+            epoch: 1,
+            floor: None,
+            step: super::super::Step::Lock {
+                txn: TxnId {
+                    coordinator: 1,
+                    epoch: 1,
+                    seq: 1,
+                },
+                anchor: 0,
+                reads: keys,
+                writes: Vec::new(),
+                stage: None,
+            },
+        };
+        let applied = AppliedStep {
+            reply,
+            locked: envelope.step.txn(),
+        };
+        let held = (applied, Vec::<Vec<u8>>::new()).answer_bytes();
+        let declared = step_answer(&envelope).get();
+        assert!(held <= declared, "{held} > {declared}");
     }
 }
 
@@ -2388,15 +2517,19 @@ mod sessions {
                 intent,
             };
             let key = row(1);
-            db.call_internal(until(), move |db| SqlTablet::new(db).put_lock(&key, &lock))
-                .unwrap();
+            db.call_internal(until(), AnswerMax::fixed(), move |db| {
+                SqlTablet::new(db).put_lock(&key, &lock)
+            })
+            .unwrap();
             let refused = ns.commit(put(3), until());
             assert!(
                 matches!(refused, Err(Refusal::Conflict { .. })),
                 "{refused:?}"
             );
-            db.call_internal(until(), move |db| SqlTablet::new(db).drop_locks_of(txn))
-                .unwrap();
+            db.call_internal(until(), AnswerMax::fixed(), move |db| {
+                SqlTablet::new(db).drop_locks_of(txn)
+            })
+            .unwrap();
             assert!(ns.commit(put(3), until()).is_ok());
         }
     }
@@ -2447,7 +2580,9 @@ mod sessions {
             };
             let key = row(2);
             dbs[2]
-                .call_internal(until(), move |db| SqlTablet::new(db).put_lock(&key, &lock))
+                .call_internal(until(), AnswerMax::fixed(), move |db| {
+                    SqlTablet::new(db).put_lock(&key, &lock)
+                })
                 .unwrap();
             let refused = commit_records(&cluster, "ns", &tx(6), until());
             assert!(
@@ -2515,7 +2650,7 @@ mod sessions {
                 } if recovered_first => {
                     let anchor = &dbs[usize::try_from(here).unwrap()];
                     anchor
-                        .call_internal(until(), move |db| {
+                        .call_internal(until(), AnswerMax::fixed(), move |db| {
                             SqlTablet::new(db).set_record(txn, &Record::Decided(Outcome::Aborted))
                         })
                         .unwrap();
@@ -2780,8 +2915,10 @@ mod sessions {
             writes: vec![(key, Some(vec![1]))],
             stage: None,
         });
-        let applied = group
-            .call_internal(until(), move |db| apply_step(db, 0, &lock))
+        let (applied, _) = group
+            .call_internal(until(), step_answer(&lock), move |db| {
+                apply_step(db, 0, &lock)
+            })
             .unwrap();
         let (present, _, _) = serve(
             group,
@@ -2864,15 +3001,21 @@ mod sessions {
     /// through Records, as a client would: the session's SQL refuses the `__amphora_*` tables that
     /// hold them (product metadata).
     fn head(db: &Database, token: Option<Token>) -> Result<Option<i64>, Refusal> {
-        db.query_session(crate::database::ReadMode::Session, token, until(), |c| {
-            let mut newest = None;
-            for key in 0..2u8 {
-                if let Some(row) = c.records_get("ns", "rows", &[key])? {
-                    newest = newest.max(Some(i64::try_from(row.rev)?));
+        db.query_session(
+            crate::database::ReadMode::Session,
+            token,
+            until(),
+            AnswerMax::fixed(),
+            |c| {
+                let mut newest = None;
+                for key in 0..2u8 {
+                    if let Some(row) = c.records_get("ns", "rows", &[key])? {
+                        newest = newest.max(Some(i64::try_from(row.rev)?));
+                    }
                 }
-            }
-            Ok(newest)
-        })
+                Ok(newest)
+            },
+        )
     }
 
     /// T-T1.10.W4 (AC-T1.10.1, lane xgroup-sql-9): a group on a second node adds its closed time
@@ -3285,7 +3428,8 @@ mod sessions {
                 let (entered, applied) = mpsc::channel();
                 let (resume, held) = mpsc::channel();
                 let first = resolution.clone();
-                let outcome = step(&group, &AtomicU64::new(0), deadline, move |db| {
+                let answer = step_answer(&first);
+                let outcome = step(&group, &AtomicU64::new(0), deadline, answer, move |db| {
                     let result = apply_step(db, 0, &first)?;
                     entered.send(())?;
                     held.recv_timeout(limit.saturating_duration_since(Instant::now()))?;
@@ -3438,8 +3582,12 @@ mod sessions {
                     "{reads:?}: {answer:?}"
                 );
                 let reader = &dbs[1];
+                // One row's value, as a Records get answers it.
+                let value = AnswerMax::bytes(
+                    std::mem::size_of::<Option<Vec<u8>>>() + amphora_api::VALUE_MAX,
+                );
                 let today = reader
-                    .query(until(), |c| {
+                    .query(until(), value, |c| {
                         Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
                     })
                     .unwrap();
@@ -3449,7 +3597,7 @@ mod sessions {
                 let waiting = {
                     let runs = Arc::clone(&runs);
                     scope.spawn(move || {
-                        reader.query_waiting(until(), move |c| {
+                        reader.query_waiting(until(), value, move |c| {
                             runs.fetch_add(1, Ordering::AcqRel);
                             Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
                         })

@@ -21,13 +21,16 @@ pub(crate) use vtab::{
     create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
 };
 
-use crate::{function::ExternalFunc, Connection, Database};
+use crate::{
+    function::{ExternalFunc, WindowCallbacks},
+    Connection, Database,
+};
 use crate::{vtab::VirtualTable, SymbolTable};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
 use amphora_engine_ext::{
     ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
-    VTabModuleImpl, ValueDestructor,
+    VTabModuleImpl, ValueDestructor, ValueFunction,
 };
 pub use amphora_engine_ext::{
     FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType,
@@ -190,6 +193,64 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     aggregate_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
+    unsafe {
+        register_aggregate(
+            ctx,
+            name,
+            args,
+            context,
+            (init_func, step_func, finalize_func),
+            None,
+            (context_destructor, aggregate_destructor, value_destructor),
+        )
+    }
+}
+
+/// sqlite3_create_window_function: an aggregate with xValue and xInverse, usable over any frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn register_window_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    context: usize,
+    init_func: InitAggFunction,
+    step_func: StepFunction,
+    finalize_func: FinalizeFunction,
+    value_func: ValueFunction,
+    inverse_func: StepFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    unsafe {
+        register_aggregate(
+            ctx,
+            name,
+            args,
+            context,
+            (init_func, step_func, finalize_func),
+            Some(WindowCallbacks {
+                value: value_func,
+                inverse: inverse_func,
+            }),
+            (context_destructor, aggregate_destructor, value_destructor),
+        )
+    }
+}
+
+unsafe fn register_aggregate(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    context: usize,
+    func: (InitAggFunction, StepFunction, FinalizeFunction),
+    window: Option<WindowCallbacks>,
+    destructors: (
+        Option<ContextDestructor>,
+        Option<ContextDestructor>,
+        Option<ValueDestructor>,
+    ),
+) -> ResultCode {
     if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
@@ -198,11 +259,13 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let (context_destructor, aggregate_destructor, value_destructor) = destructors;
     let function = match ExternalFunc::new_aggregate(
         name_str.clone(),
         args,
         context,
-        (init_func, step_func, finalize_func),
+        func,
+        window,
         context_destructor,
         aggregate_destructor,
         value_destructor,
@@ -270,6 +333,17 @@ impl Database {
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
+            // floatingpoint.html §2.2.6: "the \"decimal\" collating sequence that compares decimal
+            // text strings in numeric order".
+            syms.collations.insert(
+                crate::translate::collate::CollationSeq::custom("decimal").id(),
+                Arc::new(crate::function::ExternalCollation::new(
+                    "decimal".to_string(),
+                    0,
+                    decimal_collation,
+                    None,
+                )),
+            );
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
@@ -293,6 +367,7 @@ impl Database {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            register_window_function,
         };
 
         #[cfg(feature = "uuid")]
@@ -304,6 +379,8 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        crate::ieee754::register_extension(&mut ext_api);
+        crate::decimal::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
@@ -368,6 +445,7 @@ impl Connection {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            register_window_function,
         }
     }
 
@@ -379,5 +457,27 @@ impl Connection {
             return;
         }
         let _ = unsafe { Box::from_raw(api.ctx as *mut ExtensionCtx) };
+    }
+}
+
+/// The decimal collating sequence's callback: both sides as text, in numeric order.
+unsafe extern "C" fn decimal_collation(
+    _context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let side = |ptr: *const u8, len: usize| -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: the comparator hands each side as a pointer and length into a live buffer.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
+    };
+    match crate::decimal::decimal_collate(&side(left_ptr, left_len), &side(right_ptr, right_len)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }

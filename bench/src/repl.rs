@@ -4,7 +4,8 @@
 //! `crate::event`), `--batch` events a write, one write outstanding per writer.
 //!
 //! - `commit` (AC-T1.8.2, AC-T1.8.3): `--writers` closed-loop writers for `--seconds` after
-//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput.
+//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput, overall and by the node that
+//!   acknowledged, and the writes that missed `--deadline-s` (each sent again unchanged).
 //! - `failover` (AC-T1.8.4; step 3's "kill -9 of the leader 100 times under load"): writers run
 //!   throughout; `--kills` times the leader is killed and a probe writes through the survivors until
 //!   one write is acknowledged: the time from the kill to that acknowledgement. Every writer resends
@@ -20,7 +21,8 @@
 //! Amphora's three members run in this process, relayed by the host's part as `cluster.rs` does; a
 //! killed member is cut off from the relay, which its peers can't tell from kill -9 (nothing more
 //! comes from it, nothing reaches it). `amphora-procs` runs each member as its own process, on the
-//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as
+//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill its kill -9 and a start its process run
+//! again on the data it kept (a member on this host; one on another machine is refused). The competitors run as
 //! processes on this host through their scripts, `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N|about`
 //! (a kill is kill -9 of the node's recorded process group), from the release binaries
 //! `bench/servers/repl/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
@@ -32,7 +34,7 @@
 //!
 //! usage: amphora-bench --repl <commit|failover|catchup> --system <amphora|rqlite|dqlite|litefs|libsql>
 //!        --batch N --text-bytes N --deadline-s N [--record FILE]
-//!        commit:   --writers N --warmup-s N --seconds N
+//!        commit:   --writers N --warmup-s N --seconds N [--route spread|leader]
 //!        failover: --writers N --kills N --settle-s N
 //!        catchup:  --behind N --poll-us N
 //!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
@@ -147,27 +149,62 @@ fn column_of(about: &serde_json::Value) -> Option<&'static str> {
 /// the sockets it holds open at the end (its pooled connections). Linux's /proc; elsewhere null.
 fn client_use() -> serde_json::Value {
     let status = std::fs::read_to_string("/proc/self/status").ok();
-    let field = |name: &str| status.as_deref().and_then(|s| s.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()));
+    let field = |name: &str| {
+        status.as_deref().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+    };
     // utime and stime are the 14th and 15th fields, counted after the parenthesised name (which
     // can hold spaces), in clock ticks of the system's rate (getconf CLK_TCK).
-    let ticks = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
-        let rest = s.rsplit_once(')')?.1;
-        let f: Vec<&str> = rest.split_whitespace().collect();
-        Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
-    });
-    let hz = std::process::Command::new("getconf").arg("CLK_TCK").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse::<u64>().ok()).filter(|&h| h > 0);
+    let ticks = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let rest = s.rsplit_once(')')?.1;
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+        });
+    let hz = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&h| h > 0);
     let cpu_s = ticks.zip(hz).map(|(t, h)| t as f64 / h as f64);
-    let sockets = std::fs::read_dir("/proc/self/fd").ok().map(|d| d.filter_map(Result::ok).filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l.to_string_lossy().starts_with("socket:"))).count());
+    let sockets = std::fs::read_dir("/proc/self/fd").ok().map(|d| {
+        d.filter_map(Result::ok)
+            .filter(|e| {
+                std::fs::read_link(e.path())
+                    .is_ok_and(|l| l.to_string_lossy().starts_with("socket:"))
+            })
+            .count()
+    });
     serde_json::json!({ "cpu_s": cpu_s, "peak_rss_kib": field("VmHWM:"), "sockets": sockets })
 }
 
 /// The host the client ran on: its kernel, and the platform the driver itself ran on.
 fn platform() -> serde_json::Value {
-    let uname = std::process::Command::new("uname").arg("-srm").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned());
+    let uname = std::process::Command::new("uname")
+        .arg("-srm")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned());
     serde_json::json!({ "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "kernel": uname })
 }
 
 pub const NODES: usize = 3;
+
+/// Where `commit`'s writers send: `Spread` starts writer w at node w % NODES, `Leader` sends every
+/// writer to the node the cluster names its leader once the schema is in (lane V12's leader-only rows).
+#[derive(Clone, Copy)]
+enum Route {
+    Spread,
+    Leader,
+}
 
 struct Opts {
     measure: String,
@@ -188,6 +225,7 @@ struct Opts {
     spanning: Option<u32>,
     relay_records: Option<usize>,
     members: Option<Vec<String>>,
+    route: Route,
     scripts: PathBuf,
     shell: String,
 }
@@ -218,13 +256,20 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
         spanning: None,
         relay_records: None,
         members: None,
+        route: Route::Spread,
         scripts: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/servers/repl")),
         shell: "bash".into(),
     };
     let mut it = args.iter();
-    let secs = |v: &str| -> anyhow::Result<Duration> { Ok(Duration::try_from_secs_f64(v.parse::<f64>()?)?) };
+    let secs = |v: &str| -> anyhow::Result<Duration> {
+        Ok(Duration::try_from_secs_f64(v.parse::<f64>()?)?)
+    };
     while let Some(a) = it.next() {
-        let mut v = || it.next().cloned().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--repl" => measure = Some(v()?),
             "--system" => system = Some(v()?),
@@ -244,12 +289,20 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--spanning" => o.spanning = Some(v()?.parse()?),
             "--relay-records" => o.relay_records = Some(v()?.parse()?),
             "--members" => o.members = Some(v()?.split(',').map(str::to_owned).collect()),
+            "--route" => {
+                o.route = match v()?.as_str() {
+                    "spread" => Route::Spread,
+                    "leader" => Route::Leader,
+                    other => anyhow::bail!("unknown route {other} (spread, leader)"),
+                }
+            }
             "--scripts" => o.scripts = PathBuf::from(v()?),
             "--shell" => o.shell = v()?,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    o.measure = measure.ok_or_else(|| anyhow::anyhow!("--repl names the measure: commit, failover or catchup"))?;
+    o.measure = measure
+        .ok_or_else(|| anyhow::anyhow!("--repl names the measure: commit, failover or catchup"))?;
     let m = o.measure.clone();
     o.system = need(system, "--system", &m)?;
     o.batch = need(batch, "--batch", &m)?;
@@ -258,12 +311,18 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
     anyhow::ensure!(o.batch > 0, "--batch takes at least 1");
     match m.as_str() {
         "commit" => {
-            anyhow::ensure!(need(o.writers, "--writers", &m)? > 0, "--writers takes at least 1");
+            anyhow::ensure!(
+                need(o.writers, "--writers", &m)? > 0,
+                "--writers takes at least 1"
+            );
             need(o.warmup, "--warmup-s", &m)?;
             need(o.seconds, "--seconds", &m)?;
         }
         "failover" => {
-            anyhow::ensure!(need(o.writers, "--writers", &m)? > 0, "--writers takes at least 1");
+            anyhow::ensure!(
+                need(o.writers, "--writers", &m)? > 0,
+                "--writers takes at least 1"
+            );
             need(o.kills, "--kills", &m)?;
             need(o.settle, "--settle-s", &m)?;
         }
@@ -274,14 +333,23 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
         other => anyhow::bail!("unknown measure {other} (commit, failover, catchup)"),
     }
     if o.system == "amphora-procs" {
-        anyhow::ensure!(need(o.members.as_ref(), "--members", &m)?.len() == NODES, "--members names {NODES} members");
+        anyhow::ensure!(
+            need(o.members.as_ref(), "--members", &m)?.len() == NODES,
+            "--members names {NODES} members"
+        );
     }
     if o.system == "amphora" {
         need(o.dir.as_ref(), "--dir", &m)?;
-        anyhow::ensure!(need(o.relay_records, "--relay-records", &m)? > 0, "--relay-records takes at least 1");
+        anyhow::ensure!(
+            need(o.relay_records, "--relay-records", &m)? > 0,
+            "--relay-records takes at least 1"
+        );
         match need(o.class.as_deref(), "--class", &m)? {
             "persisted" => {}
-            "replicated" => anyhow::ensure!(need(o.spanning, "--spanning", &m)? >= 2, "--spanning takes at least 2"),
+            "replicated" => anyhow::ensure!(
+                need(o.spanning, "--spanning", &m)? >= 2,
+                "--spanning takes at least 2"
+            ),
             other => anyhow::bail!("unknown class {other} (persisted, replicated)"),
         }
     }
@@ -294,12 +362,18 @@ fn us(t: Instant) -> u64 {
 
 /// One write of `events` as statements.
 fn stmts(events: &[Event]) -> anyhow::Result<Vec<(String, Vec<Arg>)>> {
-    events.iter().map(|e| Ok((crate::schema::EVENT_UPSERT.to_owned(), event_args(e)?))).collect()
+    events
+        .iter()
+        .map(|e| Ok((crate::schema::EVENT_UPSERT.to_owned(), event_args(e)?)))
+        .collect()
 }
 
 /// The schema through any node that takes it before the deadline.
 fn schema(c: &dyn Cluster, until: Instant) -> anyhow::Result<()> {
-    let s: Vec<(String, Vec<Arg>)> = crate::schema::SCHEMA.iter().map(|s| ((*s).to_owned(), Vec::new())).collect();
+    let s: Vec<(String, Vec<Arg>)> = crate::schema::SCHEMA
+        .iter()
+        .map(|s| ((*s).to_owned(), Vec::new()))
+        .collect();
     let mut last = None;
     let mut via = 0;
     while Instant::now() < until {
@@ -309,7 +383,9 @@ fn schema(c: &dyn Cluster, until: Instant) -> anyhow::Result<()> {
         }
         via += 1;
     }
-    Err(anyhow::anyhow!("no node took the schema before the deadline: {last:?}"))
+    Err(anyhow::anyhow!(
+        "no node took the schema before the deadline: {last:?}"
+    ))
 }
 
 /// A writer's events: session `writer`, sequence numbers from 1, `batch` a write.
@@ -321,7 +397,11 @@ struct Writer {
 
 impl Writer {
     fn new(session: usize) -> Self {
-        Self { rng: Rng(0x9e37_79b9_7f4a_7c15 ^ (session as u64).wrapping_add(1)), session, seq: 0 }
+        Self {
+            rng: Rng(0x9e37_79b9_7f4a_7c15 ^ (session as u64).wrapping_add(1)),
+            session,
+            seq: 0,
+        }
     }
 
     fn next(&mut self, batch: usize, text_bytes: usize) -> Vec<Event> {
@@ -335,23 +415,57 @@ impl Writer {
 }
 
 /// Sends `events` through the live nodes, starting at `via`, until one acknowledges them or the
-/// deadline passes: the same ids every time, so a resend is the same write.
-fn send(c: &dyn Cluster, down: &[AtomicBool; NODES], via: usize, s: &[(String, Vec<Arg>)], deadline: Duration) -> anyhow::Result<usize> {
+/// deadline passes: the same ids every time, so a resend is the same write. A write refused
+/// [`amphora_api::Refusal::Serialization`] (what it read changed: Amphora's 40001) is asked again
+/// at the node that refused it, which is up and serving; any other failure moves to the next node.
+fn send(
+    c: &dyn Cluster,
+    down: &[AtomicBool; NODES],
+    via: usize,
+    s: &[(String, Vec<Arg>)],
+    deadline: Duration,
+) -> anyhow::Result<usize> {
+    send_counting(c, down, via, s, deadline, &Default::default())
+}
+
+/// [`send`], counting each node's `Serialization` refusals in `refused`.
+fn send_counting(
+    c: &dyn Cluster,
+    down: &[AtomicBool; NODES],
+    via: usize,
+    s: &[(String, Vec<Arg>)],
+    deadline: Duration,
+    refused: &[AtomicU64; NODES],
+) -> anyhow::Result<usize> {
     let until = Instant::now() + deadline;
     let mut n = via;
     let mut last = None;
     while Instant::now() < until {
         let node = n % NODES;
-        n += 1;
         if down.get(node).is_some_and(|d| d.load(Ordering::Relaxed)) {
+            n += 1;
             continue;
         }
         match c.exec(node, s, until) {
             Ok(()) => return Ok(node),
-            Err(e) => last = Some(e),
+            Err(e) => {
+                if matches!(
+                    e.downcast_ref::<amphora_api::Refusal>(),
+                    Some(amphora_api::Refusal::Serialization { .. })
+                ) {
+                    if let Some(r) = refused.get(node) {
+                        r.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    n += 1;
+                }
+                last = Some(e);
+            }
         }
     }
-    Err(anyhow::anyhow!("no live node acknowledged a write within --deadline-s: {last:?}"))
+    Err(anyhow::anyhow!(
+        "no live node acknowledged a write within --deadline-s: {last:?}"
+    ))
 }
 
 /// The commit this bench was built from (Amphora's version in a record).
@@ -368,10 +482,16 @@ fn record_commit() -> String {
 
 /// The record's common fields: what ran, where, when, at which commit.
 fn record_head(o: &Opts, c: &str) -> serde_json::Value {
-    let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_default();
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default();
     let commit = record_commit();
-    let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next().map(str::to_owned));
-    let date = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_owned));
+    let date = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     serde_json::json!({
         "bench": format!("repl_{}", o.measure), "system": c, "nodes": NODES, "batch": o.batch, "text_bytes": o.text_bytes,
         "host": host, "cpus": std::thread::available_parallelism().map_or(0, usize::from), "commit": commit, "unix_s": date, "load1": load,
@@ -389,7 +509,10 @@ fn emit(o: &Opts, mut head: serde_json::Value, body: serde_json::Value) -> anyho
     println!("{line}");
     if let Some(path) = &o.record {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         writeln!(f, "{line}")?;
     }
     Ok(())
@@ -397,44 +520,101 @@ fn emit(o: &Opts, mut head: serde_json::Value, body: serde_json::Value) -> anyho
 
 fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let writers = need(o.writers, "--writers", "commit")?;
-    let (warmup, seconds) = (need(o.warmup, "--warmup-s", "commit")?, need(o.seconds, "--seconds", "commit")?);
+    let (warmup, seconds) = (
+        need(o.warmup, "--warmup-s", "commit")?,
+        need(o.seconds, "--seconds", "commit")?,
+    );
     let down: [AtomicBool; NODES] = Default::default();
+    // Each ask is a round trip to a node, so the wait paces itself: no interval of its own.
+    let to_leader = match o.route {
+        Route::Spread => None,
+        Route::Leader => Some(leader_by(c, o.deadline, Duration::ZERO)?),
+    };
     let began = Instant::now();
     let (counting, ends) = (began + warmup, began + warmup + seconds);
-    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<(Hist, u64)>> {
+    // Each write's latency by the node that acknowledged it, and the `Serialization` refusals
+    // each node gave counted writes (lane W4: the leader's writes against the followers').
+    let refused: [AtomicU64; NODES] = Default::default();
+    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<([Hist; NODES], u64, u64)>> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
-                let down = &down;
-                scope.spawn(move || -> anyhow::Result<(Hist, u64)> {
+                let (down, refused) = (&down, &refused);
+                scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64, u64)> {
                     let mut wr = Writer::new(w);
-                    let (mut h, mut writes) = (Hist::new(), 0u64);
+                    let (mut h, mut writes, mut missed) =
+                        (std::array::from_fn(|_| Hist::new()), 0u64, 0u64);
                     loop {
                         let t = Instant::now();
                         if t >= ends {
-                            return Ok((h, writes));
+                            return Ok((h, writes, missed));
                         }
                         let s = stmts(&wr.next(o.batch, o.text_bytes))?;
-                        send(c, down, w, &s, o.deadline)?;
+                        let mine: [AtomicU64; NODES] = Default::default();
+                        // A write that misses its deadline is counted, not the run's end: it is sent
+                        // again unchanged (same ids), as `failover`'s writers do, and timed from its
+                        // first send once acknowledged; one unacknowledged when the run ends is untimed.
+                        let node = loop {
+                            match send_counting(
+                                c,
+                                down,
+                                to_leader.unwrap_or(w),
+                                &s,
+                                o.deadline,
+                                &mine,
+                            ) {
+                                Ok(node) => break Some(node),
+                                Err(_) if t >= counting => missed += 1,
+                                Err(_) => {}
+                            }
+                            if Instant::now() >= ends {
+                                break None;
+                            }
+                        };
+                        let Some(node) = node else {
+                            return Ok((h, writes, missed));
+                        };
                         if t >= counting {
-                            h.record(us(t));
+                            if let Some(h) = h.get_mut(node) {
+                                h.record(us(t));
+                            }
+                            for (total, n) in refused.iter().zip(&mine) {
+                                total.fetch_add(n.load(Ordering::Relaxed), Ordering::Relaxed);
+                            }
                             writes += 1;
                         }
                     }
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().map_err(|_| anyhow::anyhow!("a writer panicked"))?).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| anyhow::anyhow!("a writer panicked"))?)
+            .collect()
     })?;
     let mut all = Hist::new();
-    let mut writes = 0u64;
-    for (h, n) in &hists {
-        all.merge(h);
+    let mut nodes: [Hist; NODES] = std::array::from_fn(|_| Hist::new());
+    let (mut writes, mut missed, mut writers_missed) = (0u64, 0u64, 0u64);
+    for (hs, n, m) in &hists {
+        for (node, h) in nodes.iter_mut().zip(hs) {
+            all.merge(h);
+            node.merge(h);
+        }
         writes += n;
+        missed += m;
+        writers_missed += u64::from(*m > 0);
     }
+    let by_node: Vec<_> = nodes
+        .into_iter()
+        .zip(&refused)
+        .map(|(h, r)| serde_json::json!({ "buckets_us": h.buckets(), "max_us": h.max, "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
+        .collect();
+    let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
     let secs = seconds.as_secs_f64();
     Ok(serde_json::json!({
-        "writers": writers, "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
+        "writers": writers, "route": match o.route { Route::Spread => "spread", Route::Leader => "leader" },
+        "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
         "writes_per_s": writes as f64 / secs, "events_per_s": (writes as f64) * (o.batch as f64) / secs,
+        "by_node": by_node, "leader": leader, "deadline_misses": missed, "writers_missed": writers_missed,
     }))
 }
 
@@ -455,7 +635,10 @@ fn failover(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
         return Err(Refusal::NoConcept(why).into());
     }
     let writers = need(o.writers, "--writers", "failover")?;
-    let (kills, settle) = (need(o.kills, "--kills", "failover")?, need(o.settle, "--settle-s", "failover")?);
+    let (kills, settle) = (
+        need(o.kills, "--kills", "failover")?,
+        need(o.settle, "--settle-s", "failover")?,
+    );
     let down: [AtomicBool; NODES] = Default::default();
     let stop = AtomicBool::new(false);
     // Each writer's last acknowledged sequence number: everything up to it is acknowledged.
@@ -495,14 +678,18 @@ fn failover(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
                 let leader = leader_by(c, o.deadline, settle)?;
                 let s = stmts(&probe.next(o.batch, o.text_bytes))?;
                 let at = Instant::now();
-                down.get(leader).ok_or_else(|| anyhow::anyhow!("no node {leader}"))?.store(true, Ordering::Relaxed);
+                down.get(leader)
+                    .ok_or_else(|| anyhow::anyhow!("no node {leader}"))?
+                    .store(true, Ordering::Relaxed);
                 c.kill(leader)?;
                 send(c, &down, leader + 1, &s, o.deadline)?;
                 let t = us(at);
                 times.record(t);
                 each_ms.push(t as f64 / 1000.0);
                 c.start(leader)?;
-                down.get(leader).ok_or_else(|| anyhow::anyhow!("no node {leader}"))?.store(false, Ordering::Relaxed);
+                down.get(leader)
+                    .ok_or_else(|| anyhow::anyhow!("no node {leader}"))?
+                    .store(false, Ordering::Relaxed);
             }
             std::thread::park_timeout(settle);
             Ok(())
@@ -510,7 +697,11 @@ fn failover(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
         stop.store(true, Ordering::Relaxed);
         ran
     })?;
-    if let Some(e) = failed.lock().map_err(|_| anyhow::anyhow!("a writer's failure was poisoned"))?.take() {
+    if let Some(e) = failed
+        .lock()
+        .map_err(|_| anyhow::anyhow!("a writer's failure was poisoned"))?
+        .take()
+    {
         return Err(e);
     }
     // Every acknowledged event, counted on the leader.
@@ -520,7 +711,15 @@ fn failover(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     for (w, a) in acked.iter().enumerate() {
         let want = a.load(Ordering::Relaxed);
         let session = Writer::new(w).session;
-        let held = c.count(leader, "SELECT count(*) FROM events WHERE session = ?1 AND seq <= ?2", vec![Arg::Text(format!("s-{session:06}")), Arg::Int(i64::try_from(want)?)], until)?;
+        let held = c.count(
+            leader,
+            "SELECT count(*) FROM events WHERE session = ?1 AND seq <= ?2",
+            vec![
+                Arg::Text(format!("s-{session:06}")),
+                Arg::Int(i64::try_from(want)?),
+            ],
+            until,
+        )?;
         acknowledged += want;
         lost += want.saturating_sub(held);
     }
@@ -534,17 +733,28 @@ fn catchup(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     if let Some(why) = c.no_catch_up() {
         return Err(Refusal::NoConcept(why).into());
     }
-    let (behind, poll) = (need(o.behind, "--behind", "catchup")?, need(o.poll, "--poll-us", "catchup")?);
+    let (behind, poll) = (
+        need(o.behind, "--behind", "catchup")?,
+        need(o.poll, "--poll-us", "catchup")?,
+    );
     let down: [AtomicBool; NODES] = Default::default();
     let leader = leader_by(c, o.deadline, poll)?;
     let member = (leader + 1) % NODES;
-    down.get(member).ok_or_else(|| anyhow::anyhow!("no node {member}"))?.store(true, Ordering::Relaxed);
+    down.get(member)
+        .ok_or_else(|| anyhow::anyhow!("no node {member}"))?
+        .store(true, Ordering::Relaxed);
     c.kill(member)?;
     let mut wr = Writer::new(0);
     let mut left = behind;
     while left > 0 {
         let n = left.min(o.batch);
-        send(c, &down, leader, &stmts(&wr.next(n, o.text_bytes))?, o.deadline)?;
+        send(
+            c,
+            &down,
+            leader,
+            &stmts(&wr.next(n, o.text_bytes))?,
+            o.deadline,
+        )?;
         left -= n;
     }
     let until = Instant::now() + o.deadline;
@@ -553,22 +763,37 @@ fn catchup(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     c.start(member)?;
     loop {
         // A member not yet answering is a member not yet caught up.
-        if c.count(member, "SELECT count(*) FROM events", Vec::new(), until).is_ok_and(|n| n >= target) {
+        if c.count(member, "SELECT count(*) FROM events", Vec::new(), until)
+            .is_ok_and(|n| n >= target)
+        {
             break;
         }
-        anyhow::ensure!(Instant::now() < until, "node {member} didn't catch up within --deadline-s");
+        anyhow::ensure!(
+            Instant::now() < until,
+            "node {member} didn't catch up within --deadline-s"
+        );
         std::thread::park_timeout(poll);
     }
     let t = us(at);
-    Ok(serde_json::json!({ "behind": behind, "rows": target, "poll_us": poll.as_micros() as u64, "catchup_ms": t as f64 / 1000.0 }))
+    Ok(
+        serde_json::json!({ "behind": behind, "rows": target, "poll_us": poll.as_micros() as u64, "catchup_ms": t as f64 / 1000.0 }),
+    )
 }
 
 fn open(o: &Opts) -> anyhow::Result<Box<dyn Cluster>> {
     Ok(match o.system.as_str() {
         "amphora" => Box::new(inproc::Amphora::open(o)?),
         "amphora-procs" => Box::new(procs::Procs::open(o)?),
-        "rqlite" | "dqlite" | "litefs" | "libsql" => Box::new(http::Http::up(&o.system, &o.scripts, &o.shell, o.deadline, o.writers.unwrap_or(1))?),
-        other => anyhow::bail!("unknown system {other} (amphora, amphora-procs, rqlite, dqlite, litefs, libsql)"),
+        "rqlite" | "dqlite" | "litefs" | "libsql" => Box::new(http::Http::up(
+            &o.system,
+            &o.scripts,
+            &o.shell,
+            o.deadline,
+            o.writers.unwrap_or(1),
+        )?),
+        other => anyhow::bail!(
+            "unknown system {other} (amphora, amphora-procs, rqlite, dqlite, litefs, libsql)"
+        ),
     })
 }
 
@@ -616,7 +841,7 @@ pub fn main() -> anyhow::Result<()> {
 /// Amphora's three members in this process (`cluster.rs`'s relay), a kill a cut from the relay.
 mod inproc {
     use super::*;
-    use amphora::database::Database;
+    use amphora::database::{AnswerMax, Database};
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
 
     pub struct Amphora {
@@ -643,32 +868,57 @@ mod inproc {
             let durability = match o.class.as_deref() {
                 // Each member its own fate (the operator's number for what it fails with: here its
                 // node ID, three members on three fates).
-                Some("replicated") => Durability::Replicated(Fates { of: ids.iter().map(|&i| (i, i)).collect(), spanning: need(o.spanning, "--spanning", &o.measure)? }),
+                Some("replicated") => Durability::Replicated(Fates {
+                    of: ids.iter().map(|&i| (i, i)).collect(),
+                    spanning: need(o.spanning, "--spanning", &o.measure)?,
+                }),
                 _ => Durability::Persisted,
             };
             let mut members = Vec::new();
             for &node_id in &ids {
-                let config = ReplicaConfig { node_id, voters: ids.clone(), learners: Vec::new(), bootstrap: None };
-                let db = Database::open_replicated_with(&dir.join(format!("state-{node_id}.db")), &dir.join(format!("raft-{node_id}.log")), config, durability.clone(), Instant::now() + o.deadline)
-                    .map_err(|e| anyhow::anyhow!("member {node_id}: {e:?}"))?;
+                let config = ReplicaConfig {
+                    node_id,
+                    voters: ids.clone(),
+                    learners: Vec::new(),
+                    bootstrap: None,
+                };
+                let db = Database::open_replicated_with(
+                    &dir.join(format!("state-{node_id}.db")),
+                    &dir.join(format!("raft-{node_id}.log")),
+                    config,
+                    durability.clone(),
+                    Instant::now() + o.deadline,
+                )
+                .map_err(|e| anyhow::anyhow!("member {node_id}: {e:?}"))?;
                 members.push(db);
             }
-            let handles: Vec<amphora::replication::ReplicaHandle> = members.iter().filter_map(Database::replica).collect();
+            let handles: Vec<amphora::replication::ReplicaHandle> =
+                members.iter().filter_map(Database::replica).collect();
             anyhow::ensure!(handles.len() == NODES, "a member has no replica handle");
             let cut: Arc<[AtomicBool; NODES]> = Arc::new(Default::default());
             let stop = Arc::new(AtomicBool::new(false));
             let (c, s, wait) = (cut.clone(), stop.clone(), o.deadline);
             let records = need(o.relay_records, "--relay-records", &o.measure)?;
             let relay = std::thread::spawn(move || relay(&handles, &c, &s, wait, records));
-            Ok(Self { members, cut, stop, relay: Some(relay) })
+            Ok(Self {
+                members,
+                cut,
+                stop,
+                relay: Some(relay),
+            })
         }
 
         fn member(&self, n: usize) -> anyhow::Result<&Database> {
-            self.members.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))
+            self.members
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))
         }
 
         fn set_cut(&self, n: usize, to: bool) -> anyhow::Result<()> {
-            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(to, Ordering::Relaxed);
+            self.cut
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .store(to, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -676,7 +926,13 @@ mod inproc {
     /// Every member's outgoing records to the member they name, until `stop`; a cut member's
     /// records, out or in, are lost as a dead node's are. When nothing moved it yields its core and
     /// looks again: no sleep of a picked length between a record and its delivery.
-    fn relay(handles: &[amphora::replication::ReplicaHandle], cut: &[AtomicBool; NODES], stop: &AtomicBool, wait: Duration, records: usize) {
+    fn relay(
+        handles: &[amphora::replication::ReplicaHandle],
+        cut: &[AtomicBool; NODES],
+        stop: &AtomicBool,
+        wait: Duration,
+        records: usize,
+    ) {
         let is_cut = |i: usize| cut.get(i).is_some_and(|c| c.load(Ordering::Relaxed));
         while !stop.load(Ordering::Relaxed) {
             let mut moved = 0usize;
@@ -688,7 +944,8 @@ mod inproc {
                         continue;
                     }
                     if let Some(target) = handles.get(to) {
-                        let _ = target.receive(from as u64 + 1, record.bytes, Instant::now() + wait);
+                        let _ =
+                            target.receive(from as u64 + 1, record.bytes, Instant::now() + wait);
                     }
                 }
             }
@@ -717,30 +974,48 @@ mod inproc {
             })
         }
 
-        fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], until: Instant) -> anyhow::Result<()> {
-            anyhow::ensure!(!self.cut.get(via).is_some_and(|c| c.load(Ordering::Relaxed)), "node {via} is down");
+        fn exec(
+            &self,
+            via: usize,
+            stmts: &[(String, Vec<Arg>)],
+            until: Instant,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.cut.get(via).is_some_and(|c| c.load(Ordering::Relaxed)),
+                "node {via} is down"
+            );
             let stmts = stmts.to_vec();
             self.member(via)?
-                .call(until, move |c| {
+                .call(until, AnswerMax::fixed(), move |c| {
                     for (sql, args) in stmts {
                         if args.is_empty() {
                             c.execute_batch(&sql)?;
                         } else {
-                            c.prepare_cached(&sql)?.execute(args.into_iter().map(value).collect::<Vec<_>>())?;
+                            c.prepare_cached(&sql)?
+                                .execute(args.into_iter().map(value).collect::<Vec<_>>())?;
                         }
                     }
                     Ok(())
                 })
-                .map_err(|e| anyhow::anyhow!("node {via} refused a write: {e:?}"))
+                .map_err(|e| anyhow::Error::new(e).context(format!("node {via} refused a write")))
         }
 
-        fn count(&self, on: usize, sql: &str, args: Vec<Arg>, until: Instant) -> anyhow::Result<u64> {
+        fn count(
+            &self,
+            on: usize,
+            sql: &str,
+            args: Vec<Arg>,
+            until: Instant,
+        ) -> anyhow::Result<u64> {
             let sql = sql.to_owned();
             let n = self
                 .member(on)?
                 .query_local(until, move |c| {
                     let mut s = c.prepare_cached(&sql)?;
-                    let mut rows = s.query_map(args.into_iter().map(value).collect::<Vec<_>>(), |r| r.get::<_, i64>(0usize))?;
+                    let mut rows = s
+                        .query_map(args.into_iter().map(value).collect::<Vec<_>>(), |r| {
+                            r.get::<_, i64>(0usize)
+                        })?;
                     Ok(rows.next().transpose()?.unwrap_or(0))
                 })
                 .map_err(|e| anyhow::anyhow!("node {on} refused a read: {e:?}"))?;
@@ -753,9 +1028,16 @@ mod inproc {
                 if self.cut.get(i).is_some_and(|c| c.load(Ordering::Relaxed)) {
                     continue;
                 }
-                let Some(status) = m.replica().and_then(|h| h.status().ok()) else { continue };
+                let Some(status) = m.replica().and_then(|h| h.status().ok()) else {
+                    continue;
+                };
                 let l = usize::try_from(status.leader).unwrap_or(0);
-                if l >= 1 && !self.cut.get(l - 1).is_some_and(|c| c.load(Ordering::Relaxed)) {
+                if l >= 1
+                    && !self
+                        .cut
+                        .get(l - 1)
+                        .is_some_and(|c| c.load(Ordering::Relaxed))
+                {
                     return Ok(Some(l - 1));
                 }
             }
@@ -815,7 +1097,18 @@ mod http {
 
     /// rqlite's body: one array per statement, its SQL first.
     pub(super) fn rqlite_body(stmts: &[(String, Vec<Arg>)]) -> serde_json::Value {
-        serde_json::Value::Array(stmts.iter().map(|(sql, args)| serde_json::Value::Array(std::iter::once(serde_json::json!(sql)).chain(args.iter().map(plain)).collect())).collect())
+        serde_json::Value::Array(
+            stmts
+                .iter()
+                .map(|(sql, args)| {
+                    serde_json::Value::Array(
+                        std::iter::once(serde_json::json!(sql))
+                            .chain(args.iter().map(plain))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// sqld's pipeline: the statements in one transaction on one stream, then its close.
@@ -838,21 +1131,48 @@ mod http {
         if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
             return Some(e.to_owned());
         }
-        v.get("results")?.as_array()?.iter().find_map(|r| r.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        v.get("results")?
+            .as_array()?
+            .iter()
+            .find_map(|r| r.get("error").and_then(|e| e.as_str()).map(str::to_owned))
     }
 
     /// The first error any of sqld's results carries.
     pub(super) fn hrana_error(v: &serde_json::Value) -> Option<String> {
         let results = v.get("results").and_then(|r| r.as_array());
-        let Some(results) = results else { return Some(format!("no results in {v}")) };
-        results.iter().find_map(|r| (r.get("type").and_then(|t| t.as_str()) == Some("error")).then(|| r.get("error").map_or_else(|| r.to_string(), |e| e.to_string())))
+        let Some(results) = results else {
+            return Some(format!("no results in {v}"));
+        };
+        results.iter().find_map(|r| {
+            (r.get("type").and_then(|t| t.as_str()) == Some("error")).then(|| {
+                r.get("error")
+                    .map_or_else(|| r.to_string(), |e| e.to_string())
+            })
+        })
     }
 
     /// A count read back: rqlite's `results[0].values[0][0]`, sqld's `results[0].response.result.rows[0][0].value`.
     pub(super) fn count_of(dialect: Dialect, v: &serde_json::Value) -> Option<u64> {
         match dialect {
-            Dialect::Rqlite => v.get("results")?.get(0)?.get("values")?.get(0)?.get(0)?.as_u64(),
-            Dialect::Hrana => v.get("results")?.get(0)?.get("response")?.get("result")?.get("rows")?.get(0)?.get(0)?.get("value")?.as_str()?.parse().ok(),
+            Dialect::Rqlite => v
+                .get("results")?
+                .get(0)?
+                .get("values")?
+                .get(0)?
+                .get(0)?
+                .as_u64(),
+            Dialect::Hrana => v
+                .get("results")?
+                .get(0)?
+                .get("response")?
+                .get("result")?
+                .get("rows")?
+                .get(0)?
+                .get(0)?
+                .get("value")?
+                .as_str()?
+                .parse()
+                .ok(),
             Dialect::Shim => v.get("count")?.as_u64(),
         }
     }
@@ -861,7 +1181,13 @@ mod http {
         /// `writers` sizes the client's pool: a kept connection to each node for every writer, as
         /// `procs`'s pool keeps one, so no write pays a new connection (ureq's default keeps 3 a host,
         /// which made every write past the third writer's open one).
-        pub fn up(system: &str, scripts: &std::path::Path, shell: &str, deadline: Duration, writers: usize) -> anyhow::Result<Self> {
+        pub fn up(
+            system: &str,
+            scripts: &std::path::Path,
+            shell: &str,
+            deadline: Duration,
+            writers: usize,
+        ) -> anyhow::Result<Self> {
             let dialect = match system {
                 "rqlite" => Dialect::Rqlite,
                 "libsql" => Dialect::Hrana,
@@ -875,27 +1201,57 @@ mod http {
                 .max_idle_connections_per_host(writers)
                 .build()
                 .into();
-            let mut h = Self { system: system.to_owned(), writers, dialect, script: PathBuf::from(format!("{}/{system}.sh", scripts.display())), shell: shell.to_owned(), endpoints: Vec::new(), agent };
-            h.script(&["up"]).map_err(|e| Refusal::Unavailable(format!("{system}'s cluster didn't come up through {}: {e}", h.script.display())))?;
+            let mut h = Self {
+                system: system.to_owned(),
+                writers,
+                dialect,
+                script: PathBuf::from(format!("{}/{system}.sh", scripts.display())),
+                shell: shell.to_owned(),
+                endpoints: Vec::new(),
+                agent,
+            };
+            h.script(&["up"]).map_err(|e| {
+                Refusal::Unavailable(format!(
+                    "{system}'s cluster didn't come up through {}: {e}",
+                    h.script.display()
+                ))
+            })?;
             for n in 0..NODES {
-                h.endpoints.push(h.script(&["endpoint", &n.to_string()])?.trim().to_owned());
+                h.endpoints
+                    .push(h.script(&["endpoint", &n.to_string()])?.trim().to_owned());
             }
             Ok(h)
         }
 
         /// The script run by `--shell`.
         fn script(&self, args: &[&str]) -> anyhow::Result<String> {
-            let out = std::process::Command::new(&self.shell).arg(&self.script).args(args).output()?;
-            anyhow::ensure!(out.status.success(), "{} {}: {}", self.script.display(), args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+            let out = std::process::Command::new(&self.shell)
+                .arg(&self.script)
+                .args(args)
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{} {}: {}",
+                self.script.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
             Ok(String::from_utf8(out.stdout)?)
         }
 
         fn endpoint(&self, n: usize) -> anyhow::Result<&str> {
-            self.endpoints.get(n).map(String::as_str).ok_or_else(|| anyhow::anyhow!("no node {n}"))
+            self.endpoints
+                .get(n)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))
         }
 
         fn post(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-            let mut r = self.agent.post(url).header("content-type", "application/json").send(body.to_string())?;
+            let mut r = self
+                .agent
+                .post(url)
+                .header("content-type", "application/json")
+                .send(body.to_string())?;
             let status = r.status();
             let text = r.body_mut().read_to_string()?;
             anyhow::ensure!(status.is_success(), "{url}: {status}: {text}");
@@ -915,7 +1271,11 @@ mod http {
         fn about(&self) -> serde_json::Value {
             // The cluster script's own account (its binary's version line, the data folder's
             // filesystem and what an acknowledgement means), and the client's.
-            let mut a = self.script(&["about"]).ok().and_then(|out| serde_json::from_str::<serde_json::Value>(out.trim()).ok()).unwrap_or_else(|| serde_json::json!({ "system": self.system }));
+            let mut a = self
+                .script(&["about"])
+                .ok()
+                .and_then(|out| serde_json::from_str::<serde_json::Value>(out.trim()).ok())
+                .unwrap_or_else(|| serde_json::json!({ "system": self.system }));
             let column = column_of(&a);
             if let Some(o) = a.as_object_mut() {
                 o.insert("column".into(), serde_json::json!(column));
@@ -931,12 +1291,23 @@ mod http {
             a
         }
 
-        fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], _until: Instant) -> anyhow::Result<()> {
+        fn exec(
+            &self,
+            via: usize,
+            stmts: &[(String, Vec<Arg>)],
+            _until: Instant,
+        ) -> anyhow::Result<()> {
             let ep = self.endpoint(via)?;
             let (url, body) = match self.dialect {
                 Dialect::Rqlite => (format!("{ep}/db/execute?transaction"), rqlite_body(stmts)),
-                Dialect::Hrana => (format!("{ep}/v2/pipeline"), hrana_body(stmts, stmts.len() > 1)),
-                Dialect::Shim => (format!("{ep}/exec"), serde_json::json!({ "stmts": rqlite_body(stmts) })),
+                Dialect::Hrana => (
+                    format!("{ep}/v2/pipeline"),
+                    hrana_body(stmts, stmts.len() > 1),
+                ),
+                Dialect::Shim => (
+                    format!("{ep}/exec"),
+                    serde_json::json!({ "stmts": rqlite_body(stmts) }),
+                ),
             };
             let v = self.post(&url, &body)?;
             let err = match self.dialect {
@@ -950,17 +1321,27 @@ mod http {
             }
         }
 
-        fn count(&self, on: usize, sql: &str, args: Vec<Arg>, _until: Instant) -> anyhow::Result<u64> {
+        fn count(
+            &self,
+            on: usize,
+            sql: &str,
+            args: Vec<Arg>,
+            _until: Instant,
+        ) -> anyhow::Result<u64> {
             let ep = self.endpoint(on)?;
             let stmt = [(sql.to_owned(), args)];
             let (url, body) = match self.dialect {
                 // `level=none`: the node's own copy, not the leader's.
                 Dialect::Rqlite => (format!("{ep}/db/query?level=none"), rqlite_body(&stmt)),
                 Dialect::Hrana => (format!("{ep}/v2/pipeline"), hrana_body(&stmt, false)),
-                Dialect::Shim => (format!("{ep}/count"), serde_json::json!({ "stmts": rqlite_body(&stmt) })),
+                Dialect::Shim => (
+                    format!("{ep}/count"),
+                    serde_json::json!({ "stmts": rqlite_body(&stmt) }),
+                ),
             };
             let v = self.post(&url, &body)?;
-            count_of(self.dialect, &v).ok_or_else(|| anyhow::anyhow!("{} node {on}: no count in {v}", self.system))
+            count_of(self.dialect, &v)
+                .ok_or_else(|| anyhow::anyhow!("{} node {on}: no count in {v}", self.system))
         }
 
         fn leader(&self, _until: Instant) -> anyhow::Result<Option<usize>> {
@@ -1009,7 +1390,7 @@ mod http {
 ///        (--peers: every member's address, as its peers reach it, this one's the Nth: it listens there)
 mod procs {
     use super::*;
-    use amphora::database::Database;
+    use amphora::database::{AnswerMax, Database};
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -1025,64 +1406,121 @@ mod procs {
         durability: Durability,
         relay_records: usize,
         deadline: Duration,
+        reopen: bool,
     }
 
     fn member_opts(args: &[String]) -> anyhow::Result<MemberOpts> {
-        let (mut node, mut peers, mut dir, mut class, mut spanning, mut relay_records, mut deadline) = (None, None, None, None, None, None, None);
+        let (
+            mut node,
+            mut peers,
+            mut dir,
+            mut class,
+            mut spanning,
+            mut relay_records,
+            mut deadline,
+        ) = (None, None, None, None, None, None, None);
+        let mut reopen = false;
         let mut it = args.iter();
         while let Some(a) = it.next() {
-            let mut v = || it.next().cloned().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+            let mut v = || {
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+            };
             match a.as_str() {
                 "--repl-member" => {}
+                // Started again by the driver after a kill -9 (`Procs::start`): on the data it kept.
+                "--reopen" => reopen = true,
                 "--node" => node = Some(v()?.parse::<u64>()?),
                 "--peers" => peers = Some(v()?.split(',').map(str::to_owned).collect::<Vec<_>>()),
                 "--dir" => dir = Some(PathBuf::from(v()?)),
                 "--class" => class = Some(v()?),
                 "--spanning" => spanning = Some(v()?.parse::<u32>()?),
                 "--relay-records" => relay_records = Some(v()?.parse::<usize>()?),
-                "--deadline-s" => deadline = Some(Duration::try_from_secs_f64(v()?.parse::<f64>()?)?),
+                "--deadline-s" => {
+                    deadline = Some(Duration::try_from_secs_f64(v()?.parse::<f64>()?)?)
+                }
                 other => anyhow::bail!("unknown argument {other}"),
             }
         }
         let m = "--repl-member";
         let peers = need(peers, "--peers", m)?;
-        anyhow::ensure!(peers.len() == NODES, "--peers names {NODES} members, not {}", peers.len());
+        anyhow::ensure!(
+            peers.len() == NODES,
+            "--peers names {NODES} members, not {}",
+            peers.len()
+        );
         let node = need(node, "--node", m)?;
-        anyhow::ensure!((1..=NODES as u64).contains(&node), "--node takes 1 to {NODES}");
+        anyhow::ensure!(
+            (1..=NODES as u64).contains(&node),
+            "--node takes 1 to {NODES}"
+        );
         let ids: Vec<u64> = (1..=NODES as u64).collect();
         let durability = match need(class, "--class", m)?.as_str() {
             // Each member its own fate, as `inproc`'s: three members on three fates.
-            "replicated" => Durability::Replicated(Fates { of: ids.iter().map(|&i| (i, i)).collect(), spanning: need(spanning, "--spanning", m)? }),
+            "replicated" => Durability::Replicated(Fates {
+                of: ids.iter().map(|&i| (i, i)).collect(),
+                spanning: need(spanning, "--spanning", m)?,
+            }),
             "persisted" => Durability::Persisted,
             other => anyhow::bail!("unknown class {other} (persisted, replicated)"),
         };
         let relay_records = need(relay_records, "--relay-records", m)?;
         anyhow::ensure!(relay_records > 0, "--relay-records takes at least 1");
-        Ok(MemberOpts { node, peers, dir: need(dir, "--dir", m)?, durability, relay_records, deadline: need(deadline, "--deadline-s", m)? })
+        Ok(MemberOpts {
+            node,
+            peers,
+            dir: need(dir, "--dir", m)?,
+            durability,
+            relay_records,
+            deadline: need(deadline, "--deadline-s", m)?,
+            reopen,
+        })
     }
 
     fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
-        addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("{addr} names no address"))
+        addr.to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{addr} names no address"))
     }
 
     fn arg_of(v: &serde_json::Value) -> anyhow::Result<amphora_api::Value> {
         Ok(match v {
             serde_json::Value::String(s) => amphora_api::Value::Text(s.clone()),
-            serde_json::Value::Number(n) => amphora_api::Value::Integer(n.as_i64().ok_or_else(|| anyhow::anyhow!("{n} isn't an integer"))?),
+            serde_json::Value::Number(n) => amphora_api::Value::Integer(
+                n.as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("{n} isn't an integer"))?,
+            ),
             serde_json::Value::Null => amphora_api::Value::Null,
             other => anyhow::bail!("{other} isn't an argument"),
         })
     }
 
     /// `[[sql, arg, ...], ...]` (rqlite's body, as `http::rqlite_body` writes it) as statements.
-    fn stmts_of(v: Option<&serde_json::Value>) -> anyhow::Result<Vec<(String, Vec<amphora_api::Value>)>> {
-        let list = v.and_then(|v| v.as_array()).ok_or_else(|| anyhow::anyhow!("no stmts"))?;
+    fn stmts_of(
+        v: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Vec<(String, Vec<amphora_api::Value>)>> {
+        let list = v
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("no stmts"))?;
         list.iter()
             .map(|s| {
-                let parts = s.as_array().ok_or_else(|| anyhow::anyhow!("a statement isn't an array"))?;
-                let (sql, args) = parts.split_first().ok_or_else(|| anyhow::anyhow!("an empty statement"))?;
-                let sql = sql.as_str().ok_or_else(|| anyhow::anyhow!("a statement's SQL isn't text"))?.to_owned();
-                Ok((sql, args.iter().map(arg_of).collect::<anyhow::Result<Vec<_>>>()?))
+                let parts = s
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("a statement isn't an array"))?;
+                let (sql, args) = parts
+                    .split_first()
+                    .ok_or_else(|| anyhow::anyhow!("an empty statement"))?;
+                let sql = sql
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("a statement's SQL isn't text"))?
+                    .to_owned();
+                Ok((
+                    sql,
+                    args.iter()
+                        .map(arg_of)
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                ))
             })
             .collect()
     }
@@ -1098,7 +1536,10 @@ mod procs {
         fn answer(&self, line: &str) -> serde_json::Value {
             match self.request(line) {
                 Ok(v) => v,
-                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+                // The refusal's type beside its text, so the driver retries on the type.
+                Err(e) => {
+                    serde_json::json!({ "error": format!("{e:#}"), "refusal": e.downcast_ref::<amphora_api::Refusal>() })
+                }
             }
         }
 
@@ -1110,7 +1551,7 @@ mod procs {
                     anyhow::ensure!(!self.cut.load(Ordering::Relaxed), "this member is cut");
                     let stmts = stmts_of(r.get("stmts"))?;
                     self.db
-                        .call(until, move |c| {
+                        .call(until, AnswerMax::fixed(), move |c| {
                             for (sql, args) in stmts {
                                 if args.is_empty() {
                                     c.execute_batch(&sql)?;
@@ -1120,7 +1561,7 @@ mod procs {
                             }
                             Ok(())
                         })
-                        .map_err(|e| anyhow::anyhow!("refused a write: {e:?}"))?;
+                        .map_err(|e| anyhow::Error::new(e).context("refused a write"))?;
                     Ok(serde_json::json!({ "ok": true }))
                 }
                 Some("count") => {
@@ -1138,16 +1579,59 @@ mod procs {
                     Ok(serde_json::json!({ "count": n }))
                 }
                 Some("leader") => {
-                    let status = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.status().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    let status = self
+                        .db
+                        .replica()
+                        .ok_or_else(|| anyhow::anyhow!("no replica"))?
+                        .status()
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     Ok(serde_json::json!({ "leader": status.leader }))
                 }
+                Some("counters") => {
+                    let c = self
+                        .db
+                        .replica()
+                        .ok_or_else(|| anyhow::anyhow!("no replica"))?
+                        .counters();
+                    Ok(serde_json::json!({
+                        "commits_held": c.commits_held, "commits_classic": c.commits_classic,
+                        "flushes": c.flushes.iter().sum::<u64>(), "flush_ms": c.flush_time.as_secs_f64() * 1e3,
+                        "flush_backlog": c.flush_backlog, "write_slot_holds": c.write_slot_holds,
+                    }))
+                }
                 Some("cut") => {
-                    self.cut.store(r.get("to").and_then(|t| t.as_bool()).ok_or_else(|| anyhow::anyhow!("cut takes to"))?, Ordering::Relaxed);
+                    self.cut.store(
+                        r.get("to")
+                            .and_then(|t| t.as_bool())
+                            .ok_or_else(|| anyhow::anyhow!("cut takes to"))?,
+                        Ordering::Relaxed,
+                    );
                     Ok(serde_json::json!({ "ok": true }))
                 }
                 Some("stop") => {
-                    let _ = self.stop.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.send(());
+                    let _ = self
+                        .stop
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("poisoned"))?
+                        .send(());
                     Ok(serde_json::json!({ "ok": true }))
+                }
+                // How to start this member again on its data: what `Procs::start` runs.
+                Some("launch") => {
+                    let exe = std::env::current_exe()?;
+                    let mut args: Vec<String> = std::env::args().skip(1).collect();
+                    if !args.iter().any(|a| a == "--reopen") {
+                        args.push("--reopen".to_owned());
+                    }
+                    Ok(serde_json::json!({ "exe": exe.to_string_lossy(), "args": args }))
+                }
+                // kill -9 of this process, as the competitors' scripts kill a node: nothing flushed,
+                // nothing closed in order. The asker learns it died when its connection ends.
+                Some("kill") => {
+                    let status = std::process::Command::new("kill")
+                        .args(["-9", &std::process::id().to_string()])
+                        .status()?;
+                    anyhow::bail!("kill -9 of this member returned {status}")
                 }
                 other => anyhow::bail!("unknown op {other:?}"),
             }
@@ -1165,7 +1649,10 @@ mod procs {
                 let mut from = [0u8; 8];
                 r.read_exact(&mut from)?;
                 let from = u64::from_le_bytes(from);
-                let handle = member.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?;
+                let handle = member
+                    .db
+                    .replica()
+                    .ok_or_else(|| anyhow::anyhow!("no replica"))?;
                 loop {
                     let mut len = [0u8; 4];
                     r.read_exact(&mut len)?;
@@ -1210,8 +1697,13 @@ mod procs {
                 .ok();
             }
             let Some(s) = conn.as_mut() else { continue };
-            let Ok(len) = u32::try_from(bytes.len()) else { continue };
-            if s.write_all(&len.to_le_bytes()).and_then(|()| s.write_all(&bytes)).is_err() {
+            let Ok(len) = u32::try_from(bytes.len()) else {
+                continue;
+            };
+            if s.write_all(&len.to_le_bytes())
+                .and_then(|()| s.write_all(&bytes))
+                .is_err()
+            {
                 conn = None;
             }
         }
@@ -1221,16 +1713,40 @@ mod procs {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let m = member_opts(&args)?;
         let at = usize::try_from(m.node)? - 1;
-        let listen = m.peers.get(at).ok_or_else(|| anyhow::anyhow!("no peer {}", m.node))?.clone();
-        let _ = std::fs::remove_dir_all(&m.dir);
+        let listen = m
+            .peers
+            .get(at)
+            .ok_or_else(|| anyhow::anyhow!("no peer {}", m.node))?
+            .clone();
+        if !m.reopen {
+            let _ = std::fs::remove_dir_all(&m.dir);
+        }
         std::fs::create_dir_all(&m.dir)?;
         let ids: Vec<u64> = (1..=NODES as u64).collect();
-        let config = ReplicaConfig { node_id: m.node, voters: ids, learners: Vec::new(), bootstrap: None };
-        let db = Database::open_replicated_with(&m.dir.join(format!("state-{}.db", m.node)), &m.dir.join(format!("raft-{}.log", m.node)), config, m.durability.clone(), Instant::now() + m.deadline)
-            .map_err(|e| anyhow::anyhow!("member {}: {e:?}", m.node))?;
-        let handle = db.replica().ok_or_else(|| anyhow::anyhow!("member {} has no replica handle", m.node))?;
+        let config = ReplicaConfig {
+            node_id: m.node,
+            voters: ids,
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let db = Database::open_replicated_with(
+            &m.dir.join(format!("state-{}.db", m.node)),
+            &m.dir.join(format!("raft-{}.log", m.node)),
+            config,
+            m.durability.clone(),
+            Instant::now() + m.deadline,
+        )
+        .map_err(|e| anyhow::anyhow!("member {}: {e:?}", m.node))?;
+        let handle = db
+            .replica()
+            .ok_or_else(|| anyhow::anyhow!("member {} has no replica handle", m.node))?;
         let (stop_tx, stop_rx) = mpsc::channel();
-        let member = Arc::new(Member { db, cut: AtomicBool::new(false), deadline: m.deadline, stop: Mutex::new(stop_tx) });
+        let member = Arc::new(Member {
+            db,
+            cut: AtomicBool::new(false),
+            deadline: m.deadline,
+            stop: Mutex::new(stop_tx),
+        });
         let listener = TcpListener::bind(resolve(&listen)?)?;
         // Each peer's records wait at most --relay-records deep; past that they're lost, as a
         // congested link's are.
@@ -1285,6 +1801,9 @@ mod procs {
         Ok(())
     }
 
+    /// A program and its arguments.
+    type Program = (String, Vec<String>);
+
     /// The three members over TCP, each request on a connection of the member's pool: a writer
     /// takes one, or opens one, and gives it back, so writers never queue behind each other here.
     pub struct Procs {
@@ -1292,22 +1811,46 @@ mod procs {
         pools: Vec<Mutex<Vec<BufReader<TcpStream>>>>,
         cut: [AtomicBool; NODES],
         deadline: Duration,
+        /// Each killed member's program and arguments, for `start`.
+        relaunch: [Mutex<Option<Program>>; NODES],
+        /// The members `start` ran, waited for as the driver ends.
+        started: Mutex<Vec<std::process::Child>>,
     }
 
     impl Procs {
         pub fn open(o: &Opts) -> anyhow::Result<Self> {
             let members = need(o.members.clone(), "--members", &o.measure)?;
-            anyhow::ensure!(members.len() == NODES, "--members names {NODES} members, not {}", members.len());
-            Ok(Self { pools: members.iter().map(|_| Mutex::new(Vec::new())).collect(), members, cut: Default::default(), deadline: o.deadline })
+            anyhow::ensure!(
+                members.len() == NODES,
+                "--members names {NODES} members, not {}",
+                members.len()
+            );
+            Ok(Self {
+                pools: members.iter().map(|_| Mutex::new(Vec::new())).collect(),
+                members,
+                cut: Default::default(),
+                deadline: o.deadline,
+                relaunch: Default::default(),
+                started: Mutex::new(Vec::new()),
+            })
         }
 
         fn ask(&self, n: usize, req: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-            let pool = self.pools.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
-            let taken = pool.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.pop();
+            let pool = self
+                .pools
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+            let taken = pool
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pool poisoned"))?
+                .pop();
             let mut conn = match taken {
                 Some(c) => c,
                 None => {
-                    let addr = self.members.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+                    let addr = self
+                        .members
+                        .get(n)
+                        .ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
                     let mut s = TcpStream::connect_timeout(&resolve(addr)?, self.deadline)?;
                     s.set_nodelay(true)?;
                     s.set_read_timeout(Some(self.deadline))?;
@@ -1319,23 +1862,29 @@ mod procs {
             line.push('\n');
             conn.get_mut().write_all(line.as_bytes())?;
             let mut back = String::new();
-            anyhow::ensure!(conn.read_line(&mut back)? > 0, "node {n} closed the connection");
-            pool.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.push(conn);
+            anyhow::ensure!(
+                conn.read_line(&mut back)? > 0,
+                "node {n} closed the connection"
+            );
+            pool.lock()
+                .map_err(|_| anyhow::anyhow!("pool poisoned"))?
+                .push(conn);
             let v: serde_json::Value = serde_json::from_str(&back)?;
             if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
-                anyhow::bail!("node {n}: {e}");
+                return Err(
+                    match v.get("refusal").and_then(|r| {
+                        serde_json::from_value::<amphora_api::Refusal>(r.clone()).ok()
+                    }) {
+                        Some(refusal) => anyhow::Error::new(refusal).context(format!("node {n}")),
+                        None => anyhow::anyhow!("node {n}: {e}"),
+                    },
+                );
             }
             Ok(v)
         }
 
         fn is_cut(&self, n: usize) -> bool {
             self.cut.get(n).is_some_and(|c| c.load(Ordering::Relaxed))
-        }
-
-        fn set_cut(&self, n: usize, to: bool) -> anyhow::Result<()> {
-            self.ask(n, &serde_json::json!({ "op": "cut", "to": to }))?;
-            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(to, Ordering::Relaxed);
-            Ok(())
         }
     }
 
@@ -1344,6 +1893,13 @@ mod procs {
             for n in 0..NODES {
                 if let Err(e) = self.ask(n, &serde_json::json!({ "op": "stop" })) {
                     eprintln!("node {n} stop: {e}");
+                }
+            }
+            if let Ok(mut started) = self.started.lock() {
+                for c in started.iter_mut() {
+                    if let Err(e) = c.wait() {
+                        eprintln!("a restarted member: {e}");
+                    }
                 }
             }
         }
@@ -1363,14 +1919,31 @@ mod procs {
             })
         }
 
-        fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], _until: Instant) -> anyhow::Result<()> {
+        fn exec(
+            &self,
+            via: usize,
+            stmts: &[(String, Vec<Arg>)],
+            _until: Instant,
+        ) -> anyhow::Result<()> {
             anyhow::ensure!(!self.is_cut(via), "node {via} is down");
-            self.ask(via, &serde_json::json!({ "op": "exec", "stmts": http::rqlite_body(stmts) })).map(|_| ())
+            self.ask(
+                via,
+                &serde_json::json!({ "op": "exec", "stmts": http::rqlite_body(stmts) }),
+            )
+            .map(|_| ())
         }
 
-        fn count(&self, on: usize, sql: &str, args: Vec<Arg>, _until: Instant) -> anyhow::Result<u64> {
+        fn count(
+            &self,
+            on: usize,
+            sql: &str,
+            args: Vec<Arg>,
+            _until: Instant,
+        ) -> anyhow::Result<u64> {
             let v = self.ask(on, &serde_json::json!({ "op": "count", "stmts": http::rqlite_body(&[(sql.to_owned(), args)]) }))?;
-            v.get("count").and_then(|c| c.as_u64()).ok_or_else(|| anyhow::anyhow!("node {on}: no count in {v}"))
+            v.get("count")
+                .and_then(|c| c.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("node {on}: no count in {v}"))
         }
 
         fn leader(&self, _until: Instant) -> anyhow::Result<Option<usize>> {
@@ -1378,8 +1951,14 @@ mod procs {
                 if self.is_cut(n) {
                     continue;
                 }
-                let Ok(v) = self.ask(n, &serde_json::json!({ "op": "leader" })) else { continue };
-                let l = v.get("leader").and_then(|l| l.as_u64()).and_then(|l| usize::try_from(l).ok()).unwrap_or(0);
+                let Ok(v) = self.ask(n, &serde_json::json!({ "op": "leader" })) else {
+                    continue;
+                };
+                let l = v
+                    .get("leader")
+                    .and_then(|l| l.as_u64())
+                    .and_then(|l| usize::try_from(l).ok())
+                    .unwrap_or(0);
                 if l >= 1 && !self.is_cut(l - 1) {
                     return Ok(Some(l - 1));
                 }
@@ -1387,12 +1966,82 @@ mod procs {
             Ok(None)
         }
 
+        // kill -9 of the member's process, as the competitors' `kill N` (AC-T1.8.4): a cut would
+        // keep its memory and its open log, and spare its restart the catch-up measure times.
         fn kill(&self, n: usize) -> anyhow::Result<()> {
-            self.set_cut(n, true)
+            let addr = self
+                .members
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+            anyhow::ensure!(
+                resolve(addr)?.ip().is_loopback(),
+                "node {n} at {addr} is on another machine: only a member on this one is started again from here"
+            );
+            let v = self.ask(n, &serde_json::json!({ "op": "launch" }))?;
+            let exe = v
+                .get("exe")
+                .and_then(|e| e.as_str())
+                .ok_or_else(|| anyhow::anyhow!("node {n}: no exe in {v}"))?
+                .to_owned();
+            let args = v
+                .get("args")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| anyhow::anyhow!("node {n}: no args in {v}"))?;
+            let args = args
+                .iter()
+                .map(|a| {
+                    a.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("node {n}: an argument in {v}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            *self
+                .relaunch
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))? = Some((exe, args));
+            self.cut
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .store(true, Ordering::Relaxed);
+            // The member's process ends inside this request: its connection ending is the answer.
+            anyhow::ensure!(
+                self.ask(n, &serde_json::json!({ "op": "kill" })).is_err(),
+                "node {n} answered after its kill -9"
+            );
+            self.pools
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pool poisoned"))?
+                .clear();
+            Ok(())
         }
 
         fn start(&self, n: usize) -> anyhow::Result<()> {
-            self.set_cut(n, false)
+            let (exe, args) = self
+                .relaunch
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("node {n} wasn't killed"))?;
+            let child = std::process::Command::new(&exe)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()?;
+            self.started
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .push(child);
+            self.cut
+                .get(n)
+                .ok_or_else(|| anyhow::anyhow!("no node {n}"))?
+                .store(false, Ordering::Relaxed);
+            Ok(())
         }
     }
 }
@@ -1400,6 +2049,44 @@ mod procs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W6 (CP-T1.8): runs' bucket lists summed by least value are the merged runs' histogram, so
+    // `bench/pool.py` pools rounds into quantiles over all their samples; each sample reads back as
+    // its bucket's least value, within 1/64 of itself.
+    #[test]
+    fn w6_buckets_of_runs_pool_into_the_merged_histogram() {
+        let (mut a, mut b, mut merged) = (Hist::new(), Hist::new(), Hist::new());
+        let mut rng = Rng(7);
+        for i in 0..20_000u64 {
+            let us = 1 + rng.next() % 5_000_000;
+            if i % 3 == 0 {
+                a.record(us)
+            } else {
+                b.record(us)
+            }
+            merged.record(us);
+            if i % 10 == 0 {
+                let mut one = Hist::new();
+                one.record(us);
+                let least = one.buckets()[0][0].as_u64().unwrap();
+                assert!(
+                    least <= us && us - least <= us / 64,
+                    "{us} reads back as {least}"
+                );
+            }
+        }
+        let mut pooled = std::collections::BTreeMap::<u64, u64>::new();
+        for h in [&a, &b] {
+            for p in h.buckets().as_array().into_iter().flatten() {
+                *pooled.entry(p[0].as_u64().unwrap()).or_default() += p[1].as_u64().unwrap();
+            }
+        }
+        let pooled: Vec<_> = pooled
+            .into_iter()
+            .map(|(least, n)| serde_json::json!([least, n]))
+            .collect();
+        assert_eq!(serde_json::Value::from(pooled), merged.buckets());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
@@ -1411,10 +2098,23 @@ mod tests {
         let base = "--repl commit --system rqlite --batch 1 --text-bytes 100 --deadline-s 5";
         let e = parse(&args(base)).err().unwrap().to_string();
         assert!(e.contains("--writers"), "{e}");
-        let e = parse(&args(&format!("{base} --writers 2 --warmup-s 1"))).err().unwrap().to_string();
+        let e = parse(&args(&format!("{base} --writers 2 --warmup-s 1")))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("--seconds"), "{e}");
-        assert!(parse(&args(&format!("{base} --writers 2 --warmup-s 1 --seconds 3"))).is_ok());
-        let e = parse(&args("--repl catchup --system rqlite --batch 1 --text-bytes 1 --deadline-s 5 --behind 10")).err().unwrap().to_string();
+        assert!(
+            parse(&args(&format!(
+                "{base} --writers 2 --warmup-s 1 --seconds 3"
+            )))
+            .is_ok()
+        );
+        let e = parse(&args(
+            "--repl catchup --system rqlite --batch 1 --text-bytes 1 --deadline-s 5 --behind 10",
+        ))
+        .err()
+        .unwrap()
+        .to_string();
         assert!(e.contains("--poll-us"), "{e}");
         let e = parse(&args("--repl failover --system amphora --batch 1 --text-bytes 1 --deadline-s 5 --writers 1 --kills 1 --settle-s 1 --dir d --relay-records 64 --class replicated")).err().unwrap().to_string();
         assert!(e.contains("--spanning"), "{e}");
@@ -1424,24 +2124,48 @@ mod tests {
     // G12 step 1: the same write reaches rqlite and sqld as each one's dialect says.
     #[test]
     fn g12_repl_dialects_carry_the_same_write() {
-        let s = vec![("INSERT INTO t VALUES (?1, ?2, ?3)".to_owned(), vec![Arg::Text("a".into()), Arg::Int(7), Arg::Null])];
-        assert_eq!(http::rqlite_body(&s), serde_json::json!([["INSERT INTO t VALUES (?1, ?2, ?3)", "a", 7, null]]));
+        let s = vec![(
+            "INSERT INTO t VALUES (?1, ?2, ?3)".to_owned(),
+            vec![Arg::Text("a".into()), Arg::Int(7), Arg::Null],
+        )];
+        assert_eq!(
+            http::rqlite_body(&s),
+            serde_json::json!([["INSERT INTO t VALUES (?1, ?2, ?3)", "a", 7, null]])
+        );
         let h = http::hrana_body(&s, true);
         let reqs = h["requests"].as_array().unwrap();
         assert_eq!(reqs.len(), 4, "BEGIN, the insert, COMMIT, close");
-        assert_eq!(reqs[1]["stmt"]["args"], serde_json::json!([{ "type": "text", "value": "a" }, { "type": "integer", "value": "7" }, { "type": "null" }]));
+        assert_eq!(
+            reqs[1]["stmt"]["args"],
+            serde_json::json!([{ "type": "text", "value": "a" }, { "type": "integer", "value": "7" }, { "type": "null" }])
+        );
         assert_eq!(reqs[3]["type"], "close");
-        assert_eq!(http::hrana_body(&s, false)["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            http::hrana_body(&s, false)["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     // G12 step 1: an error in any result is a refused write, never an acknowledged one.
     #[test]
     fn g12_repl_errors_are_refusals() {
         assert_eq!(http::rqlite_error(&serde_json::json!({ "results": [{ "last_insert_id": 1 }, { "error": "not leader" }] })).as_deref(), Some("not leader"));
-        assert_eq!(http::rqlite_error(&serde_json::json!({ "results": [{ "rows_affected": 1 }] })), None);
+        assert_eq!(
+            http::rqlite_error(&serde_json::json!({ "results": [{ "rows_affected": 1 }] })),
+            None
+        );
         assert!(http::hrana_error(&serde_json::json!({ "results": [{ "type": "ok" }, { "type": "error", "error": { "message": "busy" } }] })).unwrap().contains("busy"));
-        assert_eq!(http::hrana_error(&serde_json::json!({ "results": [{ "type": "ok" }] })), None);
-        assert!(http::hrana_error(&serde_json::json!({})).is_some(), "no results is no acknowledgement");
+        assert_eq!(
+            http::hrana_error(&serde_json::json!({ "results": [{ "type": "ok" }] })),
+            None
+        );
+        assert!(
+            http::hrana_error(&serde_json::json!({})).is_some(),
+            "no results is no acknowledgement"
+        );
     }
 
     // A writer resends the same ids: its events are numbered from 1 in one session.
@@ -1450,7 +2174,10 @@ mod tests {
         let mut w = Writer::new(4);
         let a = w.next(2, 10);
         let b = w.next(1, 10);
-        assert_eq!(a.iter().chain(&b).map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            a.iter().chain(&b).map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert!(a.iter().chain(&b).all(|e| e.session == "s-000004"));
         assert_eq!(event_args(&b[0]).unwrap().len(), 13);
     }
@@ -1466,8 +2193,14 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(u["cpu_s"].as_f64().is_some(), "{u}");
             assert!(u["peak_rss_kib"].as_u64().is_some_and(|k| k > 0), "{u}");
-            assert!(u["sockets"].as_u64().is_some_and(|n| n >= 1), "the held listener is a socket: {u}");
-            assert!(p["kernel"].as_str().is_some_and(|k| k.starts_with("Linux")), "{p}");
+            assert!(
+                u["sockets"].as_u64().is_some_and(|n| n >= 1),
+                "the held listener is a socket: {u}"
+            );
+            assert!(
+                p["kernel"].as_str().is_some_and(|k| k.starts_with("Linux")),
+                "{p}"
+            );
         }
         drop(held);
     }
@@ -1476,8 +2209,14 @@ mod tests {
     // of the two; anything else stands in no column, never beside the quorum systems.
     #[test]
     fn g12_repl_columns_keep_primary_only_apart() {
-        assert_eq!(column_of(&serde_json::json!({ "column": "quorum" })), Some(QUORUM));
-        assert_eq!(column_of(&serde_json::json!({ "column": "primary only" })), Some(PRIMARY_ONLY));
+        assert_eq!(
+            column_of(&serde_json::json!({ "column": "quorum" })),
+            Some(QUORUM)
+        );
+        assert_eq!(
+            column_of(&serde_json::json!({ "column": "primary only" })),
+            Some(PRIMARY_ONLY)
+        );
         assert_eq!(column_of(&serde_json::json!({ "column": "Quorum" })), None);
         assert_eq!(column_of(&serde_json::json!({ "column": 1 })), None);
         assert_eq!(column_of(&serde_json::json!({ "system": "libsql" })), None);

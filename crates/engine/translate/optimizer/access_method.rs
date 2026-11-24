@@ -66,6 +66,8 @@ pub struct AccessMethod {
     pub consumed_where_terms: BitSet<usize>,
     /// Table-type specific access method details.
     pub params: AccessMethodParams,
+    /// Amphora (QT.5, T-QT.5.3; lane T19): the star filter `cost` is priced with, if any.
+    pub star_filter: Option<crate::translate::plan::StarFilterPrice>,
 }
 
 /// Table‑specific details of how an [`AccessMethod`] operates.
@@ -890,6 +892,7 @@ fn consider_in_seek_access_method(
     )?
     .map(|chosen| -> Result<AccessMethod> {
         Ok(AccessMethod {
+            star_filter: None,
             cost: chosen.cost,
             estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
             consumed_where_terms: iter::once(chosen.constraint_idx).try_collect()?,
@@ -1020,6 +1023,7 @@ pub fn find_best_access_method_for_join_order(
             params,
         ),
         Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
+            star_filter: None,
             cost: estimate_cost_for_scan_or_seek(
                 None,
                 &[],
@@ -1137,6 +1141,7 @@ fn find_best_access_method_for_btree(
         )?;
     }
     let mut best_access_method = AccessMethod {
+        star_filter: None,
         cost: best.cost,
         estimated_rows_per_outer_row,
         consumed_where_terms,
@@ -1230,6 +1235,7 @@ fn find_best_access_method_for_btree(
             );
             let cost = scan_cost + build_cost + seek_cost;
             let temporary_index = AccessMethod {
+                star_filter: None,
                 cost,
                 estimated_rows_per_outer_row: rows_per_seek,
                 consumed_where_terms: consumed_where_terms_from_constraint_refs(
@@ -1452,6 +1458,7 @@ fn find_best_access_method_for_vtab(
                 BitSet::default()
             };
             Ok(Some(AccessMethod {
+                star_filter: None,
                 // TODO: Base cost on `IndexInfo::estimated_cost`.
                 cost: estimate_cost_for_scan_or_seek(
                     None,
@@ -1592,6 +1599,40 @@ pub fn bloom_filter_rate_saving(
     build_cost: f64,
     params: &CostModelParams,
 ) -> Option<(f64, bool)> {
+    bloom_filter_costs(
+        build_keys,
+        probe_rows,
+        matched_probe_rows,
+        probe_cost,
+        build_cost,
+        params,
+    )
+    .map(|costs| (costs.rate_per_key, costs.with_filter < costs.without))
+}
+
+/// A Bloom filter's costs as [bloom_filter_rate_saving] weighs them.
+#[derive(Debug, Clone, Copy)]
+pub struct BloomFilterCosts {
+    /// The rate per key the filter is sized at.
+    pub rate_per_key: f64,
+    /// Its false-positive rate at the build's keys.
+    pub rate: f64,
+    /// Its lookups, bits and build, and the probes of the misses it passes.
+    pub with_filter: f64,
+    /// The misses' probes with no filter.
+    pub without: f64,
+}
+
+/// [bloom_filter_rate_saving]'s sizing, with the costs it compares: `None` when a cost isn't
+/// measured or no rate under one is worth its bits.
+pub fn bloom_filter_costs(
+    build_keys: f64,
+    probe_rows: f64,
+    matched_probe_rows: f64,
+    probe_cost: f64,
+    build_cost: f64,
+    params: &CostModelParams,
+) -> Option<BloomFilterCosts> {
     let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let lookup_cost = params.bloom_lookup_cost;
     let bit_cost =
@@ -1612,7 +1653,12 @@ pub fn bloom_filter_rate_saving(
     let with_filter =
         probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost + build_cost;
     let without = misses * probe_cost;
-    Some((rate_per_key, with_filter < without))
+    Some(BloomFilterCosts {
+        rate_per_key,
+        rate,
+        with_filter,
+        without,
+    })
 }
 
 /// Estimate the cost of a hash join between two tables.
@@ -1777,7 +1823,8 @@ pub(super) fn merge_inputs_in_key_order(
                 read_in_key_order(probe_table, None, key.get_probe_expr(where_clause)),
             )
         })
-        .max_by_key(|&(build, probe)| u8::from(build) + u8::from(probe))
+        // Ordered as the count of sides in key order: both, then either, then neither.
+        .max_by_key(|&(build, probe)| (build && probe, build || probe))
         .unwrap_or((false, false))
 }
 
@@ -1938,6 +1985,7 @@ pub fn try_hash_join_access_method(
         params,
     );
     Ok(Some(AccessMethod {
+        star_filter: None,
         cost,
         estimated_rows_per_outer_row,
         consumed_where_terms: join_keys
@@ -2220,6 +2268,7 @@ fn find_best_access_method_for_subquery(
     // This check must come first because correlated CTEs should NOT share materialized data.
     if plan_has_outer_scope_dependency(&subquery.plan) {
         return Ok(Some(AccessMethod {
+            star_filter: None,
             // Correlated subqueries always rerun for each outer row, even if the
             // enclosing CTE/subquery might otherwise be shareable.
             cost: coroutine_cost,
@@ -2239,6 +2288,7 @@ fn find_best_access_method_for_subquery(
         .is_some_and(JoinInfo::keeps_right_rows)
     {
         return Ok(Some(AccessMethod {
+            star_filter: None,
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
@@ -2299,6 +2349,7 @@ fn find_best_access_method_for_subquery(
             schema,
         ) {
             return Ok(Some(AccessMethod {
+                star_filter: None,
                 cost: scan_cost,
                 estimated_rows_per_outer_row: *base_row_count,
                 consumed_where_terms: Default::default(),
@@ -2309,6 +2360,7 @@ fn find_best_access_method_for_subquery(
 
     if usable.is_empty() {
         return Ok(Some(AccessMethod {
+            star_filter: None,
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
@@ -2322,6 +2374,7 @@ fn find_best_access_method_for_subquery(
     let key_col_positions = ordered_ephemeral_key_columns(&usable_constraints);
     if key_col_positions.is_empty() {
         return Ok(Some(AccessMethod {
+            star_filter: None,
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
@@ -2371,6 +2424,7 @@ fn find_best_access_method_for_subquery(
             "using coroutine subquery access because no usable seek constraints remain"
         );
         return Ok(Some(AccessMethod {
+            star_filter: None,
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
@@ -2440,6 +2494,7 @@ fn find_best_access_method_for_subquery(
     );
     let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
     let scan_method = AccessMethod {
+        star_filter: None,
         cost: scan_cost,
         estimated_rows_per_outer_row: *base_row_count,
         consumed_where_terms: Default::default(),
@@ -2448,6 +2503,7 @@ fn find_best_access_method_for_subquery(
         },
     };
     let index_method = AccessMethod {
+        star_filter: None,
         cost: total_cost,
         estimated_rows_per_outer_row,
         consumed_where_terms: consumed_where_terms_from_constraint_refs(

@@ -1,0 +1,15 @@
+round 1 start (amphora-procs-persisted amphora-procs-replicated rqlite dqlite libsql litefs) 2026-11-23T12:57:06Z load 14.42 19.38 26.74 | cpu some avg10=0.38 avg60=0.18 avg300=1.71 total=8136792457 | io some avg10=2.85 avg60=3.75 avg300=3.53 total=17334380491 / full avg10=2.46 avg60=3.20 avg300=2.82 total=15528563614
+round 1 exit 1
+round 1 end 2026-11-23T12:59:09Z load 19.69 19.08 25.70 | cpu some avg10=1.96 avg60=0.93 avg300=1.37 total=8138304478 | io some avg10=3.38 avg60=3.47 avg300=3.49 total=17339166034 / full avg10=2.30 avg60=2.67 avg300=2.77 total=15532499165
+round 2 start (litefs libsql dqlite rqlite amphora-procs-replicated amphora-procs-persisted) 2026-11-23T12:59:09Z load 19.69 19.08 25.70 | cpu some avg10=1.96 avg60=0.93 avg300=1.37 total=8138304479 | io some avg10=3.38 avg60=3.47 avg300=3.49 total=17339166193 / full avg10=2.30 avg60=2.67 avg300=2.77 total=15532499322
+round 2 exit 1
+round 2 end 2026-11-23T13:01:08Z load 21.84 19.55 25.02 | cpu some avg10=1.02 avg60=1.21 avg300=1.28 total=8140244734 | io some avg10=3.75 avg60=3.66 avg300=3.57 total=17344101757 / full avg10=2.63 avg60=2.60 avg300=2.75 total=15536395967
+round 3 start (amphora-procs-persisted amphora-procs-replicated rqlite dqlite libsql litefs) 2026-11-23T13:01:08Z load 21.84 19.55 25.02 | cpu some avg10=1.02 avg60=1.21 avg300=1.28 total=8140244750 | io some avg10=3.75 avg60=3.66 avg300=3.57 total=17344101988 / full avg10=2.63 avg60=2.60 avg300=2.75 total=15536396089
+round 3 exit 1
+round 3 end 2026-11-23T13:03:21Z load 18.22 19.30 24.20 | cpu some avg10=2.77 avg60=1.42 avg300=1.18 total=8142376084 | io some avg10=3.58 avg60=4.04 avg300=3.84 total=17350515683 / full avg10=2.27 avg60=2.96 avg300=2.95 total=15541530832
+round 4 start (litefs libsql dqlite rqlite amphora-procs-replicated amphora-procs-persisted) 2026-11-23T13:03:21Z load 18.22 19.30 24.20 | cpu some avg10=2.77 avg60=1.42 avg300=1.18 total=8142376143 | io some avg10=3.58 avg60=4.04 avg300=3.84 total=17350515774 / full avg10=2.27 avg60=2.96 avg300=2.95 total=15541530851
+round 4 exit 1
+round 4 end 2026-11-23T13:05:20Z load 21.07 19.42 23.61 | cpu some avg10=1.51 avg60=1.45 avg300=1.19 total=8144464356 | io some avg10=3.65 avg60=3.80 avg300=3.84 total=17355655467 / full avg10=2.29 avg60=2.72 avg300=2.91 total=15545593757
+round 5 start (amphora-procs-persisted amphora-procs-replicated rqlite dqlite libsql litefs) 2026-11-23T13:05:20Z load 21.07 19.42 23.61 | cpu some avg10=1.51 avg60=1.45 avg300=1.19 total=8144464356 | io some avg10=3.65 avg60=3.80 avg300=3.84 total=17355655467 / full avg10=2.29 avg60=2.72 avg300=2.91 total=15545593757
+round 5 exit 1
+round 5 end 2026-11-23T13:07:23Z load 23.22 20.55 23.50 | cpu some avg10=3.58 avg60=1.87 avg300=1.29 total=8146811014 | io some avg10=2.07 avg60=3.71 avg300=3.84 total=17360962133 / full avg10=1.44 avg60=2.63 avg300=2.86 total=15549665422

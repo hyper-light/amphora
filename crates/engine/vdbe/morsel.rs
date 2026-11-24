@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::alloc::TryClone;
 use crate::numeric::Numeric;
 use crate::types::Value;
+use crate::RealSums;
 
 /// The switch: parallel execution is off until a caller turns it on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -554,16 +555,28 @@ struct WorkerResult<T> {
 }
 
 /// A REAL sum kept exact until its one rounding: the non-overlapping partials of Shewchuk's
-/// "Adaptive Precision Floating-Point Arithmetic" (1997), as Python's `math.fsum` keeps them. The
-/// sum of a set of doubles is then one number whatever the order they arrive in, so a parallel
-/// sum equals the serial one. Finite partials never overlap, so there are at most as many as the
-/// double's exponent range over its precision (2098 / 53, about 40): the bound is the format's.
-#[derive(Clone, Debug, Default)]
+/// "Adaptive Precision Floating-Point Arithmetic" (1997), as Python's `math.fsum` keeps them, and
+/// a count of [`CARRY_UNIT`]s the partials hand on (lane R4). The sum of a set of doubles is then
+/// one number whatever the order they arrive in, so a parallel sum equals the serial one, even
+/// where a running sum passes the double's range and comes back. Finite partials never overlap,
+/// so there are at most as many as the double's exponent range over its precision (2098 / 53,
+/// about 40): the bound is the format's.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExactSum {
+    /// Each below [`CARRY_UNIT`], so together below twice it.
     partials: Vec<f64>,
-    /// The sum of the non-finite inputs, and of a sum that left the double's range.
+    /// The sum's multiple of [`CARRY_UNIT`] the partials don't hold.
+    carry: i64,
+    /// The sum of the non-finite inputs.
     special: Option<f64>,
 }
+
+/// 2^1021, the unit of [`ExactSum`]'s carry. An input below it, a partial below it and the
+/// partials' sum below twice it add to less than 2^1023, so no step of the two-sum overflows: a
+/// finite binary64 is below 2^1024 (IEEE 754-2019, table 3.5: emax 1023).
+const CARRY_UNIT: f64 = f64::from_bits(0x7FC0_0000_0000_0000);
+/// 2^-1021, a normal double, so scaling by it is exact down to the subnormals.
+const CARRY_UNIT_INVERSE: f64 = f64::from_bits(0x0020_0000_0000_0000);
 
 impl ExactSum {
     pub fn add(&mut self, value: f64) -> Result<(), MorselError> {
@@ -571,7 +584,7 @@ impl ExactSum {
             self.special = Some(self.special.map_or(value, |special| special + value));
             return Ok(());
         }
-        let mut x = value;
+        let mut x = self.carry_out(value)?;
         let mut kept = 0usize;
         let count = self.partials.len();
         for j in 0..count {
@@ -592,58 +605,169 @@ impl ExactSum {
             x = high;
         }
         self.partials.truncate(kept);
-        if !x.is_finite() {
-            // The exact sum left the double's range: it rounds to this infinity.
-            self.special = Some(self.special.map_or(x, |special| special + x));
-            return Ok(());
-        }
+        let x = self.carry_out(x)?;
         self.partials.try_reserve(1)?;
         self.partials.push(x);
         Ok(())
+    }
+
+    /// Moves `value`'s whole [`CARRY_UNIT`]s into the carry and returns the rest, below one. Each
+    /// step is exact: it changes only the bits from the unit's up. A finite double holds at most
+    /// seven units.
+    fn carry_out(&mut self, mut value: f64) -> Result<f64, MorselError> {
+        let overflow = || MorselError::Overflow {
+            what: "an exact sum's carry",
+        };
+        while value >= CARRY_UNIT {
+            value -= CARRY_UNIT;
+            self.carry = self.carry.checked_add(1).ok_or_else(overflow)?;
+        }
+        while value <= -CARRY_UNIT {
+            value += CARRY_UNIT;
+            self.carry = self.carry.checked_sub(1).ok_or_else(overflow)?;
+        }
+        Ok(value)
     }
 
     pub fn merge(&mut self, other: &ExactSum) -> Result<(), MorselError> {
         for partial in &other.partials {
             self.add(*partial)?;
         }
+        self.carry = self
+            .carry
+            .checked_add(other.carry)
+            .ok_or(MorselError::Overflow {
+                what: "an exact sum's carry",
+            })?;
         if let Some(special) = other.special {
             self.add(special)?;
         }
         Ok(())
     }
 
-    /// The exact sum rounded once to the nearest double, ties to even (`math.fsum`'s last step).
+    /// The sum as a payload slot's bytes (lane G8, the serial loop under `RealSums::Exact`): a tag
+    /// for `special` (0 none, 1 plus infinity, 2 minus infinity), the carry's eight bytes, then
+    /// each partial's bits. A NaN special has none: the caller keeps it as SQLite's NULL.
+    pub(crate) fn write_to(&self, out: &mut crate::alloc::Vec<u8>) -> Result<(), MorselError> {
+        out.clear();
+        out.try_reserve_exact(
+            self.partials
+                .len()
+                .saturating_add(1)
+                .saturating_mul(8)
+                .saturating_add(1),
+        )?;
+        out.push(match self.special {
+            Some(special) if special > 0.0 => 1,
+            Some(_) => 2,
+            None => 0,
+        });
+        out.extend_from_slice(&self.carry.to_le_bytes());
+        for partial in &self.partials {
+            out.extend_from_slice(&partial.to_bits().to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// The sum [`ExactSum::write_to`] wrote.
+    pub(crate) fn read_from(bytes: &[u8]) -> Result<ExactSum, MorselError> {
+        let (tag, rest) = bytes
+            .split_first()
+            .ok_or(MorselError::Corrupt("an exact sum's bytes are empty"))?;
+        let special = match tag {
+            0 => None,
+            1 => Some(f64::INFINITY),
+            2 => Some(f64::NEG_INFINITY),
+            _ => return Err(MorselError::Corrupt("an exact sum's tag")),
+        };
+        let (carry, rest) = rest
+            .split_first_chunk::<8>()
+            .ok_or(MorselError::Corrupt("an exact sum's carry"))?;
+        let carry = i64::from_le_bytes(*carry);
+        let mut partials = Vec::new();
+        partials.try_reserve_exact(rest.len() / 8)?;
+        for chunk in rest.chunks(8) {
+            let bits: [u8; 8] = chunk
+                .try_into()
+                .map_err(|_| MorselError::Corrupt("an exact sum's partial"))?;
+            partials.push(f64::from_bits(u64::from_le_bytes(bits)));
+        }
+        Ok(ExactSum {
+            partials,
+            carry,
+            special,
+        })
+    }
+
+    /// Whether the sum met both infinities: SQLite's sum is then NULL.
+    pub(crate) fn is_nan(&self) -> bool {
+        self.special.is_some_and(f64::is_nan)
+    }
+
+    /// The exact sum of the finite inputs rounded once to the nearest double, ties to even; with
+    /// non-finite inputs, their sum. The finite inputs' exact sum is a real number however far
+    /// past the double's range, so it never turns an infinite input into NaN (lane R5).
     pub fn value(&self) -> f64 {
         if let Some(special) = self.special {
             return special;
         }
-        let mut rest = self.partials.iter().rev();
-        let Some(mut high) = rest.next().copied() else {
-            return 0.0;
-        };
-        let mut low = 0.0;
-        let mut below = None;
-        while let Some(y) = rest.next().copied() {
-            let x = high;
-            high = x + y;
-            let rounded = high - x;
-            low = y - rounded;
-            if low != 0.0 {
-                below = rest.next().copied();
-                break;
+        let partials = self.partials.iter().rev().copied();
+        match i8::try_from(self.carry) {
+            Ok(0) => round_once(partials),
+            // The carry's units are the largest partial (the others are below one), and the sum
+            // is below 2^1023, so no step of the rounding overflows.
+            Ok(units @ -2..=2) => {
+                round_once(std::iter::once(f64::from(units) * CARRY_UNIT).chain(partials))
             }
-        }
-        if let Some(next) = below {
-            if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
-                let y = low * 2.0;
-                let x = high + y;
-                if y == x - high {
-                    high = x;
-                }
+            // The sum is at least one unit: rounded at 2^-1021 its size, where no step overflows,
+            // then scaled back, which is exact or past the range an infinity. A partial below 1
+            // there counts only by its sign (it settles a tie), so one that would vanish keeps it.
+            Ok(units @ -9..=9) => {
+                let scaled = partials.map(|partial| {
+                    let scaled = partial * CARRY_UNIT_INVERSE;
+                    if scaled == 0.0 && partial != 0.0 {
+                        f64::from_bits(1).copysign(partial)
+                    } else {
+                        scaled
+                    }
+                });
+                round_once(std::iter::once(f64::from(units)).chain(scaled)) * CARRY_UNIT
             }
+            // At least (10 - 2) units, 2^1024: past the range.
+            _ if self.carry < 0 => f64::NEG_INFINITY,
+            _ => f64::INFINITY,
         }
-        high
     }
+}
+
+/// Non-overlapping partials, largest first, rounded once to the nearest double, ties to even
+/// (`math.fsum`'s last step).
+fn round_once(mut rest: impl Iterator<Item = f64>) -> f64 {
+    let Some(mut high) = rest.next() else {
+        return 0.0;
+    };
+    let mut low = 0.0;
+    let mut below = None;
+    while let Some(y) = rest.next() {
+        let x = high;
+        high = x + y;
+        let rounded = high - x;
+        low = y - rounded;
+        if low != 0.0 {
+            below = rest.next();
+            break;
+        }
+    }
+    if let Some(next) = below {
+        if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
+            let y = low * 2.0;
+            let x = high + y;
+            if y == x - high {
+                high = x;
+            }
+        }
+    }
+    high
 }
 
 /// A value as a grouping or join key: SQLite's numeric equality (an integral REAL equals its
@@ -737,11 +861,62 @@ pub enum Predicate {
     NotNull {
         column: usize,
     },
+    /// `column op ?` (lane R9): a bound parameter, which only [`Predicate::bind`] turns into the
+    /// `Compare` the pipelines test, once the statement runs.
+    Parameter {
+        column: usize,
+        op: CmpOp,
+        index: NonZeroUsize,
+        /// The comparison's affinity, the serial loop's (`comparison_affinity`).
+        affinity: crate::vdbe::affinity::Affinity,
+    },
 }
 
 impl Predicate {
+    /// The term with its parameter's bound value (an unbound one NULL, as `Variable` reads it),
+    /// converted as the serial loop's comparison converts it (`Affinity::convert_for_compare`).
+    /// The column's side needs no conversion: the shape takes a parameter only against an INTEGER
+    /// or a REAL column, whose stored text is text no numeric affinity converts, and both
+    /// pipelines read a REAL column's INTEGER as a REAL (`MorselAggregateData::reals`).
+    pub(crate) fn bind(
+        &self,
+        parameters: &[Value],
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Result<Predicate, MorselError> {
+        let Predicate::Parameter {
+            column,
+            op,
+            index,
+            affinity,
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let bound = index
+            .get()
+            .checked_sub(1)
+            .and_then(|at| parameters.get(at))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let value = match affinity.convert_for_compare(&bound, digits) {
+            Some(either::Either::Left(converted)) => {
+                converted.to_owned().map_err(|_| MorselError::Alloc)?
+            }
+            Some(either::Either::Right(converted)) => converted,
+            None => bound,
+        };
+        Ok(Predicate::Compare {
+            column: *column,
+            op: *op,
+            value,
+        })
+    }
+
     pub(crate) fn holds(&self, row: &[Value]) -> Result<bool, MorselError> {
         Ok(match self {
+            Predicate::Parameter { .. } => {
+                return Err(MorselError::Corrupt("a parameter's term tested unbound"))
+            }
             Predicate::Compare {
                 column: at,
                 op,
@@ -767,6 +942,95 @@ impl Predicate {
     }
 }
 
+/// The rowids a scan reads (lane R11): those every term of `filter` on the rowid's alias column
+/// `alias` admits, within `range`, each end inclusive, None unbounded: a term's bound that admits
+/// every rowid on its side (an i64's end, a text or a blob as an upper bound) bounds nothing, so a
+/// statement no term bounds, or bounds at both ends of the i64s, is a scan of the whole table. A
+/// term admits the rowids [`Predicate::holds`] passes, as SQLite compares an INTEGER with the
+/// value under NUMERIC affinity: an integer as itself, a real by its value (a start of 4.5 seeks
+/// 5: `OP_SeekGE` in vdbe.c shifts the seek past the integer it truncates to), a text or a blob
+/// no number reads as above every rowid, NULL true of none (`OP_SeekGE` jumps past the table for
+/// one of them; the end's `OP_Gt` carries `SQLITE_JUMPIFNULL`, wherecode.c). It may admit rowids
+/// the terms don't, never fewer: the terms still decide each row. When none is admitted,
+/// `(Some(i64::MAX), Some(i64::MIN))`, which no rowid is between.
+pub(crate) fn rowid_range(
+    filter: &[Predicate],
+    alias: usize,
+    range: (Option<i64>, Option<i64>),
+) -> (Option<i64>, Option<i64>) {
+    let (mut lo, mut hi) = range;
+    for term in filter {
+        let Predicate::Compare { column, op, value } = term else {
+            continue;
+        };
+        if *column != alias {
+            continue;
+        }
+        let Some((least, greatest)) = admitted(*op, value) else {
+            return (Some(i64::MAX), Some(i64::MIN));
+        };
+        if least > i64::MIN {
+            lo = Some(lo.map_or(least, |at| at.max(least)));
+        }
+        if greatest < i64::MAX {
+            hi = Some(hi.map_or(greatest, |at| at.min(greatest)));
+        }
+    }
+    match (lo, hi) {
+        (Some(least), Some(greatest)) if least > greatest => (Some(i64::MAX), Some(i64::MIN)),
+        _ => (lo, hi),
+    }
+}
+
+/// The least and greatest rowid `rowid op value` holds for; None: none.
+fn admitted(op: CmpOp, value: &Value) -> Option<(i64, i64)> {
+    let all = Some((i64::MIN, i64::MAX));
+    // The least rowid at or above the value, and the greatest at or below it (None: no rowid is).
+    let (up, down) = match value {
+        Value::Null => return None,
+        Value::Text(_) | Value::Blob(_) => {
+            return match op {
+                CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+            }
+        }
+        Value::Numeric(Numeric::Integer(i)) => (Some(*i), Some(*i)),
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            // Strictly between the ends a double's ceiling and floor are integers in range.
+            let (Some(ceiling), Some(floor)) = (integral(f.ceil()), integral(f.floor())) else {
+                return if f.is_nan() {
+                    all
+                } else if f >= I64_HIGH {
+                    match op {
+                        CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+                    }
+                } else if f < I64_LOW {
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Lt | CmpOp::Le => None,
+                    }
+                } else {
+                    all
+                };
+            };
+            (Some(ceiling), Some(floor))
+        }
+    };
+    match op {
+        CmpOp::Ge => Some((up?, i64::MAX)),
+        CmpOp::Gt => Some((down.map_or(Some(i64::MIN), |d| d.checked_add(1))?, i64::MAX)),
+        CmpOp::Le => Some((i64::MIN, down?)),
+        CmpOp::Lt => Some((i64::MIN, up.map_or(Some(i64::MAX), |u| u.checked_sub(1))?)),
+        CmpOp::Eq => match (up, down) {
+            (Some(u), Some(d)) if u == d => Some((u, u)),
+            _ => None,
+        },
+        CmpOp::Ne => all,
+    }
+}
+
 /// An aggregate a scan computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aggregate {
@@ -784,7 +1048,7 @@ pub enum Aggregate {
 /// Integers a double holds exactly: below 2^53, its significand's 53 bits (IEEE 754 binary64).
 /// While the magnitudes of AVG's or TOTAL's integers sum below it, every partial sum the serial
 /// loop's compensated double sum takes, in any order, is exact, and so equals the exact sum.
-const DOUBLE_EXACT: u128 = 1 << 53;
+pub(crate) const DOUBLE_EXACT: u128 = 1 << 53;
 
 #[derive(Clone, Debug)]
 enum Accumulator {
@@ -797,24 +1061,46 @@ enum Accumulator {
         any_real: bool,
         seen: bool,
     },
-    /// AVG or TOTAL over integers: their exact sum, the sum of their magnitudes (the bound of
-    /// every partial sum in any order) and how many there were (lane qs6-17).
+    /// AVG or TOTAL: the integers' exact sum, the sum of their magnitudes (the bound of every
+    /// partial sum in any order) and how many values there were (lane qs6-17); under
+    /// [`RealSums::Exact`] the REALs' exact sum too (lane G8).
     Mean {
         integers: i128,
         magnitude: u128,
         count: u64,
         total: bool,
+        reals: ExactSum,
+        exact: bool,
     },
     /// The least or greatest value with the row it came from; ties keep the earliest row.
     Extreme {
         best: Option<(Value, usize)>,
         greatest: bool,
     },
+    /// SUM, AVG or TOTAL under [`RealSums::RowOrder`] (lane G9): each input with its row's
+    /// position, folded at the end by the serial loop's own steps in row order.
+    Ordered {
+        func: crate::function::AggFunc,
+        inputs: Vec<(usize, Value)>,
+    },
 }
 
 impl Accumulator {
-    fn new(aggregate: Aggregate) -> Self {
+    fn new(aggregate: Aggregate, sums: RealSums) -> Self {
+        use crate::function::AggFunc;
         match aggregate {
+            Aggregate::Sum(_) | Aggregate::Avg(_) | Aggregate::Total(_)
+                if sums == RealSums::RowOrder =>
+            {
+                Accumulator::Ordered {
+                    func: match aggregate {
+                        Aggregate::Avg(_) => AggFunc::Avg,
+                        Aggregate::Total(_) => AggFunc::Total,
+                        _ => AggFunc::Sum,
+                    },
+                    inputs: Vec::new(),
+                }
+            }
             Aggregate::CountStar | Aggregate::Count(_) => Accumulator::Count(0),
             Aggregate::Sum(_) => Accumulator::Sum {
                 integers: 0,
@@ -835,6 +1121,8 @@ impl Accumulator {
                 magnitude: 0,
                 count: 0,
                 total: matches!(aggregate, Aggregate::Total(_)),
+                reals: ExactSum::default(),
+                exact: sums == RealSums::Exact,
             },
         }
     }
@@ -844,8 +1132,21 @@ impl Accumulator {
         aggregate: Aggregate,
         row: &[Value],
         position: usize,
+        budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         match (self, aggregate) {
+            (
+                Accumulator::Ordered { inputs, .. },
+                Aggregate::Sum(at) | Aggregate::Avg(at) | Aggregate::Total(at),
+            ) => {
+                // The serial steps leave a sum as it was at a NULL.
+                let value = column(row, at)?;
+                if !matches!(value, Value::Null) {
+                    budget.charge(std::mem::size_of::<(usize, Value)>())?;
+                    inputs.try_reserve(1)?;
+                    inputs.push((position, value.try_clone().map_err(|_| MorselError::Alloc)?));
+                }
+            }
             (Accumulator::Count(count), Aggregate::CountStar) => *count = count.saturating_add(1),
             (Accumulator::Count(count), Aggregate::Count(at)) => {
                 if !matches!(column(row, at)?, Value::Null) {
@@ -884,6 +1185,8 @@ impl Accumulator {
                     integers,
                     magnitude,
                     count,
+                    reals,
+                    exact,
                     ..
                 },
                 Aggregate::Avg(at) | Aggregate::Total(at),
@@ -901,6 +1204,10 @@ impl Accumulator {
                             what: "an average's sum",
                         },
                     )?;
+                    *count = count.saturating_add(1);
+                }
+                Value::Numeric(Numeric::Float(f)) if *exact => {
+                    reals.add(f64::from(*f))?;
                     *count = count.saturating_add(1);
                 }
                 // The serial loop's compensated double sum over REALs isn't the exact sum.
@@ -937,6 +1244,10 @@ impl Accumulator {
 
     fn merge(&mut self, other: Accumulator) -> Result<(), MorselError> {
         match (self, other) {
+            (Accumulator::Ordered { inputs, .. }, Accumulator::Ordered { inputs: more, .. }) => {
+                inputs.try_reserve(more.len())?;
+                inputs.extend(more);
+            }
             (Accumulator::Count(count), Accumulator::Count(more)) => {
                 *count = count.saturating_add(more)
             }
@@ -966,15 +1277,18 @@ impl Accumulator {
                     integers,
                     magnitude,
                     count,
+                    reals,
                     ..
                 },
                 Accumulator::Mean {
                     integers: more,
                     magnitude: more_magnitude,
                     count: more_count,
+                    reals: more_reals,
                     ..
                 },
             ) => {
+                reals.merge(&more_reals)?;
                 *integers = integers.checked_add(more).ok_or(MorselError::Overflow {
                     what: "an average's sum",
                 })?;
@@ -1012,6 +1326,27 @@ impl Accumulator {
 
     fn finish(self) -> Result<Value, MorselError> {
         Ok(match self {
+            Accumulator::Ordered { func, mut inputs } => {
+                use crate::vdbe::execute::{
+                    finalize_agg_payload, init_agg_payload, update_agg_payload,
+                };
+                let engine = |e: crate::LimboError| MorselError::Body(Box::new(e));
+                inputs.sort_unstable_by_key(|(position, _)| *position);
+                let mut payload = crate::alloc::vec![];
+                init_agg_payload(&func, &mut payload).map_err(engine)?;
+                for (_, value) in &inputs {
+                    update_agg_payload(
+                        &func,
+                        value,
+                        None,
+                        &mut payload,
+                        crate::translate::collate::CollationSeq::Binary,
+                        || Ok(None),
+                    )
+                    .map_err(engine)?;
+                }
+                finalize_agg_payload(&func, &payload).map_err(engine)?
+            }
             Accumulator::Count(count) => {
                 Value::from_i64(i64::try_from(count).map_err(|_| MorselError::IntegerOverflow)?)
             }
@@ -1025,30 +1360,31 @@ impl Accumulator {
             }
             Accumulator::Sum {
                 integers,
-                mut reals,
+                reals,
                 any_real: true,
                 ..
+            } => Value::from_f64(exact_total(integers, reals)?),
+            // Lane G8: the exact sum rounded once, as the serial loop's under `RealSums::Exact`.
+            Accumulator::Mean {
+                total: false,
+                count: 0,
+                exact: true,
+                ..
+            } => Value::Null,
+            Accumulator::Mean {
+                integers,
+                count,
+                total,
+                reals,
+                exact: true,
+                ..
             } => {
-                // The integer part enters the exact sum in three pieces each a double holds exactly.
-                // `integers` is top * 2^100 + middle * 2^50 + low, with middle and low in [0, 2^50)
-                // and top within 2^28 of zero: each converts to a double exactly.
-                let piece = |shift: u32, mask: i128| -> Result<f64, MorselError> {
-                    let part = integers.checked_shr(shift).ok_or(MorselError::Overflow {
-                        what: "a sum's piece",
-                    })? & mask;
-                    let whole = i64::try_from(part).map_err(|_| MorselError::Overflow {
-                        what: "a sum's piece",
-                    })? as f64;
-                    Ok(whole
-                        * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow {
-                            what: "a sum's piece",
-                        })?))
-                };
-                const LOW_50: i128 = 0x3_ffff_ffff_ffff;
-                reals.add(piece(100, -1)?)?;
-                reals.add(piece(50, LOW_50)?)?;
-                reals.add(piece(0, LOW_50)?)?;
-                Value::from_f64(reals.value())
+                let sum = exact_total(integers, reals)?;
+                if total {
+                    Value::from_f64(sum)
+                } else {
+                    Value::from_f64(sum / count as f64)
+                }
             }
             // Past a double's exact integers the serial loop's rounding is its own: it answers.
             Accumulator::Mean { magnitude, .. } if magnitude >= DOUBLE_EXACT => {
@@ -1080,6 +1416,29 @@ impl Accumulator {
     }
 }
 
+/// The exact sum of `integers` and `reals`, rounded once. The integer part enters the exact sum in
+/// three pieces each a double holds exactly: `integers` is top * 2^100 + middle * 2^50 + low, with
+/// middle and low in [0, 2^50) and top within 2^28 of zero, so each converts to a double exactly.
+fn exact_total(integers: i128, mut reals: ExactSum) -> Result<f64, MorselError> {
+    let piece = |shift: u32, mask: i128| -> Result<f64, MorselError> {
+        let part = integers.checked_shr(shift).ok_or(MorselError::Overflow {
+            what: "a sum's piece",
+        })? & mask;
+        let whole = i64::try_from(part).map_err(|_| MorselError::Overflow {
+            what: "a sum's piece",
+        })? as f64;
+        Ok(whole
+            * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow {
+                what: "a sum's piece",
+            })?))
+    };
+    const LOW_50: i128 = 0x3_ffff_ffff_ffff;
+    reals.add(piece(100, -1)?)?;
+    reals.add(piece(50, LOW_50)?)?;
+    reals.add(piece(0, LOW_50)?)?;
+    Ok(reals.value())
+}
+
 #[derive(Clone, Debug)]
 struct Group {
     first_row: usize,
@@ -1094,6 +1453,8 @@ pub struct ScanAggregate<'a> {
     pub filter: &'a [Predicate],
     pub group_by: &'a [usize],
     pub aggregates: &'a [Aggregate],
+    /// How AVG and TOTAL take REALs (lane G8; SUM keeps them exact under every setting).
+    pub sums: RealSums,
 }
 
 /// The partial state of a [`ScanAggregate`]: its groups by key.
@@ -1114,7 +1475,7 @@ impl ScanAggregate<'_> {
                 accumulators: self
                     .aggregates
                     .iter()
-                    .map(|a| Accumulator::new(*a))
+                    .map(|a| Accumulator::new(*a, self.sums))
                     .collect(),
             });
         }
@@ -1173,7 +1534,7 @@ impl ScanAggregate<'_> {
                 let accumulators = self
                     .aggregates
                     .iter()
-                    .map(|a| Accumulator::new(*a))
+                    .map(|a| Accumulator::new(*a, self.sums))
                     .collect();
                 partial.groups.try_reserve(1)?;
                 partial.groups.entry(key).or_insert(Group {
@@ -1184,7 +1545,7 @@ impl ScanAggregate<'_> {
             }
         };
         for (accumulator, aggregate) in group.accumulators.iter_mut().zip(self.aggregates) {
-            accumulator.step(*aggregate, row, position)?;
+            accumulator.step(*aggregate, row, position, budget)?;
         }
         Ok(())
     }
@@ -1299,7 +1660,14 @@ impl Partitioner {
         let count = u64::try_from(self.count.get()).map_err(|_| MorselError::Overflow {
             what: "the partition count",
         })?;
-        usize::try_from(self.hasher.hash_one(key) % count).map_err(|_| MorselError::Overflow {
+        let partition =
+            self.hasher
+                .hash_one(key)
+                .checked_rem(count)
+                .ok_or(MorselError::Overflow {
+                    what: "a key's partition",
+                })?;
+        usize::try_from(partition).map_err(|_| MorselError::Overflow {
             what: "a key's partition",
         })
     }
@@ -1737,6 +2105,7 @@ mod tests {
                 filter: &filter,
                 group_by: &group_by,
                 aggregates: &aggregates,
+                sums: RealSums::Serial,
             };
             let budget = MemoryBudget::new(BIG);
             let serial = execute_at(&pipeline, 0, Degree::Serial, None, &budget)
@@ -1842,6 +2211,68 @@ mod tests {
         assert_eq!(special.value(), f64::INFINITY);
     }
 
+    /// Lane R4: a sum stays exact past the double's range. Do: R1's bigpairs (+1e308 +1e308
+    /// -1e308 -1e308 an order, a short order's +1e308s unmatched), a running sum that overflows
+    /// and comes back, and sums at the range's edge (a tie, and a tie a tiny term breaks), each
+    /// cut in two at every place, merged both ways, and through the payload's bytes. Expect the
+    /// exact sum rounded once: +inf for bigpairs (SQLite's too), never NULL.
+    #[test]
+    fn r4_exact_sum_stays_exact_past_the_range() {
+        let max = f64::MAX;
+        let half_ulp = 2f64.powi(970);
+        let tiny = f64::from_bits(1);
+        let cases: [(&str, &[f64], f64); 7] = [
+            (
+                "bigpairs",
+                &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308],
+                f64::INFINITY,
+            ),
+            (
+                "overflow and back",
+                &[1e308, 1e308, -1e308, -1e308, 1.5],
+                1.5,
+            ),
+            (
+                "down and back",
+                &[-max, -max, -max, max, max, max, -0.25],
+                -0.25,
+            ),
+            ("max again", &[max, max, -max], max),
+            ("the tie past max", &[max, half_ulp], f64::INFINITY),
+            ("a tiny term breaks the tie", &[max, half_ulp, -tiny], max),
+            (
+                "an infinity beside an overflow the other way",
+                &[f64::INFINITY, -1e308, -1e308],
+                f64::INFINITY,
+            ),
+        ];
+        for (name, terms, expected) in cases {
+            for cut in 0..=terms.len() {
+                let (left, right) = terms.split_at(cut);
+                let mut a = ExactSum::default();
+                left.iter().for_each(|t| a.add(*t).unwrap());
+                let mut b = ExactSum::default();
+                right.iter().rev().for_each(|t| b.add(*t).unwrap());
+                let mut ab = a.clone();
+                ab.merge(&b).unwrap();
+                let mut ba = b.clone();
+                ba.merge(&a).unwrap();
+                let mut bytes = crate::alloc::Vec::new();
+                ab.write_to(&mut bytes).unwrap();
+                let read = ExactSum::read_from(&bytes).unwrap();
+                for (way, sum) in [("a+b", &ab), ("b+a", &ba), ("bytes", &read)] {
+                    assert!(!sum.is_nan(), "{name}, cut at {cut}, {way}");
+                    assert_eq!(
+                        sum.value().to_bits(),
+                        expected.to_bits(),
+                        "{name}, cut at {cut}, {way}: {}",
+                        sum.value()
+                    );
+                }
+            }
+        }
+    }
+
     /// T-QT.6.4: a statement whose workers together pass its memory budget is refused with the typed
     /// error at every worker count, and the budget's use never passes its limit.
     #[test]
@@ -1855,6 +2286,7 @@ mod tests {
             filter: &[],
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: RealSums::Serial,
         };
         let limit = pipeline.group_bytes() * 10;
         for workers in [1, 2, 4, 8] {
@@ -1926,6 +2358,7 @@ mod tests {
             filter: &[],
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: RealSums::Serial,
         };
         let budget = MemoryBudget::new(BIG);
         let (serial, _) = execute(&pipeline, ParallelMode::Off, &mut costs, &budget).unwrap();

@@ -1,0 +1,506 @@
+# Lane W (persisted) on adacachy2: "the database advanced since preparation" (2026-11-23)
+
+Ada's goal is Amphora correct and about 10x faster than every competitor. Bench lane S4 saw the persisted class refuse
+writes as `Invalid { what: "prepared transaction", why: "the database advanced since preparation" }` at 128 writers and
+in its 5-kill failover smoke, until the bench's 10 s deadline. This lane looked for why and fixed what it found.
+
+## What the evidence says
+
+1. **Not persisted alone.** S4's own round logs (`2026-11-23-adacachy2-repl/round*.err`) show the replicated class
+   failing the 128-writer rung with the same refusal in 3 rungs, and one persisted failure that was a `Timeout`. The
+   class is not the cause.
+2. **Not stuck.** The unmodified bench (7ac4153d, S4's binary) at 128 writers on persisted passed when this lane ran it
+   (r630, load 71-81): 24.8 writes/s, p50 3.6 s, p90 6.4 s, max 9.2 s against the 10 s deadline. Every attempt waits
+   seconds in its member's queue, so a write refused once rarely fits a second attempt inside 10 s. The refusal is
+   what the bench reports because it is the last error a timed-out writer saw.
+3. **Where it is raised.** `replication::on_base` (crates/amphora/src/replication.rs): a prepared write applies only on
+   the entry it was prepared after. Nothing keeps a stale preparation across retries: each retry is a new call,
+   prepared again. Whether a restart leaves anything stale is not settled here: the driven crash test (32 writers,
+   five leader crashes, on branch perf/persisted-crash) stops first on `Full { limit: 2 }`, a restarted member's
+   input bound, which the test pump's `admit_receive(..).unwrap()` and the test's writers don't yet take.
+4. **The defect found: the leader's own writes never took the read-set check.** A leader prepares on its applied state,
+   behind the forwards its log holds uncommitted (the persisted class's widest gap, its commit waiting on a quorum's
+   flush). Members' forwards get the read-set walk at append (`step_forward`, `rebase`); the leader's own proposal
+   (`Actor::propose`) did not, so it was refused whenever a follower wrote, whatever it touched.
+   Driven runs, three writers (leader and both followers), 15 commits each, 32 lists spread over pages:
+
+   | arm | leader refused (3 seeds) | leader most in a row | followers most in a row |
+   |---|---|---|---|
+   | fix reverted (a68c4d17, r679) | 21 | 8 | 1 |
+   | fix (277d6d3b, r679) | 1, 3, 1 | 1 | 1 |
+   | fix after merging main (113bca75, r697) | 1, 2, 2 | 1 | 1 |
+
+   Earlier probe on the base (481a621d, r634): the leader refused 11, 17, 11 times, 4, 5, 3 in a row.
+5. **What the fix does not change: the bench's rows conflict.** Every bench write appends to one table (its rowid's
+   rightmost leaf, page 1's size), so no read set can move it. On two hot lists the followers are refused once for
+   about every commit (9 to 15 refusals for 15 commits, never twice in a row: the slot), and the leader sometimes
+   twice in a row outside its turn (seed 1 in r697, seed 3 in r667). The 128-writer driven test refused 59 to 63 times
+   in all, at most 3 or 4 for one write, before and after the fix alike. So the 128-writer bench rung still depends
+   on one refusal fitting a second queue wait inside 10 s; the remedies are decisions (below).
+
+## What changed (perf/persisted)
+
+- `Actor::propose`: the leader's own write takes the same read-set walk as a member's forward, against its last entry.
+- `Actor::prepare`: a claimed write reads the floor again inside its traced session, so a raise appended after its
+  base conflicts in the walk. Before this the claim was checked in `read_db`, outside the read set, so a forward whose
+  pages missed the raise's could be moved past it (since read sets, 2026-11-21); the leader's writes now take the same
+  walk, so this closes it for both.
+- Tests: `no_writer_is_refused_twice_in_a_row_when_every_member_writes`,
+  `a_hundred_and_twenty_eight_writers_each_land_and_every_acknowledged_row_is_held`. The crash test
+  (`writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held`) is unfinished, on
+  perf/persisted-crash.
+
+## Commands
+
+All on adacachy2 (runner 00aad8da...), needs `linux/amd64,cpus=8,mem=24g`, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=8,
+target `~/.cache/amphora-perf-target/persisted`, a clone at `~/.cache/amphora-perf/persisted-remote` checked out at
+each SHA (`~/.cache/amphora-perf/persisted-scripts/t.sh SHA cargo-args`).
+
+- Bench repro: `~/.cache/amphora-perf/persisted-scripts/repro.sh BIN 128 procs` (three `--repl-member` processes on
+  29390-29392, then `--repl commit --system amphora-procs --class persisted --writers 128 --batch 1 --text-bytes 600
+  --deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 5`).
+- Tests: `cargo test -p amphora --lib --locked -- --test-threads=8 --nocapture no_writer_is_refused_twice_in_a_row
+  a_hundred_and_twenty_eight_writers`.
+- Module suites: `cargo test -p amphora --lib --locked -- --test-threads=8 database::replicated replication::
+  database::slot`. Before merging main (277d6d3b): 160 passed, 5 failed, each a known failure on main that lane
+  replicated-K5 fixed (2026-11-23-adacachy2-perf-replicated.md). After merging main (113bca75): 165 passed, 1 failed
+  (the crash test, since moved to perf/persisted-crash). At 6d0f897a: 165 passed, the crash test failed on
+  `Full { limit: 2 }`.
+- Merged to main as d4d0e096 (r749): clippy `-p amphora --all-targets -D warnings` clean; the touched tests and the
+  floor, raise, read-set and slot tests 24 of 24; the module suites with `database::application` 164 passed, 1 failed:
+  `a_change_past_its_deadline_answers_what_its_stage_knows`, main's own (lane replicated-K5, r683, the same
+  `Full { limit: 2 }`).
+- Not checked on the bench's own surface after the fix: `cargo build --release --locked --manifest-path
+  bench/Cargo.toml` at d4d0e096 with the lane's offline CARGO_HOME refused (`no matching package named awak`, r759).
+  The prediction, not measured: the 128-writer rung does not change, its rows conflicting on every write (point 5).
+- Cost not measured: every claimed write now reads the floor policy once more inside its preparation (one small
+  table read on the owner's thread).
+
+Load on adacachy2 ran 60 to 1189 through these runs (other lanes); every number above is a count from driven time, not
+a timing.
+
+## Decisions for Ada
+
+- **A typed refusal for a stale base.** Today it is `Invalid`, which says the caller's input was wrong; kiln retries
+  it by matching the text. A new `Refusal` variant is a wire change (append-only, a new capability) that kiln and the
+  bench would read. Choice: keep `Invalid` with its text, or add a retryable variant.
+- **The leader's general tail rule** (replication.md, "The leader's turn"). Outside its turn the leader still prepares
+  behind uncommitted forwards; on hot rows it can be refused twice in a row. The rule would make it wait for its log,
+  as followers do, but two floor tests rest on a leader write prepared beside an entry in flight. Choice: adopt it and
+  change those tests, or keep today's rule.
+- **Hot rows under many writers.** A refused member's slot serves its next write, which under a deep queue is another
+  caller's, so the refused caller's retry waits a whole queue again. Holding every member's barrier while a slot is
+  held would end those refusals, but a barrier does not say whether it is a read or a write, so reads would wait on
+  slots too.
+
+# Lane W2 (persisted) on adacachy2: a retryable refusal for a stale base (2026-11-23)
+
+Ada's goal: Amphora correct and about 10x faster than every competitor, and replicated writes never stuck. The
+coordinator's decisions on lane W's three questions: (1) a typed, retryable refusal; (2) the leader's general tail rule
+by an A/B; (3) read-or-write intent on member requests. Branch perf/persisted-w2.
+
+## 1. `Refusal::Serialization` (done)
+
+- `replication::on_base` now refuses a write whose base moved `Refusal::Serialization { what: "prepared transaction",
+  why: "the database advanced since preparation" }`, appended to `amphora_api::Refusal` (PostgreSQL's 40001). Its
+  Display is the `Invalid` text it had, so a caller matching the text still retries. Every match on the old
+  `Invalid { what == "prepared transaction" }` (the slot's counts, the floor keeper, `overtaken`, the driven tests)
+  matches the type now.
+- Wire: the owner transport's `VERSION` 9 to 10 (`VERSION_SERIALIZATION`), the `Q` connection's `SQL_VERSION` 2 to 3
+  (main had taken 2 for streamed answers). An owner sends the variant only on a connection that agreed on that version,
+  and the `Invalid` it was below it (`transport::common::spoken`, `Refusal::without_serialization`).
+  local-owner-transport.md, "Version 10".
+- Bench: `send` asks a write refused `Serialization` again at the node that refused it and moves to the next node on any
+  other failure; `--repl-member` sends the refusal's type beside its text (`"refusal"`), and the driver decodes it.
+  Not compiled here: the bench's own manifest still refuses offline (`no matching package named awak`, lane W's r759).
+- Tests: `an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid` (driven, three members appending to
+  one table: some append refused `Serialization` with the old text, a follower's self-refused write `Invalid`, every
+  append held once); `a_peer_before_version_10_is_sent_serialization_as_invalid` (at 9 the `Invalid`, decodable; at 10
+  the type; a malformed request's `Invalid` unchanged at both).
+- Checks: at e9204b04 (r838) clippy `-p amphora-api -p amphora --all-targets -D warnings` clean; the touched and
+  neighbouring tests 31 of 31 (the two new ones, the 128-writer test, the stale-base raise, the slot and leader's-turn
+  tests, the floor tests, transport version tests, `serve::`); `--test transport` 6 of 6 (r809).
+
+## A finding from the first version of the test (r831): a slot held by a write that prepares nothing
+
+Run beside the appends, a follower's write that refused itself (nothing prepared, nothing forwarded) left the next
+member's append unanswered for good in the driven harness (round 1, the append via member 2). The slot core
+(database/slot.rs) ends a holder's slot on its next forward, its second barrier, or its learned length passing. A
+holder whose write prepares nothing (a self-refused write, a SQL error, or a read made through `call`) sends no
+forward, so every other member's forwards and the leader's own writes wait out the slot's length: an election timeout
+before any gap is learned. The driven clock stands still, so there it never ends; in production, inferred and not
+measured, it costs up to that length per such write under contention. Item 3's intent on barriers would let a read
+skip the slot; a write that fails in preparation still needs the member to say it has nothing to forward. Not fixed
+here.
+
+## 2. The leader's general tail rule (not started)
+
+Not built: the hour went to item 1. Where it goes: the leader's turn rule (replication.md "The leader's turn",
+`Slots::turn`, the turn's prepare-after-apply target in `Actor`), made to apply to every leader write behind one switch;
+the two floor tests that rest on today's rule are `a_raise_beside_a_change_holds_through_a_lost_lead` and
+`a_raise_whose_base_is_joint_is_refused`. The A/B's bench rungs need the bench to build on adacachy2 first (offline
+`awak`).
+
+## 3. Read-or-write intent on member requests (not started)
+
+What it touches, read here: a member's barrier is a raft ReadIndex whose context is `Actor::context`'s four `u64`s
+(id, term, incarnation, serial; `CONTEXT_BYTES`), the same bytes the proposal's log entry carries. Appending an intent
+byte changes (a) `CONTEXT_BYTES`, which `FRAMING_BYTES` and so `MESSAGE_BYTES` derive from (a record bound peers
+check), (b) the follower's match of a ReadState to its pending context, and (c) the leader's `Slots::read`, which gets
+the message whole. The kinds known at the barrier: `Operation::Mutation` and `Import` are writes, `Get`, `Scan`,
+`Changes`, `Head` reads, `Call` unknown (a closure; a write unless its caller says otherwise).
+
+## 4. The crash test after lane K6's fix
+
+K6's fix is on main (46abb6c0). bd6abd42 had taken the test off main; W2 brought it back on main 7777fa99 (with
+`Serialization`), perf/persisted-w2-crash 5159e10e. r882: it passes, "32 writers through 5 leader crashes: 25 sent
+again, 153 rounds", one run (load 14-34); clippy `-p amphora --all-targets -D warnings` clean (the run after r882). No stale state
+after a restart showed in this run; it stopped on `Full { limit: 2 }` before K6's fix and not after. The other W2
+checks after the merge (09f19c51, r861): clippy clean, the touched tests 36 of 36, `--test transport` 6 of 6. Not
+run: the module suites on main after the push (rule 5b), for the successor.
+
+# Lane W3 (persisted) on adacachy2: floor raises answer Serialization; a failed slot holder says so at once (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, and at agentic Meta scale one failing or slow
+client never stalls everyone. The coordinator's rulings on W2's questions, in order. Branch perf/persisted-w3.
+
+## 1. A floor raise refused for a moved base answers `Serialization` (done)
+
+`writer_floor` passed the stale-base rule's refusal through `overtaken`, which turned it into `Unavailable` ("the
+group changed while the raise was proven; raise again"). Deleted: the raise is answered `Serialization`, like any
+write whose base moved, still counted `FloorRefusal::StaleBase`. Its text is the `Invalid` text it had, so a caller
+matching it still retries; a peer below transport 10 / SQL 3 is sent that `Invalid`. replication.md, "Raising the
+floor" b. The driven tests `a_raise_a_change_overtakes_is_refused_by_the_stale_base_rule` (Serialization) and
+`a_raise_another_lead_wrote_over_is_answered_unknown_outcome` (UnknownOutcome) lose their assertions on the deleted
+mapping. The driven tests reach the raise through the owner's queue, not `writer_floor`, so `writer_floor`'s
+pass-through is checked by its having no mapping left, not by a test.
+
+## 2. A slot holder whose write forwards nothing tells the leader at once (done)
+
+**The ruling asked for a new message at the end of the wire; this uses one every leader already reads.** The
+members' wire is hyper-raft's record format (vendor/hyper-raft `wire.rs`: a version byte, a kind byte, unknown kinds
+refused): Amphora has no member-to-member envelope of its own and no version agreed between members. A new kind
+there is a vendored hyper-raft change. But the slot core already ends a holder's slot, `released`, on its second
+barrier before any forward (`Slots::read`, slot.rs since amphora-owner-t1-g-slot-878285a): every leader, old or new,
+reads a second barrier as "my slot's work was no write". What was missing was a member that sends it.
+
+- `Actor::slotted`: the term in which one of this follower's writes was refused `Serialization` (learned from its
+  own answer, on the commit or at apply: the verdict the leader queued it by at its append).
+- `Actor::prepare`: when the barrier's work ends with nothing forwarded (a read through `call`, a claim or SQL
+  refusal, the deadline) and `slotted` names the current term, the member sends a fresh barrier (`replica.read`
+  with a new context). The leader ends the slot on its next step. The barrier's read state matches nothing at the
+  member and is dropped (`output.reads`). A forward clears `slotted` too.
+- Cost, not measured: one ReadIndex (the leader's heartbeat round to a quorum) per write that forwards nothing right
+  after its member was refused. Every other write sends nothing new.
+- Test `a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length`: three members; the holder, queued
+  and knowing it, writes to a missing table; then the leader and member 2 write. Both commit, the holder's slot
+  began, and `Driven::lapses` is 0: the harness never moved a clock past a slot's end. Red arm f5a2408b (the same
+  without the barrier, branch perf/persisted-w3-red): the test fails (r923).
+- replication.md, "When a slot starts".
+
+## 3. The leader's general tail rule A/B (not started)
+
+Not run: the hour went to items 1 and 2, with adacachy2 refusing runs for room (0 to 3 idle cores) for the first 20
+minutes. Where it stands is W2's note, unchanged.
+
+## 4. Read-or-write intent on barriers (not started)
+
+## Checks
+
+All on adacachy2 (runner 00aad8da...), needs `linux/amd64,cpus=8,mem=24g`, CARGO_INCREMENTAL=0, through
+`~/.cache/amphora-perf/persisted-scripts/t.sh SHA cargo-args`.
+
+- r931 at c5e4ba73 (load 54-68): clippy `-p amphora --all-targets --locked -D warnings` clean;
+  `a_slot_holder_whose_write_fails...`, `a_raise_a_change_overtakes...`, `every_falsifier_of_the_floor_holds_under_a_nemesis`
+  3 of 3; at base 9a7b14bb the nemesis test passed too.
+- r923 at 167cc8f9 (item 2 before the clippy fix, load 36-78): 37 of 38 of the floor, slot, raise, retry and
+  overlapping-write tests; `every_falsifier_of_the_floor_holds_under_a_nemesis` failed once, at its promote-while-the-
+  tail-is-unapplied assertion (replicated.rs, "At once, Unavailable, naming both indexes"), and passed in r931 on the
+  same code. Seen once in three runs (two with this change, one without): not settled whether this change or the
+  test's own timing (its flushes run off the driver's thread) caused it. For the successor: run it 10 times on both
+  arms. Red arm f5a2408b: the new test failed, as it should.
+- r951 at b3b4b6d8 (merged with origin/main 952f5766, load 55-128): clippy `-p amphora --all-targets --locked -D
+  warnings` clean; the floor, slot, raise, retry, overlapping-write and new tests 38 of 38 (the nemesis among them).
+- Not run: the module suites after the merge (rule 5b), and no timing of the extra barrier.
+
+# Lane W4 (persisted) on adacachy2: W3's nemesis check and the leader-tail A/B (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, and at agentic Meta scale one failing or slow
+client never stalls everyone. The coordinator's units, in order. Branch perf/persisted-w4.
+
+## 1. W3's open check (done: the failure is not W3's; no fix made)
+
+At main 7c303299 (r1036, load 52-76): clippy `-p amphora --all-targets --locked -D warnings` clean; the touched tests
+6 of 6 (`a_slot_holder_whose_write_fails...`, `a_raise_a_change_overtakes...`, `a_raise_another_lead_wrote_over...`,
+`every_falsifier_of_the_floor...`, `a_raise_beside_a_change_holds...`, `a_raise_whose_base_is_joint...`).
+
+`every_falsifier_of_the_floor_holds_under_a_nemesis` alone (`--exact`, one thread), each arm's lib test binary built
+once and copied, the arms alternated (`persisted-scripts/flip.sh`; r1036 10 rounds, r1082 6 more, load 48-96):
+
+| arm | runs | failed | where |
+|---|---|---|---|
+| main 7c303299 (W3's change in) | 16 | 1 (r1036 run 10) | the driven pump's `settle` (replicated.rs:6001 at 7c303299); its message was cut by r1036's filter |
+| main with W3's 4add0134 and 43ff1807 reverted (96e10da5, branch perf/persisted-w4-revert) | 16 | 1 (r1082 run 4) | the same `settle` (5958 at 96e10da5): `MsgReadIndex from 1 (wire 4) to 2 (wire 2), term 0 refused: Invalid { what: "replica sender", why: "authenticated sender or destination differs from record" }` |
+
+So the failure rate is not higher with W3's change: 1 of 16 on each arm (with W3's own runs, 2 of 19 with it, 1 of 17
+without). The failure is older than W3. In the pump's label, `from 1 (wire 4)` is the transport sender 1 carrying a
+raft message whose `from` is 4: member 1 relayed member 4's ReadIndex. A follower forwards a ReadIndex it receives to
+the leader it knows, keeping the requester as `from` (vendor/hyper-raft raft.rs, the follower's `MsgReadIndex` arm,
+`self.forward(message)`), so a ReadIndex sent to a member that has just lost the lead arrives at the new leader from the
+wrong sender, and `step`'s authenticated-sender check (replicated.rs, "replica sender") refuses it, typed. `settle`
+excuses `Unavailable` (`Transferring`, `NoLeader`) for proposals and "sender is not a current member" for departed
+members, not this. Read from the message's fields and the code, not traced through a run. What it costs outside the
+test, inferred: that one barrier is lost, and its member's operation waits for its requeue (term or leader change) or
+its deadline. W3's promote-assertion failure (r923) did not recur in these 32 runs.
+
+For the successor, a choice of where to fix it: (a) the core drops a relayed ReadIndex at a follower (`drop_read`, as
+it does with no leader) instead of forwarding a record the next hop must refuse, a vendored hyper-raft change; or (b)
+`settle` excuses this refusal. Either way the requester's barrier waits for its requeue, as now; what would shorten that
+wait (the relay answering the requester that it no longer leads) is a wire question. Not done here.
+
+## 2. The leader-tail A/B (done: mixed; the switch stays off main)
+
+The switch (commit cf62b1f3 on perf/persisted-w4, not on main): `AMPHORA_LEADER_TAIL=1` adds the leader to
+`prepare_barrier`'s tail rule, so its every write waits until it has applied its own log through the last index it
+held as its barrier passed, as a follower's does. One binary runs both arms, so both share one calibration key
+(RULES 5e holds without a copy).
+
+W's driven three-writer test (`no_writer_is_refused_twice_in_a_row_when_every_member_writes`: leader and both
+followers write 15 commits each, seeds 1 to 3), 3 alternated rounds (r1043, load 66-93). Refusals summed over 3
+rounds x 3 seeds, leader first:
+
+| keys | arm | leader refused | leader most in a row | followers refused | followers most in a row |
+|---|---|---|---|---|---|
+| 2 (hot) | today | 19 (1 to 4 a run) | 2 | 203 | 1 |
+| 2 (hot) | leader tail | 5 (0 or 1 a run) | 1 | 190 | 1 |
+| 32 | today | 12 (0 to 4 a run) | 1 | 15 | 1 |
+| 32 | leader tail | 5 (0 or 1 a run) | 1 | 12 | 1 |
+
+Every run committed 15 of 15 for each writer on both arms. Counts from driven time, not timings.
+
+The floor tests with the switch on (r1043): `a_raise_beside_a_change_holds_through_a_lost_lead` fails "the change was
+never proposed" (replicated.rs:13691) and `a_raise_whose_base_is_joint_is_refused` fails "a driven operation was
+unanswered" (the harness's round limit): both build a leader raise prepared beside an entry in flight, which the tail
+rule makes wait for that entry's apply. Six other slot and floor tests pass with it on (the nemesis, the slot holder,
+the three W tests, the retry race).
+
+Bench timings, r1158 (`persisted-scripts/ab4.sh`, the bench at bc856f59 built once, both arms that one binary, so
+one calibration, measured by the first run and read by the other 29; in-process persisted commit, `--batch 1
+--text-bytes 600 --deadline-s 10`, 5 s after 1 s warmup, 5 rounds alternated; load 26-82, CPU pressure avg10 1-50%,
+I/O 0-10%, other lanes running). The leader was node 2 in 18 of the 20 runs that finished; the two whose leader had
+changed by the end (r2 w3 tail, r3 w32 today) are left out. Leader rows are its own acknowledged writes; medians of the
+runs, range in brackets:
+
+| writers | arm | runs | leader p50 ms | leader p99 ms | leader refused per write | followers refused per run | writes/s |
+|---|---|---|---|---|---|---|---|
+| 3 | today | 5 | 104 [78-150] | 573 [141-680] | 0.36 (71 / 195) | 46 | 14.8 [12.2-22.2] |
+| 3 | leader tail | 4 | 100 [67-128] | 350 [274-401] | 0.14 (27 / 190) | 52 | 16.4 [13.6-24.0] |
+| 32 | today | 4 | 1024 [713-1147] | 2392 [2163-3277] | 0.23 (39 / 173) | | 14.0 [11.6-21.8] |
+| 32 | leader tail | 5 | 1065 [786-1491] | 2523 [1786-4981] | 0.27 (54 / 202) | | 16.0 [12.4-20.4] |
+| 128 | both | 5 + 5 | every run ended at once: a writer's 10 s deadline (UnknownOutcome or "the deadline elapsed") | | | | |
+
+Verdict: mixed, and the timings inconclusive. At 3 writers the leader's refusals per write fall 0.36 to 0.14, as the
+driven counts said, and its p50 shows no measurable difference. Its p99 looks lower, but with 25 to 68 leader writes a
+run the p99 and the p99.9 are each run's slowest write, so neither is resolved. At 32 writers, no measurable difference
+in any column. The limiter is not named: writes take hundreds of ms at about 15 a second, which reads as the persisted
+class's quorum flush under the host's load, not measured. The 128-writer rung fails on both arms, as S4 saw: the bench
+aborts the run on one writer's deadline. So the switch stays off main, on perf/persisted-w4. What would decide it: the
+same rungs on an idle machine (the coordinator's new room, Mac Studio 2, both arms there at cpus=16), more seconds a
+run so p99.9 has 1,000 leader writes, and the 128 rung reporting its deadline misses per arm instead of aborting.
+
+## 3. The read-or-write tag on member requests (not started)
+
+Not built: the hour went to units 1 and 2. What the code says, read here, for the successor: the context's bytes are
+parsed in one place, the forward's origin check (`entry.context.get(..8)`, replicated.rs `step`'s forward walk), a
+prefix; a ReadState is matched to its pending operation by whole-context equality at the member that made both; and
+`entry_room` takes the context's actual length. So a tag byte appended after the serial reaches no length check: older
+peers read the prefix as before. `CONTEXT_BYTES` (and through `FRAMING_BYTES`, `MESSAGE_BYTES`, the record bound
+peers check) grows by one. The leader's `Slots::read` gets the message whole and would read the tag from its context
+to step a read barrier without waiting for a slot.
+
+## Checks (lane W4)
+
+All on adacachy2 (runner 00aad8da...), needs `linux/amd64,cpus=8,mem=24g`, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=8,
+target `~/.cache/amphora-perf-target/persisted`, scripts in `~/.cache/amphora-perf/persisted-scripts` (`t.sh`, `bin.sh`,
+`flip.sh`, `ab2.sh`, `ab3.sh`). No code of this lane is on main: the switch stays on perf/persisted-w4 until its
+verdict.
+
+# Lane W5 (persisted) on adacachy2: the relayed read dropped at its cause; the leader-tail A/B rerun (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, and no stall for everyone when one client fails
+or is slow. The coordinator's units, in order. Branches perf/persisted-w5 (unit 2), perf/persisted-w5-ab (units 3, 4).
+
+## 1. The bench's compile break (skipped: lane V4's bba65c73 on main is the same one-line fix)
+
+## 2. A follower drops a peer's read instead of passing it on (hyper-raft change 0011)
+
+W4 traced the nemesis test's 1-in-16 failure to a relayed ReadIndex: a member asks the node it takes for the leader,
+which has lost the lead since; that node, now a follower, passes the read on (`step_follower`, `forward`) with the
+asker still its `from`, and the new leader's authenticated sender check (`replicated.rs` `step`, "replica sender")
+refuses the record. Confirmed in the code: `push_with` fills `from` only when it is 0, so a relayed read keeps the
+asker's id. The coordinator's ruling: fix it at the cause.
+
+- `vendor/patches/hyper-raft/0011-cp-t1-8-a-follower-drops-a-peer-s-read-instead-of-passing-it.patch` (numbered
+  past the two 0009s on perf/commits-v3 and perf/serve-p7): a follower that knows its leader drops a read a peer
+  sent it (`drop_read`, as with no leader) and passes on only its own. The asker's read is lost either way, as it
+  was before (the new leader refused it); its owner asks again on the leader change, as for any lost read. What
+  changes is that no record goes out that the next hop must refuse.
+- hyper-raft's differential comparison (`tests/differential.rs`) gets a fifth decided difference: raft-rs passes
+  the read on, so such a delivery is lost for both (`relays_a_peers_read`, `Reached::relayed_reads`).
+- Test `a_follower_passes_on_its_own_read_and_drops_a_peers` (hyper-raft `src/tests.rs`): a follower that knows its
+  leader is sent a peer's read (no term, as on the wire) and sends nothing; its own read goes to the leader from it.
+  Red arm (the arm's `|| message.from != 0` taken out, r1226): fails at "assertion failed: drain(&mut node).is_empty()",
+  the peer's read passed on. A first version built the read with a term, and its red arm failed on `push_with`'s
+  "a term given to a message that takes the member's" instead (r1215); fixed in c55464eb.
+- `python3 scripts/vendor.py check hyper-raft`: 1377 files at d5d5f8f6, 8 recorded changes, 0 differences.
+- Not changed, seen while reading: a follower passes a peer's `MsgPropose` on the same way (`step_follower`'s
+  `MsgPropose` arm), which `step`'s sender check would refuse the same way; Amphora's comment there says nothing
+  re-forwards a proposal. Not observed in a run.
+
+Checks, all on adacachy2 (runner 00aad8da...; Mac Studio 2 refused this clone's sync: "did not answer the sync in
+60s", r1202, and has no GitHub key for a clone of its own, r1199), needs `linux/amd64,cpus=8,mem=24g`, CARGO_INCREMENTAL=0:
+
+- hyper-raft's own suites on upstream's tree (d5d5f8f6, Amphora's 8 patches applied in order; the vendored copy can't
+  build them without `hyper-check`, as lane V4 found), rustc 1.98.1: r1215 at 425a25c1, the read tests 22 of 22 and
+  `--test differential` 8 of 8 (the comparison loses the relayed reads for both and agrees on the rest); clippy
+  `-p hyper-raft --all-targets -D warnings` clean. r1226 at c55464eb: the read tests 22 of 22, clippy clean, red arm
+  as above.
+- r1214 at 425a25c1 (load 9-24): clippy `-p amphora --all-targets --locked -D warnings` clean (main's own two
+  `fetch_update` deprecation warnings in vendored hyper-rt). `every_falsifier_of_the_floor_holds_under_a_nemesis`, each
+  arm's lib test binary built once, alternated, 16 runs each: main 945b633a 16 of 16 passed, the fix 16 of 16 passed,
+  no "replica sender" in any run. The base did not fail here (W4 saw 1 in 16 at load 48-96), so these runs show the
+  fix breaks nothing in the nemesis; the cause is shown gone by the hyper-raft test and its red arm, not by them.
+
+## 3. The leader-tail A/B
+
+r1218 on adacachy2 (needs cpus=16; Mac Studio 2 refused this clone's sync), the bench at 78cf8028 (perf/persisted-w5-ab:
+0011, W4's switch cf62b1f3, unit 4's bench), both arms one binary, so one calibration (measured by the first probe,
+read by every run after; RULES 5e holds without a copy). In-process persisted commit, `--batch 1 --text-bytes 600
+--deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 90` (the probe's 15 writes/s asked for 200 s
+to reach 1000 leader writes; 90 s is the cap), arm order alternated by round; load 18-27, CPU pressure avg10 0.1-2.6%,
+I/O 3-10% (my nemesis and clippy runs beside the first rounds). Rounds 1 and 2, the leader the node with the most
+acknowledged writes and the lowest p50 (node 2 or 0; `leader` at the end agreed in every 3-writer run):
+
+| writers | arm | round | leader writes | leader p50 ms | p99 ms | p99.9 ms | leader refused per write | writes/s | missed (writers) |
+|---|---|---|---|---|---|---|---|---|---|
+| 3 | today | 1 | 617 | 118 | 524 | 680 | 0.53 (327) | 15.0 | 0 |
+| 3 | leader tail | 1 | 645 | 111 | 532 | 844 | 0.31 (202) | 15.9 | 0 |
+| 3 | leader tail | 2 | 599 | 118 | 565 | 1024 | 0.36 (216) | 15.1 | 0 |
+| 3 | today | 2 | 682 | 110 | 479 | 754 | 0.44 (301) | 15.6 | 0 |
+| 32 | today | 1 | (leader moved) | | | | | 13.3 | 11 (11) |
+| 32 | leader tail | 1 | 691 | 1065 | 4096 | 6291 | 0.37 (257) | 17.5 | 5 (5) |
+| 32 | leader tail | 2 | 520 | 1442 | 6160 | 7274 | 0.34 (176) | 12.7 | 10 (8) |
+
+Not a verdict: 2 of 5 rounds, and each run's leader holds 520 to 690 writes, under the 1000 the p99.9 needs (the bench
+gives each run's quantiles, not its samples, so runs can't be pooled). So far, as W4 saw: at 3 writers the leader's
+refusals per write fall (0.53, 0.44 today; 0.31, 0.36 with the tail rule) and its p50 and p99 show no measurable
+difference; its p99.9 is higher with the tail rule in both rounds (844, 1024 against 680, 754 ms), within 600 writes a
+run. The rest is in `~/.cache/amphora-perf/persisted-w5ab/results.txt` on adacachy2 and r1218's output when it ends
+(3 more rounds, then 128 writers once per arm). The switch stays off main.
+
+## 4. The commit rung counts deadline misses
+
+`commit` (bench/src/repl.rs): a writer whose write misses `--deadline-s` no longer ends the run. It counts the miss
+and sends the same write again unchanged (same ids, as `failover`'s writers do), timed from its first send once
+acknowledged; one still unacknowledged at the run's end is counted and untimed. The record gains `deadline_misses`
+and `writers_missed`, beside W4's per-node latency and `Serialization` refusals (`by_node`, from cf62b1f3).
+
+Checks on adacachy2: r1218 built the bench at 78cf8028 (the same `repl.rs`) and ran it: the 32-writer runs above
+missed 5 to 11 deadlines on 5 to 11 writers and went on, where W4's r1158 ended at the first. `cargo clippy
+--manifest-path bench/Cargo.toml --all-targets -D warnings` (r1239) is not clean on main itself: 166 errors at main
+945b633a and 166 at 6043acfe, 9 of them in `repl.rs` at each (the same 9, moved by the added lines). r1241: `cargo check
+--release` on the bench after merging main (65c59f28). Not run: a 128-writer rung of this landing (r1218 runs it last).
+
+# Lane W6 (persisted) on adacachy2: poolable bench output; a member sends in its own name only (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, decisions made on p50, p99 and p99.9 data.
+Branches perf/persisted-w6 (unit 1), perf/persisted-w6-ab (unit 2's bench), perf/persisted-w6-relay (unit 3).
+
+## 1. The commit rung's latencies pool across rounds (done, on main at 88054d7f)
+
+Each `by_node` entry of `--repl commit` now carries its histogram: `buckets_us`, the nonzero buckets of the bench's
+`Hist` as `[least µs, count]` pairs (64 to each power of two, so a sample reads back within 1/64 of itself, as the
+quantiles always did), and `max_us`. Summing counts by least value across runs gives the merged histogram
+(`w6_buckets_of_runs_pool_into_the_merged_histogram`). `bench/pool.py FILE...` pools one arm's runs (a JSON record a
+line) into its leader's histogram (the leader: the member with the most acknowledged writes in the run) and prints
+leader writes, p50, p99, p99.9, max and refusals per write. Checks: the test passed (r1266, release); bench clippy at
+cd7ce20d has 166 errors, as main has (W5's r1239), none in W6's lines (r1282).
+
+## 2. The leader-tail A/B (r1218 read; the pooled rerun r1266 still running at the hand-over)
+
+r1218 ended (17:19Z). Per run, the leader taken as the member with the most acknowledged writes (bench 78cf8028,
+90 s a run, rounds alternated, load 18-28, CPU pressure avg10 0.1-4.9%, I/O 3-10%):
+
+| writers | round | today: writes, p50 / p99 / p99.9 ms, refused per write | leader tail: writes, p50 / p99 / p99.9 ms, refused per write |
+|---|---|---|---|
+| 3 | 1 | 617, 118 / 524 / 680, 0.53 | 645, 111 / 532 / 844, 0.31 |
+| 3 | 2 | 682, 110 / 479 / 754, 0.44 | 599, 118 / 565 / 1024, 0.36 |
+| 3 | 3 | 568, 125 / 623 / 827, 0.54 | 519, 128 / 573 / 1229, 0.47 |
+| 3 | 4 | 661, 110 / 508 / 631, 0.43 | 564, 123 / 631 / 934, 0.32 |
+| 3 | 5 | 696, 104 / 500 / 819, 0.43 | 613, 111 / 598 / 999, 0.36 |
+| 32 | 1 | 484, 1245 / 7668 / 13500, 0.60 | 691, 1065 / 4096 / 6291, 0.37 |
+| 32 | 2 | 544, 1229 / 7406 / 23069, 0.45 | 520, 1442 / 6160 / 7274, 0.34 |
+| 32 | 3 | 500, 1327 / 7733 / 9306, 0.62 | 646, 1098 / 4325 / 7471, 0.30 |
+| 32 | 4 | 473, 1393 / 7274 / 9306, 0.54 | 583, 1212 / 5243 / 5898, 0.32 |
+| 32 | 5 | 517, 1245 / 5571 / 8126, 0.52 | 651, 1196 / 5112 / 6816, 0.30 |
+| 128 | 1 | 33 writes in 5 s, 1 deadline miss | 32 writes in 5 s, 2 deadline misses |
+
+Not pooled (r1218's bench gave quantiles only), so each run's p99.9 is its slowest write. What it shows so far: the
+tail rule cuts the leader's refusals per write at both sizes, every round. At 3 writers its slowest write is slower in
+5 of 5 rounds (844-1229 ms against 631-827), its p99 in 4 of 5 and its p50 in 4 of 5. At 32 writers it is faster in
+p99 and p99.9 in 5 of 5 rounds and p50 in 4 of 5, with more leader writes. So: worse at 3 writers on the slowest
+writes, better at 32. The coordinator's rule (adopt only if no worse at all three percentiles) can't be met unless
+the pooled 3-writer p99.9 says otherwise.
+
+The pooled rerun: r1266 (`persisted-scripts/w6-ab.sh e906eec9 95`: the bench at e906eec9, perf/persisted-w6-ab = W5's
+78cf8028 plus unit 1; one binary, one calibration measured by an untimed probe; 5 rounds alternated, 3 and 32
+writers, 95 s a run). Its wait for r1218 ran its 20-minute cap (r1218's last line was its `== done` header, which the
+wait didn't expect), so its rounds began about 17:51Z and end about 18:25Z, after this lane's hour. Its records are
+in `~/.cache/amphora-perf/persisted-w6ab/rec/t{0,1}-w{3,32}.jsonl` on adacachy2, and its last step writes
+`~/.cache/amphora-perf/persisted-w6ab/pooled.txt` (`python3 bench/pool.py` over the four files). The switch stays off
+main until that verdict.
+
+## 3. A member sends in its own name only (done; patch 0011 removed)
+
+The coordinator's ruling (after Ada's question): the refusal is Amphora's rule, not a hyper-raft fault. hyper-raft
+passes a peer's read or proposal on with the peer as `from`, as raft-rs does, and Amphora's `step` refuses any record
+whose `from` is not its authenticated sender ("replica sender"). So the fix is Amphora's: the owner's outgoing loop
+(`replicated.rs`, where `output.messages` become wire records) sends no record whose `from` is not its own id, reads
+and proposals alike. The peer's request is lost as on a lossy link, as before (the new leader refused it then), and
+its owner asks again on the leader change.
+
+- Vendored patch 0011, its `UPSTREAM.md` row, its hyper-raft test and the differential test's fifth difference are
+  removed: `python3 scripts/vendor.py check hyper-raft` reports 8 recorded changes (0001, 0003-0009), 0 differences,
+  after merging main's 0009.
+- Tests `a_deposed_leader_passes_no_peers_read_on_in_the_peers_name` and
+  `a_deposed_leader_passes_no_peers_proposal_on_in_the_peers_name`: three voters, the lead moves from the first leader
+  to another, the third member's record (MsgReadIndex, or MsgPropose of a prepared write) reaches the deposed one from
+  the third; every record the pump then relays must leave its sender in that sender's own name, and every receipt
+  must be answered (the pump fails a refusal). Red arm (the drop taken out, 8fcc7152, r1282): both fail at the pump,
+  `MsgReadIndex from 1 (wire 3) to 2 (wire 2), term 0 refused: Invalid { what: "replica sender", ... }` and the same
+  for `MsgPropose`: the relay the nemesis failed on. With the fix (ce479ab9, and merged with main as dc7fe71e) both
+  pass.
+- Checks at dc7fe71e (r1291, needs `linux/amd64,cpus=4,mem=16g`): clippy `-p amphora --all-targets --locked -D
+  warnings` clean (main's two vendored hyper-rt `fetch_update` deprecation warnings only); the two tests and
+  `a_forward_naming_another_member_as_its_origin_is_refused_and_applies_nowhere` pass; the `database::replicated`
+  suite 143 passed, 0 failed, 5 ignored.
+- `every_falsifier_of_the_floor_holds_under_a_nemesis` alone (`--exact`, one thread), each arm's lib test binary built
+  once and copied, alternated, 16 runs each (r1282, 17:44-17:55Z, load 14-22): main 6cf414ad (with 0011) 16 of 16
+  passed, the fix ce479ab9 (0011 removed, the owner's drop in) 16 of 16 passed, no "replica sender" line in any run.
+  As in W5's r1214, the base did not fail here, so these runs show the fix breaks nothing in the nemesis; the relay is
+  shown gone by the two tests and their red arm.
+- Re-checked after merging main again (its 0009 update, lane V6) at f0fb2e8f (r1306): clippy clean as above, the three
+  tests pass, the `database::replicated` suite 143 passed, 0 failed, 5 ignored; `vendor.py check hyper-raft` 8 recorded
+  changes, 0 differences. Main moved once more (lane K8's replicated.rs): at 124ef7e9, the tip merged to main, the same
+  checks again (18:03-18:05Z): clippy clean, the three tests pass, the suite 143 passed, 0 failed, 5 ignored.
+
+## 4. The read-or-write tag on member requests (not started)
+
+The hour went to units 1 to 3. W4's notes on where the tag goes (section 3 of W4 above) still hold.
+
+## Open for the successor
+
+- Read `~/.cache/amphora-perf/persisted-w6ab/pooled.txt` on adacachy2 when r1266 ends (about 18:25Z) and decide by the
+  coordinator's rule: wait adopted only if no worse at p50, p99 and p99.9 at both 3 and 32 writers; else the switch
+  is dropped and the pooled table goes here. Check `leader_writes` is at least 3,000 per arm and `lead_moved_runs`.
+- Unit 4.

@@ -107,8 +107,12 @@ impl SearchBudget {
         let running = bound_cost? * self.nanos_per_row? * executions.max(1.0);
         let per_candidate = self.nanos_per_candidate.filter(|nanos| *nanos > 0.0)?;
         let candidates = running / per_candidate;
-        // `as` saturates: an unbounded run allows every subset.
-        (!candidates.is_nan() && candidates >= 0.0).then_some(candidates as usize)
+        // Past usize saturates: an unbounded run allows every subset.
+        if !candidates.is_nan() && candidates >= 0.0 {
+            Some(num_traits::ToPrimitive::to_usize(&candidates).unwrap_or(usize::MAX))
+        } else {
+            None
+        }
     }
 }
 

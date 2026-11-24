@@ -250,13 +250,18 @@ pub enum WhereTermOrigin {
     /// This term also has a join origin. The separate variant lets the
     /// unmatched-right read rebuild the argument instead of treating it as an ON term.
     TableFunction(JoinOrigin),
+    /// An equality the optimizer inferred from the WHERE and inner-join ON equalities
+    /// (`add_implied_column_equalities`), consumed: it can pick an access path, and the stated
+    /// terms verify each row. It holds only of rows those terms were tested on, not of a row an
+    /// outer join later padded with NULLs for their tables.
+    Implied,
 }
 
 impl WhereTermOrigin {
     /// Get the join origin when the term belongs to a join source.
     pub fn join_origin(self) -> Option<JoinOrigin> {
         match self {
-            Self::Where => None,
+            Self::Where | Self::Implied => None,
             Self::Join(origin) | Self::TableFunction(origin) => Some(origin),
         }
     }
@@ -269,7 +274,7 @@ impl WhereTermOrigin {
     pub fn table_function_table(self) -> Option<TableInternalId> {
         match self {
             Self::TableFunction(origin) => Some(origin.right_table()),
-            Self::Where | Self::Join(_) => None,
+            Self::Where | Self::Implied | Self::Join(_) => None,
         }
     }
 }
@@ -817,6 +822,9 @@ pub enum SimpleAggregate {
     MinMax(Box<MinMaxDef>),
 }
 
+/// An ORDER BY's terms: each expression, its direction and where its NULLs come.
+pub(crate) type OrderTerms = Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>;
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table_references: TableReferences,
@@ -831,6 +839,9 @@ pub struct SelectPlan {
     pub group_by: Option<GroupBy>,
     /// order by clause
     pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
+    /// Amphora (QT.6): the ORDER BY the chosen loops give by themselves, taken from `order_by` with
+    /// its sort. Rows made another way (the morsel hook's workers) are sorted by it.
+    pub(crate) loop_order: OrderTerms,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
@@ -1798,6 +1809,8 @@ pub struct TablePlanEstimate {
     pub total_cost: f64,
     /// The access's place in the join order: the last one's `output_rows` are the join's.
     pub position: usize,
+    /// The star filter this access was priced with, if any (`lip::price_read`).
+    pub star_filter: Option<StarFilterPrice>,
 }
 
 #[derive(Debug, Clone)]
@@ -2810,6 +2823,19 @@ pub struct LipFilter {
     pub max_bytes: usize,
     /// The planner's estimate of the share of fact rows it passes.
     pub pass: f64,
+}
+
+/// Amphora (QT.5, T-QT.5.3; lane T19): the star filter a dimension's read was priced with in the
+/// join search: that read on the fact rows the filter passes, plus the filter's build and its
+/// check of each fact row. `lip::choose` keeps every filter the chosen plan was priced with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StarFilterPrice {
+    /// The fact table, whose scan checks the filter.
+    pub fact_idx: usize,
+    /// The filter's false-positive rate per distinct key (`bloom_filter_costs`).
+    pub fp_per_key: f64,
+    /// The share of the fact rows it checks that it passes, its false positives included.
+    pub passed: f64,
 }
 
 #[derive(Debug, Clone, Copy)]

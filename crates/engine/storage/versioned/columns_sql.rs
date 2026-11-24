@@ -38,8 +38,8 @@
 //! its table grows. Counters and trace events (target `amphora::columns`) say what each copy did
 //! and why (AC-CB.3).
 //!
-//! Behind the planner's switch (`AMPHORA_COLUMN_PATH=on`, `column_path::asked`), read once when
-//! the storage opens.
+//! Only a table declared `COLUMNAR` keeps a copy (`docs/design/columnar.md`, decision 1, item 1):
+//! the translator hands the scan hook a statement on such a table alone (`translate::parallel`).
 
 use super::blink::Descender;
 use super::columns::scan::{
@@ -48,7 +48,7 @@ use super::columns::scan::{
 };
 use super::columns::{as_u64, Block, Columns, Feed, Plain, Rows, Rowset};
 use super::columns_path::{self, CopyScan, OnCopy, Scanned};
-use super::cursor::key_rowid;
+use super::cursor::{key_rowid, rowid_key};
 use super::durable::Database as VDatabase;
 use super::memory::{self, Source};
 use super::switch::{tree_of, Switch};
@@ -64,10 +64,10 @@ use crate::vdbe::morsel::{
 };
 use crate::Result;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// What the copies have counted: the evidence that SQL reads them.
+/// What the copies have counted: the evidence that SQL reads them. Each count saturates at
+/// `u64::MAX`: a count is evidence, and no statement fails for its count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCounts {
     /// Copies made (a table's second analytic statement).
@@ -271,7 +271,7 @@ pub struct Wait {
 
 fn asked(e: &LimboError) -> u64 {
     match e {
-        LimboError::MemoryBudget { asked, .. } => *asked,
+        LimboError::MemoryBudget(full) => full.asked,
         _ => 0,
     }
 }
@@ -300,7 +300,6 @@ pub(crate) struct TableCopy {
 
 /// A storage's SQL tables' copies.
 pub(crate) struct Copies {
-    on: AtomicBool,
     /// How a copy let go is bought again.
     rebuy: Mutex<Rebuy>,
     /// The storage's memory source, counted ([`Metered`]): what each copy's queue, decoded blocks
@@ -321,6 +320,58 @@ pub(crate) struct Copies {
     absent: Mutex<HashMap<u64, u64>>,
     /// Each tree's rows as its copy's last build read them.
     rows_known: Mutex<HashMap<u64, u64>>,
+    /// Each tree's row path as measured (lane R6): the nanoseconds the engine's serial loop took
+    /// for the statements the copies handed it, and the rows of the table they were charged per
+    /// ([`Copies::rows_measured`]), as the copy's own scans are charged ([`Columns::measured_scan`]).
+    rows_cost: Mutex<HashMap<u64, (u128, u128)>>,
+}
+
+/// A statement the copies handed to its serial loop, timed for its table's row path (lane R6):
+/// the table's tree, and its rows at the statement's snapshot when the copy's view knew them (the
+/// copy's own charge per row of the table); else the rows the loop reads count, which for a
+/// whole-table statement are the table's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowsTimed {
+    tree: u64,
+    table_rows: Option<u64>,
+}
+
+/// What the copies answer a statement the scan hook hands them.
+pub(crate) enum Handed {
+    /// The copy answered: its rows.
+    Copy(Vec<Vec<Value>>),
+    /// The serial loop answers; timed for the table's row path when `Some`.
+    Rows(Option<RowsTimed>),
+}
+
+/// The serial loop of a statement the copies handed back, timed while it runs (lane R6): the
+/// engine's own time, from the hand-over to the statement's end, not the time its caller holds a
+/// row between steps.
+#[derive(Debug)]
+pub(crate) struct RowsTiming {
+    of: RowsTimed,
+    /// The rows the statement's cursors had read at the hand-over.
+    read_before: u64,
+    nanos: u128,
+    /// When the current run of the loop began: the hand-over, or the step that resumed it.
+    since: Instant,
+}
+
+impl RowsTiming {
+    pub(crate) fn start(of: RowsTimed, read_before: u64) -> Self {
+        Self {
+            of,
+            read_before,
+            nanos: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// The loop ran from `since` (the step's start, or the hand-over within it) until now.
+    pub(crate) fn ran(&mut self, since: Option<Instant>) {
+        let from = since.unwrap_or(self.since);
+        self.nanos = self.nanos.saturating_add(from.elapsed().as_nanos());
+    }
 }
 
 fn nanos(base: Instant) -> u128 {
@@ -332,14 +383,13 @@ fn tick(base: Instant) -> u64 {
 }
 
 impl Copies {
-    pub(crate) fn new(on: bool, room: Arc<dyn Source>) -> Self {
+    pub(crate) fn new(room: Arc<dyn Source>) -> Self {
         let meter = Arc::new(Metered {
             inner: room,
             meter: Mutex::new(Meter::default()),
         });
         let room: Arc<dyn Source> = meter.clone();
         Self {
-            on: AtomicBool::new(on),
             rebuy: Mutex::new(Rebuy::asked()),
             room,
             meter,
@@ -351,7 +401,30 @@ impl Copies {
             waiting: Mutex::new(HashMap::new()),
             absent: Mutex::new(HashMap::new()),
             rows_known: Mutex::new(HashMap::new()),
+            rows_cost: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A statement's serial loop ended, `timed`, its cursors having read `read_now` rows in all:
+    /// charged to its table's row path per row of the table.
+    pub(crate) fn rows_measured(&self, timed: RowsTiming, read_now: u64) {
+        let read = read_now.saturating_sub(timed.read_before);
+        let rows = timed.of.table_rows.unwrap_or(read);
+        if rows == 0 {
+            return;
+        }
+        let mut cost = self.rows_cost.lock();
+        let e = cost.entry(timed.of.tree).or_insert((0, 0));
+        e.0 = e.0.saturating_add(timed.nanos);
+        e.1 = e.1.saturating_add(u128::from(rows));
+    }
+
+    /// `tree`'s row path's measured nanoseconds per row of the table; None before a statement's
+    /// serial loop was timed on it.
+    fn rows_rate(&self, tree: u64) -> Option<f64> {
+        let cost = self.rows_cost.lock();
+        let (nanos, rows) = cost.get(&tree).copied()?;
+        (rows > 0).then(|| nanos as f64 / rows as f64)
     }
 
     /// How a copy let go is bought again.
@@ -468,16 +541,6 @@ impl Copies {
         self.tables.lock().contains_key(&tree)
     }
 
-    /// Whether the planner's switch is on: the translator then hands analytic statements to the
-    /// scan hook.
-    pub(crate) fn on(&self) -> bool {
-        self.on.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn set_on(&self, on: bool) {
-        self.on.store(on, Ordering::Relaxed);
-    }
-
     pub(crate) fn counts(&self) -> CopyCounts {
         *self.counts.lock()
     }
@@ -492,12 +555,12 @@ impl Copies {
     /// statement pays the rent again and the one after buys again; B, it waits for room for
     /// `expected` bytes and what its table grows by.
     fn let_go(&self, db: &VDatabase, tree: u64, refused: LimboError, expected: u64) -> Result<()> {
-        let LimboError::MemoryBudget {
-            asked, held, limit, ..
-        } = refused
-        else {
+        let LimboError::MemoryBudget(full) = refused else {
             return Err(refused);
         };
+        let crate::BudgetFull {
+            asked, held, limit, ..
+        } = *full;
         let now = tick(self.base);
         let rebuy = self.rebuy();
         self.tables.lock().remove(&tree);
@@ -532,7 +595,8 @@ impl Copies {
             held,
             limit,
         });
-        self.counts.lock().dropped += 1;
+        let mut c = self.counts.lock();
+        c.dropped = c.dropped.saturating_add(1);
         Ok(())
     }
 
@@ -559,7 +623,8 @@ impl Copies {
                 }
                 self.waiting.lock().remove(&tree);
                 db.drop_columns(tree);
-                self.counts.lock().resumed += 1;
+                let mut c = self.counts.lock();
+                c.resumed = c.resumed.saturating_add(1);
                 tracing::debug!(target: "amphora::columns", tree, bytes, room, "column copy: room for it again");
             }
             None => {
@@ -585,9 +650,9 @@ impl Copies {
         let rebuy = self.absent.lock().contains_key(&tree);
         {
             let mut c = self.counts.lock();
-            c.kept += 1;
+            c.kept = c.kept.saturating_add(1);
             if rebuy {
-                c.rebuys += 1;
+                c.rebuys = c.rebuys.saturating_add(1);
             }
         }
         tracing::debug!(target: "amphora::columns", tree, rebuy, "column copy bought");
@@ -601,6 +666,7 @@ impl Copies {
         self.waiting.lock().remove(&tree);
         self.absent.lock().remove(&tree);
         self.rows_known.lock().remove(&tree);
+        self.rows_cost.lock().remove(&tree);
         db.drop_columns(tree);
     }
 }
@@ -629,17 +695,27 @@ impl Rows for At<'_> {
 }
 
 /// A SQL table's rows: record payloads, an INTEGER PRIMARY KEY's column (stored as NULL) read
-/// from the row's key, as the executor's scan hook reads it.
-struct SqlRows {
+/// from the row's key, as the executor's scan hook reads it; an INTEGER in a column of REAL
+/// affinity read as a REAL, as the serial loop's `RealAffinity` makes it (lane R10). Both come
+/// from the table's schema, so the blocks a copy caches decode alike for every statement.
+struct SqlRows<'a> {
     rowid_alias: Option<usize>,
+    reals: &'a [usize],
 }
 
-impl Decode for SqlRows {
+impl Decode for SqlRows<'_> {
     fn decode(&self, key: &[u8], row: &[u8], out: &mut Vec<Cell>) -> Result<()> {
         Records.decode(key, row, out)?;
         if let Some(at) = self.rowid_alias {
             if let Some(cell) = out.get_mut(at) {
                 *cell = Cell::Int(key_rowid(key)?);
+            }
+        }
+        for at in self.reals {
+            if let Some(cell) = out.get_mut(*at) {
+                if let Cell::Int(i) = *cell {
+                    *cell = Cell::Real(i as f64);
+                }
             }
         }
         Ok(())
@@ -652,6 +728,7 @@ impl Decode for SqlRows {
 struct OnCores<'a> {
     cache: &'a Cache,
     mode: ParallelMode,
+    sums: crate::RealSums,
     costs: &'a Mutex<Option<MachineCosts>>,
     budget: &'a MemoryBudget,
     declined: std::cell::Cell<bool>,
@@ -676,6 +753,15 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
         if let Some(kind) = sums_text(q, &granules) {
             self.declined.set(true);
             return Err(morsel(MorselError::Unsupported { kind }));
+        }
+        // A REAL to sum (lane R10): the copy's sum is exact and rounded once, `RealSums::Exact`'s
+        // answer. Under the others the sum is SQLite's compensated one in row order, which the
+        // serial loop takes, as the morsels' workers hand it back (`no_real_outputs`).
+        if self.sums != crate::RealSums::Exact && sums_real(q, &granules) {
+            self.declined.set(true);
+            return Err(morsel(MorselError::Unsupported {
+                kind: "a REAL to sum outside RealSums::Exact",
+            }));
         }
         let built = granules
             .iter()
@@ -705,13 +791,13 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
     }
 }
 
-/// The kind of the first value that isn't a number in a column `q` sums (None: every one is a
-/// number or null).
+/// The kind of the first value that isn't a number in a column `q` sums or averages (None: every
+/// one is a number or null).
 fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
     q.aggs
         .iter()
         .filter_map(|a| match a {
-            Agg::Sum(c) => Some(*c),
+            Agg::Sum(c) | Agg::Avg(c) => Some(*c),
             _ => None,
         })
         .find_map(|c| {
@@ -725,6 +811,26 @@ fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
                         Cell::Blob(_) => Some("BLOB"),
                         _ => None,
                     }),
+                })
+        })
+}
+
+/// Whether a column `q` sums or averages holds a REAL in any granule (AVG's REALs follow SUM's
+/// rule, lane R11).
+fn sums_real(q: &Query, granules: &[Placed]) -> bool {
+    q.aggs
+        .iter()
+        .filter_map(|a| match a {
+            Agg::Sum(c) | Agg::Avg(c) => Some(*c),
+            _ => None,
+        })
+        .any(|c| {
+            granules
+                .iter()
+                .any(|p| match p.granule.columns.get(c).map(|v| &v.data) {
+                    Some(Data::Real(_)) => true,
+                    Some(Data::Mixed(cells)) => cells.iter().any(|v| matches!(v, Cell::Real(_))),
+                    _ => false,
                 })
         })
 }
@@ -771,6 +877,12 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
             },
             Predicate::IsNull { column } => Filter::IsNull(*column),
             Predicate::NotNull { column } => Filter::NotNull(*column),
+            // `op_morsel_aggregate` binds every parameter before the copy reads the filter.
+            Predicate::Parameter { .. } => {
+                return Err(LimboError::InternalError(
+                    "the column copy's filter holds an unbound parameter".into(),
+                ))
+            }
         });
     }
     let mut aggs = Vec::with_capacity(data.aggregates.len());
@@ -781,37 +893,45 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
             Aggregate::Sum(c) => Agg::Sum(*c),
             Aggregate::Min(c) => Agg::Min(*c),
             Aggregate::Max(c) => Agg::Max(*c),
-            // Only the loop body's copy takes them, which `aggregate` hands to the rows.
-            Aggregate::Avg(_) | Aggregate::Total(_) => {
+            Aggregate::Avg(c) => Agg::Avg(*c),
+            // Only the loop body's copy takes it, which `aggregate` hands to the rows.
+            Aggregate::Total(_) => {
                 return Err(LimboError::InternalError(
-                    "the column copy has no AVG or TOTAL".into(),
+                    "the column copy has no TOTAL".into(),
                 ))
             }
         });
     }
+    // The rowids the scan reads (lane R11), as the copy's keys order them.
+    let key = |rowid: Option<i64>| {
+        rowid.map_or(std::ops::Bound::Unbounded, |r| {
+            std::ops::Bound::Included(rowid_key(r).to_vec())
+        })
+    };
     Ok(Query {
         filters,
         group: data.group_by.clone(),
         aggs,
         budget,
-        keys: KeyRange::default(),
+        keys: KeyRange {
+            lo: key(data.rowid_range.0),
+            hi: key(data.rowid_range.1),
+        },
     })
 }
 
 /// Answers the scan hook's statement `data` from its table's column copy when the planner chooses
-/// the copy: its rows (the GROUP BY values, then the aggregates, groups in key order). None: the
-/// statement's serial loop reads the rows.
+/// the copy: its rows (the GROUP BY values, then the aggregates, groups in key order). Else the
+/// statement's serial loop reads the rows, timed for its table's row path when a copy could have
+/// answered it (lane R6).
 pub(crate) fn aggregate(
     switch: &Switch,
     data: &MorselAggregateData,
     connection: &crate::Connection,
     statement_memory: usize,
-) -> Result<Option<Vec<Vec<Value>>>> {
+) -> Result<Handed> {
     let storage = switch.storage();
     let copies = &storage.copies;
-    if !copies.on() {
-        return Ok(None);
-    }
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
     let skip = match &data.body {
@@ -824,13 +944,16 @@ pub(crate) fn aggregate(
     };
     copies.handed(skip);
     if skip.is_some() {
-        return Ok(None);
+        return Ok(Handed::Rows(None));
     }
     let db = storage.db();
     let tree = tree_of(data.root_page)?;
     let Some(copy) = copies.for_statement(db, tree)? else {
         copies.by_rows(tree, true);
-        return Ok(None);
+        return Ok(Handed::Rows(Some(RowsTimed {
+            tree,
+            table_rows: None,
+        })));
     };
     let q = query(data, statement_memory)?;
     // At the transaction's own snapshot (lane colcopy-10, AC-CB.4.7); in autocommit with none
@@ -846,7 +969,7 @@ pub(crate) fn aggregate(
             // What the copy answered is kept as read, the whole table, for the transaction's
             // validation: a superset of the rows the aggregate depends on refuses more, never
             // less, as the rows' cursor walking every row would keep.
-            if matches!(answered, Ok(Some(_))) {
+            if matches!(answered, Ok(Handed::Copy(_))) {
                 let mut guard = shared.lock();
                 let txn = guard.as_mut().ok_or_else(ended)?;
                 db.v.keep_read(txn, tree, None, None)?;
@@ -860,7 +983,7 @@ pub(crate) fn aggregate(
             answered
         }
     };
-    if matches!(answered, Ok(None)) {
+    if matches!(answered, Ok(Handed::Rows(_))) {
         copies.by_rows(tree, !copies.has(tree));
     }
     answered
@@ -880,33 +1003,60 @@ fn read(
     data: &MorselAggregateData,
     q: &Query,
     connection: &crate::Connection,
-) -> Result<Option<Vec<Vec<Value>>>> {
+) -> Result<Handed> {
     let base = copies.base;
     let clock = move || nanos(base);
     let rows = At { db, snap, tree };
+    let timed = |table_rows: Option<u64>| Handed::Rows(Some(RowsTimed { tree, table_rows }));
     // The queued commits applied, each change's bytes granted first (AC-CB.1.1); refused, the copy
     // is let go, expecting what it held and the bytes asked, and the rows answer.
     if let Err(refused) = copy.columns.catch_up(tick(base)) {
         let expected = as_u64(copy.columns.granted()).saturating_add(asked(&refused));
         copies.let_go(db, tree, refused, expected)?;
-        return Ok(None);
+        return Ok(timed(None));
     }
-    // Unknown rates price nothing: the rows.
-    let rates = RowRates::learned(&connection.db.learned_costs);
+    // Both paths priced as measured on this table (lane R6): the copy by its scans' time per row of
+    // the table, the rows by the time the engine's serial loop took for the statements the copies
+    // handed it, per row of the table too; a seek (a queued key's read) by the database's learned
+    // rate. Rows never timed on this table, or unknown rates, price nothing: the rows, which their
+    // statement then measures.
+    let rates = RowRates::learned(&connection.db.learned_costs).and_then(|learned| {
+        copies.rows_rate(tree).map(|row| RowRates {
+            row,
+            seek: learned.seek,
+        })
+    });
     let chosen =
         rates.map(|r| columns_path::aggregate_choice(&copy.columns, snap.start, q, r, true));
+    if let (Some((choice, view)), Some(r)) = (&chosen, rates) {
+        tracing::debug!(
+            target: "amphora::column_path",
+            tree,
+            rows = view.rows,
+            queued = view.queued,
+            exact = view.exact,
+            copy_nanos_per_row = ?view.nanos_per_row,
+            rows_nanos_per_row = r.row,
+            rows_cost = choice.rows_cost,
+            copy_cost = ?choice.copy_cost,
+            path = ?choice.path,
+            "column copy or rows: the choice and its two costs"
+        );
+    }
     let answer = match chosen {
         Some((choice, view)) if choice.path == Path::Copy => {
             let budget = MemoryBudget::new(q.budget);
             let scan = OnCores {
                 cache: &copy.cache,
                 mode: connection.parallel_mode(),
+                sums: connection.real_sums(),
                 costs: &connection.morsel_costs,
                 budget: &budget,
                 declined: std::cell::Cell::new(false),
             };
             let dec = SqlRows {
                 rowid_alias: data.rowid_alias,
+                reals: &data.reals,
             };
             match columns_path::aggregate_on_copy(
                 &copy.columns,
@@ -929,9 +1079,11 @@ fn read(
                     for row in answer {
                         out.push(row.into_iter().map(value).collect::<Result<Vec<_>>>()?);
                     }
-                    Some(out)
+                    Handed::Copy(out)
                 }
-                Err(_) if scan.declined.get() => None,
+                Err(_) if scan.declined.get() => {
+                    timed(Some(as_u64(view.rows.saturating_add(view.queued))))
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -940,15 +1092,22 @@ fn read(
             // answer (lane colcopy-10, AC-CB.4.7).
             {
                 let mut c = copies.counts.lock();
-                c.rows += 1;
+                c.rows = c.rows.saturating_add(1);
                 c.unserved = c.unserved.saturating_add(1);
             }
             tracing::debug!(target: "amphora::columns", tree, snapshot = snap.start, "column copy refused: no generation answers the statement's snapshot");
-            None
+            timed(None)
         }
-        _ => {
-            copies.counts.lock().rows += 1;
-            None
+        Some((_, view)) => {
+            let mut c = copies.counts.lock();
+            c.rows = c.rows.saturating_add(1);
+            timed(Some(as_u64(view.rows.saturating_add(view.queued))))
+        }
+        None => {
+            tracing::debug!(target: "amphora::column_path", tree, "column copy or rows: the rows, not yet timed on this table, answer and are timed");
+            let mut c = copies.counts.lock();
+            c.rows = c.rows.saturating_add(1);
+            timed(None)
         }
     };
     // The copy's own upkeep, after the statement's choice: a copy behind its snapshot was not
@@ -1001,7 +1160,7 @@ fn rebuild(
 
 fn count_copy(copies: &Copies, counts: &Counts, _sources: &Sources) {
     let mut c = copies.counts.lock();
-    c.copy += 1;
+    c.copy = c.copy.saturating_add(1);
     c.granules = c.granules.saturating_add(counts.granules);
     c.granule_rows = c.granule_rows.saturating_add(counts.rows);
 }
@@ -1016,8 +1175,34 @@ mod tests {
         connect_in(None)
     }
 
+    /// `AMPHORA_PLAN_TRACE`: the copies' choices, each with its two costs, to stderr, each line
+    /// named by its test's thread.
+    fn trace() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("AMPHORA_PLAN_TRACE").is_none() {
+            return;
+        }
+        ONCE.call_once(|| {
+            use tracing_subscriber::filter::{LevelFilter, Targets};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            let only = Targets::new()
+                .with_target("amphora::column_path", LevelFilter::DEBUG)
+                .with_target("amphora::columns", LevelFilter::DEBUG);
+            let shown = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_thread_names(true);
+            let _ = tracing_subscriber::registry()
+                .with(shown)
+                .with(only)
+                .try_init();
+        });
+    }
+
     /// A connection on a versioned storage whose memory source is `room` (None: the machine's).
     fn connect_in(room: Option<Arc<dyn Source>>) -> (Arc<Database>, Arc<crate::Connection>) {
+        trace();
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let opts = ConnectOpts::new().with_versioned_storage();
@@ -1037,12 +1222,12 @@ mod tests {
     impl Source for Refuses {
         fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
             if what == self.what {
-                return Err(LimboError::MemoryBudget {
+                return Err(LimboError::MemoryBudget(Box::new(crate::BudgetFull {
                     what,
                     asked: bytes,
                     held: 0,
                     limit: 0,
-                });
+                })));
             }
             Ok(())
         }
@@ -1076,6 +1261,17 @@ mod tests {
 
     const SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)";
 
+    /// Runs `sql`, a CREATE TABLE, declared `COLUMNAR` when `declared`: the table keeps a column
+    /// copy (decision 1, item 1).
+    fn create(conn: &Arc<crate::Connection>, sql: &str, declared: bool) {
+        let sql = if declared {
+            format!("{sql} COLUMNAR")
+        } else {
+            sql.to_string()
+        };
+        conn.execute(sql).unwrap();
+    }
+
     fn fill(conn: &Arc<crate::Connection>, from: i64, to: i64) {
         conn.execute(format!(
             "INSERT INTO t SELECT value, value % 7, (value * 37) % 1000, \
@@ -1092,9 +1288,7 @@ mod tests {
     #[test]
     fn a_default_read_is_counted_when_the_copy_defers_to_the_rows() {
         let (_db, conn) = connect();
-        copies(&conn).set_on(true);
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
-            .unwrap();
+        create(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY)", true);
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 7")
             .unwrap();
@@ -1117,10 +1311,8 @@ mod tests {
     fn cs5_sql_aggregates_answer_alike_on_copy_and_rows() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 3000);
         }
         let writes = [
@@ -1147,13 +1339,37 @@ mod tests {
         assert_eq!(copies(&off).counts(), CopyCounts::default());
     }
 
+    /// T-QT.6.36. Do: groups whose ORDER BY the planner merged into the GROUP BY, up, down, NULLS
+    /// FIRST and NULLS LAST, from a table's copy and from its rows. Expect: the same groups in the
+    /// same order, and the copy answered.
+    #[test]
+    fn t_qt_6_36_a_copys_groups_come_out_in_the_order_stated() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
+            fill(c, 1, 3000);
+        }
+        for q in [
+            "SELECT g, count(*), sum(v) FROM t GROUP BY g ORDER BY g",
+            "SELECT g, count(*), sum(v) FROM t GROUP BY g ORDER BY g DESC",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s DESC",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s NULLS LAST",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s DESC NULLS FIRST",
+            "SELECT g, s, count(*) FROM t GROUP BY g, s ORDER BY s DESC, g",
+        ] {
+            assert_eq!(rows(&on, q), rows(&off, q), "{q}");
+        }
+        let seen = copies(&on).counts();
+        assert!(seen.copy > 0, "no statement read the copy: {seen:?}");
+    }
+
     /// Do: a table no analytic statement reads, and one read once. Expect: neither keeps a copy
     /// (the first statement pays the rent; only a second buys).
     #[test]
     fn cs5_a_copy_is_kept_only_for_tables_analytic_statements_read() {
         let (_a, conn) = connect();
-        copies(&conn).set_on(true);
-        conn.execute(SCHEMA).unwrap();
+        create(&conn, SCHEMA, true);
         conn.execute("CREATE TABLE u (a INTEGER, b INTEGER)")
             .unwrap();
         fill(&conn, 1, 200);
@@ -1163,6 +1379,1217 @@ mod tests {
         assert_eq!(copies(&conn).counts().kept, 0);
         rows(&conn, "SELECT sum(v) FROM t");
         assert_eq!(copies(&conn).counts().kept, 1);
+    }
+
+    /// AC-CS.5.3, decision 1, item 1 (`docs/design/columnar.md`): two tables alike, one declared
+    /// `COLUMNAR`, each read by the same analytic statements three times (the rent, the buy, a
+    /// read). Expect: the same answers from both; a copy kept for the declared table alone; and
+    /// the declaration kept in its CREATE statement.
+    #[test]
+    fn cs5_only_a_table_declared_columnar_keeps_a_copy() {
+        let (_a, conn) = connect();
+        let table = "(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)";
+        create(&conn, &format!("CREATE TABLE a {table}"), true);
+        create(&conn, &format!("CREATE TABLE b {table}"), false);
+        for t in ["a", "b"] {
+            conn.execute(format!(
+                "INSERT INTO {t} SELECT value, value % 7, (value * 37) % 1000 \
+                 FROM generate_series(1, 500)"
+            ))
+            .unwrap();
+        }
+        let root = |t: &str| match rows(
+            &conn,
+            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{t}'"),
+        )
+        .first()
+        .and_then(|r| r.first())
+        {
+            Some(Value::Numeric(Numeric::Integer(n))) => tree_of(*n).unwrap(),
+            other => panic!("no root page for {t}: {other:?}"),
+        };
+        for q in [
+            "SELECT g, count(*), sum(v) FROM {t} GROUP BY g",
+            "SELECT sum(v), max(g) FROM {t}",
+        ] {
+            for _ in 0..3 {
+                assert_eq!(
+                    rows(&conn, &q.replace("{t}", "a")),
+                    rows(&conn, &q.replace("{t}", "b")),
+                    "{q}"
+                );
+            }
+        }
+        let seen = copies(&conn).counts();
+        assert_eq!(seen.kept, 1, "{seen:?}");
+        assert!(
+            copies(&conn).kept(root("a")).is_some(),
+            "the declared table keeps a copy"
+        );
+        assert!(
+            copies(&conn).kept(root("b")).is_none(),
+            "the undeclared table keeps none"
+        );
+        let sql = rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 'a'");
+        assert!(
+            matches!(sql.first().and_then(|r| r.first()), Some(Value::Text(t)) if t.as_str().ends_with("COLUMNAR")),
+            "{sql:?}"
+        );
+    }
+
+    /// Lane R8 (AC-CS.5.3): S8's five analytics statements (the bench's suite, its tables and
+    /// indexes, `bench/src/suite.rs`) on its tables declared `COLUMNAR`, each run three times with
+    /// its parameters bound as the suite binds them. Expect: the same answers as on the same tables
+    /// undeclared; and, printed with the copies' trace events, each statement's reach: whether the
+    /// translator handed it to the copies (`MorselAggregate` in its program), its plan, and what
+    /// the copies counted for it.
+    #[test]
+    fn r8_s8_statements_on_declared_tables_say_why_they_skip_the_copy() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        let tables = [
+            "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "CREATE TABLE owners (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region INTEGER NOT NULL, score REAL NOT NULL)",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, grp INTEGER NOT NULL, owner INTEGER NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL, flag INTEGER NOT NULL, created INTEGER NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, data BLOB NOT NULL, doc TEXT NOT NULL, note TEXT)",
+        ];
+        let load = [
+            "INSERT INTO regions SELECT value, 'region-' || value FROM generate_series(1, 8)",
+            "INSERT INTO owners SELECT value, 'owner-' || value, 1 + value % 8, value * 0.5 FROM generate_series(1, 64)",
+            "INSERT INTO items SELECT value, value * 7, value % 10, 1 + value % 64, (value % 1000) * 1.25, value % 100, value % 2, 1700000000 + value, 'item-' || value, 'body', x'00', '{}', NULL FROM generate_series(1, 3000)",
+            "CREATE INDEX items_k ON items (k)",
+            "CREATE INDEX items_name ON items (name)",
+            "CREATE INDEX items_grp_created ON items (grp, created)",
+            "CREATE INDEX items_owner ON items (owner)",
+            "CREATE INDEX owners_region ON owners (region)",
+        ];
+        for (c, declared) in [(&on, true), (&off, false)] {
+            for t in tables {
+                create(c, t, declared);
+            }
+            for l in load {
+                c.execute(l).unwrap();
+            }
+        }
+        let statements: [(&str, &str, Vec<Value>); 5] = [
+            ("table_count", "SELECT COUNT(*) FROM items", vec![]),
+            ("table_group_by", "SELECT grp, COUNT(*), AVG(price), MAX(qty) FROM items GROUP BY grp", vec![]),
+            ("filter_no_index", "SELECT COUNT(*) FROM items WHERE qty = ? AND price < ?", vec![Value::from_i64(7), Value::from_f64(500.0)]),
+            ("aggregates_range", "SELECT SUM(price), AVG(qty), MIN(created), MAX(created) FROM items WHERE id BETWEEN ? AND ?", vec![Value::from_i64(10), Value::from_i64(1009)]),
+            ("join_three", "SELECT r.name, COUNT(*), AVG(i.price) FROM items i JOIN owners o ON o.id = i.owner JOIN regions r ON r.id = o.region WHERE i.id BETWEEN ? AND ? GROUP BY r.name", vec![Value::from_i64(10), Value::from_i64(1009)]),
+        ];
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().cloned().collect());
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        for (name, sql, params) in &statements {
+            let program = rows(&on, &format!("EXPLAIN {sql}"));
+            let hooked = program.iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            let plan: Vec<String> = rows(&on, &format!("EXPLAIN QUERY PLAN {sql}"))
+                .iter()
+                .map(|r| format!("{:?}", r.last()))
+                .collect();
+            eprintln!("== r8 {name}: begins");
+            let before = copies(&on).counts();
+            for _ in 0..3 {
+                assert_eq!(bound(&on, sql, params), bound(&off, sql, params), "{name}");
+            }
+            let after = copies(&on).counts();
+            eprintln!(
+                "== r8 {name}: hook in its program {hooked}; plan {plan:?}; handed {}, skipped rows/body/join/transaction {}/{}/{}/{}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+                after.handed - before.handed,
+                after.skipped_rows - before.skipped_rows,
+                after.skipped_body - before.skipped_body,
+                after.skipped_join - before.skipped_join,
+                after.skipped_transaction - before.skipped_transaction,
+                after.copy - before.copy,
+                after.rows - before.rows,
+                after.absent - before.absent,
+                after.kept,
+            );
+        }
+    }
+
+    /// Lane R9: a term comparing an INTEGER column with a bound parameter. Do: the same table,
+    /// declared `COLUMNAR` and not, with an integer, a real, a text and a NULL among the compared
+    /// column's values; the statement bound to an integer, a real, a numeric text, a text no
+    /// number reads as, a blob and NULL, three runs each. Expect: the same rows on both tables,
+    /// the declared table's statement handed to the copies every run and never skipped as `body`,
+    /// and a numeric text bound answering as its number (NUMERIC affinity applied to the
+    /// parameter, SQLite's datatype3 section 4.2).
+    #[test]
+    fn r9_a_parameter_compared_with_an_integer_column_reaches_the_copies() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
+            fill(c, 1, 3000);
+            c.execute("INSERT INTO t VALUES (3001, 1, 2.5, 'r'), (3002, 1, 'abc', 't'), (3003, 1, NULL, 'n'), (3004, 1, x'01', 'b')")
+                .unwrap();
+        }
+        let sql = "SELECT COUNT(*), MIN(g), MAX(g), COUNT(s) FROM t WHERE v >= ?";
+        let bound = |conn: &Arc<crate::Connection>, param: &Value| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.bind_at(std::num::NonZero::new(1).unwrap(), param.clone())
+                .unwrap();
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().cloned().collect());
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        let hooked = rows(&on, &format!("EXPLAIN {sql}")).iter().any(|r| {
+            r.iter()
+                .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+        });
+        assert!(hooked, "the statement's program holds the copies' hook");
+        let params = [
+            Value::from_i64(500),
+            Value::from_f64(499.5),
+            Value::build_text("500"),
+            Value::build_text("abc"),
+            Value::from_blob(vec![0]),
+            Value::Null,
+        ];
+        let before = copies(&on).counts();
+        for param in &params {
+            for _ in 0..3 {
+                assert_eq!(bound(&on, param), bound(&off, param), "v >= {param:?}");
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(params.len() * 3).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert_eq!(
+            bound(&on, &Value::build_text("500")),
+            bound(&on, &Value::from_i64(500)),
+            "a numeric text bound compares as its number"
+        );
+        eprintln!(
+            "== r9 v >= ?: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
+    }
+
+    /// Lane R10: REAL columns through the copies, with SQLite's answers. Do: a table with an
+    /// INTEGER column `q` holding stray REALs (2.5, f64::MAX twice, -0.0) and a REAL column `p`
+    /// holding whole-number REALs (stored as integers), halves, -0.0, both f64::MAX, the least
+    /// subnormal, 2^53 + 1 and i64's ends as integers (read as their nearest doubles), a text and
+    /// NULL; declared `COLUMNAR` and not, and on the pager's storage; each statement bound as
+    /// `bench/sqlite_answers_r10.py` binds it, one worker and then the
+    /// workers the switch picks, three runs each, under `RealSums::Serial`. Expect: every answer
+    /// bit for bit the one that script printed from SQLite 3.54.0, on both tables; the statements
+    /// handed to the copies, none skipped as `body`, and the copy reading some.
+    #[test]
+    fn r10_real_columns_reach_the_copies_with_sqlites_answers() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        // The pager's storage, whose scan hook reads the rows on morsels (`TableSource`).
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let paged_db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let paged = paged_db.connect(ConnectOpts::new()).unwrap();
+        for (c, declared) in [(&on, true), (&off, false), (&paged, false)] {
+            create(
+                c,
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, q INTEGER, p REAL)",
+                declared,
+            );
+            c.execute("INSERT INTO r SELECT value, value % 10, (value % 50) * 0.5 - 5.0 FROM generate_series(1, 600)")
+                .unwrap();
+            c.execute("INSERT INTO r VALUES (601, 7, -0.0), (602, 7, 1.7976931348623157e308), (603, 7, -1.7976931348623157e308), \
+                 (604, 7, 4.9406564584124654e-324), (605, 7, 9007199254740993), (606, 7, 9223372036854775807), \
+                 (607, 2.5, 1.0), (608, 1.7976931348623157e308, 2.0), (609, 1.7976931348623157e308, 3.0), \
+                 (610, NULL, NULL), (611, -9223372036854775808, -9223372036854775808), (612, 7, 'abc'), (613, -0.0, 4.0)")
+                .unwrap();
+        }
+        let sql = [
+            "SELECT COUNT(*) FROM r WHERE p < ?",
+            "SELECT COUNT(*) FROM r WHERE p >= ?",
+            "SELECT COUNT(*) FROM r WHERE p = ?",
+            "SELECT COUNT(*) FROM r WHERE ? <> p",
+            "SELECT COUNT(*) FROM r WHERE q = ? AND p < ?",
+            "SELECT SUM(q), COUNT(q), MIN(q), MAX(q) FROM r WHERE p > ?",
+            "SELECT SUM(q), COUNT(*) FROM r WHERE p < ?",
+        ];
+        let sqlite: Vec<(usize, Vec<Value>, &str)> = vec![
+            (0, vec![Value::from_i64(500)], "i608"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i608",
+            ),
+            (0, vec![Value::from_i64(0)], "i122"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i122",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i122",
+            ),
+            (0, vec![Value::from_i64(-5)], "i2"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i610",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i0",
+            ),
+            (0, vec![Value::from_i64(9007199254740992)], "i608"),
+            (0, vec![Value::from_i64(9007199254740993)], "i609"),
+            (0, vec![Value::from_i64(9223372036854775807)], "i609"),
+            (0, vec![Value::from_i64(i64::MIN)], "i1"),
+            (0, vec![Value::build_text("500")], "i608"),
+            (0, vec![Value::build_text("1e400")], "i611"),
+            (0, vec![Value::build_text("-0.0")], "i122"),
+            (0, vec![Value::build_text("abc")], "i611"),
+            (0, vec![Value::Null], "i0"),
+            (0, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i135",
+            ),
+            (1, vec![Value::from_i64(500)], "i4"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i4",
+            ),
+            (1, vec![Value::from_i64(0)], "i490"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i490",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i490",
+            ),
+            (1, vec![Value::from_i64(-5)], "i610"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i2",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i612",
+            ),
+            (1, vec![Value::from_i64(9007199254740992)], "i4"),
+            (1, vec![Value::from_i64(9007199254740993)], "i3"),
+            (1, vec![Value::from_i64(9223372036854775807)], "i3"),
+            (1, vec![Value::from_i64(i64::MIN)], "i611"),
+            (1, vec![Value::build_text("500")], "i4"),
+            (1, vec![Value::build_text("1e400")], "i1"),
+            (1, vec![Value::build_text("-0.0")], "i490"),
+            (1, vec![Value::build_text("abc")], "i1"),
+            (1, vec![Value::Null], "i0"),
+            (1, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i477",
+            ),
+            (2, vec![Value::from_i64(500)], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i0",
+            ),
+            (2, vec![Value::from_i64(0)], "i13"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i13",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i13",
+            ),
+            (2, vec![Value::from_i64(-5)], "i12"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i1",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i1",
+            ),
+            (2, vec![Value::from_i64(9007199254740992)], "i1"),
+            (2, vec![Value::from_i64(9007199254740993)], "i0"),
+            (2, vec![Value::from_i64(9223372036854775807)], "i0"),
+            (2, vec![Value::from_i64(i64::MIN)], "i1"),
+            (2, vec![Value::build_text("500")], "i0"),
+            (2, vec![Value::build_text("1e400")], "i0"),
+            (2, vec![Value::build_text("-0.0")], "i13"),
+            (2, vec![Value::build_text("abc")], "i1"),
+            (2, vec![Value::Null], "i0"),
+            (2, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i1",
+            ),
+            (3, vec![Value::from_i64(500)], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i612",
+            ),
+            (3, vec![Value::from_i64(0)], "i599"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i599",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i599",
+            ),
+            (3, vec![Value::from_i64(-5)], "i600"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i611",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i611",
+            ),
+            (3, vec![Value::from_i64(9007199254740992)], "i611"),
+            (3, vec![Value::from_i64(9007199254740993)], "i612"),
+            (3, vec![Value::from_i64(9223372036854775807)], "i612"),
+            (3, vec![Value::from_i64(i64::MIN)], "i611"),
+            (3, vec![Value::build_text("500")], "i612"),
+            (3, vec![Value::build_text("1e400")], "i612"),
+            (3, vec![Value::build_text("-0.0")], "i599"),
+            (3, vec![Value::build_text("abc")], "i611"),
+            (3, vec![Value::Null], "i0"),
+            (3, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i611",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(7),
+                    Value::from_f64(f64::from_bits(0x407f400000000000)),
+                ],
+                "i63",
+            ),
+            (4, vec![Value::from_i64(7), Value::from_i64(0)], "i13"),
+            (
+                4,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_i64(2),
+                ],
+                "i1",
+            ),
+            (
+                4,
+                vec![Value::from_i64(7), Value::build_text("1e400")],
+                "i66",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(0),
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                ],
+                "i12",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0xc000000000000000))],
+                "r7ff0000000000000,i526,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "r7ff0000000000000,i464,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "r7ff0000000000000,i439,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4004000000000000))],
+                "r7fefffffffffffff,i414,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4008000000000000))],
+                "i1936,i401,i0,i9",
+            ),
+            (5, vec![Value::Null], "n,i0,n,n"),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff0000000000000))],
+                "i-9223372036854775235,i148",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "rc3dfffffffffffff,i161",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0xc010000000000000))],
+                "i-9223372036854775789,i26",
+            ),
+        ];
+        let cell = |v: &Value| match v {
+            Value::Null => "n".to_string(),
+            Value::Numeric(Numeric::Integer(i)) => format!("i{i}"),
+            Value::Numeric(Numeric::Float(f)) => format!("r{:016x}", f64::from(*f).to_bits()),
+            Value::Text(t) => format!("t{}", t.as_str()),
+            Value::Blob(b) => format!("b{b:?}"),
+        };
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<String> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().map(cell).collect::<Vec<_>>().join(","));
+                Ok(())
+            })
+            .unwrap();
+            out.join(";")
+        };
+        for text in sql {
+            let hooked = rows(&on, &format!("EXPLAIN {text}")).iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            assert!(
+                hooked,
+                "{text}: the statement's program holds the copies' hook"
+            );
+        }
+        let before = copies(&on).counts();
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            on.set_parallel_mode(mode);
+            off.set_parallel_mode(mode);
+            paged.set_parallel_mode(mode);
+            for (at, params, answer) in &sqlite {
+                let text = sql[*at];
+                assert_eq!(
+                    bound(&paged, text, params),
+                    *answer,
+                    "the pager's storage, {mode:?}: {text} {params:?}"
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        bound(&on, text, params),
+                        *answer,
+                        "declared, {mode:?}: {text} {params:?}"
+                    );
+                    assert_eq!(
+                        bound(&off, text, params),
+                        *answer,
+                        "not declared, {mode:?}: {text} {params:?}"
+                    );
+                }
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(sqlite.len() * 3 * 2).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert!(after.copy > before.copy, "the copy read some");
+        eprintln!(
+            "== r10: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
+    }
+
+    /// Lane R11: S8's aggregates_range, a search by a rowid range between parameters, with
+    /// SQLite's answers, and the same ranges under statements the copy answers itself. Do: S8's
+    /// `items` columns the statements read, with rows at both ends of the rowids and NULLs among
+    /// the averaged ones; declared `COLUMNAR` and not, and on the pager's storage; each statement
+    /// bound as `bench/sqlite_answers_r10.py` binds it (ranges at and past both ends, one row,
+    /// empty, reversed; each bound an integer, a real, a numeric text, another text, a blob and
+    /// NULL), one worker and then the workers the switch picks, three runs each, under
+    /// `RealSums::Serial`. Expect: every answer bit for bit the one that script printed from
+    /// SQLite 3.54.0; every statement's program holding the copies' hook, every run handed to
+    /// them and none skipped as `body`; the copy reading the statements with no REAL to sum.
+    #[test]
+    fn r11_a_rowid_range_between_parameters_reaches_the_copies_with_sqlites_answers() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        // The pager's storage, whose scan hook reads the rows on morsels (`TableSource`).
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let paged_db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let paged = paged_db.connect(ConnectOpts::new()).unwrap();
+        for (c, declared) in [(&on, true), (&off, false), (&paged, false)] {
+            create(
+                c,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, price REAL NOT NULL, qty INTEGER, created INTEGER NOT NULL)",
+                declared,
+            );
+            c.execute("INSERT INTO items SELECT value, (value % 1000) * 1.25, CASE WHEN value % 97 = 0 THEN NULL ELSE value % 100 END, 1700000000 + value FROM generate_series(1, 3000)")
+                .unwrap();
+            c.execute("INSERT INTO items VALUES (-9223372036854775808, -0.0, 4503599627370496, -5), (9223372036854775807, 0.1, 7, 4611686018427387904)")
+                .unwrap();
+        }
+        let sql = [
+            "SELECT SUM(price), AVG(qty), MIN(created), MAX(created) FROM items WHERE id BETWEEN ? AND ?",
+            "SELECT AVG(qty), MIN(created), MAX(created), COUNT(*) FROM items WHERE id BETWEEN ? AND ?",
+            "SELECT COUNT(*), SUM(qty) FROM items WHERE id >= ? AND id < ?",
+            "SELECT COUNT(*), AVG(qty) FROM items WHERE id > ?",
+            "SELECT COUNT(*), MAX(created) FROM items WHERE id <= ?",
+        ];
+        let sqlite: Vec<(usize, Vec<Value>, &str)> = vec![
+            (
+                0,
+                vec![Value::from_i64(10), Value::from_i64(1009)],
+                "r41230dee00000000,r4048940a57eb5029,i1700000010,i1700001009",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1), Value::from_i64(3000)],
+                "r413c94e500000000,r4048bad40a57eb50,i1700000001,i1700003000",
+            ),
+            (
+                0,
+                vec![Value::from_i64(0), Value::from_i64(3001)],
+                "r413c94e500000000,r4048bad40a57eb50,i1700000001,i1700003000",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_i64(i64::MIN),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r413c94e51999999a,r42760d17c620b874,i-5,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_i64(3000), Value::from_i64(3000)],
+                "r0000000000000000,r0000000000000000,i1700003000,i1700003000",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1), Value::from_i64(1)],
+                "r3ff4000000000000,r3ff0000000000000,i1700000001,i1700000001",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1009), Value::from_i64(10)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(5000), Value::from_i64(6000)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_i64(9223372036854775807),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r3fb999999999999a,r401c000000000000,i4611686018427387904,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "r0000000000000000,r4330000000000000,i-5,i-5",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xbfe0000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r400e000000000000,r3ff8000000000000,i1700000001,i1700000002",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r4004000000000000,r4000000000000000,i1700000002,i1700000002",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_f64(f64::from_bits(0x400599999999999a)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e47e43c8800759c)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xfe37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                ],
+                "r413c94e51999999a,r42760d17c620b874,i-5,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4008000000000000)),
+                ],
+                "r401e000000000000,r4000000000000000,i1700000001,i1700000003",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x43e0000000000000)),
+                    Value::from_f64(f64::from_bits(0x43e158e460913d00)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xc3e158e460913d00)),
+                    Value::from_f64(f64::from_bits(0xc3e0000000000000)),
+                ],
+                "r0000000000000000,r4330000000000000,i-5,i-5",
+            ),
+            (
+                0,
+                vec![Value::build_text("10"), Value::build_text("1009")],
+                "r41230dee00000000,r4048940a57eb5029,i1700000010,i1700001009",
+            ),
+            (
+                0,
+                vec![Value::build_text(" 10 "), Value::build_text("20")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("9.5"), Value::build_text("20.5")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("1e1"), Value::build_text("2e1")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("1e400"), Value::from_i64(5)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::build_text("-1e400"), Value::build_text("3")],
+                "r401e000000000000,r4310000000000006,i-5,i1700000003",
+            ),
+            (
+                0,
+                vec![Value::build_text("abc"), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "r413c94acd999999a,r4048ca48f1ffa77f,i1700000010,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_blob(vec![1]), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(10), Value::from_blob(vec![1])],
+                "r413c94acd999999a,r4048ca48f1ffa77f,i1700000010,i4611686018427387904",
+            ),
+            (0, vec![Value::Null, Value::from_i64(20)], "n,n,n,n"),
+            (0, vec![Value::from_i64(10), Value::Null], "n,n,n,n"),
+            (
+                0,
+                vec![
+                    Value::from_i64(5),
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::build_text("12abc"), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::from_i64(1009)],
+                "r4048940a57eb5029,i1700000010,i1700001009,i1000",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1), Value::from_i64(3000)],
+                "r4048bad40a57eb50,i1700000001,i1700003000,i3000",
+            ),
+            (
+                1,
+                vec![Value::from_i64(0), Value::from_i64(3001)],
+                "r4048bad40a57eb50,i1700000001,i1700003000,i3000",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_i64(i64::MIN),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r42760d17c620b874,i-5,i4611686018427387904,i3002",
+            ),
+            (
+                1,
+                vec![Value::from_i64(3000), Value::from_i64(3000)],
+                "r0000000000000000,i1700003000,i1700003000,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1), Value::from_i64(1)],
+                "r3ff0000000000000,i1700000001,i1700000001,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1009), Value::from_i64(10)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(5000), Value::from_i64(6000)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_i64(9223372036854775807),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r401c000000000000,i4611686018427387904,i4611686018427387904,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "r4330000000000000,i-5,i-5,i1",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xbfe0000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r3ff8000000000000,i1700000001,i1700000002,i2",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r4000000000000000,i1700000002,i1700000002,i1",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_f64(f64::from_bits(0x400599999999999a)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e47e43c8800759c)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xfe37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                ],
+                "r42760d17c620b874,i-5,i4611686018427387904,i3002",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4008000000000000)),
+                ],
+                "r4000000000000000,i1700000001,i1700000003,i3",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x43e0000000000000)),
+                    Value::from_f64(f64::from_bits(0x43e158e460913d00)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xc3e158e460913d00)),
+                    Value::from_f64(f64::from_bits(0xc3e0000000000000)),
+                ],
+                "r4330000000000000,i-5,i-5,i1",
+            ),
+            (
+                1,
+                vec![Value::build_text("10"), Value::build_text("1009")],
+                "r4048940a57eb5029,i1700000010,i1700001009,i1000",
+            ),
+            (
+                1,
+                vec![Value::build_text(" 10 "), Value::build_text("20")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("9.5"), Value::build_text("20.5")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("1e1"), Value::build_text("2e1")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("1e400"), Value::from_i64(5)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::build_text("-1e400"), Value::build_text("3")],
+                "r4310000000000006,i-5,i1700000003,i4",
+            ),
+            (
+                1,
+                vec![Value::build_text("abc"), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "r4048ca48f1ffa77f,i1700000010,i4611686018427387904,i2992",
+            ),
+            (
+                1,
+                vec![Value::from_blob(vec![1]), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::from_blob(vec![1])],
+                "r4048ca48f1ffa77f,i1700000010,i4611686018427387904,i2992",
+            ),
+            (1, vec![Value::Null, Value::from_i64(20)], "n,n,n,i0"),
+            (1, vec![Value::from_i64(10), Value::Null], "n,n,n,i0"),
+            (
+                1,
+                vec![
+                    Value::from_i64(5),
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::build_text("12abc"), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                2,
+                vec![Value::from_i64(10), Value::from_i64(20)],
+                "i10,i145",
+            ),
+            (2, vec![Value::from_i64(10), Value::from_i64(10)], "i0,n"),
+            (
+                2,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4025000000000000)),
+                ],
+                "i1,i10",
+            ),
+            (
+                2,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "i0,n",
+            ),
+            (
+                2,
+                vec![Value::from_i64(2999), Value::from_i64(9223372036854775807)],
+                "i2,i99",
+            ),
+            (
+                2,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(-4)],
+                "i1,i4503599627370496",
+            ),
+            (
+                2,
+                vec![
+                    Value::build_text("10"),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "i11,i165",
+            ),
+            (
+                2,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "i2992,i146857",
+            ),
+            (3, vec![Value::from_i64(2999)], "i2,r400c000000000000"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x40a76f0000000000))],
+                "i2,r400c000000000000",
+            ),
+            (3, vec![Value::from_i64(3000)], "i1,r401c000000000000"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (
+                3,
+                vec![Value::from_i64(i64::MIN)],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (3, vec![Value::from_i64(9223372036854775807)], "i0,n"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x7e37e43c8800759c))],
+                "i0,n",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0xfe37e43c8800759c))],
+                "i3002,r42760d17c620b874",
+            ),
+            (3, vec![Value::build_text("2999")], "i2,r400c000000000000"),
+            (3, vec![Value::build_text("abc")], "i0,n"),
+            (3, vec![Value::from_blob(vec![0])], "i0,n"),
+            (3, vec![Value::Null], "i0,n"),
+            (4, vec![Value::from_i64(2999)], "i3000,i1700002999"),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x40a76f0000000000))],
+                "i3000,i1700002999",
+            ),
+            (4, vec![Value::from_i64(3000)], "i3001,i1700003000"),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "i1,i-5",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i1,i-5",
+            ),
+            (4, vec![Value::from_i64(i64::MIN)], "i1,i-5"),
+            (
+                4,
+                vec![Value::from_i64(9223372036854775807)],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x7e37e43c8800759c))],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0xfe37e43c8800759c))],
+                "i0,n",
+            ),
+            (4, vec![Value::build_text("2999")], "i3000,i1700002999"),
+            (
+                4,
+                vec![Value::build_text("abc")],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_blob(vec![0])],
+                "i3002,i4611686018427387904",
+            ),
+            (4, vec![Value::Null], "i0,n"),
+        ];
+        let cell = |v: &Value| match v {
+            Value::Null => "n".to_string(),
+            Value::Numeric(Numeric::Integer(i)) => format!("i{i}"),
+            Value::Numeric(Numeric::Float(f)) => format!("r{:016x}", f64::from(*f).to_bits()),
+            Value::Text(t) => format!("t{}", t.as_str()),
+            Value::Blob(b) => format!("b{b:?}"),
+        };
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<String> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().map(cell).collect::<Vec<_>>().join(","));
+                Ok(())
+            })
+            .unwrap();
+            out.join(";")
+        };
+        for text in sql {
+            let hooked = rows(&on, &format!("EXPLAIN {text}")).iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            assert!(
+                hooked,
+                "{text}: the statement's program holds the copies' hook"
+            );
+        }
+        let before = copies(&on).counts();
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            on.set_parallel_mode(mode);
+            off.set_parallel_mode(mode);
+            paged.set_parallel_mode(mode);
+            for (at, params, answer) in &sqlite {
+                let text = sql[*at];
+                assert_eq!(
+                    bound(&paged, text, params),
+                    *answer,
+                    "the pager's storage, {mode:?}: {text} {params:?}"
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        bound(&on, text, params),
+                        *answer,
+                        "declared, {mode:?}: {text} {params:?}"
+                    );
+                    assert_eq!(
+                        bound(&off, text, params),
+                        *answer,
+                        "not declared, {mode:?}: {text} {params:?}"
+                    );
+                }
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(sqlite.len() * 3 * 2).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert!(after.copy > before.copy, "the copy read some");
+        eprintln!(
+            "== r11: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
     }
 
     /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same
@@ -1176,9 +2603,8 @@ mod tests {
     fn cb4_statements_no_copy_can_answer_are_counted_with_their_reason() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 500);
         }
         let q = "SELECT count(*), sum(v) FROM t WHERE v < 700";
@@ -1237,8 +2663,7 @@ mod tests {
         let writer = db
             .connect(ConnectOpts::new().with_versioned_storage())
             .unwrap();
-        copies(&reader).set_on(true);
-        reader.execute(SCHEMA).unwrap();
+        create(&reader, SCHEMA, true);
         fill(&reader, 1, 2000);
         // Rent, buy (built after the statement's choice), then read.
         for _ in 0..3 {
@@ -1341,11 +2766,9 @@ mod tests {
     fn cs5_a_copy_behind_its_snapshot_is_never_read() {
         let (_a, on) = connect_in(refusing(super::super::columns::QUEUE));
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
         let q = "SELECT g, count(*), sum(v), max(s) FROM t GROUP BY g";
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 2000);
         }
         // Rent, buy (built after the statement's choice), then read.
@@ -1382,12 +2805,10 @@ mod tests {
     fn cs5_a_copy_its_memory_refuses_is_let_go_and_the_rows_answer() {
         let (_a, on) = connect_in(refusing(BLOCKS));
         let (_b, off) = connect();
-        copies(&on).set_on(true);
         copies(&on).set_rebuy(Rebuy::Rent);
-        copies(&off).set_on(false);
         let q = "SELECT g, count(*), sum(v) FROM t GROUP BY g";
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 2000);
         }
         for _ in 0..4 {
@@ -1414,10 +2835,8 @@ mod tests {
     fn cs5_sum_over_text_in_an_integer_column_answers_as_sqlite() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 3000);
             c.execute("INSERT INTO t VALUES (4001, 1, 'abc', 'x'), (4002, 2, x'01', 'y')")
                 .unwrap();
@@ -1448,14 +2867,52 @@ mod tests {
         );
     }
 
+    /// Lane R5 (one `ExactSum`): SQL under `RealSums::Exact` on a versioned storage, its column
+    /// copies switched on and off. Do: per group, R1's bigpairs, a sum that overflows and comes
+    /// back, and an infinity beside finite values that overflow the other way. Expect +inf, 1.5
+    /// and +inf from both. (The copy declines these statements, r1735: the scan's own sum is
+    /// held by `r5_the_copys_sum_stays_exact_past_the_range`.)
+    #[test]
+    fn r5_versioned_exact_sums_stay_exact_past_the_range() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            c.set_real_sums(crate::RealSums::Exact);
+            create(
+                c,
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, g INTEGER, x REAL)",
+                declared,
+            );
+            c.execute(
+                "INSERT INTO r VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 1, -1e308), \
+                 (4, 1, -1e308), (5, 1, 1e308), (6, 1, 1e308), (7, 2, 1e308), (8, 2, 1e308), \
+                 (9, 2, -1e308), (10, 2, -1e308), (11, 2, 1.5), (12, 3, 9e999), \
+                 (13, 3, -1e308), (14, 3, -1e308)",
+            )
+            .unwrap();
+            c.execute("INSERT INTO r SELECT value + 100, 0, 0.0 FROM generate_series(1, 3000)")
+                .unwrap();
+        }
+        let q = "SELECT g, sum(x) FROM r GROUP BY g";
+        let want = vec![
+            vec![Value::from_i64(0), Value::from_f64(0.0)],
+            vec![Value::from_i64(1), Value::from_f64(f64::INFINITY)],
+            vec![Value::from_i64(2), Value::from_f64(1.5)],
+            vec![Value::from_i64(3), Value::from_f64(f64::INFINITY)],
+        ];
+        for _ in 0..3 {
+            assert_eq!(rows(&on, q), want, "copies on");
+            assert_eq!(rows(&off, q), want, "copies off");
+        }
+    }
+
     use crate::storage::versioned::memory::Capped;
 
     /// The bytes granted the generation of a copy of `t` filled with rows 1 to `n`, with room to
     /// spare: what the tests size their room by.
     fn need(n: i64) -> u64 {
         let (_a, c) = connect();
-        copies(&c).set_on(true);
-        c.execute(SCHEMA).unwrap();
+        create(&c, SCHEMA, true);
         fill(&c, 1, n);
         for _ in 0..3 {
             rows(&c, QUERIES[2]);
@@ -1469,9 +2926,8 @@ mod tests {
         let room = Arc::new(Capped::new(u64::MAX / 2));
         let shared: Arc<dyn Source> = room.clone();
         let (db, on) = connect_in(Some(shared));
-        copies(&on).set_on(true);
         copies(&on).set_rebuy(rebuy);
-        on.execute(SCHEMA).unwrap();
+        create(&on, SCHEMA, true);
         fill(&on, 1, n);
         (db, on, room)
     }
@@ -1493,9 +2949,7 @@ mod tests {
     }
 
     fn plain() -> (Arc<Database>, Arc<crate::Connection>) {
-        let (db, off) = connect();
-        copies(&off).set_on(false);
-        (db, off)
+        connect()
     }
 
     /// T-CB.1.3: a copy with room for it, then one with half the room it needs, through writes,
@@ -1690,11 +3144,10 @@ mod tests {
             let shared: Arc<dyn Source> = room.clone();
             let (_a, on) = connect_in(Some(shared));
             let (_b, off) = plain();
-            copies(&on).set_on(true);
             copies(&on).set_rebuy(rebuy);
-            for c in [&on, &off] {
+            for (c, declared) in [(&on, true), (&off, false)] {
                 for i in 0..s.tables {
-                    c.execute(schema(i)).unwrap();
+                    create(c, &schema(i), declared);
                     c.execute(fill_sql(i, 1, s.rows)).unwrap();
                 }
             }
@@ -1875,7 +3328,7 @@ mod tests {
         fn cb4_ab_both_rebuy_policies_at_the_extremes() {
             let k = scale();
             let mut out = Vec::new();
-            for s in scenarios(k) {
+            for s in scenarios(k).expect("the scenarios at this scale") {
                 let need = need_of(s.rows);
                 for rebuy in [Rebuy::Rent, Rebuy::Room] {
                     let traces = Traces::default();

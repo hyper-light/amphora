@@ -5,9 +5,12 @@
 //! refused round after round. Once one of a member's writes is refused at the leader's append,
 //! that member is queued, and its next barrier (its ReadIndex) waits at the leader for its slot.
 //! While it holds the slot, the leader appends nothing of its own and holds the other members'
-//! forwards, until the member's next forward arrives or the slot's learned length passes. A member
-//! that never comes back never holds the leader. A pure core: the owner tells it what the leader
-//! appends, receives and measures, and asks it what to hold and what to step.
+//! forwards, until the member's next forward or its close (a barrier marked a read's) arrives. A
+//! live holder's slot ends by those alone; by time only when the host's detector suspects the
+//! holder (`keep`), or at the deadline its write's barrier stated, which bounds a lost forward
+//! (CP-T1.8, lane V14). A member that never comes back never holds the leader. A pure core: the
+//! owner tells it what the leader appends, receives and measures, and asks it what to hold and
+//! what to step.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -15,8 +18,9 @@ use std::time::{Duration, Instant};
 use crate::meter::SlotEnd;
 
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
-/// any of its retries is measured. A learned gap is believed for one to two of its member's
-/// generations, each as long as the member went between its last two learned gaps, the first
+/// any of its retries is measured and its shortest after (lane V13). A learned gap is believed
+/// for one to two of its member's generations, each as long as the member went between its last
+/// two learned gaps, the first
 /// counted from its first slot (replication.md, "Decision (lane constants): generations learned
 /// where they run"). No ceiling bounds a gap by a number: a member is gone, not slow, when the
 /// host's detector suspects it while its retry is awaited (`keep`), a verdict learned where it
@@ -64,7 +68,8 @@ struct Holding {
 /// One member's retries as the leader measured them: the longest gap from a slot's start to its
 /// next forward in this generation and in the one before, and the start of the slot it is
 /// waiting on, if any. A slot that expired keeps waiting, so a late retry still teaches the next,
-/// unless the host's detector suspected the member while it waited (`suspected`).
+/// unless the host's detector suspected the member while it waited (`suspected`), and a late
+/// second barrier is still its close (`Slots::ask`).
 struct Gap {
     member: u64,
     current: Option<Duration>,
@@ -87,8 +92,9 @@ pub(super) struct Slots<T> {
     term: Option<u64>,
     // Members a refusal queued, whose next barrier has not come yet.
     queue: VecDeque<u64>,
-    // Queued members' barriers, in arrival order, each waiting for its member's slot.
-    waiting: VecDeque<(u64, T)>,
+    // Queued members' barriers, in arrival order, each waiting for its member's slot, with the
+    // end of the write it stated, on this leader's clock (`read`).
+    waiting: VecDeque<(u64, T, Option<Instant>)>,
     holding: Option<Holding>,
     // The leader's own turn is owed: one preparation of its own between two slots.
     turn: bool,
@@ -128,7 +134,11 @@ impl<T> Slots<T> {
         }
         self.term = term;
         let ended = self.end(at, SlotEnd::Released);
-        self.ready.extend(self.waiting.drain(..));
+        self.ready.extend(
+            self.waiting
+                .drain(..)
+                .map(|(member, barrier, _)| (member, barrier)),
+        );
         self.queue.clear();
         self.turn = false;
         for gap in &mut self.gaps {
@@ -149,11 +159,11 @@ impl<T> Slots<T> {
         let kept = |queued: u64| member(queued) && !suspected(queued);
         self.queue.retain(|queued| kept(*queued));
         let mut index = 0;
-        while let Some((queued, _)) = self.waiting.get(index) {
+        while let Some((queued, _, _)) = self.waiting.get(index) {
             if kept(*queued) {
                 index = index.saturating_add(1);
-            } else if let Some(gone) = self.waiting.remove(index) {
-                self.ready.push_back(gone);
+            } else if let Some((gone, barrier, _)) = self.waiting.remove(index) {
+                self.ready.push_back((gone, barrier));
             }
         }
         self.gaps.retain(|gap| member(gap.member));
@@ -180,11 +190,33 @@ impl<T> Slots<T> {
         }
     }
 
-    /// `member`'s barrier (its ReadIndex) at `at`. A queued member's waits for its slot. The
-    /// holder's second barrier before any forward means its slot's work was no write (a read, or
-    /// a write that prepared nothing), so its slot ends released and the barrier steps. Anything
-    /// else steps now.
-    pub(super) fn read(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
+    /// `member`'s barrier asks for a slot before its first try (CP-T1.8, lane V8): it joins the
+    /// queue's tail unless a slot begun for it still waits for its close (`Gap::from`), held or
+    /// ended first (its length passed, or a release). That barrier is the close (`Slots::read`):
+    /// a slot no work would end never begins for it (replication.md, "the write slot"; lane P14).
+    pub(super) fn ask(&mut self, member: u64) {
+        if self
+            .gaps
+            .iter()
+            .any(|gap| gap.member == member && gap.from.is_some())
+        {
+            return;
+        }
+        self.refused(member);
+    }
+
+    /// `member`'s barrier (its ReadIndex) at `at`, its write ending `stated` after it, if the
+    /// barrier says (CP-T1.8, lane V14). A queued member's waits for its slot. A second barrier
+    /// before any forward means its slot's work was no write (a read, or a write that prepared
+    /// nothing): it ends the slot released if still held, ends nothing if the slot ended first,
+    /// since a slot ends once, and steps. Anything else steps now.
+    pub(super) fn read(
+        &mut self,
+        member: u64,
+        at: Instant,
+        message: T,
+        stated: Option<Duration>,
+    ) -> Taken<T> {
         if self.term.is_none() {
             return Taken {
                 step: Some(message),
@@ -196,30 +228,39 @@ impl<T> Slots<T> {
             self.queue.remove(position);
             // A barrier from a member whose last still waits is a new operation (its owner
             // makes one at a time): the older steps, the newer waits in its place.
-            if let Some(position) = self.waiting.iter().position(|(m, _)| *m == member)
-                && let Some(older) = self.waiting.remove(position)
+            if let Some(position) = self.waiting.iter().position(|(m, _, _)| *m == member)
+                && let Some((older, barrier, _)) = self.waiting.remove(position)
             {
-                self.ready.push_back(older);
+                self.ready.push_back((older, barrier));
             }
-            self.waiting.push_back((member, message));
+            let deadline = stated.and_then(|stated| at.checked_add(stated));
+            self.waiting.push_back((member, message, deadline));
             return Taken {
                 step: None,
                 ended: None,
                 unmeasured: None,
             };
         }
-        let ended = if self
-            .holding
-            .as_ref()
-            .is_some_and(|holding| holding.member == member)
+        let ended = self.released(member, at);
+        Taken {
+            step: Some(message),
+            ended,
+            unmeasured: None,
+        }
+    }
+
+    /// `member`'s barrier at `at` for work that writes nothing: a read, or the end of a write that
+    /// forwarded nothing (CP-T1.8, lane V11). It asks for no slot and steps now. A slot `member`
+    /// holds ends released, and its older barrier still waiting steps, its operation over (its
+    /// owner makes one at a time, and its link delivers in order, as `read` takes it). A queue
+    /// entry a refusal left waits for the member's next write.
+    pub(super) fn pass(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
+        if let Some(position) = self.waiting.iter().position(|(m, _, _)| *m == member)
+            && let Some((older, barrier, _)) = self.waiting.remove(position)
         {
-            if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
-                gap.from = None;
-            }
-            self.end(at, SlotEnd::Released)
-        } else {
-            None
-        };
+            self.ready.push_back((older, barrier));
+        }
+        let ended = self.released(member, at);
         Taken {
             step: Some(message),
             ended,
@@ -231,7 +272,11 @@ impl<T> Slots<T> {
     /// being `last` and its commit `commit`, unless a slot is held, or the leader's own turn is
     /// owed and `own` (it has a write to prepare). The barrier steps once the commit reaches
     /// `last`, so the member's retry prepares on every entry before the slot (amphora-seam-owner-
-    /// 2's ruling, Q2 b). Returns whose slot began and its length.
+    /// 2's ruling, Q2 b). A turn the leader has no write for passes only to a slot that begins:
+    /// with no barrier waiting it stays owed, so the leader's next write still prepares behind
+    /// the holder's entry, and only the forwards it held go (CP-T1.8, lane V13). The slot ends by
+    /// time at the end its holder's barrier stated; a barrier that stated none (a member before
+    /// lane V14) ends it at its learned length. Returns whose slot began and how long it holds.
     pub(super) fn start(
         &mut self,
         at: Instant,
@@ -246,12 +291,15 @@ impl<T> Slots<T> {
             if own {
                 return None;
             }
+            if self.waiting.is_empty() {
+                self.ready.extend(self.forwards.drain(..));
+                return None;
+            }
             self.took_turn();
         }
-        let (member, barrier) = self.waiting.pop_front()?;
-        let length = self.length(member);
-        let Some(until) = at.checked_add(length) else {
-            self.waiting.push_front((member, barrier));
+        let (member, barrier, deadline) = self.waiting.pop_front()?;
+        let Some(until) = deadline.or_else(|| at.checked_add(self.length(member))) else {
+            self.waiting.push_front((member, barrier, deadline));
             return None;
         };
         self.holding = Some(Holding {
@@ -281,11 +329,14 @@ impl<T> Slots<T> {
                 generation: None,
             }),
         }
-        Some((member, length))
+        Some((member, until.saturating_duration_since(at)))
     }
 
-    /// The length of `member`'s next slot: the longest gap it took to retry in this generation
-    /// and the one before, or the election timeout while none is measured.
+    /// The length of `member`'s next slot when its barrier states no deadline: the core's
+    /// election timeout, or the longest gap it took to retry in this generation and the one
+    /// before when that is longer. A learned gap is an estimate a live holder's next retry
+    /// outruns, and the leader then appends first and refuses it. At 32 spread writers that ended
+    /// 37 to 47 slots a run, a stale refusal each (CP-T1.8, lane V13's trace, r1814).
     pub(super) fn length(&self, member: u64) -> Duration {
         self.gaps
             .iter()
@@ -296,7 +347,9 @@ impl<T> Slots<T> {
                     Some(current.unwrap_or_default().max(before.unwrap_or_default()))
                 }
             })
-            .unwrap_or(self.bounds.election)
+            .map_or(self.bounds.election, |learned| {
+                learned.max(self.bounds.election)
+            })
     }
 
     /// Whether the leader appends nothing of its own now.
@@ -321,7 +374,11 @@ impl<T> Slots<T> {
     pub(super) fn release(&mut self, at: Instant) -> Option<Ended> {
         let ended = self.end(at, SlotEnd::Released);
         self.took_turn();
-        self.ready.extend(self.waiting.drain(..));
+        self.ready.extend(
+            self.waiting
+                .drain(..)
+                .map(|(member, barrier, _)| (member, barrier)),
+        );
         self.queue.clear();
         ended
     }
@@ -421,6 +478,12 @@ impl<T> Slots<T> {
         self.read.is_some()
     }
 
+    /// The member whose slot is held: a test's view.
+    #[cfg(test)]
+    pub(super) fn holder(&self) -> Option<u64> {
+        self.holding.as_ref().map(|holding| holding.member)
+    }
+
     /// The next held message an end released, with its sender, in the order they arrived.
     pub(super) fn ready(&mut self) -> Option<(u64, T)> {
         self.ready.pop_front()
@@ -449,6 +512,23 @@ impl<T> Slots<T> {
         }
         gap.learned = at;
         Ok(())
+    }
+
+    /// `member`'s barrier, marked a read's or not, closes a slot begun for it, held or ended
+    /// first (lane P14), so its next write's barrier asks for a slot again (lane P16); a slot it
+    /// still holds ends released at `at`: its work was no write.
+    fn released(&mut self, member: u64, at: Instant) -> Option<Ended> {
+        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
+            gap.from = None;
+        }
+        if !self
+            .holding
+            .as_ref()
+            .is_some_and(|holding| holding.member == member)
+        {
+            return None;
+        }
+        self.end(at, SlotEnd::Released)
     }
 
     fn end(&mut self, at: Instant, how: SlotEnd) -> Option<Ended> {
@@ -485,7 +565,7 @@ mod tests {
     }
     /// `member`'s barrier, queued: it waits.
     fn waits(slots: &mut Slots<&'static str>, member: u64, at: Instant) {
-        assert!(slots.read(member, at, "barrier").step.is_none());
+        assert!(slots.read(member, at, "barrier", None).step.is_none());
     }
 
     /// T-T1.8.W4 (AC-T1.8.W1): do refuse member 2, then take its barrier; expect it waiting, its
@@ -516,7 +596,118 @@ mod tests {
         );
         assert!(!slots.holds());
         assert_eq!(drained(&mut slots), vec![(3, "three")]);
-        assert_eq!(slots.length(2), 5 * MS);
+        assert_eq!(
+            slots.length(2),
+            BOUNDS.election,
+            "a gap shorter than the election timeout shortened the slot"
+        );
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V13): a slot ends by time only past the core's election timeout,
+    /// never at a learned gap shorter than it. Lane V13's trace (r1814, 32 spread writers, both
+    /// classes) found 148 of 155 stale forwards were a live holder's whose slot ended at its
+    /// learned length (the longest of its last one or two gaps) while its forward was on its way;
+    /// the leader then appended first. Do: member 2 retries 5 ms into its first slot, then takes
+    /// its next, and 6 ms pass. Expect: the slot still held, and the holder's forward stepped,
+    /// ending it forwarded.
+    #[test]
+    fn a_slot_outlasts_a_learned_gap_shorter_than_the_election_timeout() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        slots.start(t, 1, 1, false);
+        drained(&mut slots);
+        slots.forward(2, t + 5 * MS, "first");
+        slots.took_turn();
+        let next = t + 10 * MS;
+        slots.ask(2);
+        waits(&mut slots, 2, next);
+        assert_eq!(slots.start(next, 2, 2, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        assert_eq!(
+            slots.expire(next + 6 * MS),
+            None,
+            "the live holder's slot ended at its learned 5 ms"
+        );
+        assert!(slots.holds());
+        let retry = slots.forward(2, next + 30 * MS, "second");
+        assert_eq!(retry.step, Some("second"));
+        assert_eq!(retry.ended.map(|e| e.how), Some(SlotEnd::Forwarded));
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V14): a live holder's slot ends by its forward, never by time
+    /// before the end its barrier stated. On real time the core's election timeout follows the
+    /// owner's pace, 28 to 49 ms in lane V13's r1942, and a holder answering heartbeats while its
+    /// forward is slow outlasted it. Do: member 2's barrier states 10 s at a 30 ms election
+    /// timeout, then 6 election timeouts pass, then its forward comes; then its next barrier
+    /// states 500 ms and no forward comes. Expect: the first slot held through, ended forwarded;
+    /// the second held at 500 ms and ended expired just past it, the lost forward's bound.
+    #[test]
+    fn a_live_holders_slot_ends_by_its_forward_or_its_stated_deadline_not_the_election_timeout() {
+        let t = Instant::now();
+        let election = 30 * MS;
+        let mut slots = Slots::new(Bounds { election });
+        slots.lead(Some(7), t);
+        slots.ask(2);
+        let asked = slots.read(2, t, "barrier", Some(Duration::from_secs(10)));
+        assert!(asked.step.is_none());
+        assert_eq!(
+            slots.start(t, 1, 1, false),
+            Some((2, Duration::from_secs(10)))
+        );
+        drained(&mut slots);
+        assert_eq!(
+            slots.expire(t + 6 * election),
+            None,
+            "a live holder's slot ended at the election timeout"
+        );
+        let retry = slots.forward(2, t + 6 * election + MS, "write");
+        assert_eq!(retry.step, Some("write"));
+        assert_eq!(retry.ended.map(|e| e.how), Some(SlotEnd::Forwarded));
+        slots.took_turn();
+        let next = t + Duration::from_secs(1);
+        slots.ask(2);
+        slots.read(2, next, "barrier", Some(500 * MS));
+        assert_eq!(slots.start(next, 2, 2, false), Some((2, 500 * MS)));
+        assert_eq!(
+            slots.expire(next + 500 * MS),
+            None,
+            "at its deadline it holds"
+        );
+        let lost = slots.expire(next + 500 * MS + Duration::from_nanos(1));
+        assert_eq!(lost.map(|e| e.how), Some(SlotEnd::Expired));
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V14): a holder that dies with its forward unsent holds the leader
+    /// only until the host's detector suspects it. Do: member 2's barrier states 10 s, member 3's
+    /// forward is held, 10 election timeouts pass, then the detector suspects member 2. Expect:
+    /// the slot held until the verdict, then ended released, member 3's forward ready and the
+    /// leader's turn owed.
+    #[test]
+    fn a_dead_holders_slot_ends_when_the_detector_suspects_it() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        slots.read(2, t, "barrier", Some(Duration::from_secs(10)));
+        slots.start(t, 1, 1, false);
+        drained(&mut slots);
+        assert!(slots.forward(3, t + MS, "three").step.is_none());
+        let late = t + 10 * BOUNDS.election;
+        assert_eq!(slots.expire(late), None);
+        assert_eq!(slots.keep(late, |_| true, |_| false), None);
+        assert!(slots.holds(), "the slot ended with no verdict");
+        let ended = slots.keep(late, |_| true, |member| member == 2);
+        assert_eq!(
+            ended,
+            Some(Ended {
+                member: 2,
+                how: SlotEnd::Released,
+                held: 10 * BOUNDS.election
+            })
+        );
+        assert_eq!(drained(&mut slots), vec![(3, "three")]);
+        assert!(slots.turn());
     }
 
     /// T-T1.8.W4: do refuse a member that never comes back; expect no slot, and another member's
@@ -527,8 +718,48 @@ mod tests {
         let mut slots = leading(t);
         slots.refused(2);
         assert_eq!(slots.start(t, 1, 1, false), None);
-        assert_eq!(slots.read(3, t, "other").step, Some("other"));
+        assert_eq!(slots.read(3, t, "other", None).step, Some("other"));
         assert_eq!(slots.forward(3, t, "write").step, Some("write"));
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V11): a barrier for work that writes nothing asks for no slot. Do:
+    /// member 3 holds a slot and member 2's write barrier waits; then read barriers from member
+    /// 2, from member 4 (queued by a refusal), and from member 3. Expect: each steps at once;
+    /// member 2's older barrier steps with its read, and no slot begins for member 2; member 3's
+    /// ends its slot released; member 4 stays queued, its next write's barrier waiting.
+    #[test]
+    fn a_read_barrier_asks_for_no_slot_and_ends_its_members_own() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(3);
+        waits(&mut slots, 3, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(3));
+        assert_eq!(drained(&mut slots), vec![(3, "barrier")]);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        let read = slots.pass(2, t + MS, "read");
+        assert_eq!(read.step, Some("read"));
+        assert!(read.ended.is_none());
+        assert_eq!(drained(&mut slots), vec![(2, "barrier")]);
+        slots.refused(4);
+        assert_eq!(slots.pass(4, t + MS, "four").step, Some("four"));
+        assert!(slots.holds(), "another member's read ended member 3's slot");
+        let own = slots.pass(3, t + 2 * MS, "end");
+        assert_eq!(own.step, Some("end"));
+        assert_eq!(
+            own.ended,
+            Some(Ended {
+                member: 3,
+                how: SlotEnd::Released,
+                held: 2 * MS
+            })
+        );
+        waits(&mut slots, 4, t + 3 * MS);
+        assert_eq!(
+            slots.start(t + 3 * MS, 1, 1, false).map(|(m, _)| m),
+            Some(4),
+            "a slot began for member 2's read"
+        );
     }
 
     /// T-T1.8.W4: do refuse members 2 and 3 and take both barriers; expect one slot each, in the
@@ -566,7 +797,9 @@ mod tests {
     /// T-T1.8.W4 (amphora-owner-t1-g-slot-878285a-20261111): do end member 2's slot, then forward
     /// from member 3 in the leader's turn; expect 3's forward held through the turn, ready once
     /// the leader's own write is appended, and held again only by a slot; and a turn the leader
-    /// has no write for given up at the next start, its holds ready.
+    /// has no write for, with no barrier waiting, still owed at the next start, its holds ready
+    /// (CP-T1.8, lane V13: a turn given up while the holder's entry was uncommitted let the
+    /// leader's next write prepare behind it, refused stale at apply in r1814's trace).
     #[test]
     fn forwards_wait_through_the_leaders_turn() {
         let t = Instant::now();
@@ -593,8 +826,19 @@ mod tests {
         slots.forward(2, t, "two");
         slots.forward(3, t, "three");
         assert_eq!(slots.start(t, 3, 3, false), None, "nothing waits");
-        assert!(!slots.turn(), "a turn with no write is given up");
+        assert!(
+            slots.turn(),
+            "a turn with no write was given up with nothing waiting"
+        );
         assert_eq!(drained(&mut slots), vec![(3, "three")]);
+        slots.ask(4);
+        waits(&mut slots, 4, t);
+        assert_eq!(
+            slots.start(t, 4, 4, false).map(|(m, _)| m),
+            Some(4),
+            "a waiting barrier takes the turn the leader has no write for"
+        );
+        assert!(!slots.turn());
     }
 
     /// T-T1.8.W4 (amphora-seam-owner-2, Q1 a): do forward twice from member 3 during member 2's
@@ -627,7 +871,7 @@ mod tests {
         waits(&mut slots, 2, t);
         slots.start(t, 1, 1, false);
         drained(&mut slots);
-        let again = slots.read(2, t + 3 * MS, "next");
+        let again = slots.read(2, t + 3 * MS, "next", None);
         assert_eq!(again.step, Some("next"));
         assert_eq!(
             again.ended.map(|e| (e.member, e.how)),
@@ -660,6 +904,67 @@ mod tests {
             "held through the leader's turn after the slot"
         );
         assert_eq!(slots.length(2), 300 * MS);
+    }
+
+    /// T-T1.8.W4 (CP-T1.13, lane P14): do let member 2's slot pass its length while member 3's
+    /// barrier waits, then take 2's late second barrier as the owner takes every barrier (`ask`,
+    /// then `read`); expect it stepped, ending nothing, 3's slot begun next and none for 2, and
+    /// once 3's ends, no slot held and none begun: a slot ends once, and its close asks nothing.
+    #[test]
+    fn a_late_second_barrier_after_its_slot_expired_begins_no_slot() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        slots.ask(3);
+        waits(&mut slots, 3, t + MS);
+        let expired = slots.expire(t + BOUNDS.election + MS).unwrap();
+        assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
+        let late = t + 300 * MS;
+        slots.ask(2);
+        let close = slots.read(2, late, "close", None);
+        assert_eq!(close.step, Some("close"));
+        assert_eq!(close.ended, None, "its slot ended already");
+        assert_eq!(slots.start(late, 1, 1, false).map(|(m, _)| m), Some(3));
+        drained(&mut slots);
+        slots.forward(3, late + MS, "three");
+        assert_eq!(
+            slots.start(late + MS, 2, 2, false),
+            None,
+            "none for the late close"
+        );
+        assert!(!slots.holds());
+        assert_eq!(slots.length(2), BOUNDS.election, "a close teaches no gap");
+    }
+
+    /// T-T1.8.W4 (CP-T1.13, lane P16): do let member 2's slot pass its length, then take its late
+    /// close marked a read's (`pass`: its write forwarded nothing, lane V11), then its next
+    /// write's barrier as the owner takes it (`ask`, then `read`); expect the close stepped,
+    /// ending nothing, and the next write's barrier waiting for a slot of its own, which begins:
+    /// a marked close closes the slot as an unmarked one does.
+    #[test]
+    fn a_late_marked_close_after_its_slot_expired_leaves_the_next_write_its_slot() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        let expired = slots.expire(t + BOUNDS.election + MS).unwrap();
+        assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
+        let late = t + 300 * MS;
+        let close = slots.pass(2, late, "close");
+        assert_eq!(close.step, Some("close"));
+        assert_eq!(close.ended, None, "its slot ended already");
+        slots.ask(2);
+        assert_eq!(
+            slots.read(2, late + MS, "next", None).step,
+            None,
+            "the next write stepped without a slot"
+        );
+        assert_eq!(slots.start(late + MS, 1, 1, false).map(|(m, _)| m), Some(2));
     }
 
     /// T-T1.8.W4 (Q3): do let the host's detector suspect a member while its retry is awaited,
@@ -701,9 +1006,10 @@ mod tests {
         assert_eq!(slots.length(2), 5 * BOUNDS.election);
     }
 
-    /// T-T1.8.W4 (Q3), T-GN.1.2: do learn a gap 40 ms after the member's first slot began, then
-    /// let time pass with none; expect it believed through the next generation, as long as the
-    /// member took to its first gap (40 ms), and forgotten after it, back to the election timeout.
+    /// T-T1.8.W4 (Q3), T-GN.1.2: do learn a gap 400 ms after the member's first slot began (past
+    /// the election timeout, which a slot never ends before), then let time pass with none;
+    /// expect it believed through the next generation, as long as the member took to its first
+    /// gap (400 ms), and forgotten after it, back to the election timeout.
     #[test]
     fn a_learned_gap_is_believed_for_one_to_two_of_its_members_generations() {
         let t = Instant::now();
@@ -712,13 +1018,13 @@ mod tests {
         slots.refused(2);
         waits(&mut slots, 2, t);
         slots.start(t, 1, 1, false);
-        slots.forward(2, t + 40 * MS, "two");
-        assert_eq!(slots.length(2), 40 * MS);
-        slots.expire(t + 40 * MS);
-        assert_eq!(slots.length(2), 40 * MS, "believed in the next generation");
-        slots.expire(t + 79 * MS);
-        assert_eq!(slots.length(2), 40 * MS, "believed through it");
-        slots.expire(t + 80 * MS);
+        slots.forward(2, t + 400 * MS, "two");
+        assert_eq!(slots.length(2), 400 * MS);
+        slots.expire(t + 400 * MS);
+        assert_eq!(slots.length(2), 400 * MS, "believed in the next generation");
+        slots.expire(t + 799 * MS);
+        assert_eq!(slots.length(2), 400 * MS, "believed through it");
+        slots.expire(t + 800 * MS);
         assert_eq!(slots.length(2), BOUNDS.election, "forgotten after it");
     }
 
@@ -740,13 +1046,13 @@ mod tests {
         assert_eq!((ended.member, ended.how), (2, SlotEnd::Released));
         assert_eq!(drained(&mut slots), vec![(4, "four"), (3, "barrier")]);
         assert_eq!(
-            slots.read(2, t, "free").step,
+            slots.read(2, t, "free", None).step,
             Some("free"),
             "no slot without a term"
         );
         slots.lead(Some(8), t);
         assert_eq!(
-            slots.read(2, t, "free").step,
+            slots.read(2, t, "free", None).step,
             Some("free"),
             "the queue went with the term"
         );

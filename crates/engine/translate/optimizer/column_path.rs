@@ -3,8 +3,10 @@
 //! statements to the copy, point reads to the rows, by measured cost [c95]).
 //!
 //! Every cost here is nanoseconds, measured where the engine runs, never a picked weight:
-//! - the row path's: a row's visit and a seek, the database's learned rates
-//!   (`learned_costs::LearnedCosts::nanos_per`, calibrated at start and moved by its operators);
+//! - the row path's: a row's visit and a seek. For SQL's aggregates the row's visit is the
+//!   table's own, measured as the copy's is: the time the engine's serial loop took per row of the
+//!   table for the statements the copies handed it (`storage::versioned::columns_sql`, lane R6).
+//!   The seek is the database's learned rate (`learned_costs::LearnedCosts::nanos_per`);
 //! - the copy's: its own measured scan time per row at the block size it is cut at
 //!   (`storage::versioned::columns::Columns::plan_view`), which already carries what its deltas
 //!   cost, and the keys its queue holds at the statement's snapshot, each read from the rows (a
@@ -20,18 +22,10 @@
 //! (`Columns::scan`); once G11 step 4's vectorized scan lands, the rows of the granules its
 //! summaries keep, which the caller passes as [`CopyView::reads`] with nothing else here changing.
 //!
-//! Behind a switch: [`asked`], `AMPHORA_COLUMN_PATH=on`. SQL's aggregates reach it through the
-//! storage's reader (`storage::versioned::columns_path`) for the SQL tables that keep a copy
-//! (`storage::versioned::columns_sql`).
+//! SQL's aggregates reach it through the storage's reader (`storage::versioned::columns_path`) for
+//! the SQL tables that keep a copy, those declared `COLUMNAR` (`storage::versioned::columns_sql`;
+//! `docs/design/columnar.md`, decision 1, item 1).
 #![cfg_attr(not(test), allow(dead_code))]
-
-/// The environment variable that turns the copy's access path on: `on`.
-pub const ENV: &str = "AMPHORA_COLUMN_PATH";
-
-/// Whether the environment turns the copy's access path on.
-pub fn asked() -> bool {
-    std::env::var(ENV).is_ok_and(|v| v == "on")
-}
 
 /// What the statement asks of one table.
 #[derive(Debug, Clone, Copy, PartialEq)]

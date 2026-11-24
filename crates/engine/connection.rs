@@ -236,6 +236,22 @@ pub enum OuterJoinProbe {
     Kept = 1,
 }
 
+/// Amphora (audit 3, lane G8): how SUM, AVG and TOTAL add REALs (`Connection::set_real_sums`), the
+/// two designs Ada decides between by their A/B kept beside today's. Read when a statement runs.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum RealSums {
+    /// Today's, the default: SQLite's compensated sum (Kahan-Babuska-Neumaier) in row order, on
+    /// the serial loop only; a statement whose workers meet a REAL to sum goes back to it.
+    Serial = 0,
+    /// Arm (b): every path sums exactly and rounds once (`morsel::ExactSum`), the serial loop
+    /// included, so the workers' answer is the serial loop's at any worker count.
+    Exact = 1,
+    /// Arm (a), lane G9: the workers keep each SUM, AVG and TOTAL input with its row's position,
+    /// and the serial loop's own steps fold them in row order, so the answer is the serial loop's
+    /// bit for bit at any worker count.
+    RowOrder = 2,
+}
+
 /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
 /// the tables before it (a rowid lookup, or a seek in one of its indexes) runs on morsels
 /// (`Connection::set_parallel_searched_links`): the candidates, kept so measurements decide.
@@ -658,6 +674,9 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// SQLITE_DBCONFIG_FP_DIGITS (c3ref/c_dbconfig_defensive.html; lane G12): the significant digits
+    /// this connection writes a REAL as text with (CAST, `||`, TEXT affinity, printf's text forms).
+    pub(super) fp_digits: AtomicU8,
     /// Amphora: statements prepared from now on count the rows of their table accesses and
     /// joins (`vdbe/row_counts.rs`).
     pub(super) row_counters: AtomicBool,
@@ -730,7 +749,8 @@ pub struct Connection {
     pub(super) adaptive_handoffs: AtomicU64,
     /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
     /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
-    pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
+    pub(super) pinned_cost_weights:
+        crate::sync::RwLock<Option<crate::translate::optimizer::learned_costs::LearnedWeights>>,
     /// Amphora: see [`Connection::set_automatic_indexes`].
     pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
@@ -745,6 +765,8 @@ pub struct Connection {
     pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
     /// Amphora: see [`Connection::set_parallel_searched_links`].
     pub(super) parallel_searched_links: AtomicSearchedLinks,
+    /// Amphora: see [`Connection::set_real_sums`].
+    pub(super) real_sums: AtomicRealSums,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -1397,6 +1419,17 @@ impl Connection {
         self.parallel_searched_links.get()
     }
 
+    /// Amphora (audit 3, lane G8): how SUM, AVG and TOTAL add REALs from now on, in statements
+    /// prepared before too ([`RealSums`]; `Serial`, today's, by default). For the A/B that decides
+    /// between the designs.
+    pub fn set_real_sums(&self, sums: RealSums) {
+        self.real_sums.set(sums);
+    }
+
+    pub(crate) fn real_sums(&self) -> RealSums {
+        self.real_sums.get()
+    }
+
     pub(crate) fn parallel_join_direct(&self) -> bool {
         self.parallel_join_direct.load(Ordering::Acquire)
     }
@@ -1547,16 +1580,23 @@ impl Connection {
         self.adaptive_handoffs.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Amphora (PL.13, T-PL.13.1): plans newly prepared statements with these weights of a seek, a
-    /// hash table's build and its probe (in rows' visits) in place of the learned ones, so a test's
-    /// switch point does not move with the machine's timings. None: the learned ones again.
-    #[cfg(feature = "simulator")]
-    pub fn pin_cost_weights(&self, weights: Option<(f64, f64, f64)>) {
+    /// Amphora (PL.13, T-PL.13.1; lane T9, the versioned cost snapshot): plans newly prepared
+    /// statements with this whole set of weights in place of the learned ones, the page-miss ratio
+    /// included, so no cost input of a test's plans moves with the machine's timings, its cache or
+    /// the test's earlier runs. None: the learned ones again. Lane T17: the bench's too
+    /// (`--pin-weights`), so two arms or two plans are made on identical cost inputs.
+    #[cfg(any(test, feature = "simulator", feature = "bench"))]
+    pub fn pin_cost_weights(
+        &self,
+        weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    ) {
         *self.pinned_cost_weights.write() = weights;
         self.bump_prepare_context_generation();
     }
 
-    pub(crate) fn pinned_cost_weights(&self) -> Option<(f64, f64, f64)> {
+    pub(crate) fn pinned_cost_weights(
+        &self,
+    ) -> Option<crate::translate::optimizer::learned_costs::LearnedWeights> {
         *self.pinned_cost_weights.read()
     }
 
@@ -3104,8 +3144,8 @@ impl Connection {
 
     /// Update schema version to the new value within opened write transaction
     ///
-    /// New version of the schema must be strictly greater than previous one - otherwise method will panic
-    /// Write transaction must be opened in advance - otherwise method will panic
+    /// New version of the schema must be strictly greater than previous one - otherwise it returns an error
+    /// Write transaction must be opened in advance - otherwise it returns an error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
         let TransactionState::Write { .. } = self.get_tx_state() else {
@@ -3116,10 +3156,12 @@ impl Connection {
         let pager = self.pager.load();
         pager.io.block(|| {
             pager.with_header_mut(|header| {
-                turso_assert!(
-                    header.schema_cookie.get() < version,
-                    "cookie can't go back in time"
-                );
+                let cookie = header.schema_cookie.get();
+                if cookie >= version {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cookie can't go back in time: schema version {version} is not above {cookie}"
+                    )));
+                }
                 self.with_schema_mut(|schema| schema.schema_version = version)
                     .map(|()| {
                         self.set_tx_state(TransactionState::Write {
@@ -3554,7 +3596,11 @@ impl Connection {
         while let IOResult::IO(io) = state_machine.step(mv_store)? {
             io.wait(self.db.io.as_ref())?;
         }
-        assert!(state_machine.is_finalized());
+        if !state_machine.is_finalized() {
+            return Err(LimboError::InternalError(
+                "main MVCC commit ended its steps without finalizing".to_string(),
+            ));
+        }
         self.set_mv_tx(None);
         self.publish_schema_if_newer();
         Ok(())
@@ -4363,13 +4409,13 @@ impl Connection {
     }
 
     fn database_has_existing_wal_state(db: &Database) -> bool {
-        let shared_wal = db.shared_wal.read();
+        let shared_wal = db.shared_wal.current().read();
         shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
     }
 
     fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
         let shared_wal = db.shared_wal.clone();
-        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = shared_wal.current().read().last_checksum_and_max_frame();
         let wal = Arc::new(crate::storage::wal::WalFile::new(
             db.io.clone(),
             shared_wal,
@@ -5010,6 +5056,23 @@ impl Connection {
 
     pub fn get_query_only(&self) -> bool {
         self.is_query_only()
+    }
+
+    /// `sqlite3_db_config(db, SQLITE_DBCONFIG_FP_DIGITS, n, &out)`: "The first argument is a small
+    /// integer, between 3 and 23, or zero. The FP_DIGITS setting is changed to that small integer, or
+    /// left unaltered if the first argument is zero or out of range." Returns the setting "after
+    /// possibly being modified by the first arguments". The default is 17.
+    pub fn db_config_fp_digits(&self, n: i32) -> u8 {
+        if let Some(digits) = crate::numeric::fp::FpDigits::new(n) {
+            self.fp_digits.store(digits.get(), Ordering::Relaxed);
+        }
+        self.fp_digits.load(Ordering::Relaxed)
+    }
+
+    /// The digits a statement on this connection writes a REAL as text with.
+    pub(crate) fn fp_digits(&self) -> crate::numeric::fp::FpDigits {
+        crate::numeric::fp::FpDigits::new(i32::from(self.fp_digits.load(Ordering::Relaxed)))
+            .unwrap_or(crate::numeric::fp::FpDigits::DEFAULT)
     }
 
     pub fn set_query_only(&self, value: bool) {

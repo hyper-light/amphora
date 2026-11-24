@@ -13,7 +13,7 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, ReleaseWait},
+    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases, ReleaseWait},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -891,7 +891,6 @@ impl Statement {
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         self.release_wait = None;
-        self.state.busy_writer = None;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -899,10 +898,13 @@ impl Statement {
             return self.drive_analyze_refresh(waker);
         }
         // Amphora (lane constants-22): the releases so far, read before the step tries its locks,
-        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]).
-        if let Some(release) = self.lock_release.as_ref() {
+        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]); this
+        // step's own releases counted apart (lane perf-A5).
+        let own = self.lock_release.as_ref().map(|release| {
+            let own = release.own_releases();
             self.release_seen = release.generation();
-        }
+            own
+        });
         // Amphora (PL.13): a run handed to a second prepare starts again here, once.
         let res = loop {
             if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -936,7 +938,7 @@ impl Statement {
                 }
             }
         };
-        self.finish_step(res, waker)
+        self.finish_step(res, waker, own)
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): an
@@ -1087,6 +1089,7 @@ impl Statement {
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
+        own: Option<OwnReleases>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
@@ -1168,27 +1171,22 @@ impl Statement {
                 (BusyHandler::Timeout(max), Some(waker))
                     if self.program.connection.busy_wake() == BusyWake::Release =>
                 {
-                    let event = match self.state.busy_writer.take() {
-                        Some(wait) => wait.0,
-                        None => {
-                            if self.lock_release.is_none() {
-                                self.lock_release =
-                                    self.pager.wal.as_ref().and_then(|wal| wal.lock_release());
-                            }
-                            self.lock_release
-                                .as_ref()
-                                .map(|event| (Arc::clone(event), self.release_seen))
-                        }
-                    };
-                    event.map(|(release, seen)| (*max, release, seen, waker))
+                    if self.lock_release.is_none() {
+                        self.lock_release =
+                            self.pager.wal.as_ref().and_then(|wal| wal.lock_release());
+                    }
+                    self.lock_release
+                        .as_ref()
+                        .map(|release| (*max, release, waker))
                 }
                 _ => None,
             };
-            if let Some((max, release, seen, waker)) = release {
+            if let Some((max, release, waker)) = release {
                 if let Some(left) = busy_state.until_released(max, now) {
                     // Registered: sleep until the release (or the deadline). A release came
                     // since the step read the count: step again now.
-                    self.release_wait = release.subscribe(seen, waker);
+                    let own = own.unwrap_or_else(|| release.own_releases());
+                    self.release_wait = release.subscribe(self.release_seen, &own, waker);
                     let duration = if self.release_wait.is_some() {
                         left
                     } else {
@@ -2863,7 +2861,9 @@ mod tests {
         let mut flips = 0;
         for i in 0..40 {
             let build = if i % 2 == 0 { 15.0 * 1.1 } else { 15.0 / 1.1 };
-            conn.pin_cost_weights(Some((10.0, build, 15.0)));
+            conn.pin_cost_weights(Some(crate::translate::optimizer::adaptive::weights(
+                10.0, build, 15.0,
+            )));
             stmt.reprepare().unwrap();
             let now = order(&stmt);
             if now != last {

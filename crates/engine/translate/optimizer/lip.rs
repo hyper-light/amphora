@@ -15,15 +15,20 @@
 //! tables' source (`CostModelParams::statement_memory`); a filter past its share is dropped and
 //! passes every row.
 
-use super::access_method::bloom_filter_rate_saving;
+use super::access_method::{
+    bloom_filter_costs, bloom_filter_rate_saving, reads_whole_table, AccessMethod,
+    AccessMethodParams,
+};
 use super::constraints::BinaryExprSide;
+use super::cost::Cost;
 use super::cost_params::CostModelParams;
+use super::join::JoinN;
 use crate::schema::Table;
 use crate::translate::expr::as_binary_components;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{
-    HashJoinKey, JoinOrderMember, JoinedTable, LipFilter, Operation, Scan, TableReferences,
-    WhereTerm, WhereTermOrigin,
+    HashJoinKey, JoinOrderMember, JoinedTable, LipFilter, Operation, Scan, StarFilterPrice,
+    TableReferences, WhereTerm, WhereTermOrigin,
 };
 use crate::StarFilters;
 use amphora_engine_parser::ast::{self, Expr};
@@ -68,7 +73,7 @@ pub(crate) fn choose(
             continue;
         };
         let mut candidates = Vec::new();
-        for dim_member in join_order.iter().skip(fact_pos + 1) {
+        for dim_member in join_order.iter().skip(fact_pos).skip(1) {
             let dim_idx = dim_member.original_idx;
             let Some(dim) = joined.get(dim_idx) else {
                 continue;
@@ -86,7 +91,12 @@ pub(crate) fn choose(
             let pass = dim
                 .plan_estimate
                 .map_or(1.0, |e| e.rows_per_input.clamp(0.0, 1.0));
-            candidates.push((pass, dim_idx, keys, dim_terms));
+            // Lane T19: the filter the join search priced this dimension's read with.
+            let priced = dim
+                .plan_estimate
+                .and_then(|e| e.star_filter)
+                .filter(|price| price.fact_idx == fact_idx);
+            candidates.push((pass, dim_idx, keys, dim_terms, priced));
         }
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         let probe_rows = fact_est.output_rows;
@@ -97,31 +107,28 @@ pub(crate) fn choose(
             0.0
         };
         let mut reaching = probe_rows;
-        for (pass, dim_idx, keys, dim_terms) in candidates {
-            let dim_rows = base_rows
-                .get(dim_idx)
-                .copied()
-                .unwrap_or(params.rows_per_table_fallback);
-            let build_keys = dim_rows * pass;
-            // The dimension read once more: its rows, its terms on each, and its pages at the
-            // connection's measured share that miss the cache (`cost::file_reads`).
-            let build_cost = dim_rows
-                * (params.cpu_cost_per_row
-                    + params.cpu_cost_per_where_step * dim_terms.len() as f64)
-                + dim_rows / params.rows_per_table_page.max(1.0) * params.page_miss;
-            let sized = bloom_filter_rate_saving(
-                build_keys,
-                reaching,
-                reaching * pass,
-                saved_per_miss,
-                build_cost,
-                params,
-            );
-            let fp_per_key = match (rule, sized) {
-                (_, Some((rate, true))) => rate,
-                (StarFilters::Always, Some((rate, false))) => rate,
-                (StarFilters::Always, None) => 0.0,
-                _ => continue,
+        for (pass, dim_idx, keys, dim_terms, priced) in candidates {
+            // A filter the plan was priced with is kept as priced: the plan's cost already
+            // counts its cut, which `end_cost` can't weigh again.
+            let fp_per_key = if let Some(price) = priced {
+                price.fp_per_key
+            } else if rule == StarFilters::ByCost {
+                // Lane T20 (arm C): by cost, only the filters the join search priced.
+                continue;
+            } else {
+                let dim_rows = base_rows
+                    .get(dim_idx)
+                    .copied()
+                    .unwrap_or(params.rows_per_table_fallback);
+                let sized = bloom_filter_rate_saving(
+                    dim_rows * pass,
+                    reaching,
+                    reaching * pass,
+                    saved_per_miss,
+                    build_cost(dim_rows, dim_terms.len(), params),
+                    params,
+                );
+                sized.map_or(0.0, |(rate, _)| rate)
             };
             chosen.push(LipFilter {
                 fact_idx,
@@ -135,11 +142,114 @@ pub(crate) fn choose(
             reaching *= pass;
         }
     }
-    let share = params.statement_memory / chosen.len().max(1);
+    // No filter chosen leaves the whole budget, as dividing by max(1) did.
+    let share = params
+        .statement_memory
+        .checked_div(chosen.len())
+        .unwrap_or(params.statement_memory);
     for filter in &mut chosen {
         filter.max_bytes = share;
     }
     chosen
+}
+
+/// The dimension read once more into its filter: its rows, its terms on each, and its pages at
+/// the connection's measured share that miss the cache (`cost::file_reads`).
+fn build_cost(dim_rows: f64, dim_terms: usize, params: &CostModelParams) -> f64 {
+    dim_rows * (params.cpu_cost_per_row + params.cpu_cost_per_where_step * dim_terms as f64)
+        + dim_rows / params.rows_per_table_page.max(1.0) * params.page_miss
+}
+
+/// Lane T19: `read`, the dimension `dim_idx`'s read after `lhs`'s loops giving it `pass` rows
+/// each, priced with the star filter it would give a fact table `lhs` reads whole, as `choose`
+/// builds it: the read on the fact rows the filter passes, plus the filter's build, bits and a
+/// lookup a fact row. `choose` weighs a filter against the whole plan's cost, which the search
+/// can't know yet; here a fact row the filter drops saves what it surely saves, this read's share
+/// of it (a lower bound: the loops between the fact table and this one save too), and `choose`
+/// keeps the filter the plan was priced with. None: no filter this read can give, or none that
+/// pays under `rule`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn price_read(
+    rule: StarFilters,
+    joined: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    lhs: &JoinN,
+    arena: &[AccessMethod],
+    dim_idx: usize,
+    read: &AccessMethod,
+    pass: f64,
+    dim_rows: f64,
+    params: &CostModelParams,
+) -> Option<(Cost, StarFilterPrice)> {
+    if rule == StarFilters::Off
+        || matches!(read.params, AccessMethodParams::HashJoin { .. })
+        || joined
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.keeps_right_rows()))
+    {
+        return None;
+    }
+    let dim = joined.get(dim_idx)?;
+    if !plain_inner(dim) || !rowid_btree(dim) {
+        return None;
+    }
+    let dim_terms = local_terms(where_clause, dim);
+    if dim_terms.is_empty() {
+        return None;
+    }
+    let pass = pass.clamp(0.0, 1.0);
+    let lhs_reads = || lhs.data.iter().filter_map(|&(_, am_idx)| arena.get(am_idx));
+    for (position, &(fact_idx, am_idx)) in lhs.data.iter().enumerate() {
+        let (Some(fact), Some(fact_read)) = (joined.get(fact_idx), arena.get(am_idx)) else {
+            continue;
+        };
+        // A hash join's build table is read by its build, not a loop whose scan checks filters.
+        let hash_built = lhs_reads().any(|am| {
+            matches!(am.params, AccessMethodParams::HashJoin { build_table_idx, .. } if build_table_idx == fact_idx)
+        });
+        if !plain_inner(fact)
+            || !rowid_btree(fact)
+            || !reads_whole_table(fact_read)
+            || hash_built
+            || keys_between(where_clause, fact, dim).is_empty()
+        {
+            continue;
+        }
+        // The fact rows the filter checks: the fact table's, less the filters priced before it.
+        let passed_before: f64 = lhs_reads()
+            .filter_map(|am| am.star_filter)
+            .filter(|price| price.fact_idx == fact_idx)
+            .map(|price| price.passed)
+            .product();
+        let Some(reaching) = lhs
+            .prefix_cardinalities
+            .get(position)
+            .map(|rows| rows * passed_before)
+            .filter(|rows| *rows > 0.0)
+        else {
+            continue;
+        };
+        let Some(costs) = bloom_filter_costs(
+            dim_rows * pass,
+            reaching,
+            reaching * pass,
+            read.cost.0 / reaching,
+            build_cost(dim_rows, dim_terms.len(), params),
+            params,
+        ) else {
+            continue;
+        };
+        if costs.with_filter >= costs.without && rule != StarFilters::Always {
+            continue;
+        }
+        let price = StarFilterPrice {
+            fact_idx,
+            fp_per_key: costs.rate_per_key,
+            passed: pass + (1.0 - pass) * costs.rate,
+        };
+        return Some((Cost(read.cost.0 - costs.without + costs.with_filter), price));
+    }
+    None
 }
 
 /// A table joined plainly: not an outer, semi or anti join's.
@@ -163,7 +273,10 @@ fn keys_between(
 ) -> Vec<HashJoinKey> {
     let mut keys = Vec::new();
     for (idx, term) in where_clause.iter().enumerate() {
-        if !matches!(term.origin, WhereTermOrigin::Where) {
+        if !matches!(
+            term.origin,
+            WhereTermOrigin::Where | WhereTermOrigin::Implied
+        ) {
             continue;
         }
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&term.expr) else {
@@ -177,12 +290,18 @@ fn keys_between(
         }
         let side = match (column_of(lhs), column_of(rhs)) {
             (Some((l, lc)), Some((r, rc))) if l == fact.internal_id && r == dim.internal_id => {
-                { binary_collation(fact, lc) && binary_collation(dim, rc) }
-                    .then_some(BinaryExprSide::Rhs)
+                if binary_collation(fact, lc) && binary_collation(dim, rc) {
+                    Some(BinaryExprSide::Rhs)
+                } else {
+                    None
+                }
             }
             (Some((l, lc)), Some((r, rc))) if l == dim.internal_id && r == fact.internal_id => {
-                { binary_collation(dim, lc) && binary_collation(fact, rc) }
-                    .then_some(BinaryExprSide::Lhs)
+                if binary_collation(dim, lc) && binary_collation(fact, rc) {
+                    Some(BinaryExprSide::Lhs)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -219,7 +338,10 @@ fn local_terms(where_clause: &[WhereTerm], dim: &JoinedTable) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, term)| {
-            matches!(term.origin, WhereTermOrigin::Where) && reads_only(&term.expr, dim)
+            matches!(
+                term.origin,
+                WhereTermOrigin::Where | WhereTermOrigin::Implied
+            ) && reads_only(&term.expr, dim)
         })
         .map(|(idx, _)| idx)
         .collect()

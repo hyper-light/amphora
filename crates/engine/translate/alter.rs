@@ -473,7 +473,7 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
 }
 
 fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
-    if let Some(converted) = affinity.convert(value) {
+    if let Some(converted) = affinity.convert(value, crate::numeric::fp::FpDigits::DEFAULT) {
         *value = match converted {
             Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
             Either::Left(_) => {
@@ -1177,7 +1177,11 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(
+                &connection
+                    .dialect()
+                    .format_altered_table_sql(btree.to_sql())?,
+            );
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1470,7 +1474,11 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let escaped = escape_sql_string_literal(
+                &connection
+                    .dialect()
+                    .format_altered_table_sql(btree.to_sql())?,
+            );
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"

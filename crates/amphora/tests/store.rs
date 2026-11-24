@@ -46,6 +46,12 @@ impl Engine for Events {
         &row.key
     }
 
+    fn row_bytes(row: &Row) -> usize {
+        std::mem::size_of::<Row>()
+            .saturating_add(row.key.capacity())
+            .saturating_add(row.text.capacity())
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         self.db.transaction(|db| insert(db, rows))?;
         Ok(rows.len())
@@ -186,6 +192,50 @@ fn count(store: &Store<Events>, key: &str) -> i64 {
 
 /// What is put is read back by its key at once: a read waits for its key's writes handed over
 /// before it, and no longer.
+fn rows_in(db: &Db) -> i64 {
+    let mut n = 0;
+    db.query("SELECT count(*) FROM t", [], |r| {
+        n = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .unwrap();
+    n
+}
+
+/// Decision 45 (lane B18): one slow reader never holds up a write. Do: commit 10 rows, open a
+/// read transaction on a reader and leave it open, start the log again on the writer, and commit
+/// 50 rows past it. Expect: the restart happens with the read still open (the writer switches to
+/// the log's free segment), a new reader reads all 60 rows, and the open read still reads the 10
+/// committed before it began.
+#[test]
+fn d45_a_reader_that_never_finishes_holds_up_no_restart_and_no_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.db");
+    let mut writer = Db::open(&path).unwrap();
+    writer.exec("CREATE TABLE t (n INTEGER)").unwrap();
+    for n in 0..10 {
+        writer.exec(&format!("INSERT INTO t VALUES ({n})")).unwrap();
+    }
+    let slow = writer.reader().unwrap();
+    slow.exec("BEGIN").unwrap();
+    assert_eq!(rows_in(&slow), 10);
+    assert!(
+        writer.restart_log().unwrap(),
+        "the writer starts the log again with a read under way"
+    );
+    for n in 10..60 {
+        writer.exec(&format!("INSERT INTO t VALUES ({n})")).unwrap();
+    }
+    assert_eq!(
+        rows_in(&writer.reader().unwrap()),
+        60,
+        "a new read sees every commit"
+    );
+    assert_eq!(rows_in(&slow), 10, "the open read keeps its snapshot");
+    slow.exec("COMMIT").unwrap();
+    assert_eq!(rows_in(&slow), 60);
+}
+
 #[test]
 fn what_is_put_is_read_back_by_its_key_at_once() {
     let lab = lab(Config::default(), None);
@@ -511,41 +561,6 @@ fn a_transaction_holding_a_failed_statement_is_never_committed() {
     assert_eq!(rows, vec![3]);
 }
 
-/// A full queue refuses what it can't take, typed and counted; a sender that waits for room is
-/// taken once the writer frees some.
-#[test]
-fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
-    let config = Config {
-        queue: 1,
-        ..Config::default()
-    };
-    let lab = lab(config, None);
-    // The writer held by a job, the queue filled behind it.
-    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let busy = lab.store.clone();
-    let job = std::thread::spawn(move || {
-        busy.run(soon(), move |_| {
-            held_tx.send(()).unwrap();
-            go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            Ok(())
-        })
-    });
-    held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    lab.store.put(vec![row("a", 1)]).unwrap();
-    assert_eq!(lab.store.put(vec![row("a", 2)]).err(), Some(Refused::Full));
-    assert_eq!(lab.store.counters().dropped, 1);
-    // A wait for room is taken once the writer goes on.
-    let waiting = lab.store.clone();
-    let waiter = std::thread::spawn(move || waiting.put_wait(vec![row("a", 3)], soon()));
-    go_tx.send(()).unwrap();
-    waiter.join().unwrap().unwrap();
-    job.join().unwrap().unwrap();
-    lab.store.sync(soon()).unwrap();
-    // The refused row isn't there; the others are.
-    assert_eq!(count(&lab.store, "a"), 2);
-}
-
 /// Under writes and reads that never pause, the log stays bounded: the checkpointer copies it and
 /// the writer starts it again between commits, holding the readers back for the moment it takes.
 #[test]
@@ -716,4 +731,130 @@ fn reads_go_on_while_the_engine_replaces_its_file() {
     }
     lab.store.put(vec![row("a", 2)]).unwrap();
     assert_eq!(count(&lab.store, "a"), 2);
+}
+
+/// A flush the test holds while it runs: how many began, and whether the first may end yet.
+struct Held {
+    state: std::sync::Mutex<(u64, bool)>,
+    moved: std::sync::Condvar,
+}
+
+impl Held {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new((0, true)),
+            moved: std::sync::Condvar::new(),
+        })
+    }
+
+    /// A flush that counts itself and holds the first until [`Held::end_first`].
+    fn flush(self: &Arc<Self>) -> Flush {
+        let me = self.clone();
+        Box::new(move || {
+            let mut s = me.state.lock().unwrap();
+            s.0 += 1;
+            me.moved.notify_all();
+            while s.0 == 1 && s.1 {
+                s = me.moved.wait(s).unwrap();
+            }
+            Ok(())
+        })
+    }
+
+    fn first_began(&self) {
+        let mut s = self.state.lock().unwrap();
+        while s.0 == 0 {
+            s = self.moved.wait(s).unwrap();
+        }
+    }
+
+    fn end_first(&self) {
+        self.state.lock().unwrap().1 = false;
+        self.moved.notify_all();
+    }
+
+    fn began(&self) -> u64 {
+        self.state.lock().unwrap().0
+    }
+}
+
+/// A flush waits for the batches handed to the writer before it begins: one committed during the
+/// last flush and one the busy writer had not yet taken are made durable by one flush, the next
+/// (docs/design/store.md, decision 14; AC-T1.1.1).
+#[test]
+fn a_batch_handed_before_a_flush_begins_is_made_durable_by_it() {
+    let held = Held::new();
+    let lab = lab(Config::default(), Some(held.flush()));
+    let store = &lab.store;
+    store.put(vec![row("p", 1)]).unwrap();
+    held.first_began();
+    let x = store.put(vec![row("x", 1)]).unwrap();
+    assert_eq!(
+        count(store, "x"),
+        1,
+        "x is committed during the first flush"
+    );
+    let job = Arc::new((
+        std::sync::Mutex::new((false, false)),
+        std::sync::Condvar::new(),
+    ));
+    std::thread::scope(|s| {
+        let busy = job.clone();
+        s.spawn(move || {
+            store
+                .run(soon(), move |_e| {
+                    let (m, cv) = &*busy;
+                    let mut j = m.lock().unwrap();
+                    j.0 = true;
+                    cv.notify_all();
+                    while !j.1 {
+                        j = cv.wait(j).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        });
+        let (m, cv) = &*job;
+        let mut j = m.lock().unwrap();
+        while !j.0 {
+            j = cv.wait(j).unwrap();
+        }
+        drop(j);
+        let y = store.put(vec![row("y", 1)]).unwrap();
+        held.end_first();
+        m.lock().unwrap().1 = true;
+        cv.notify_all();
+        store.durable(&y, soon()).unwrap();
+    });
+    store.durable(&x, soon()).unwrap();
+    assert_eq!(
+        held.began(),
+        2,
+        "x and y were made durable by one flush after the first"
+    );
+}
+
+/// A sender told its batch is durable that never sends again holds no flush: what was committed
+/// during the flush that told it is made durable by the next (docs/design/store.md, decision 14;
+/// AC-T1.1.1).
+#[test]
+fn a_sender_told_durable_that_sends_nothing_more_holds_no_flush() {
+    let held = Held::new();
+    let lab = lab(Config::default(), Some(held.flush()));
+    let store = &lab.store;
+    let p = store.put(vec![row("p", 1)]).unwrap();
+    held.first_began();
+    std::thread::scope(|s| {
+        let told = s.spawn(|| store.durable(&p, soon()));
+        let x = store.put(vec![row("x", 1)]).unwrap();
+        assert_eq!(
+            count(store, "x"),
+            1,
+            "x is committed during the first flush"
+        );
+        held.end_first();
+        told.join().unwrap().unwrap();
+        store.durable(&x, soon()).unwrap();
+    });
+    assert_eq!(held.began(), 2);
 }

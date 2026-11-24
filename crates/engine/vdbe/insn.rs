@@ -538,14 +538,25 @@ pub struct MorselAggregateData {
     /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// The table's columns of REAL affinity (lane R10), from its schema, so every statement on a
+    /// table reads its rows alike: an INTEGER stored in one (SQLite stores a whole REAL so) reads
+    /// as a REAL, as the serial loop's `RealAffinity` makes it. Empty for a body or a join, whose
+    /// workers convert their own (`MorselBody::reals`).
+    pub reals: Vec<usize>,
     /// Each column's value in a row written before the column was added (ALTER TABLE ADD COLUMN),
     /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
     pub defaults: Vec<crate::types::Value>,
     /// The least and greatest rowid the scan reads, each inclusive; `(None, None)`: the whole
-    /// table. The morsels are cut from the leaves that hold them (lane qs6-17).
+    /// table. The morsels are cut from the leaves that hold them (lane qs6-17), and the column
+    /// copy reads the keys between them. A scan's terms on its rowid's alias narrow it when the
+    /// statement runs (lane R11: `morsel::rowid_range`).
     pub rowid_range: (Option<i64>, Option<i64>),
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
+    /// How the groups come out: each GROUP BY value's direction and where its NULLs come, those of
+    /// the ORDER BY the planner merged into the GROUP BY (`compute_order_target`), ascending where
+    /// it merged none.
+    pub group_order: Vec<crate::types::KeyInfo>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
@@ -631,6 +642,10 @@ pub struct MorselBody {
     pub keep: BranchOffset,
     pub skip: BranchOffset,
     pub columns_start: usize,
+    /// The joined row's places whose column has REAL affinity (audit 3, prototypes 2): an
+    /// INTEGER read from one becomes a REAL as it loads, as the serial loop's `RealAffinity`
+    /// after its `Column` makes it.
+    pub reals: Vec<usize>,
     pub rowid: usize,
     pub out_start: usize,
     pub out_count: usize,
@@ -2983,6 +2998,8 @@ pub enum Cookie {
     ApplicationId = 8,
     /// The page size, as read by the page_size pragma.
     PageSize = 9,
+    /// Amphora: the PostgreSQL dialect's next OID (`DatabaseHeader::pg_next_oid`).
+    PgNextOid = 10,
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::busy::BusyWake;
 use amphora_engine::io::FileSyncType;
+use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
     DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
@@ -20,6 +21,8 @@ use amphora_engine::{
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
 
+#[cfg(test)]
+mod allocs;
 mod cache;
 
 /// The pages a process's databases share (docs/design/store.md, decision 20).
@@ -118,6 +121,12 @@ fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
 /// (the release of the lock it found held, [`step`]).
 struct Unpark(std::thread::Thread);
 
+thread_local! {
+    /// This thread's [`Unpark`], made once: every statement stepped here shares it, since only the
+    /// thread is woken and one thread waits on one statement at a time (AUDIT 1, perf-A3).
+    static UNPARK: std::task::Waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+}
+
 impl std::task::Wake for Unpark {
     fn wake(self: Arc<Self>) {
         self.0.unpark();
@@ -146,6 +155,15 @@ fn wal_path(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     PathBuf::from(wal)
+}
+
+/// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
+/// `-wal2`.
+fn segment_path(path: &Path, segment: SegmentId) -> String {
+    match segment {
+        SegmentId::First => format!("{}-wal", path.display()),
+        SegmentId::Second => format!("{}-wal2", path.display()),
+    }
 }
 
 /// Makes `path`, if it doesn't exist yet, an empty file that a copy-on-write file system writes in
@@ -378,6 +396,16 @@ impl Db {
         self.exec(&format!("PRAGMA cache_size = {pages}"))
     }
 
+    /// This connection's page cache as `PRAGMA cache_size` states it: pages, or KiB when negative.
+    pub(crate) fn cache_pages(&self) -> anyhow::Result<i64> {
+        let mut pages = None;
+        self.query("PRAGMA cache_size", [], |row| {
+            pages = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        pages.ok_or_else(|| anyhow::anyhow!("PRAGMA cache_size answered no row"))
+    }
+
     /// Another connection on the same database, for reading or checkpointing: each read sees what
     /// was committed before it; its checkpoints flush.
     pub fn reader(&self) -> anyhow::Result<Self> {
@@ -435,7 +463,7 @@ impl Db {
     /// leaving the disk's cache): the log keeps its length across restarts (within
     /// [`Db::keep_log`]), so once it has been as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
-        let wal = format!("{}-wal", self.path.display());
+        let path = self.path.clone();
         let held = EngineHandles {
             io: self.io.clone(),
             db: self.db.clone(),
@@ -453,6 +481,8 @@ impl Db {
             // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
             // log may have been made again. No log: everything is in the file, which the checkpoint
             // that emptied the log flushed.
+            // The segment the prefix is in: a switch flushes the one it closes (decision 45).
+            let wal = segment_path(&path, db.wal_segment());
             let file = match io.open_file(&wal, OpenFlags::NoLock, false) {
                 Ok(file) => file,
                 Err(LimboError::CompletionError(CompletionError::IOError(
@@ -501,15 +531,29 @@ impl Db {
         }
     }
 
-    /// With no reader reading (the store holds them back), copies what remains, flushes the file,
-    /// and starts the log from its beginning: whether it did. The log's file keeps its length
-    /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is
-    /// cut to nothing, once every frame is in the file (docs/design/store.md, decision 31).
+    /// Copies what the reads under way let it, then starts the log again by switching the writer
+    /// to its free segment (docs/design/store.md, decision 45): whether it did. The current
+    /// segment is flushed and closes; reads under way keep reading it. It waits for no read:
+    /// false while another connection writes, or while a read still counts on the segment the
+    /// last switch closed, and the caller asks again at its next turn. A segment switched to is
+    /// cut to nothing first if it holds room for more frames than [`Db::keep_log`] keeps
+    /// (decision 31).
     ///
     /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
     /// and the backup is told its log broke there (docs/design/backup.md).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(true)
+    }
+
+    /// [`Db::restart_log`]'s switch alone, copying nothing: for a writer whose passes run on
+    /// another thread. What the segment it closes still holds uncopied, the next pass copies
+    /// ([`Db::checkpoint`]): the closing segment first (decision 45).
+    pub(crate) fn switch_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(false)
+    }
+
+    fn start_log_again(&mut self, copy: bool) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
         let over = self.log_frames()? > self.log_kept;
         let (seq, frame) = self.db.wal_end();
@@ -520,23 +564,27 @@ impl Db {
         if !shipped && !over {
             return Ok(false);
         }
-        let mode = if over {
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            }
-        } else {
-            CheckpointMode::Restart
-        };
-        match self.conn.checkpoint(mode) {
-            Ok(_) => {
-                if let Some(hooks) = &self.backup {
-                    hooks.fence.ended(seq, frame, !shipped)?;
-                }
-                Ok(true)
-            }
-            Err(LimboError::Busy) => Ok(false),
-            Err(e) => Err(fail(e)),
+        // The segment switched to is cut to nothing if it holds room for more frames than a
+        // restart keeps (decision 31, at each segment's reuse).
+        let cut_past = PAGE_BYTES
+            .checked_add(FRAME_HEADER_BYTES)
+            .and_then(|frame| frame.checked_mul(self.log_kept))
+            .and_then(|frames| frames.checked_add(LOG_HEADER_BYTES));
+        // What the reads let a pass copy, the closing segment's and then the current one's: with
+        // no read under way every frame is in the file, as before. The switch needs the closing
+        // segment reset, which a read still on it holds off (the writer asks again at its next
+        // turn).
+        if copy {
+            let _closing = self.checkpoint()?;
+            let _current = self.checkpoint()?;
         }
+        if !self.db.switch_log(cut_past).map_err(fail)? {
+            return Ok(false);
+        }
+        if let Some(hooks) = &self.backup {
+            hooks.fence.ended(seq, frame, !shipped)?;
+        }
+        Ok(true)
     }
 
     /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
@@ -604,9 +652,32 @@ impl Db {
         self.db.wal_end()
     }
 
-    /// `len` bytes of the log's file from `offset`; None when there is no log file.
+    /// `len` bytes of the current segment's file of the log from `offset` (decision 45); None
+    /// when there is no such file.
     pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_at(&wal_path(&self.path).display().to_string(), offset, len)
+        self.read_at(
+            &segment_path(&self.path, self.db.wal_segment()),
+            offset,
+            len,
+        )
+    }
+
+    /// The header the current segment's file of the log holds (decision 45): its own, or that of
+    /// the generation the file held before, until its first commit writes its own. None while the
+    /// file holds none, which is no failure: a switch makes the file, or cuts it to nothing, and
+    /// the segment's first commit writes its header; a log folded whole is emptied too.
+    pub(crate) fn log_header(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let len = usize::try_from(LOG_HEADER_BYTES)?;
+        let wal = segment_path(&self.path, self.db.wal_segment());
+        Ok(self
+            .read_to(&wal, 0, len)?
+            .filter(|header| header.len() == len))
+    }
+
+    /// Whether the file holds every frame committed before the log's current segment (decision
+    /// 45): what a copy of the file needs before it begins in the current generation.
+    pub(crate) fn closing_copied(&self) -> bool {
+        self.db.wal_closing_copied()
     }
 
     /// `len` bytes of the database's file from `offset`.
@@ -624,7 +695,21 @@ impl Db {
         file.size().map_err(fail)
     }
 
+    /// `len` bytes of `path` from `offset`; None when there is no such file, and refused when it
+    /// holds fewer.
     fn read_at(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let bytes = self.read_to(path, offset, len)?;
+        if let Some(bytes) = &bytes
+            && bytes.len() != len
+        {
+            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
+        }
+        Ok(bytes)
+    }
+
+    /// What `path` holds of the `len` bytes from `offset`, fewer past its end; None when there is
+    /// no such file.
+    fn read_to(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
         let file = match self.io.open_file(path, OpenFlags::NoLock, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -655,9 +740,6 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("a read's lock was poisoned"))?
             .take()
             .ok_or_else(|| anyhow::anyhow!("reading {path} failed"))?;
-        if bytes.len() != len {
-            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
-        }
         Ok(Some(bytes))
     }
 
@@ -699,9 +781,12 @@ impl Db {
         step_between(self.io.as_ref(), &mut stmt, [], each, between)
     }
 
-    /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
+    /// The frames the log's current segment holds now, from the log's shared state. This
+    /// connection's own view is no count of it: a switch (decision 45, [`Db::restart_log`]) leaves
+    /// that view on the segment it closed until the connection's next transaction, so a replica
+    /// past its room would refuse every submit after the restart that brought it back within.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
-        Ok(self.conn.wal_state().map_err(fail)?.max_frame)
+        Ok(self.db.wal_backfill().0)
     }
 
     /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing
@@ -719,7 +804,7 @@ impl Db {
 
     /// The frames the log's file holds room for: none without a log.
     pub(crate) fn log_frames(&self) -> anyhow::Result<u64> {
-        let wal = format!("{}-wal", self.path.display());
+        let wal = segment_path(&self.path, self.db.wal_segment());
         let bytes = match self.io.open_file(&wal, OpenFlags::NoLock, false) {
             Ok(file) => file.size().map_err(fail)?,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -784,7 +869,7 @@ impl Db {
         let result = self.conn.prepare_execute_batch(sql).map_err(fail);
         // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
         // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
-        self.statements.schema(self.conn.current_schema())?;
+        self.statements.schema(&self.conn.current_schema())?;
         self.marked()?;
         result
     }
@@ -809,19 +894,16 @@ impl Db {
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
-        let (mut stmt, marked) = match self.statements.take(sql)? {
-            Some(taken) => taken,
-            None => (self.conn.prepare(sql).map_err(fail)?, false),
+        let (text, mut stmt, marked) = match self.statements.take(sql, &schema)? {
+            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
+            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
+        // A callback can change schema and run another query. The cache never keeps this
+        // checked-out statement under that later schema's cache identity.
         let current = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&current))?;
-        // A callback can change schema and run another query. Never return this checked-out
-        // statement under that later schema's cache identity.
-        if same_schema(&schema, &current) {
-            self.statements.put(sql, stmt, marked)?;
-        }
+        self.statements
+            .put(sql, text, stmt, marked, &schema, &current)?;
         self.marked()
     }
 
@@ -832,13 +914,14 @@ impl Db {
     /// Keeps its cache entry's validation mark and never sets one, as [`Db::query_owned`].
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
-        self.statements.schema(self.conn.current_schema())?;
-        let (stmt, marked) = match self.statements.take(sql)? {
-            Some(taken) => taken,
-            None => (self.conn.prepare(sql).map_err(fail)?, false),
+        let schema = self.conn.current_schema();
+        let (text, stmt, marked) = match self.statements.take(sql, &schema)? {
+            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
+            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
-        self.statements.put(sql, stmt, marked)?;
+        self.statements
+            .put(sql, text, stmt, marked, &schema, &schema)?;
         Ok(columns)
     }
 
@@ -849,23 +932,19 @@ impl Db {
     pub(crate) fn cached(&self, sql: &str) -> anyhow::Result<Option<Held>> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
-        Ok(self
-            .statements
-            .take(sql)?
-            .map(|(statement, validated)| Held {
-                sql: sql.to_owned(),
-                statement,
-                schema,
-                validated,
-            }))
+        Ok(self.statements.take(sql, &schema)?.map(|taken| Held {
+            sql: sql.to_owned(),
+            statement: taken.statement,
+            schema,
+            validated: taken.validated,
+        }))
     }
 
     /// Prepares `sql` for a caller that holds it as [`Db::cached`] says, unmarked.
     pub(crate) fn prepare_held(&self, sql: &str) -> anyhow::Result<Held> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
+        self.statements.schema(&schema)?;
         Ok(Held {
             sql: sql.to_owned(),
             statement: self.conn.prepare(sql).map_err(fail)?,
@@ -884,7 +963,7 @@ impl Db {
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
+        self.statements.schema(&schema)?;
         if !same_schema(&held.schema, &schema) {
             held.statement = self.conn.prepare(&held.sql).map_err(fail)?;
             held.schema = schema;
@@ -896,11 +975,14 @@ impl Db {
     /// schema is the one it was prepared under.
     pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
         let current = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&current))?;
-        if same_schema(&held.schema, &current) {
-            self.statements
-                .put(&held.sql, held.statement, held.validated)?;
-        }
+        self.statements.put(
+            &held.sql,
+            None,
+            held.statement,
+            held.validated,
+            &held.schema,
+            &current,
+        )?;
         Ok(())
     }
 
@@ -1262,7 +1344,7 @@ impl Db {
         // writes the header's cookie, marks the transaction's schema changed (published to every
         // connection when it commits) and reads this writer's schema again.
         self.conn.write_schema_version(next).map_err(fail)?;
-        self.statements.schema(self.conn.current_schema())?;
+        self.statements.schema(&self.conn.current_schema())?;
         Ok(())
     }
 
@@ -1351,6 +1433,18 @@ impl Db {
         Ok(value)
     }
 
+    /// `f` with every statement that writes refused (the engine's `query_only`), in the
+    /// transaction under way: a replicated query's session (`Database::query`).
+    pub(crate) fn query_only<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.conn.set_query_only(true);
+        let done = f(self);
+        self.conn.set_query_only(false);
+        done
+    }
+
     /// `f` on each of `batches`, in order, in one transaction ([`Db::transaction`]) that ends
     /// before a batch its cache might not hold: once the pages written so far, and as many again
     /// as the last batch wrote, pass what the cache holds before it spills written pages into the
@@ -1393,6 +1487,13 @@ pub(crate) struct Held {
 impl Held {
     pub(crate) fn columns(&self) -> usize {
         self.statement.num_columns()
+    }
+
+    /// Its result columns' names, in order.
+    pub(crate) fn column_names(&self) -> Vec<String> {
+        (0..self.statement.num_columns())
+            .map(|i| self.statement.get_column_name(i).into_owned())
+            .collect()
     }
 
     pub(crate) fn validated(&self) -> bool {
@@ -1439,7 +1540,11 @@ fn step_between(
     }
     // The engine wakes this thread when a lock the statement found held is released, and the
     // statement tries again then: no delay of its own between tries (lane constants-22).
-    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    // `try_with`, not `with`: a statement stepped while the thread's locals are torn down gets a
+    // waker of its own rather than a panic.
+    let waker = UNPARK
+        .try_with(std::task::Waker::clone)
+        .unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))));
     loop {
         match stmt.step_with_waker(&waker).map_err(fail)? {
             StepResult::Row => {

@@ -1,11 +1,7 @@
 use amphora_engine_parser::ast::{Expr, Literal};
 use either::Either;
 
-use crate::{
-    numeric::{format_float, DoubleDouble, Numeric},
-    types::AsValueRef,
-    Value, ValueRef,
-};
+use crate::{numeric::Numeric, types::AsValueRef, Value, ValueRef};
 
 /// # SQLite Column Type Affinities
 ///
@@ -210,7 +206,11 @@ impl Affinity {
         Affinity::Numeric
     }
 
-    pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
+    pub fn convert<'a>(
+        &self,
+        val: &'a impl AsValueRef,
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Option<Either<ValueRef<'a>, Value>> {
         let val = val.as_value_ref();
         let is_text = matches!(val, ValueRef::Text(_));
         // Apply affinity conversions
@@ -227,7 +227,7 @@ impl Affinity {
                         Some(Either::Right(Value::Text(i.to_string().into())))
                     }
                     ValueRef::Numeric(Numeric::Float(f)) => Some(Either::Right(Value::Text(
-                        format_float(f64::from(f)).into(),
+                        crate::numeric::fp::real_to_text_digits(f64::from(f), digits).into(),
                     ))),
                     ValueRef::Text(_) => {
                         // If it's already text but looks numeric, ensure it's in canonical text form
@@ -282,6 +282,7 @@ impl Affinity {
     pub fn convert_for_compare<'a>(
         &self,
         val: &'a impl AsValueRef,
+        digits: crate::numeric::fp::FpDigits,
     ) -> Option<Either<ValueRef<'a>, Value>> {
         let val_ref = val.as_value_ref();
         let is_text = matches!(val_ref, ValueRef::Text(_));
@@ -290,7 +291,7 @@ impl Affinity {
                 .then(|| apply_numeric_affinity(val_ref, false))
                 .flatten()
                 .map(Either::Left),
-            Affinity::Text => self.convert(val),
+            Affinity::Text => self.convert(val, digits),
             Affinity::Blob | Affinity::None => None,
         }
     }
@@ -399,6 +400,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         return (NumericParseResult::NotNumeric, ParsedNumber::None);
     }
 
+    let start = pos;
     let mut sign = 1i64;
 
     if bytes[pos] == b'-' {
@@ -457,6 +459,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
 
     // Check for exponent
     let mut exponent = 0i32;
+    let mantissa = bytes.get(start..pos).unwrap_or_default();
     if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
         has_exponent = true;
         pos += 1;
@@ -464,6 +467,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         if pos >= len {
             // Incomplete exponent, but we have valid digits before
             return create_result_from_significand(
+                mantissa,
                 significand,
                 sign,
                 decimal_adjust,
@@ -484,6 +488,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         if pos >= len || !bytes[pos].is_ascii_digit() {
             // Incomplete exponent
             return create_result_from_significand(
+                mantissa,
                 significand,
                 sign,
                 decimal_adjust,
@@ -506,6 +511,8 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         exponent *= exp_sign;
     }
 
+    let number = bytes.get(start..pos).unwrap_or_default();
+
     // Skip trailing whitespace
     while pos < len && is_space(bytes[pos]) {
         pos += 1;
@@ -524,6 +531,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     };
 
     create_result_from_significand(
+        number,
         significand,
         sign,
         final_exponent,
@@ -533,7 +541,10 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     )
 }
 
+/// `number` is the text the parse took (sign, digits, point, exponent), whose correctly rounded
+/// double a non-integer result is.
 fn create_result_from_significand(
+    number: &[u8],
     significand: u64,
     sign: i64,
     exponent: i32,
@@ -567,50 +578,13 @@ fn create_result_from_significand(
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
 
-    // Convert to float using Dekker double-double arithmetic for precision
-    // This matches SQLite's sqlite3AtoF implementation
-    let mut result = DoubleDouble::from(significand);
-
-    let mut exp = exponent;
-    match exp.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            while exp >= 100 {
-                result *= DoubleDouble::E100;
-                exp -= 100;
-            }
-            while exp >= 10 {
-                result *= DoubleDouble::E10;
-                exp -= 10;
-            }
-            while exp >= 1 {
-                result *= DoubleDouble::E1;
-                exp -= 1;
-            }
-        }
-        std::cmp::Ordering::Less => {
-            while exp <= -100 {
-                result *= DoubleDouble::NEG_E100;
-                exp += 100;
-            }
-            while exp <= -10 {
-                result *= DoubleDouble::NEG_E10;
-                exp += 10;
-            }
-            while exp <= -1 {
-                result *= DoubleDouble::NEG_E1;
-                exp += 1;
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-
-    let mut final_result: f64 = result.into();
-    if final_result.is_nan() {
-        final_result = f64::INFINITY;
-    }
-    if sign < 0 {
-        final_result = -final_result;
-    }
+    // Rust's parse rounds correctly over every digit; `number` is ASCII in its grammar.
+    let Some(final_result) = std::str::from_utf8(number)
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+    else {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    };
 
     (parse_result, ParsedNumber::Float(final_result))
 }

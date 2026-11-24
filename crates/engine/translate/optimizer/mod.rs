@@ -4,9 +4,9 @@ use super::{
     plan::{
         DeletePlan, GroupBy, HashJoinType, InSeekSource, IterationDirection, JoinInfo,
         JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
-        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
-        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
-        WhereTerm, WhereTermOrigin,
+        MultiIndexScanOp, Operation, OrderTerms, Plan, Search, SeekDef, SeekKey, SelectPlan,
+        SetOperation, SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan,
+        UpdatePlan, WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -72,7 +72,7 @@ use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::rewrite_or_terms;
+use lift_common_subexpressions::{column_read_can_raise, rewrite_or_terms};
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -1210,7 +1210,11 @@ fn find_select_plan_form(
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references)
             .with_primary_roots(&plan.table_references)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.table_references.has_right_or_full_join(),
@@ -1233,6 +1237,7 @@ fn find_select_plan_form(
                 access_cost: 0.0,
                 total_cost: 0.0,
                 position,
+                star_filter: None,
             });
         }
         plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
@@ -1465,7 +1470,7 @@ fn apply_select_table_plan(
         return Ok(());
     };
     let (lip_params, lip_base_rows) = (table_plan.params.clone(), table_plan.base_rows.clone());
-    plan.join_order = apply_table_access_plan(
+    let (join_order, loop_order) = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
         &mut plan.where_clause,
@@ -1473,6 +1478,8 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    plan.join_order = join_order;
+    plan.loop_order = loop_order;
     // Amphora (QT.5, T-QT.5.3): the star joins' filters, by cost, once the plan is fixed.
     let filters = lip::choose(
         resolver.star_filters(),
@@ -1494,7 +1501,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
@@ -1544,7 +1555,11 @@ fn optimize_update_plan(
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables)
         .with_primary_roots(&target_tables)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&target_tables, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.from_tables.has_right_or_full_join(),
@@ -1911,6 +1926,7 @@ fn build_update_write_set_plan(
         },
         simple_aggregate: None,
         phantom_params: vec![],
+        loop_order: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
@@ -2470,7 +2486,11 @@ fn group_count_from_index_stats<'a>(
             let rows_per_group = *index_stats
                 .avg_rows_per_distinct_prefix
                 .get(columns.len().checked_sub(1)?)?;
-            (rows_per_group > 0).then_some((total_rows / rows_per_group as f64, rows_per_group))
+            if rows_per_group > 0 {
+                Some((total_rows / rows_per_group as f64, rows_per_group))
+            } else {
+                None
+            }
         })
         .fold(
             None,
@@ -2614,7 +2634,7 @@ pub(crate) fn group_count_error(plan: &SelectPlan, schema: &Schema) -> Option<f6
     }
     let stored_average = match rows_per_group {
         0 | 1 => 0.0,
-        a => ((a - 1) as f64).recip(),
+        a => a.checked_sub(1).map_or(0.0, |below| (below as f64).recip()),
     };
     let total_rows = table_stats
         .row_count
@@ -3010,14 +3030,15 @@ fn optimize_table_access(
         return Ok(None);
     };
 
-    Ok(Some(apply_table_access_plan(
+    let (join_order, _) = apply_table_access_plan(
         resolver,
         table_references,
         where_clause,
         order_by,
         group_by,
         plan,
-    )?))
+    )?;
+    Ok(Some(join_order))
 }
 
 /// Find the best table reads without writing them into table operations.
@@ -3278,6 +3299,7 @@ fn find_table_access_plan(
         allow_automatic_index: resolver.automatic_indexes()
             && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
+        star_filters: resolver.star_filters(),
         search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
@@ -3517,6 +3539,8 @@ fn plan_unmatched_right_rows(
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
                 join_methods: resolver.join_methods(),
+                // A RIGHT or FULL JOIN takes no star filter (`lip::choose`).
+                star_filters: crate::StarFilters::Off,
                 search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
@@ -3973,6 +3997,23 @@ pub(crate) mod bushy_test_hook {
     }
 
     thread_local! {
+        /// With `PIN`: the FROM positions of the tables that probe a hash join, one bit each; with
+        /// none, the last table alone.
+        pub(crate) static PIN_HASH_JOINS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Whether the pinned plan's table at `position`, of `tables`, probes a hash join.
+    pub(crate) fn hash_join_pinned_at(position: usize, tables: usize) -> bool {
+        match PIN_HASH_JOINS.with(Cell::get) {
+            0 => tables.checked_sub(1) == Some(position),
+            positions => u32::try_from(position)
+                .ok()
+                .and_then(|shift| positions.checked_shr(shift))
+                .is_some_and(|bits| bits & 1 == 1),
+        }
+    }
+
+    thread_local! {
         /// How many plans `split_build_side` made bushy.
         pub(crate) static APPLIED: Cell<usize> = const { Cell::new(0) };
     }
@@ -4046,7 +4087,7 @@ pub(crate) mod bushy_test_hook {
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects
         )]
-        use super::{APPLIED, PIN, SPLIT};
+        use super::{APPLIED, PIN, PIN_HASH_JOINS, SPLIT};
         use crate::io::MemoryIO;
         use crate::sync::Arc;
         use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
@@ -4167,6 +4208,433 @@ pub(crate) mod bushy_test_hook {
                 }
             }
             assert_eq!(compared, 16);
+        }
+
+        /// PL.8 (TPC-H q05's shape, lane T4): a hand-built plan with two materialized build
+        /// inputs, a left-deep one (`c` and `o`, probed from `l`) and a bushy run (`s` and `n`,
+        /// probed from `r`), and a WHERE term across the two, `c.nid = s.nid`. Each input's
+        /// subplan runs only the terms its own tables hold, so the main plan runs that one.
+        /// Expect: both inputs materialized, the run built (`APPLIED`), and the answer the plan
+        /// of nested loops gives. Lane T3: consumed by the two inputs together, the term ran
+        /// nowhere and q05 at SF0.1 answered 23x high.
+        #[test]
+        fn t_pl_8_2_a_term_across_two_build_inputs_runs_in_the_main_plan() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, nid INT)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT, price INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT, nid INT)",
+                "CREATE TABLE n(id INTEGER PRIMARY KEY, rid INT, name TEXT)",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO r VALUES (1, 'ASIA'), (2, 'EUROPE'), (3, 'AMERICA')",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 9) \
+                 INSERT INTO n SELECT i, i % 3 + 1, 'n' || i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 30) \
+                 INSERT INTO c SELECT i, i % 9 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 120) \
+                 INSERT INTO o SELECT i, i % 30 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 600) \
+                 INSERT INTO l SELECT i, i % 120 + 1, i % 20, i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 20) \
+                 INSERT INTO s SELECT i, i % 20, i % 9 + 1 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            // `+ 0` keeps `s` from a seek by a table outside its run.
+            let sql = "SELECT n.name, count(*), sum(l.price) FROM c, o, l, s, n, r \
+                       WHERE o.cid = c.id AND l.oid = o.id AND l.sk = s.k + 0 \
+                       AND c.nid = s.nid + 0 AND n.id = s.nid AND r.id = n.rid \
+                       AND r.name = 'ASIA' GROUP BY n.name";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            conn.set_join_methods(JoinMethods::ByCost);
+            // Loops in the FROM order, hash joins at `l` and `r`, and the run `s n` built for `r`.
+            PIN.with(|pin| pin.set(true));
+            PIN_HASH_JOINS.with(|positions| positions.set((1 << 2) | (1 << 5)));
+            SPLIT.with(|split| split.set(Some(3)));
+            APPLIED.with(|applied| applied.set(0));
+            let bushy = rows(&conn, sql);
+            let made_bushy = APPLIED.with(Cell::get);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            SPLIT.with(|split| split.set(None));
+            PIN_HASH_JOINS.with(|positions| positions.set(0));
+            PIN.with(|pin| pin.set(false));
+            let inputs = plan
+                .iter()
+                .filter(|line| line.contains("MATERIALIZE"))
+                .count();
+            assert!(made_bushy > 0, "no plan was made bushy: {plan:?}");
+            assert_eq!(inputs, 2, "two materialized build inputs: {plan:?}");
+            assert!(!nested_loops.is_empty());
+            assert_eq!(bushy, nested_loops, "{plan:?}");
+        }
+
+        /// PL.8 (TPC-H q05's slow plan, lane T4): a bushy run `o c l` built for `s`'s hash join,
+        /// in which `c` probes `o`'s hash table and `l` is read by a seek on `o`'s key. The run's
+        /// subplan reads `o` through `c`'s probe, not a loop of its own; its seek on `l` must
+        /// stand, as the planner priced it. Expect: the run built (`APPLIED`), the answer the
+        /// plan of nested loops gives, and no table read whole more than once: the statement's
+        /// full-scan steps at most the rows of all its tables. Lane T3: the seek fell to a scan of
+        /// `l` for each of the run's `c` and `o` rows, q05's 23,291 scans of lineitem.
+        #[test]
+        fn t_pl_8_2_a_seek_on_a_probed_build_table_stands_in_its_run() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE r(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT)",
+                "CREATE INDEX l_oid ON l(oid)",
+                // Enough rows that `r.id = 1` seeks: one row, so `c`'s hash join stays unmaterialized.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1000) \
+                 INSERT INTO r SELECT i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 200) \
+                 INSERT INTO o SELECT i, i % 50 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 50) \
+                 INSERT INTO c SELECT i, i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO l SELECT i, i % 200 + 1, i % 25 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 25) \
+                 INSERT INTO s SELECT i, i % 25 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let sql = "SELECT count(*), sum(l.id), sum(s.id) FROM r, o, c, l, s \
+                       WHERE r.id = 1 AND c.id = o.cid AND l.oid = o.id AND s.k = l.sk";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            // Each table read whole once, and the run's rows once more from its input.
+            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
+            let once =
+                count(
+                    "SELECT (SELECT count(*) FROM r) + (SELECT count(*) FROM o) \
+                 + (SELECT count(*) FROM c) + (SELECT count(*) FROM l) + (SELECT count(*) FROM s)",
+                ) + count("SELECT count(*) FROM o, c, l WHERE c.id = o.cid AND l.oid = o.id");
+            conn.set_join_methods(JoinMethods::ByCost);
+            // Loops in the FROM order, hash joins at `c` and `s`, and the run `o c l` built for `s`.
+            PIN.with(|pin| pin.set(true));
+            PIN_HASH_JOINS.with(|positions| positions.set((1 << 2) | (1 << 4)));
+            SPLIT.with(|split| split.set(Some(1)));
+            APPLIED.with(|applied| applied.set(0));
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut bushy: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            bushy.sort();
+            let full_scan_steps = stmt.stmt_status(crate::StatementStatusCounter::FullscanStep);
+            let made_bushy = APPLIED.with(Cell::get);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            SPLIT.with(|split| split.set(None));
+            PIN_HASH_JOINS.with(|positions| positions.set(0));
+            PIN.with(|pin| pin.set(false));
+            assert!(made_bushy > 0, "no plan was made bushy: {plan:?}");
+            assert!(!nested_loops.is_empty());
+            assert_eq!(bushy, nested_loops, "{plan:?}");
+            assert!(
+                full_scan_steps <= once,
+                "{full_scan_steps} full-scan steps, {once} reading each table and the run once: {plan:?}"
+            );
+        }
+
+        /// T6's q05 shape at small scale (6 tables, 60,000 lines, 500 suppliers in ASIA), where a
+        /// run `s n` probed by `r` matches each outer row to every supplier in ASIA, and
+        /// `l.sk = s.id` and `c.nk = s.nk`, joining the run to the outer loops, run only after
+        /// that match. Returns the connection, the query, the nested loops' answer, and the rows
+        /// that match alone visits (the outer rows times the run's rows in ASIA).
+        fn q05_shape() -> (Arc<crate::Connection>, &'static str, Vec<String>, u64) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, name TEXT)",
+                "CREATE TABLE n(id INTEGER PRIMARY KEY, rk INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, nk INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, nk INT)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT, d INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT)",
+                "CREATE INDEX l_oid ON l(oid)",
+                "CREATE INDEX n_rk ON n(rk)",
+                "CREATE INDEX s_nk ON s(nk)",
+                "CREATE INDEX c_nk ON c(nk)",
+                "INSERT INTO r VALUES (1, 'AFRICA'), (2, 'AMERICA'), (3, 'ASIA'), (4, 'EUROPE'), \
+                 (5, 'MIDDLE EAST')",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 25) \
+                 INSERT INTO n SELECT i, i % 5 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2500) \
+                 INSERT INTO s SELECT i, i % 25 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1500) \
+                 INSERT INTO c SELECT i, i / 7 % 25 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 15000) \
+                 INSERT INTO o SELECT i, i % 1500 + 1, i % 7 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, i % 15000 + 1, i * 7919 % 2500 + 1 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let sql = "SELECT n.id, count(*) FROM c, o, l, s, n, r \
+                       WHERE c.id = o.cid AND l.oid = o.id AND l.sk = s.id AND c.nk = s.nk \
+                       AND s.nk = n.id AND n.rk = r.id AND r.name = 'ASIA' AND o.d = 3 \
+                       GROUP BY n.id";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
+            let late_match = count(
+                "SELECT count(*) FROM c, o, l WHERE c.id = o.cid AND l.oid = o.id AND o.d = 3",
+            ) * count(
+                "SELECT count(*) FROM s, n, r WHERE s.nk = n.id AND n.rk = r.id AND r.name = 'ASIA'",
+            );
+            conn.set_join_methods(JoinMethods::ByCost);
+            (conn, sql, nested_loops, late_match)
+        }
+
+        /// `sql` planned by cost: its rows, sorted; the VM steps it took; and its plan.
+        fn by_cost(conn: &Arc<crate::Connection>, sql: &str) -> (Vec<String>, u64, Vec<String>) {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut chosen: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            chosen.sort();
+            let steps = stmt.stmt_status(crate::StatementStatusCounter::VmStep);
+            (
+                chosen,
+                steps,
+                rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")),
+            )
+        }
+
+        /// Lane T6 (TPC-H q05 at SF1 passed 10 s): the planner prices the late match's visits,
+        /// so the plan it chooses takes fewer steps than that match alone visits, and answers as
+        /// the nested loops do.
+        #[test]
+        fn t6_q05_terms_from_a_run_to_the_outer_loops_are_priced_after_its_match() {
+            let (conn, sql, nested_loops, late_match) = q05_shape();
+            let (chosen, steps, plan) = by_cost(&conn, sql);
+            assert!(!nested_loops.is_empty());
+            assert_eq!(chosen, nested_loops, "{plan:?}");
+            assert!(
+                steps < late_match,
+                "{steps} steps, the match before the terms alone visits {late_match}: {plan:?}"
+            );
+        }
+
+        /// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): do plan q05's
+        /// shape against one version of the cost inputs, then move the database's learned seek
+        /// weight a millionfold and plan again against that same version; expect one plan, and
+        /// the learned weights moved (so the version, not the learning, made the plan).
+        #[test]
+        fn t13_two_plannings_against_one_version_choose_one_plan() {
+            use crate::translate::optimizer::learned_costs::Work;
+            let (conn, sql, _, _) = q05_shape();
+            let version = conn.db.learned_costs.weights_at(Some(1.0)).unwrap();
+            conn.pin_cost_weights(Some(version));
+            let (first_rows, _, first) = by_cost(&conn, sql);
+            let seek = conn.db.learned_costs.nanos_per(Work::Seek).unwrap();
+            for _ in 0..128 {
+                conn.db
+                    .learned_costs
+                    .observe(Work::Seek, 1e9, seek * 1e6 * 1e9);
+            }
+            let moved = conn.db.learned_costs.weights_at(Some(1.0)).unwrap();
+            let (second_rows, _, second) = by_cost(&conn, sql);
+            conn.pin_cost_weights(None);
+            assert!(
+                moved.seek > version.seek * 1e3,
+                "the learning did not move: {version:?} {moved:?}"
+            );
+            assert_eq!(
+                first, second,
+                "two plannings against one version chose two plans"
+            );
+            assert_eq!(first_rows, second_rows);
+        }
+
+        /// Lane T7 (TPC-H q05, option i): the late terms each visit runs are priced per visit.
+        /// Every weight is pinned at the planner bench's calibration on adacachy2 (T6's, at
+        /// 952f5766: in rows' visits a seek 18.55, a hash build 25.81, a probe 4.82, a sort 1.27,
+        /// a Bloom lookup 4.99, a WHERE step 6.77; a row's visit 0.00027 of a page read at SF1;
+        /// every page read from the file). With seeks and builds dearer by a growing factor and
+        /// the WHERE step at nothing, the pricing before this lane, the first state that takes
+        /// the late match (some step count at or past what it visits) is the slow plan's; with
+        /// the WHERE step at its measured price, that same state takes a plan doing less work,
+        /// and answers as the nested loops do.
+        #[test]
+        fn t7_q05_late_terms_priced_per_visit_keep_the_late_match_out() {
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            let (conn, sql, nested_loops, late_match) = q05_shape();
+            let pin = |factor: f64, where_step: f64| {
+                conn.pin_cost_weights(Some(LearnedWeights {
+                    row_in_pages: Some(0.00027),
+                    seek: 18.55 * factor,
+                    hash_build: 25.81 * factor,
+                    hash_probe: 4.82,
+                    sort: 1.27,
+                    bloom_probe: 4.99,
+                    where_step,
+                    page_miss: Some(1.0),
+                }));
+            };
+            let mut seen = Vec::new();
+            let mut slow_state = None;
+            for factor in (0..14).map(|power| f64::from(1u32 << power)) {
+                pin(factor, 0.0);
+                let (_, steps, plan) = by_cost(&conn, sql);
+                if steps >= late_match {
+                    slow_state = Some((factor, plan));
+                    break;
+                }
+                seen.push((factor, steps));
+            }
+            let Some((factor, slow_plan)) = slow_state else {
+                conn.pin_cost_weights(None);
+                panic!("no pinned state took the late match ({late_match} visits): {seen:?}");
+            };
+            pin(factor, 6.77);
+            let (chosen, steps, plan) = by_cost(&conn, sql);
+            conn.pin_cost_weights(None);
+            assert_eq!(chosen, nested_loops, "{plan:?}");
+            assert!(
+                steps < late_match,
+                "seeks and builds x{factor}: {steps} steps, the late match visits {late_match}: \
+                 {plan:?}; with no WHERE step: {slow_plan:?}"
+            );
+        }
+
+        /// Lane T8 (TPC-H q19 at SF1, 17x SQLite's time): q19's shape at small scale, an OR of
+        /// three branches each joining `p` to `l` with terms on each table alone. `p`'s terms
+        /// keep 239 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
+        /// `p` was priced at every row (the branches' brands are all of them, so the IN filter
+        /// on brand keeps every part) and the plan read all 60,000 of `l`. Each table's share of
+        /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
+        /// its index. Expect: fewer VM steps than reading `l` whole with its own filters (work
+        /// any plan reading all of `l` does), and the answer of the same OR inside a CASE, which
+        /// no share is taken from.
+        #[test]
+        fn t8_q19_each_tables_share_of_an_or_filters_it_before_the_join() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, brand INT, container INT, size INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, mode INT, instr INT, \
+                 price INT)",
+                "CREATE INDEX l_pk ON l(pk)",
+                // Brand, container and size independent; each part's 30 lines take each
+                // quantity once, and every mode and instruction in turn.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO p SELECT i, i % 3, i / 3 % 10, i / 30 % 50 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, i % 2000 + 1, i / 2000 % 50 + 1, (i * 3 + i / 2000) % 7, \
+                 (i + i / 2000) % 4, i % 1000 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let branches = "(p.id = l.pk AND p.brand = 0 AND p.container IN (0, 1, 2, 3) \
+                 AND l.qty >= 1 AND l.qty <= 11 AND p.size BETWEEN 1 AND 5 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 1 AND p.container IN (4, 5, 6, 7) \
+                 AND l.qty >= 10 AND l.qty <= 20 AND p.size BETWEEN 1 AND 10 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 2 AND p.container IN (6, 7, 8, 9) \
+                 AND l.qty >= 20 AND l.qty <= 30 AND p.size BETWEEN 1 AND 15 \
+                 AND l.mode IN (0, 1) AND l.instr = 0)";
+            let sql = format!("SELECT count(*), sum(l.price) FROM l, p WHERE {branches}");
+            let unshared = rows(
+                &conn,
+                &format!(
+                    "SELECT count(*), sum(l.price) FROM l, p \
+                     WHERE p.id = l.pk AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+                ),
+            );
+            let (_, whole_l, _) = by_cost(
+                &conn,
+                "SELECT count(*), sum(l.price) FROM l WHERE l.mode IN (0, 1) AND l.instr = 0",
+            );
+            let (answer, steps, plan) = by_cost(&conn, &sql);
+            assert_ne!(unshared, vec!["0,".to_string()], "no row passes the OR");
+            assert_eq!(answer, unshared, "{plan:?}");
+            assert!(
+                steps < whole_l,
+                "{steps} steps, reading l whole with its own filters takes {whole_l}: {plan:?}"
+            );
+        }
+
+        /// Lane T9 (T8's open edge): a table's share of a WHERE OR runs on rows the OR itself may
+        /// never reach. Here no line joins a part, so the OR, and its LIKEs with an ESCAPE of two
+        /// characters, one on each table so whichever table a plan reads first holds one, run on
+        /// no row: the query answers as the same OR inside a CASE (which no share is taken from)
+        /// does, rather than raising the ESCAPE's error from a share.
+        #[test]
+        fn t9_a_share_of_an_or_raises_no_error_the_or_would_not() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT, size INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, tag TEXT)",
+                "CREATE INDEX l_pk ON l(pk)",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO p SELECT i, char(97 + i % 26) || i, i % 50 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, 100000 + i % 2000, i % 50, char(97 + i % 26) || i FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let outcome = |sql: &str| -> std::result::Result<Vec<String>, String> {
+                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+                let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect())
+            };
+            let branches = "(p.id = l.pk AND p.name LIKE 'a%' ESCAPE 'xy' AND p.size < 5 \
+                 AND l.tag LIKE 'c%' ESCAPE 'xy' AND l.qty = 1) \
+                 OR (p.id = l.pk AND p.name LIKE 'b%' ESCAPE 'xy' AND p.size < 10 \
+                 AND l.tag LIKE 'd%' ESCAPE 'xy' AND l.qty = 2)";
+            let unshared = outcome(&format!(
+                "SELECT count(*) FROM l, p WHERE p.id = l.pk \
+                 AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+            ));
+            assert_eq!(unshared, Ok(vec!["0".to_string()]));
+            let sql = format!("SELECT count(*) FROM l, p WHERE {branches}");
+            assert_eq!(
+                outcome(&sql),
+                unshared,
+                "{:?}",
+                outcome(&format!("EXPLAIN QUERY PLAN {sql}"))
+            );
         }
 
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
@@ -4542,22 +5010,30 @@ pub(crate) mod bushy_search_tests {
         /// Lane pl8-20: the LEFT JOIN's dimension keeps six rows (`cat < 3`), the other one
         /// (`id = 7` or `id = 3`). Lane pl8-22: each side reaches its fact through an index made
         /// for the join, so the plan with the LEFT JOIN in the run and its mirror differ only by
-        /// which side is built and which probes (kiln run r124 planned both for one query, the
-        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after). On calibration's
-        /// weights alone the search picks the mirror (kiln run r298: an EXPLAIN before the first
-        /// run plans `d2`'s side as the run); once the query's first run has timed the seeks and
-        /// the hash joins, the learned weights make the LEFT JOIN's side the run (three runs of
-        /// three, r288). So each query runs once by cost first, its answer checked too, and the
-        /// plan's shape is checked on the run after, before the answers.
+        /// which side is built and which probes.
+        ///
+        /// Lane C6: the search takes the one or the other by the hash probe's weight, which each
+        /// query's run moves, so no weights learned here put the LEFT JOIN in the run for all
+        /// eight. Priced with the others at 8.2, 25 and 0.005736 (adacachy2's, pinned), the six
+        /// queries without `AND s.id IS NULL` alone take it at a probe of 20 rows' visits and more
+        /// (the seventh below 104 only: past that its left-deep plan is cheaper), the pair with it
+        /// at 92 and more; see the record of lane C6. The design promises the answer, and that the
+        /// shape is what is tested (T-PL.8.13), not which shape the weights learned choose
+        /// (docs/design/planner.md, the decision of lane pl8-19, "Falsified by"). So each query is
+        /// answered on the weights learned, twice, by cost; then the weights are stated and its
+        /// LEFT JOIN is in a run of a bushy plan, its answer the nested loops'.
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
             let (_db, conn) = facts();
             let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
-            for (on_extra, above) in [
-                ("", ""),
-                (" AND s.cat <> 11 AND s.cat <> 17", ""),
-                ("", " AND s.id IS NULL"),
-                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            // The hash probe's weight that puts the LEFT JOIN in the run: past which the mirror
+            // plan, with the LEFT JOIN an outer loop, costs more.
+            for (on_extra, above, hash_probe) in [
+                ("", "", 40.0),
+                (" AND s.cat <> 11 AND s.cat <> 17", "", 40.0),
+                ("", " AND s.id IS NULL", 312.9),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)", 40.0),
             ] {
                 for (from, filter) in [
                     (
@@ -4578,24 +5054,341 @@ pub(crate) mod bushy_search_tests {
                     ),
                 ] {
                     let sql = format!("{select} {from} {filter}{above}");
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                    let nested_loops = rows(&conn, &sql);
+                    assert!(!nested_loops.is_empty(), "{sql}");
                     conn.set_join_methods(JoinMethods::ByCost);
-                    let first = rows(&conn, &sql);
+                    for run in ["first", "second"] {
+                        let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                        assert_eq!(
+                            rows(&conn, &sql),
+                            nested_loops,
+                            "{sql}: the {run} run on the weights learned: {plan:?}"
+                        );
+                    }
+                    conn.pin_cost_weights(Some(LearnedWeights {
+                        row_in_pages: Some(0.005736),
+                        seek: 8.2,
+                        hash_build: 25.0,
+                        hash_probe,
+                        sort: 3.0,
+                        bloom_probe: 10.0,
+                        where_step: 1.0,
+                        page_miss: None,
+                    }));
                     BUSHY_PLANS.with(|plans| plans.set(0));
                     LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
                     let searched = rows(&conn, &sql);
                     let made_bushy = BUSHY_PLANS.with(Cell::get);
                     let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
                     let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    conn.pin_cost_weights(None);
                     eprintln!("bushy={made_bushy} in_runs={in_runs}: {sql}: {plan:?}");
+                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
                     assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
                     assert!(in_runs > 0, "no LEFT JOIN inside a run: {sql}: {plan:?}");
-                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
-                    let nested_loops = rows(&conn, &sql);
-                    assert!(!nested_loops.is_empty(), "{sql}");
-                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
-                    assert_eq!(first, nested_loops, "{sql}: the first run's plan");
                 }
             }
+        }
+
+        /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
+        /// queries with SQLite's answers, each with how many columns its ORDER BY reads (0: one row
+        /// of aggregates, compared as it stands).
+        struct OuterJoins {
+            name: &'static str,
+            fill: Vec<&'static str>,
+            queries: Vec<(usize, &'static str, &'static str)>,
+        }
+
+        fn outer_joins(name: &str) -> OuterJoins {
+            let mut out: Vec<OuterJoins> = Vec::new();
+            for line in include_str!("../../tests/fixtures/outer_joins.tsv").lines() {
+                let fields: Vec<&'static str> = line.split('\t').collect();
+                match fields.as_slice() {
+                    ["db", name] => out.push(OuterJoins {
+                        name,
+                        fill: Vec::new(),
+                        queries: Vec::new(),
+                    }),
+                    ["sql", sql] => out.last_mut().unwrap().fill.push(sql),
+                    ["q", sql, want] => out.last_mut().unwrap().queries.push((0, sql, want)),
+                    ["o", keys, sql, want] => {
+                        out.last_mut()
+                            .unwrap()
+                            .queries
+                            .push((keys.parse().unwrap(), sql, want))
+                    }
+                    _ => assert!(line.starts_with('#'), "{line}"),
+                }
+            }
+            out.into_iter().find(|db| db.name == name).unwrap()
+        }
+
+        /// FNV-1a 64 of lines, as `bench/sqlite_outer_joins.py` sums SQLite's rows.
+        fn lines_sum(lines: &[String]) -> u64 {
+            lines
+                .join("\n")
+                .bytes()
+                .fold(0xCBF2_9CE4_8422_2325_u64, |sum, byte| {
+                    (sum ^ u64::from(byte)).wrapping_mul(0x100_0000_01B3)
+                })
+        }
+
+        /// What `sql` answers, as the fixture writes SQLite's answer (`keys` 0: its row; otherwise
+        /// its rows' count, the sum of them sorted and the sum of their first `keys` columns in the
+        /// order they came), and its first rows for a report.
+        fn outer_join_outcome(
+            conn: &Arc<crate::Connection>,
+            sql: &str,
+            keys: usize,
+        ) -> (String, Vec<String>) {
+            let got = conn
+                .prepare(sql)
+                .and_then(|mut stmt| stmt.run_collect_rows());
+            let rows: Vec<Vec<String>> = match got {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|value| value.to_string()).collect())
+                    .collect(),
+                Err(error) => return (format!("refused: {error}"), Vec::new()),
+            };
+            let mut lines: Vec<String> = rows.iter().map(|row| row.join(",")).collect();
+            let first = lines.iter().take(6).cloned().collect();
+            if keys == 0 {
+                return (lines.join(";"), first);
+            }
+            let ordered: Vec<String> = rows.iter().map(|row| row[..keys].join(",")).collect();
+            lines.sort();
+            (
+                format!(
+                    "{}:{:016x}:{:016x}",
+                    rows.len(),
+                    lines_sum(&lines),
+                    lines_sum(&ordered)
+                ),
+                first,
+            )
+        }
+
+        /// How a query of the outer joins' sweep is planned.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum OuterJoinPlans {
+            /// By cost, on the learned weights.
+            ByCost,
+            /// By cost, on weights pinned at a seek's, a hash build's and a hash probe's rows'
+            /// visits, with LEFT JOIN probes allowed.
+            Weights(f64, f64, f64),
+            /// The FROM order left-deep, its last table's hash join built from the run that starts
+            /// at this position.
+            HandBuilt(usize),
+        }
+
+        /// What the sweep's runs did: what its answers were worth.
+        #[derive(Debug, Default)]
+        struct OuterJoinRuns {
+            runs: usize,
+            bushy: usize,
+            left_joins_in_runs: usize,
+            left_join_probes: usize,
+            /// The runs whose joins' workers built hash tables, by the workers stated.
+            hooked: std::collections::BTreeMap<usize, usize>,
+            /// The runs planned bushy that also took the hook.
+            bushy_hooked: usize,
+        }
+
+        /// PL.8 (T-PL.8.13, lanes C3 and C6): left, right and full joins among inner ones, four and
+        /// five tables in drawn FROM orders at three sizes, and the fact queries with their outer
+        /// join hung every way, each as a row of aggregates, as its rows under an ORDER BY (with a
+        /// LIMIT in some) and as groups in their keys' order, with SQLite's own answers
+        /// (`bench/sqlite_outer_joins.py`). Do: run each with or without statistics, by cost, under
+        /// weights that make seeks dear and hash joins cheap and the other way round, with LEFT JOIN
+        /// probes allowed, and as the hand-built bushy trees of its FROM order; each with the
+        /// parallel mode off and at 1, 2 and 8 stated workers. Expect: SQLite's answer every time,
+        /// its rows, their NULLs and their order.
+        fn outer_joins_answer_as_sqlite(name: &str, analyzed: bool) {
+            use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            use crate::vdbe::morsel::{MachineCosts, ParallelMode};
+            use std::sync::atomic::Ordering;
+            let db = outer_joins(name);
+            let io = Arc::new(MemoryIO::new());
+            let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = database.connect(ConnectOpts::new()).unwrap();
+            for sql in &db.fill {
+                conn.execute(*sql).unwrap();
+            }
+            if analyzed {
+                conn.execute("ANALYZE").unwrap();
+            }
+            // Workers, and the table an outer join of two probes on them; each plan at each.
+            let padded = crate::OuterJoinProbe::Padded;
+            let workers = [
+                None,
+                Some((1, padded)),
+                Some((2, padded)),
+                Some((8, padded)),
+                Some((8, crate::OuterJoinProbe::Kept)),
+            ];
+            let plans: &[OuterJoinPlans] = if name == "facts" {
+                &[OuterJoinPlans::ByCost]
+            } else {
+                &[
+                    OuterJoinPlans::ByCost,
+                    OuterJoinPlans::Weights(2.0, 0.5, 0.5),
+                    OuterJoinPlans::Weights(2000.0, 0.5, 0.5),
+                    OuterJoinPlans::Weights(2000.0, 50.0, 0.5),
+                    OuterJoinPlans::HandBuilt(1),
+                    OuterJoinPlans::HandBuilt(2),
+                ]
+            };
+            let mut ran = OuterJoinRuns::default();
+            let mut wrong: Vec<String> = Vec::new();
+            let mut slowest: Vec<(u128, String)> = Vec::new();
+            for plan in plans {
+                match *plan {
+                    OuterJoinPlans::ByCost => {}
+                    OuterJoinPlans::Weights(seek, hash_build, hash_probe) => {
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                        conn.pin_cost_weights(Some(LearnedWeights {
+                            row_in_pages: Some(0.003),
+                            seek,
+                            hash_build,
+                            hash_probe,
+                            sort: 3.0,
+                            bloom_probe: 10.0,
+                            where_step: 1.0,
+                            page_miss: None,
+                        }));
+                    }
+                    OuterJoinPlans::HandBuilt(split) => {
+                        conn.pin_cost_weights(None);
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                        PIN.with(|pin| pin.set(true));
+                        SPLIT.with(|first| first.set(Some(split)));
+                    }
+                }
+                // The parallel loops run where the plans differ: by cost, and on the weights that
+                // make every join a hash join. The other plans answer once, serially.
+                let parallel = matches!(
+                    plan,
+                    OuterJoinPlans::ByCost | OuterJoinPlans::Weights(2000.0, 0.5, 0.5)
+                );
+                for stated in workers {
+                    if stated.is_some() && !parallel {
+                        continue;
+                    }
+                    // The fact queries join 12,000 rows a side: serial and eight workers.
+                    if name == "facts" && stated.is_some_and(|(count, _)| count < 8) {
+                        continue;
+                    }
+                    conn.set_parallel_mode(ParallelMode::Off);
+                    if let Some((count, probe)) = stated {
+                        conn.set_parallel_mode(ParallelMode::On);
+                        conn.set_parallel_outer_probe(probe);
+                        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                            std::num::NonZeroUsize::new(count).unwrap(),
+                            1.0,
+                            1.0,
+                        ));
+                    }
+                    for (keys, sql, want) in &db.queries {
+                        BUSHY_PLANS.with(|plans| plans.set(0));
+                        LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                        LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                        APPLIED.with(|applied| applied.set(0));
+                        let links = conn.morsel_join_links.load(Ordering::Relaxed);
+                        let began = std::time::Instant::now();
+                        let (got, first) = outer_join_outcome(&conn, sql, *keys);
+                        slowest.push((began.elapsed().as_millis(), format!("{plan:?}: {sql}")));
+                        let bushy = BUSHY_PLANS.with(Cell::get) + APPLIED.with(Cell::get);
+                        let hooked = conn.morsel_join_links.load(Ordering::Relaxed) > links;
+                        ran.runs += 1;
+                        ran.bushy += usize::from(bushy > 0);
+                        ran.left_joins_in_runs +=
+                            usize::from(LEFT_JOINS_IN_RUNS.with(Cell::get) > 0);
+                        ran.left_join_probes += usize::from(LEFT_JOIN_PROBES.with(Cell::get) > 0);
+                        ran.bushy_hooked += usize::from(bushy > 0 && hooked);
+                        if let (Some((count, _)), true) = (stated, hooked) {
+                            *ran.hooked.entry(count).or_default() += 1;
+                        }
+                        if got != *want {
+                            wrong.push(format!(
+                                "{name} analyzed={analyzed} {plan:?} workers={stated:?}: got {got}, \
+                                 SQLite {want}: {sql}: first rows {first:?}: {:?}",
+                                conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+                                    .and_then(|mut stmt| stmt.run_collect_rows())
+                                    .map(|rows| rows
+                                        .iter()
+                                        .filter_map(|row| row.last().map(ToString::to_string))
+                                        .collect::<Vec<_>>())
+                            ));
+                        }
+                    }
+                }
+                conn.set_parallel_mode(ParallelMode::Off);
+                conn.set_parallel_outer_probe(padded);
+                conn.pin_cost_weights(None);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|first| first.set(None));
+            }
+            slowest.sort();
+            for (millis, what) in slowest.iter().rev().take(3) {
+                eprintln!("slowest: {millis} ms, {what}");
+            }
+            eprintln!("{name} analyzed={analyzed}: {ran:?}, {} wrong", wrong.len());
+            for line in &wrong {
+                eprintln!("WRONG {line}");
+            }
+            assert!(wrong.is_empty(), "{} of {} wrong", wrong.len(), ran.runs);
+            // Non-vacuity: bushy plans were run, and workers built the hash tables of some joins.
+            if name != "facts" {
+                assert!(ran.bushy > 0 && !ran.hooked.is_empty(), "{ran:?}");
+            }
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_analyzed() {
+            outer_joins_answer_as_sqlite("small", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small() {
+            outer_joins_answer_as_sqlite("small", false);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any_analyzed() {
+            outer_joins_answer_as_sqlite("small_any", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any() {
+            outer_joins_answer_as_sqlite("small_any", false);
+        }
+
+        #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed() {
+            outer_joins_answer_as_sqlite("middle", true);
+        }
+
+        #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle() {
+            outer_joins_answer_as_sqlite("middle", false);
+        }
+
+        #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed() {
+            outer_joins_answer_as_sqlite("facts", true);
+        }
+
+        #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts() {
+            outer_joins_answer_as_sqlite("facts", false);
         }
 
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
@@ -4760,7 +5553,14 @@ pub(crate) mod bushy_search_tests {
             for probe in [10.0, 400.0] {
                 for seek in [learned.seek / 4.0, learned.seek * 4.0] {
                     for build in [learned.hash_build / 4.0, learned.hash_build * 4.0] {
-                        conn.pin_cost_weights(Some((seek, build, probe)));
+                        conn.pin_cost_weights(Some(
+                            crate::translate::optimizer::learned_costs::LearnedWeights {
+                                seek,
+                                hash_build: build,
+                                hash_probe: probe,
+                                ..learned
+                            },
+                        ));
                         for sql in FACT_QUERIES {
                             BUSHY_PLANS.with(|plans| plans.set(0));
                             drop(conn.prepare(sql).unwrap());
@@ -4781,18 +5581,17 @@ pub(crate) mod bushy_search_tests {
     }
 }
 
+/// Writes `plan` into the tables; its join order, and the ORDER BY its loops give, whose sort it
+/// took out of `order_by`.
 fn apply_table_access_plan(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<amphora_engine_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut OrderTerms,
     group_by: &mut Option<GroupBy>,
     plan: TableAccessPlan,
-) -> Result<Vec<JoinOrderMember>> {
+) -> Result<(Vec<JoinOrderMember>, OrderTerms)> {
+    let mut loop_order = Vec::new();
     let TableAccessPlan {
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
@@ -4817,7 +5616,7 @@ fn apply_table_access_plan(
                 }
             }
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
-                order_by.clear();
+                loop_order = std::mem::take(order_by);
             }
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
                 if let Some(group) = group_by.as_mut() {
@@ -4880,6 +5679,7 @@ fn apply_table_access_plan(
             access_cost: access_method.cost.0,
             total_cost,
             position,
+            star_filter: access_method.star_filter,
         });
         input_rows = output_rows;
     }
@@ -5319,7 +6119,7 @@ fn apply_table_access_plan(
         }
     }
 
-    Ok(best_join_order)
+    Ok((best_join_order, loop_order))
 }
 
 /// Build a multi-index operation for the main loop or an unmatched-right read.

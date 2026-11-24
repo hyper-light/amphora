@@ -448,6 +448,7 @@ fn prepare_one_select_plan(
                 estimated_cost: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
+                loop_order: vec![],
             };
 
             let mut windows: Vec<Window> = Vec::new();
@@ -976,6 +977,7 @@ fn prepare_one_select_plan(
                 estimated_cost: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
+                loop_order: vec![],
             };
 
             validate_expr_correct_column_counts(&plan)?;

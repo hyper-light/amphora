@@ -79,6 +79,9 @@ mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+// floatingpoint.html §2: the CLI's ieee754 and decimal extensions (lane G13).
+mod decimal;
+mod ieee754;
 mod row_changes;
 #[cfg(feature = "series")]
 mod series;
@@ -143,10 +146,12 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, BackgroundSearch, BushyLeftJoinProbes, CarriedJoinOrders, Connection,
-    IsValueEstimate, JoinMethods, JoinSearchBudget, OuterJoinProbe, PrepareOptions, Row,
+    IsValueEstimate, JoinMethods, JoinSearchBudget, OuterJoinProbe, PrepareOptions, RealSums, Row,
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+#[cfg(any(feature = "simulator", feature = "bench"))]
+pub use translate::optimizer::learned_costs::LearnedWeights;
 pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
@@ -165,8 +170,8 @@ pub use database::{
     any(not(target_os = "windows"), feature = "experimental_win_iocp")
 ))]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, LimboError};
+pub use dialect::{Dialect, PostgresDialect, SqliteDialect};
+pub use error::{io_error, BudgetFull, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
@@ -197,7 +202,9 @@ pub use storage::{
     packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Access, Page, PagePath, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
+    wal::{
+        CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared,
+    },
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::optimizer::join::join_search_ns;
@@ -222,6 +229,7 @@ pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
+mod pg_catalog_vtab;
 mod turso_types_vtab;
 
 /// Database index for the temp database (always 1 in SQLite).

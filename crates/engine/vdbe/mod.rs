@@ -964,6 +964,12 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
+    /// Lane T18 (PL.13): with `amphora::seek_time` on at DEBUG, each cursor's seeks and their
+    /// nanoseconds this run, by cursor id (`execute::seek_trace_end`); empty otherwise.
+    pub(crate) seek_times: Vec<(u64, u64)>,
+    /// Lane T19: the statement's star-filter probes and rejects when `execute::star_trace_write`
+    /// last wrote them, so it writes each run's alone.
+    pub(crate) star_trace_base: (u64, u64),
     /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
     pub(crate) leaf_batches: leaf_batch::LeafBatches,
     /// Amphora (G5 step 4, T-G5.4.3): the scans skipping rows by a summary, a walk a cursor.
@@ -974,7 +980,6 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    pub(crate) busy_writer: Option<crate::busy::WriteLockWait>,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
@@ -996,6 +1001,9 @@ pub struct ProgramState {
     group_tables: id_map::IdMap<group_table::GroupTable>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
     morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
+    /// Amphora (CS.5, lane R6): the serial loop a column copy handed its statement to, timed while
+    /// the statement steps and charged to its table's row path when it ends.
+    pub(crate) rows_timed: Option<crate::storage::versioned::columns_sql::RowsTiming>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1133,6 +1141,8 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
+            seek_times: Vec::new(),
+            star_trace_base: (0, 0),
             leaf_batches: leaf_batch::LeafBatches::default(),
             skip_walks: crate::skipping::SkipWalks::default(),
             distinct_key_values: Vec::new(),
@@ -1149,9 +1159,9 @@ impl ProgramState {
             star_orders: id_map::IdMap::default(),
             handoff_open: false,
             handoff_asked: false,
-            busy_writer: None,
             group_tables: id_map::IdMap::default(),
             morsel_rows: None,
+            rows_timed: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1228,7 +1238,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
-        self.busy_writer = None;
+        self.seek_times.clear();
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
@@ -1355,6 +1365,7 @@ impl ProgramState {
             self.group_tables.clear();
         }
         self.morsel_rows = None;
+        self.rows_timed = None;
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
             self.ephemeral_temp_files
@@ -1832,8 +1843,9 @@ impl ProgramState {
         cursor_id: usize,
         sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
     ) -> &mut BloomFilter {
-        self.bloom_filters
-            .get_or_insert_with(cursor_id, || sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
+        self.bloom_filters.get_or_insert_with(cursor_id, || {
+            sizing.map_or_else(BloomFilter::new, BloomFilter::sized)
+        })
     }
 
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
@@ -1843,8 +1855,9 @@ impl ProgramState {
         expected_items: u32,
         false_positive_rate: f32,
     ) -> &mut BloomFilter {
-        self.bloom_filters
-            .get_or_insert_with(cursor_id, || BloomFilter::with_capacity(expected_items, false_positive_rate))
+        self.bloom_filters.get_or_insert_with(cursor_id, || {
+            BloomFilter::with_capacity(expected_items, false_positive_rate)
+        })
     }
 
     /// Gets an existing bloom filter for the given cursor ID.
@@ -2465,11 +2478,15 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
+        let entered = state.rows_timed.is_some().then(std::time::Instant::now);
         let result = if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
+        if state.rows_timed.is_some() {
+            self.time_rows(state, entered, &result);
+        }
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
@@ -2634,6 +2651,35 @@ impl Program {
                     }
                 }
             }
+        }
+    }
+
+    /// Amphora (CS.5, lane R6): a step of a statement a column copy handed to its serial loop ran
+    /// from `entered` (None: from the hand-over within it); at the statement's end its time is
+    /// charged to its table's row path, and a statement that fails or is interrupted charges none.
+    #[inline(never)]
+    fn time_rows(
+        &self,
+        state: &mut ProgramState,
+        entered: Option<std::time::Instant>,
+        result: &ProgramStep,
+    ) {
+        if let Some(timing) = state.rows_timed.as_mut() {
+            timing.ran(entered);
+        }
+        match result {
+            ProgramStep::Done => {
+                if let (Some(timing), Some(switch)) =
+                    (state.rows_timed.take(), self.connection.versioned.as_ref())
+                {
+                    switch
+                        .storage()
+                        .copies
+                        .rows_measured(timing, state.metrics.rows_read);
+                }
+            }
+            ProgramStep::Error(_) | ProgramStep::Interrupt => state.rows_timed = None,
+            _ => {}
         }
     }
 

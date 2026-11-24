@@ -423,7 +423,7 @@ In replicated mode an answer waits twice:
 CP-T1.8 already names a faster class: a replicated-class commit, p99 at most 2 ms for 3 nodes on a LAN (AC-T1.8.3),
 beside the persisted quorum commit's 5 ms (AC-T1.8.2).
 
-**What hyper-raft already does.** The revision Amphora vendored when this was decided (4d72e19b; d5d5f8f since)
+**What hyper-raft already does.** The revision Amphora vendored when this was decided (4d72e19b; d5d5f8f, then 7d1c7be since)
 builds R-8, commits on entries held in memory across fates (raft.md §3.7):
 - A follower answers at once for entries its durable promises cover.
 - The leader counts itself by its disk alone.
@@ -548,7 +548,7 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
 - The flushing thread times its flushes on the real clock, not the owner's ("The owner's time"): it measures a
   disk's real I/O, and no decision of the owner reads it, so it is outside that rule.
 - Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, upstream at hyper-raft
-  `d5d5f8f`, the revision Amphora vendors). Its commit takes the first of the classic quorum's index and the held
+  `d5d5f8f`; Amphora vendors `7d1c7be`, which holds it). Its commit takes the first of the classic quorum's index and the held
   quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
   held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
 - Labels: Amphora adds only `quorum`, two values. The host adds its own: kiln adds `db`, the record family's
@@ -1058,9 +1058,8 @@ codex-notices/OWNER.md, section 7).
   joint configuration") before it proposes. A change appended but not applied at its base is not visible there; a
   raise beside it applies only if no change applied between its base and its index, since the stale-base rule
   refuses it otherwise, so it is never applied while a member it did not prove belongs to the configuration
-  (T-T1.8.A2). `writer_floor` answers that refusal `Unavailable`, the retry class, "the database advanced since
-  preparation: the group changed while the raise was proven; raise again"; a raise whose entry another lead replaces
-  stays `UnknownOutcome`. A learner that has not attested blocks a
+  (T-T1.8.A2). `writer_floor` answers that refusal as it is, `Serialization`, like any write whose base moved, to be asked
+  again; a raise whose entry another lead replaces stays `UnknownOutcome`. A learner that has not attested blocks a
   raise, and the refusal names it. Falsified by: a floor applied while a learner of the configuration at its index had
   no attestation at its version under its current join.
 - c) **One `u32`, the highest version the binary runs.** It is the claim U05's standalone floor already carries
@@ -1307,14 +1306,14 @@ This holds whether or not anything copies the log back into the file while the r
 nothing doing so. The open reader holds a read mark at its snapshot's last frame. A checkpoint copies no frame past the
 oldest read mark held (`determine_max_safe_checkpoint_frame`, crates/engine/storage/wal.rs: a mark it can't take
 exclusively caps what it copies), so the file never holds a page newer than the reader's snapshot where the reader
-would read it from the file. A restart of the log takes every read mark exclusively first, and returns `Busy` while any
-is held (`begin_restart`, the same file), so it never pulls a reader's frames away. These are SQLite's rules for
-checkpoints under readers (sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader, and
-the log starts over only once no reader uses it). Today nothing checkpoints a replica's database at all
+would read it from the file. A restart of the log switches the writer to the log's free segment and waits for no read
+(store.md, decision 45): the open reader reads on in the segment it began on, which is reset only once no read counts
+on it, so a restart never pulls a reader's frames away. The copy's rule is SQLite's for checkpoints under readers
+(sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader). Today nothing checkpoints a replica's database at all
 (`wal_autocheckpoint = 0`, and no checkpointer runs there). That is a gap of its own, not this decision's (below).
 Falsified by: a local read whose statements see two states, part from before an image and part from it; a read begun
 after the install that sees any of the state before it; a checkpoint during an open read that changes what it sees,
-or a log restart that goes through while it is open. The test:
+or a log restart that takes away frames it reads. The test:
 `a_local_read_open_across_an_image_install_sees_one_side_whole` (T-T1.10.L4). A learner's read transaction is held open
 while the leader's image installs under it, and in a second leg a passive checkpoint and a log restart run on the
 learner's database during it.
@@ -1683,11 +1682,12 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
    25 ms, the store's measured period (store.md, decision 4). Past the bound, as the writer counts its frames, a pass
    follows every flush. A pass that copied nothing new waits for the next flush, which on this thread is automatic
    (store.md, decision 25).
-3. **The owner starts the log again**, on the machine's own connection between steps, as the store's writer does
-   (`Db::restart_log`: Restart, or Truncate past `keep_log`, store.md decision 31). It is the owner's because a
-   restart takes the engine's write lock: on another connection it would make the owner's next `wal_insert_begin`
-   busy, and a failed apply fences. The owner never waits for a reader: with a flush or a local read out, it tries
-   again at its next step. When a restart is due, when reads are held for it, and how far the log may grow are
+3. **The owner starts the log again**, on the machine's own connection between steps, as the store's writer does, by
+   the engine's switch to the log's free segment (`Db::switch_log`, which copies nothing; store.md, decisions 45 and
+   31). It is the owner's because a restart takes the engine's write lock: on another connection it would make the
+   owner's next `wal_insert_begin` busy, and a failed apply fences. The owner never waits for a reader, and no reader
+   for it (2026-11-24, lane V20): with a flush out, or the segment the last restart closed not yet free, it tries again
+   at its next step. When a restart is due, and how far the log may grow are
    "A replica's database log bounded by what it measures" (2026-11-11), below, which replaces this point's picked
    bound (`LOG_FRAMES`, 131,072 frames, and a 64th of it) and points 4 and 5. A leader's log is also started again
    by the engine itself: a preparation is a write transaction, and the engine restarts the log at a write's begin
@@ -1700,13 +1700,12 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
 5. *(Replaced, 2026-11-11: the disk a log takes is that section's C.)*
 6. **Busy is a skip; only I/O fences.** A checkpoint pass that finds the log busy copies nothing and reports nothing:
    its `Checkpointed` is the default, and the owner keeps what the last real pass said. A restart that finds the log
-   busy (`Db::restart_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
+   busy (`Db::switch_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
    other reason fences the owner, as a failed flush does: the file's state is unknown after it (store.md, decision 9's
    argument), so the failure is typed and reported, never silent.
-7. **The local reads' pool.** The restart reaches the readers through two calls on `Local`: `hold_reads` (no read
-   begins on this replica until the restart) and `restart_unread` (the restart, run only while no read of this replica
-   is out). Whatever the pool becomes (amphora-class-and-readers' goal 314d704a, one account across replicas), it
-   keeps those two per replica.
+7. *(Superseded, 2026-11-24, lane V20, by store.md's decision 45: a restart reaches no reader. The pool's two calls for
+   it, `hold_reads` (no read begins on this replica until the restart) and `restart_unread` (the restart, run only while
+   no read of this replica is out), are deleted, and with them `unhold_reads`.)*
 
 ### Evidence
 
@@ -1718,7 +1717,8 @@ lowered bounds with a lowered room.
   bound after every write, restarts and passes counted, every row read back locally and after a restart.
 - T-T1.8.D1 `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`: a local read open across 39 writes
   on a learner with a 16-frame bound. No restart under it, and its view stays whole. A read that came while the
-  restart was due was refused `Timeout` (red on main: it answered at once). A restart once it ended.
+  restart was due was refused `Timeout` (red on main: it answered at once). A restart once it ended. *(Its promise is
+  superseded by decision 45, and the test rewritten: the next section.)*
 - T-T1.8.D2 `a_held_database_flush_stalls_no_persisted_owner_step`: three persisted voters, the leader's flushes held,
   rounds for four election timeouts at least. Red on main: the leader's owner reached the held flush on its own
   thread. With the change it never did. The write was answered with its flush held, and the term and the leader
@@ -1727,7 +1727,7 @@ lowered bounds with a lowered room.
   2 to 5 applied unflushed. A pass copies through the frame the flush covered, and no further (store.md, decision 15).
 - T-T1.8.D1 `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: a local read with no end, under a deadline on a
   clock the test moves, out while the learner's log passes twice its bound. No restart while it runs. It is refused
-  at its deadline, and the restart follows.
+  at its deadline, and the restart follows. *(Superseded and rewritten the same way.)*
 - T-T1.8.D2 `a_member_power_cut_loses_no_acknowledged_persisted_write`: the power-cut nemesis on three persisted
   voters, 12 seeds: 92 writes acknowledged, 36 cuts, 16 of them of a leader holding writes unflushed, none lost. And
   `a_persisted_local_read_after_a_power_cut_is_no_older_than_its_last_flush` (T-T1.10.L6 in the persisted class).
@@ -1760,7 +1760,7 @@ log, a replica having two logs):
 
 - (the bound's falsifiers are the next section's);
 - a checkpoint pass that changed what an open local read sees;
-- a log restart while a local read was out, or a local read that began while a restart was due;
+- a log restart that waits for a local read, or a local read that waits for a restart (store.md, decision 45);
 - a persisted owner that flushes an ordinary entry's database log on its own thread, or an acknowledged write lost
   after a power cut in the persisted class (the power-cut nemesis);
 - terms that move as often under the same load after the change as before.
@@ -1827,16 +1827,31 @@ construction. With h of the tail held, the p99.9 becomes the base's quantile at 
 can't see (quorum, network) can move that by more than AC-T1.4.3's 1 ms. That 1 ms is held by the batch's
 benchmark, restarts on against off, not by this rule.
 
-**B. A restart waits for a pass that copied every durable frame.** It is ready when it is due, no flush and no read
-is out, and the last pass caught up: it copied through the frame the flush before it made durable (its cap, store.md
-decision 15; the flushing thread reports `backfilled >= durable`, or nothing left). What the restart then copies on
-the owner is only what the owner applied since that flush was asked, at most one flush's growth, the least any rule
-can leave. This replaces "a 64th left". Reads are held (`hold_due`) when a restart is due and the last pass either
-caught up (the restart waits only for the reads out) or found the log busy: a read that began on a log wholly copied
-holds read-mark 0, and a passive pass is busy beside it (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`). The
-flushing thread now reports a busy pass instead of dropping it, and a busy pass is the fact that "twice the bound
-however much is left" guessed at. While a restart is due, every flush is followed by a pass, and one is asked even
-with nothing to flush.
+**B. A restart waits for a pass, and for no read** (store.md, decision 45; revised 2026-11-24, lane V20). It is ready
+when it is due, no flush is out, and a pass has followed a flush of what the current segment holds (`Pass::ready`).
+The pass copied every durable frame the reads under way let it (its cap, store.md decision 15); how far it got is no
+part of the rule. The restart is the engine's switch alone (`Db::switch_log`): it copies nothing. It flushes what the
+current segment holds unflushed, what the owner applied since that flush was asked, at most one flush's growth, the
+least any rule can leave, and that segment closes. The flushing thread copies it: a pass is asked as the restart is
+made, so it is copied at once, and one follows the flushes after. A local read holds off no restart, and a restart no
+read:
+- **What an open read keeps.** The segment it began on, to its end: the switch leaves every frame where it was, so the
+  read's view is whole. A read that begins before the pass asked at the restart has copied the closed segment counts on
+  that one too, since not all of it is in the file; one that begins after counts on the current one alone. A read that
+  begins while a restart is due waits for nothing.
+- **How long the closed segment lives.** Until it is copied whole and no read counts on it: each read ends by its
+  caller's deadline D (`run_query`'s progress handler), and none begun after the copy counts on it, so at most 2D plus
+  one copy after the restart (decision 45, "Bounded"). Until then the other segment isn't free: the owner appends on in
+  the current one and tries again at each step.
+- **What was removed.** Until then a restart waited until no read was out, and reads were held (`hold_due`) once one
+  was due: a read that came waited for the restart and was refused at its own deadline. Both were there because a
+  restart wrote the log again from its first frame, under a read whose snapshot ended inside it. They cost what decision
+  45 names: one slow reader had every write past the room refused (C) until it ended. With them go T1's promises that no
+  restart is made under an open read and that a read that comes meanwhile waits for it, and T2's that a restart due
+  waits for a read's deadline (below, "Evidence").
+While a restart is due, every flush is followed by a pass, and one is asked even with nothing to flush. A pass that
+finds the log busy copies nothing, and the restart follows it as any other: a read that began on a log wholly copied
+holds read-mark 0, and a passive pass is busy beside it (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`).
 
 **C. The log's room, from the filesystem, at each pass.** After each pass the flushing thread (never the owner)
 reads:
@@ -1862,7 +1877,7 @@ does.
 
 Past H, on every member, a restart is due whatever the share says, and it counts as held: disk before latency.
 Without that, an owner whose own base tail has spent the share would never restart, its log would stay past H, and
-its submits would be refused for good. Reads are held. New submits are refused `Refusal::Unavailable("the
+its submits would be refused for good. No read is held (B). New submits are refused `Refusal::Unavailable("the
 database's log holds {frames} frames, past the {H} it may hold: ...")`, typed and retryable. No new variant: none
 until kiln shows a caller that must branch on it, and `Refusal` is a wire enum. A follower can't refuse what its
 group committed, and the leader can't see a follower's disk without a wire change, so a follower past H applies on.
@@ -1888,10 +1903,21 @@ registry, not a second budget beside it. One image is kept back per filesystem, 
 installing at once (a node rejoining behind on all its groups) can still meet a full disk mid-image, and fence
 typed. `SNAPSHOT_BYTES` (256 MiB, "until streaming snapshots") is itself picked, noted to amphora-constants.
 
-**D. The bound, stated.** A replica's database log holds at most min(H, what its group commits between restarts
-due by their share + what it commits while the local reads out at the due point finish). Each of those reads is
-bounded by its caller's deadline (`run_query`'s progress handler), and no new one begins. Past H no new submit is
-taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
+**D. The bound, stated.** A replica's database log is two segment files (store.md, decision 45), each within the
+room: each holds at most min(H, what its group commits between restarts due by their share, and, while a read counts
+on the other segment, until that one ends). The room counts the current segment's frames, read from the log's shared
+state (`Db::log_frames_in_use`), not the writer connection's own view, which a switch leaves on the closed segment
+until its next transaction. The closing segment holds what it held when the writer switched from it, within the room
+then, and grows no more. So the log's peak disk is two segment files, each within the room (Ada, 2026-11-24, on lane
+B19's question; lane B20). A slow local read takes no room from the writes: it keeps the segment it began on, and
+they go on in the other, up to that one's own room (lane V20). One thing a slow read can still cost is the disk's: where
+the writes fill that segment's whole room too while the read still holds the first, the member refuses new submits,
+typed (C), until the read ends, at most its caller's deadline. The room is read from the free bytes as each pass finds them: the
+pages a closed segment's copy may still add to the database's file, up to one a frame while a read holds the copy
+back, were in that segment's room while it was current, and are counted free again in the current one's, so they draw
+on the image kept back (C). Kept back too, they would leave the second segment no room while a read held the first,
+whose room, at 8,216 bytes a frame, is the log's whole share: a slow read would have a write refused again. Past H no
+new submit is taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
 
 How often each value is computed: A, F and N after every checkpoint pass, at most one a flush (one statvfs a pass);
 the counts at each owner step and tick; the restart's held at each step until idle.
@@ -1916,9 +1942,10 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
   (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
   more apply, and makes one once its generation covered its spend.
 - T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
-  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a write is
-  refused `Unavailable` naming the frames past the room, and no restart is made. Once the read ends a restart
-  follows, and the next write is taken.
+  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a restart is
+  made under it and, the second segment past its room too, a write is refused `Unavailable` naming the frames past the
+  room (2026-11-24, lane V20: no restart was made until then). Once the read ends a restart follows, and the next write
+  is taken.
 - T-T1.8.D3 `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills`: a learner past its room refusing
   submits applies 6 to 10. Its flushes then fail as a full disk's do (`StorageFull`), it fences ("failed a flush"),
   and reopened on its files it holds 1 to 10.
@@ -1927,12 +1954,19 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
 - T-T1.8.D1, rewritten on the room:
   - `a_replicas_database_log_stays_within_its_room`: 300 writes, both logs at room for 64 frames each; each within
     its room plus what two writes grow it;
-  - `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` and
-    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: past a room of 16, no restart under a read, one after
-    it;
-  - `a_read_on_a_wholly_copied_log_holds_passes_off_and_a_busy_pass_holds_reads`: a restart due by its share, a busy
-    pass, reads held, the log within its room;
-  - `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go`: the rule at each state.
+  - `a_local_read_holds_off_no_restart_of_the_log_and_one_after_waits_for_nothing` (T1, until 2026-11-24
+    `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`): past a room of 16, a restart under an open
+    read whose two views are both its own, a read beside it answered, and a restart once it ended (its segment free);
+  - `a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most` (T2, until 2026-11-24
+    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`): a restart under a read with no end, and the next once
+    its deadline ended it;
+  - `a_slow_local_read_has_no_write_refused_past_the_logs_room`: on the voter, past its room under an open read, every
+    write taken;
+  - `a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it` (lane V19): a restart that went
+    through holds no read;
+  - `a_read_on_a_wholly_copied_log_holds_passes_off_and_no_restart_or_read` (until 2026-11-24 `..._and_a_busy_pass_holds_reads`):
+    a restart due by its share, a busy pass, a restart under the read and a read answered, the log within its room;
+  - `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go`: deleted with the rule it stated, 2026-11-24.
 
 ### Metrics
 
@@ -1950,12 +1984,13 @@ beside
   restart that held no more than the worst before it (the share test);
 - a commit p99.9 that rises with restarts on against off, at a load where restarts are due by their share (the
   batch's benchmark: AC-T1.4.3's 1 ms is its to hold);
-- a submit taken on a member whose log was past its room; a restart not made past the room once no read was out
-  and a pass had caught up;
+- a submit taken on a member whose log was past its room; a restart not made past the room though the other segment
+  was free and a pass had run; a write refused past the room while the other segment was free;
 - a disk filled by replica logs while each was within its room. statvfs's `f_bavail` is an estimate on btrfs
   (compression, and space its allocator still holds) and on APFS (purgeable space counted free, and containers
   sharing one pool), so a filesystem may hold less than it said;
-- a restart that copied more than what was applied after the last caught-up pass's flush;
+- a restart that copied a frame on the owner, or flushed there more than what was applied after the last flush was
+  asked; a restart or a read that waited for the other;
 - a snapshot install that met a full disk mid-image while its filesystem was within every log's room (several
   installs at once on one filesystem are the stated exception);
 - a reopen too slow at a log near its room: a reopen reads the whole log to rebuild its index (wal.c,
@@ -1982,8 +2017,9 @@ own would, so under steady leader writes it is refused round after round, and ki
 **The rule.** The kind of slot Kung and Robinson prescribe for a transaction that keeps failing validation (f6), as
 the fallback of an optimistic rule, MOCC-style (f7). Once one of a member's writes is refused, that member is queued,
 and its next barrier (its ReadIndex) waits at the leader for its slot. While a member holds the slot, the leader
-appends nothing of its own and holds the other members' forwards, until the holder's next forward arrives or the
-slot's length passes. Today's exact base stays the only admission rule: no entry format, wire or engine change. The
+appends nothing of its own and holds the other members' forwards, until the holder's next forward or its close
+arrives; by time only at the end its write's barrier stated, or when the host's detector suspects the holder ("When
+a slot ends by time", below). Today's exact base stays the only admission rule: no entry format or engine change. The
 pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `start_slot`, `step_forward`,
 `step_ready`).
 - *When a member is queued.* At the leader's append of its refused entry, not at that entry's commit or apply. The
@@ -1999,10 +2035,66 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   slot can only expire, and the late retry it then measures teaches a longer slot, feeding back toward the ceiling.
   Started at the barrier, a member that never comes back never holds the leader, and the measured gap is the retry
   alone: from its barrier's start to its forward. The holder's second barrier before any forward means its slot's
-  work was no write (a read, or a write that prepared nothing), and the slot ends `released`. A queued member whose
-  next command is a read, and then nothing, holds the leader once, until its learned slot expires: one slot, counted
-  `expired`, and it teaches nothing, since no forward follows (amphora-owner-t1-g-slot-878285a-20261111). Agreed
-  there, as better than the ruling it departs from.
+  work was no write (a read, or a write that prepared nothing), and the slot ends `released`. A member learns its
+  write was refused as stale from its own answer (`Actor::slotted`), the verdict the leader queued it by; when the
+  next barrier's work then ends forwarding nothing (a read, a write its caller or its SQL refused, its deadline), it
+  sends that second barrier at once, so the slot ends `released` on the leader's next step, not by its length
+  (lane W3; before it, a queued member whose next command was a read, and then nothing, held the leader until its
+  learned slot expired). A leader of any version reads the second barrier so, so this adds nothing to the wire; the
+  barrier's own read state matches nothing at the member and is dropped. Agreed there
+  (amphora-owner-t1-g-slot-878285a-20261111), as better than the ruling it departs from.
+  Since lane V8 every follower barrier asks for a slot (`Slots::ask`), so a second barrier that comes after its slot
+  ended (its length passed while the work ran, or a release) asked for a new slot that no work ends, holding the
+  leader and every member queued behind it for its length (lane P13's trace, CP-T1.13). A slot begun for a member
+  waits for its close until one comes (`Gap::from`), so a barrier from a member whose slot ended before its close came
+  is that close, marked a read's or not (`Slots::released`; lane P16): it ends nothing and asks for nothing, and it
+  steps. A slot ends once (lane P14). A member sends its close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
+  leader, which gave none, would take the close as an ask (lane P14's trace, the same stuck state).
+- *Which barriers ask* (CP-T1.8, lanes V8 and V11). Since lane V8 a follower's write asks for its slot from its
+  first try: the leader queues every write's barrier (`Slots::ask`), not only a refused member's, so the base it
+  prepares on is current when its write appends. A read never asks (lane V11): work that writes nothing (a
+  Records get, scan, changes, head or import progress, and `Database::query`, which a replicated database runs
+  with its writing statements refused, as a local one does) marks its barrier's context with one byte past the
+  request identity (`READ_BARRIER`), and the leader steps a marked barrier at once (`Slots::pass`), ending a
+  slot its member holds `released`. So a follower's read never waits behind another member's slot, nor holds
+  the leader's writes for its own round trip. The second barrier a write that forwarded nothing sends is marked
+  too. A leader before this echoes the byte unread and takes the barrier as a write's, as it did; a read's
+  context is never an entry's, since a read never proposes.
+- *When a slot ends by time* (CP-T1.8, lanes V14 and V15). A write's barrier states the time its write has left:
+  past the request identity, a mark (`WRITE_DEADLINE`) and that time as it was sent, in nanoseconds. The leader
+  keeps the barrier's arrival plus that time as the slot's end on its own clock, later than the holder's own end by
+  the link's one-way time, never earlier (`Slots::read`). A live holder's slot ends by its forward (`forwarded`) or
+  its close (`released`); by time (`expired`) only at that stated end; and at once, `released`, when the host's
+  detector suspects the holder (`Slots::keep`). A barrier that states no end (a member before lane V14) keeps the
+  learned length below. The write's entry carries the request identity alone, so the log doesn't change, and a
+  leader before lane V14 takes the context as a write's and echoes it unread. A follower whose write's deadline
+  ends it at its barrier (waiting for the read's answer, or for its own log's tail) sends its close from its
+  next step that isn't paused, while the barrier's term and leader hold (lane V14). The close is asked of the core
+  after that step's one drive, so it marks the owner driving: the owner drives again at once, and the close leaves
+  with that drive's `Ready` (lane V16). Before lane V16 it waited in the core (`Raft::msgs`) for the owner's next
+  wake: on a real clock its next tick, unless an input came first (read from `run_loop`'s wait, not measured),
+  and never in the driven harness, whose clocks stand still (`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot`).
+- *What bounds a lost forward* (CP-T1.8, lanes V15 and V18; an event since V18). A holder's forward lost on the way
+  leaves the slot without its event: nothing after the forward reaches the leader for it, and the holder is live, so
+  nobody suspects it. Lane V15 measured that wait on real time (three members in one process, relayed by the test
+  pump, which lost member 3's forward): the leader's other writes waited the holder's whole 10 s deadline. Since lane
+  V18 a follower's forward is followed, in the same drive and so on the same ordered link, by a close: a barrier marked
+  a read's (`Actor::close_behind`, the second barrier a write that forwarded nothing already sent). The leader steps a
+  marked barrier at once and ends a slot its member holds `released` (`Slots::pass`), so a forward lost on the way
+  holds the slot only until that close arrives. A close behind a forward that arrived has nothing to end and its
+  answer is read by nothing (the member's own read state for it matches no request and is dropped), so the leader
+  consumes it unstepped: it knows it as that member's close by the request identity of the last forward it took from
+  the member, whose serial it follows by one (`follows`), in the same term and incarnation. No other barrier has that
+  serial, since an owner names each request once and makes none between its forward and its close. The wire is
+  unchanged: a leader of any version, and a leader that missed the forward, steps the close as the read it is.
+  Two designs were named by lane V15, and lane V18 measured what each costs a follower's write on the normal path, on
+  the driven harness with no loss (records a write, both classes). The close behind every forward: 1 more record a
+  write (the close; before the leader consumed it, 9.4 more, a read round's). A forward sent again when the
+  transport reports the link reset or the record refused: no more records, but a copy of the forward's entries kept
+  for each write in flight (4,133 bytes here), a report from each host's transport, and a typed drop of a copy at the
+  leader. The close was built: it needs nothing from a host, adds one small record, and its bound is the close's
+  arrival at the leader. What it does not bound: a loss of the whole `Ready` that held both (a link reset between
+  them), which the deadline or the detector still bounds. Numbers: bench/records, lane V18.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
@@ -2021,7 +2113,11 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   entry and the forwards stepped at the slot's end. Other members' forwards stay held through the turn, until the
   leader's own write is appended, or until the next start finds it has none to make. A second forward from a member
   held in the turn ends the turn. So the turn's write follows those entries and nothing else, and none was refused
-  in any W2 run. Outside a turn the leader's writes keep today's rule. A general tail rule at the leader is a
+  in any W2 run. A turn the leader has no write for passes only to a slot that begins: with no barrier waiting it
+  stays owed, and only the forwards it held go, so the leader's next write still prepares behind the holder's entry
+  (CP-T1.8, lane V13: given up at once, the leader's next write prepared on its applied state behind the holder's
+  uncommitted entry, and was refused stale, 1 to 4 a run at 32 spread writers in trace r1814). Outside a turn the
+  leader's writes keep today's rule. A general tail rule at the leader is a
   separate question: in the driven runs it refused the leader at most once in a row, against up to 8 without it.
   But two floor tests, `a_raise_beside_a_change_holds_through_a_lost_lead` and
   `a_raise_whose_base_is_joint_is_refused`, rest on a leader write prepared beside an entry in flight, and the
@@ -2045,7 +2141,12 @@ that member's slot to its next forward, and keeps the longest gap of this genera
 (each generation as long as the member's last two learned gaps were apart: "Decision (lane constants): generations
 learned where they run"). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
-its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
+its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value.
+The election timeout is also every slot's shortest (CP-T1.8, lane V13): a learned gap is an estimate, and a live
+holder's next retry outruns it, after which the leader appends first and refuses the retry. Lane V13's trace
+(r1814, 32 spread writers, both classes, two rounds) found 148 of 155 stale forwards were such a slot, ended at its
+learned length (37 to 47 a run) while its holder's forward was on its way. So a slot ends by time only once its
+holder is as late as the core takes a member for gone, and a gap longer than that still lengthens the next slot. No
 number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
 (`slot::Unmeasured::Suspected`), logged (`write_slot_unmeasured`) and not learned: that member was gone, not slow. The
 detector's verdict is learned where it runs; the slot no longer borrows `patience::QUORUM_CEILING`, a tail measured
@@ -2425,8 +2526,7 @@ A compaction still runs at once while the log stalls admission for room: it is w
 **The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
 one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
 
-**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
-framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+**What is left.** A configuration change's entry is not counted in the replay's bytes (it is applied
 by `apply_change`, rarely).
 
 **Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
@@ -2488,6 +2588,21 @@ the time in which the group elects another leader, so holding more serves no one
 in bytes and messages a second, the outgoing queue's in `ReplicaHandle::drain` (its reader the host) and the command
 queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gain of 1/8, as the compaction's costs are
 (CT.1; `database/drain.rs`). An interval counts when the queue held work at its start or its reader took some in it.
+The time weighed is the time the queue held work (lane constants-K3, 2026-11-23): an interval ends the moment its
+reader finds the queue empty (`Drain::dry`) and the next begins when work comes (`Drain::came`). Weighed over the time
+the reader waited too, the rate was the rate work came at, and a bound learned from it refused a burst the reader takes
+at once (driven tests' wire records `Full` at 10 inputs). A stall, work waiting and nothing read, still counts at a rate
+of zero, and the busy intervals after it raise the rate again: a rule that drops every interval in which the reader
+ran dry (BBR's application-limited samples) instead holds the bound at its least after one stall, and BBR's raise-only
+rule settles back near the rate work comes at. What a reader takes within one tick of a driven clock is weighed over
+no time, never over the empty time after it. The command queue's owner marks both moments at its intake. The outgoing
+queue's host drain does not yet: its host thread reads no owner clock, so it needs a time-stamp for the moment it ran
+dry before it can (T-QB.1.16).
+The queue holds work while inputs wait in it to be taken, in its channel or behind QB.2's pause, and only then
+(lane replicated-K6): a write, a change or a hand-off the owner took and still holds keeps its bytes charged but
+waits for no reading. Counted as work, a leader's change waiting at its barrier while its clock moved a second at a
+time weighed each second as reading time, and the leader alone learned a bound of 2 inputs, refusing records its
+followers admitted by the hundred million (`a_change_past_its_deadline_answers_what_its_stage_knows`, T-QB.1.17).
 The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
 again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
 - The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues
@@ -2979,3 +3094,225 @@ differs from the one published only in its fence wakes the waiters; one that dif
 - an answer under `Session` that differs from `Latest`'s for a session carrying its tokens;
 - a read with no token that waits for the log;
 - redirects above 1 in 100 under steady lag (the bound learned is too short).
+
+## Decision (lane P6): a caller's session runs on a worker of its own, beside the owner's step (2026-11-23, CP-T1.13; designed, not built)
+
+### What was wrong
+
+Lane P5's record (bench/records/2026-11-23-adacachy2-perf-serve-p5.md): one replicated write of 16 rows of 1 MiB
+answered UnknownOutcome after 1114 ms, and one of 12 after 776 ms, each with an election (term 1 to 2) and another
+leader; 8 MiB answered Ok in 820 ms. The caller's session runs on the owner's thread (`Actor::prepare`, then
+`Machine::prepare_db`, then `Db::prepare_traced`). While it runs the owner neither ticks nor drives, so it sends no
+heartbeat. A session longer than the followers' learned election timeout lets one campaign and win (Ongaro and
+Ousterhout, "In Search of an Understandable Consensus Algorithm", USENIX ATC 2014, section 5.2). The old leader
+proposes once the session ends, steps down on the higher term, and the write's outcome is truly unknown. Ada's bar:
+any size and length commits or is refused typed, and one long write never costs the group its leader.
+
+### The constraint: one writer
+
+The database takes one writer at a time: the engine's log write lock (SQLite's WAL design, which the engine keeps:
+"since there is only one WAL file, there can only be one writer at a time", sqlite.org/wal.html). Three things on a
+replica take it:
+
+- a session's preparation: `Db::prepare_traced` runs inside `BEGIN IMMEDIATE` and ends with `ROLLBACK`;
+- an apply: `Db::apply_pages` begins with `wal_insert_begin`, which takes the write lock (`begin_write_tx`);
+- every owner read through `Machine::read_db` (the refresh after an apply, a claim's check), which prepares too.
+
+A worker on a second connection while the owner goes on applying would have one wait on the other. The owner waiting
+on the worker's write lock is P5's stall moved, not removed. So the worker is lent the write lock for its session's
+length, and the owner takes none until it has the result back.
+
+### The decision
+
+1. **One session worker per owner.** A thread started with the owner and ended with it, waiting on its job channel
+   (it wakes on a job, never on a timer). It runs every caller's session (`Author::Application`), at a leader and at
+   a follower alike: a follower's owner stalled by a session answers its leader late too. The owner's own sessions
+   (the floor keeper's, the seed's chunks, a compaction's step) stay on the owner: each is bounded by what the owner
+   sets (a compaction's page limit and deadline), and none runs a caller's SQL.
+2. **Its connection.** Its own, opened through the machine's opener (`Machine::reader`, as a local read's), kept
+   across jobs. It runs what the owner runs today, unchanged: `prepare_traced` at the same bounds (`COMMAND_BYTES`,
+   the read-set bound, page 1 at the base), the application claim checked inside the traced session, the session's
+   deadline guard (`deadline_on`) on the owner's clock. Lane P2's rule holds inside it: a write's answer is encoded
+   and held, charged, before anything is proposed, and it is answered only on its commit.
+3. **The write lock is lent, and applies are held.** From the hand-off until the owner takes the result, the owner
+   takes no write lock: it holds applies (hyper-raft's `RawNode::pause_apply`, the hold hyper-durable already uses
+   behind its durability fence, core step R-6, under which `Ready`s go on), with a hold of Amphora's own beside the
+   fence's so the fence's `resume_apply` cannot lift it. Applied state stays still, so the owner neither refreshes
+   nor runs a `read_db`. Everything else goes on: ticks, heartbeats, votes (a vote is the raft log's hard state, not
+   the database's), appends and their flushes, ReadIndex, a member's forward appended. The database's log is not
+   restarted while the lock is lent, so a restart due and ready at the hand-off runs first (`Actor::hand_off` steps
+   the flushing), as it ran after a session run inline, and no read is held for one while the session is out.
+   Lane P15's trace: the step that lent the lock skipped a due and ready restart, the passes then found the log busy
+   under the session's reader, and the write was answered with the replica's reads held for a restart still to come
+   (CP-T1.13, lane P16).
+4. **The result handed back, on an event.** The worker sends its result on a done channel and wakes the owner's bell,
+   as the flushing thread does (`Flushing::Thread`). The owner's next step takes it with `try_recv`: it woke on the
+   bell, so nothing polls. The owner lifts its hold, lets the step's drive apply what committed meanwhile, then
+   decides the pending write, which waited in a phase of its own (running, between `Barrier` and `Proposed`):
+   - still leader, in the pending write's term, with the same leader: proposed as today (`Actor::propose`, which moves
+     a base made stale by entries appended since by its read set, `rebase`), then `Proposed`;
+   - lead lost or term moved: nothing was proposed, so nothing was written. Data (a mutation, an import: anything
+     but a caller's closure) comes back from the worker with its result and is requeued for the next lead, as a
+     pending write requeued before its preparation is (lane P8). A call is refused `NotLeader` with the leader it
+     knows, a known outcome: its session is spent (a call is `FnOnce`), so it is never run again;
+   - past its deadline: `Timeout`, as today (the deadline guard ends the SQL inside the worker too);
+   - the session's error: that error, as today.
+5. **Ordering.** Unchanged: one pending write per owner; later submits wait in `waiting` in arrival order and are
+   received once it ends. The worker moves where a session runs, not when. An entry committed during the hold (a
+   member's forward, a change of members, the class entry) keeps its place in the log before the session's entry and
+   applies when the hold lifts, before the proposal. The session's base is then behind it: the leader's walk moves
+   the base past it if the session read nothing it wrote, or the base fence refuses the write at apply, typed, as for
+   any stale base today.
+6. **Memory.** The worker's connection is one of its replica's readers, taken at the hand-off through the readers'
+   ledger at the derived bound ("A replica's local readers bounded by derivation"): with no room, the write waits for
+   one, bounded by its deadline, then `Timeout`. One worker per owner runs one session at a time, so its memory is
+   one session's: its answer's frames charged as lane P2 charges them, and its dirty pages bounded by the image's
+   `COMMAND_BYTES`, as on the owner today.
+7. **Reads during a long write.** A local read (`read_local`) runs on a reader connection of its own, a WAL snapshot
+   reader that takes no write lock: answered throughout, at the applied state, which the hold keeps still. A session
+   token's read for a write committed during the hold waits for its apply, at most until the hold lifts, bounded by
+   the read's deadline. A quorum read prepared on the owner's connection (`Machine::read`) takes the write lock, so
+   none may run during a hold; if any caller remains it moves to a read transaction (`Db::query_transaction`), which
+   takes none.
+8. **The owner ending.** A write whose session is out when its owner ends is answered the end's reason, not
+   UnknownOutcome: nothing was proposed. The worker's transaction always rolls back (`prepare_traced`), and a result
+   that comes back to no owner is dropped with its charges.
+
+### Where the hold goes in hyper-durable
+
+The replica already keeps committed entries back behind its durability fence: `Replica::apply_range` extends
+`fence`'s range while one is held, `release_fence` applies the range once the durable commit covers its first entry
+(or at the next drive for a paged one), and `RawNode::pause_apply` keeps the core from giving out more meanwhile
+(vendor/hyper-raft/crates/hyper-durable/src/replica.rs). The owner's hold is one more reason for that same range to
+wait, not a second mechanism: while it is set, `apply_range` with no fence opens one and pauses, and
+`release_fence` returns before applying. Lifting it leaves the range to `release_fence`'s own rule at the next
+drive (the durable commit covering its first entry), so the durability fence promises what it promised before.
+Entries a `Ready` gave out before the hold was taken were applied in that step's drive or wait behind the fence
+already, so the session's base is the applied point the owner hands over.
+
+### The candidates weighed
+
+- **A database thread** doing every write to the database (applies, sessions, refreshes, the floor's reads and
+  images) while the owner does only Raft. One writer either way, so an apply still waits behind a long session, and
+  every owner read of its machine becomes a round trip. More moved for nothing over the decision.
+- **A concurrent writer** (an engine transaction whose pages stay its own until commit; the engine's parser takes
+  `BEGIN CONCURRENT`, and that it builds such a writer was not checked): applies would go on beside the session. The
+  follow-on if held applies are found to cost members' writes too much (see "Falsified by").
+- **Heartbeats sent from another thread** (P5's option b): rejected as a band-aid. The core's state is the owner's;
+  a second sender would speak for a term the owner may have left.
+- **Refusing long sessions** (P5's option c): fails the any-size bar.
+
+### Tests it is built with
+
+- `cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_leader` (crates/amphora/tests/serve.rs,
+  P5's 318b0a86): 16 rows of 1 MiB commit, the term holds, the leader keeps its lead.
+- On the driven shell: a vote request stepped into the leader while its worker holds a session is answered; a local
+  read is answered meanwhile.
+- On the driven shell: the leader loses its lead while its worker holds a session; the write is refused `NotLeader`,
+  no entry was proposed for it, and no member holds its rows.
+- The replicated suite, `serve::` and tests/serve.rs as they are.
+
+### Falsified by
+
+- a leader deposed while a session runs, with no other fault;
+- a write answered UnknownOutcome whose entry was never proposed;
+- an apply whose write lock overlaps a session's transaction (the hold leaking);
+- commit latency at 1 or 32 writers on the replicated rung worse than before beyond run-to-run noise: the hand-off
+  adds a thread's wake each way, and no saving at small writes pays for it.
+
+## Decision (lane P9): heartbeats and votes never wait behind a large entry (2026-11-23, CP-T1.13; part 1 built, parts 2 and 3 designed)
+
+### What was wrong
+
+Lane P8's trace of a 20 MiB replicated write (bench/records/2026-11-23-adacachy2-perf-serve-p8.md, measured, debug
+build): the leader spent 264.6 ms in one owner step proposing the entry; each follower stepped one record of
+21,082,349 bytes (12.6 ms) ahead of the heartbeats queued behind it; a follower's messages, heartbeat answers
+included, left only once its log write was durable; then every member spent 915-962 ms applying the entry in one
+step. Against a learned election timeout of about 21 ms (`election_tick` 20, tick period 0.6-1.3 ms) the leader lost
+its quorum check and stepped down on its own: 1 of 6 such writes answered Ok, the rest UnknownOutcome. With lane V4's
+hyper-raft change (a member whose term and vote are durable answers a heartbeat at once, `answer_beat_now`) it was 6
+of 8: needed, not enough. Four costs grow with the write's size, and each holds a heartbeat or its answer:
+
+1. one FIFO per peer: one TCP stream and one sender thread carry every record, and the reader blocks in `receive`
+   until the owner has stepped the whole record, so a heartbeat behind a 21 MB append is not even read until the
+   append is stepped (serve.rs `serve`, `to_peer`, `connection`);
+2. one entry per command, however large (`max_size_per_msg` is a whole command, `MESSAGE_BYTES`): each member steps
+   it in one step, and the leader's window sends it whole (`Inflights::full` lets one entry out past the window);
+3. the proposal's copies on the owner thread: the encoding, the leader's own log append and the sends, 264.6 ms;
+4. the apply on the owner thread: 915-962 ms, every member at once.
+
+### The decision (the coordinator's, 2026-11-23 16:44Z)
+
+Heartbeats, votes and their answers never wait behind a large entry. Built in this order, each A/B'd on the 20 MiB
+commit rate and on small-write commit latency at 1 and 32 writers before the next:
+
+1. **A path of its own per peer for control records (built, lane P9).** The owner tags each outgoing record with
+   its route as it releases it (`Outbound::route`, `api::replication::Route`): `Log` for the records that carry the
+   log (`MsgAppend`, `MsgSnapshot`), `Control` for every other record (heartbeats, votes, pre-votes, their answers,
+   appends' answers, read confirmations, a hand-over's `MsgTimeoutNow`), each bounded by its fields and never by an
+   entry. `serve` keeps one sender thread, one queue and one connection per peer and route; the control connection
+   is a new kind (`H`), framed as `R`, so the protocol grows by a kind and changes none. Each route keeps the order
+   its member sent; one route's records may overtake the other's, which Raft allows of any network (every message
+   carries its term, and a heartbeat's commit is the follower's matched index at most, so one that overtakes an
+   append commits nothing the follower lacks). An append's answer goes on the control path: the leader's window and
+   its match index move as soon as the follower answers, not after the next append behind it. The route is the
+   owner's, decided where the message is made: a host never parses a record to place it.
+2. **Large entries in parts sized by the path (designed).** A command whose encoded entry is larger than one
+   heartbeat interval's carriage goes into the log as parts: consecutive entries of one term, each at most
+   `min over the voters' paths of Path::carried(heartbeat interval)`, the bytes the host drained to that member in
+   a heartbeat interval at its measured rate (`carry`, `Drain::carried`), never under one record's framing
+   (`RECORD_BYTES`), so a part always moves. No size is picked: a fast path takes large parts, a slow one small. The
+   apply stages each part (as the seed's chunks are staged) and applies the write once, at its last part, in one
+   transaction. Parts must be contiguous and of one term: an entry of another term (a new leader's empty entry) or
+   of another write between them discards what is staged, deterministically on every member, so the write is
+   refused, not lost: the member that took it answers it typed (`NotLeader`, nothing applied) once its apply passes
+   the discard, a known outcome where today's is UnknownOutcome. Each step then handles one part at most per
+   record, so a member's step is bounded by what its path carries in a heartbeat interval, and the heartbeats stepped
+   between parts reach the core within one interval.
+3. **The proposal's copies and the apply off the owner thread (designed).** The session worker (lane P6's) already
+   holds the prepared write; it also encodes its parts, so the owner's step takes ready parts and proposes them as
+   the window opens, a part a step at most past the first. The apply moves to the same worker under the same lent
+   write lock and hold (`hold_apply`): the owner hands it the committed range, keeps ticking, beating, voting and
+   appending, and takes the result on the bell, as it takes a session's; the applied point is published when the
+   worker hands the range back. One writer still: a session and an apply never overlap, because the worker runs one
+   job at a time.
+
+### The data shapes
+
+- `Route { Log, Control }` on each `Outbound` (part 1), decided by the owner from the message's type.
+- Part 2: a command variant appended to the replicated command (`Part { write: context, index, of, bytes }`, the
+  wire growing by a variant), the staging keyed by the write's context, cleared by a discard or the last part's
+  apply, bounded by `COMMAND_BYTES` as the whole command is today.
+- Part 3: the worker's job grows a variant (`Apply { range }`) beside `Session`; the hand-back carries the applied
+  point.
+
+### The candidates weighed
+
+- **One connection with frames interleaved** (records cut into frames, control frames sent between a large
+  record's frames, as HTTP/2 streams share a connection, RFC 9113 section 5): the same effect on the wire, but the
+  reader still steps a whole record in one owner step and the sender's framing state is new code on every host.
+  Two connections need neither, and the kernel already schedules them.
+- **A priority queue in the owner** (control inputs stepped before queued appends): helps only once the record is
+  read, and part 1's reader already reads control records beside a large one; the step of a 21 MB record still
+  holds everything behind it, which only parts bound.
+- **Longer election timeouts for large writes**: rejected. Failover would slow for every write to save the large
+  ones, and the timeout would follow a size someone picked.
+- **Entries by reference** (the write's pages streamed out of band and the log carrying their digest): moves the
+  durability of the pages outside the log's rules (its fsync, its truncation on a new term); parts keep them inside.
+
+### Tests it is built with
+
+- Part 1: `--test serve` as it is (every member's records cross the two paths), the replicated suite, and P5's
+  probe at 20 MiB: the commit rate (Ok of N) and every member's leader lost within a term (`P8PROBE`), arms built
+  from fixed SHAs on one machine.
+- Part 2: a write of many parts commits whole; a leader lost between parts discards the staged parts on every
+  member and the write is refused `NotLeader` with nothing applied; a part's size follows the path's carriage.
+- Part 3: a vote request stepped into a member while its worker applies is answered; reads are answered at the
+  applied point meanwhile.
+
+### Falsified by
+
+- a heartbeat or vote answer that waits, at any member, for an append's bytes to be written, read or stepped;
+- a 20 MiB write's leader stepping down with no other fault once parts 1 to 3 are in;
+- commit latency at 1 or 32 writers worse than before beyond run-to-run noise (part 1 adds a connection and a
+  thread per peer and nothing to a small write's path).

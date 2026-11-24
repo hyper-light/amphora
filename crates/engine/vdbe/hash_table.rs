@@ -58,61 +58,77 @@ fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
 /// Takes collation into account when hashing text values
 pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
-
     for (idx, value) in key_values.iter().enumerate() {
-        match value {
-            ValueRef::Null => {
-                hasher.write_u8(NULL_HASH);
-            }
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
-                let f = *i as f64;
-                if (f as i64) == *i && f.is_finite() {
-                    hasher.write_u8(FLOAT_HASH);
-                    let bits = normalized_f64_bits(f);
-                    hasher.write(&bits.to_le_bytes());
-                } else {
-                    // Fallback to the integer domain when the float representation would lose precision.
-                    hasher.write_u8(INT_HASH);
-                    hasher.write_i64(*i);
-                }
-            }
-            ValueRef::Numeric(Numeric::Float(f)) => {
-                hasher.write_u8(FLOAT_HASH);
-                let bits = normalized_f64_bits(f64::from(*f));
-                hasher.write(&bits.to_le_bytes());
-            }
-            ValueRef::Text(text) => {
-                let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
-                hasher.write_u8(TEXT_HASH);
-                match *collation {
-                    CollationSeq::NoCase => {
-                        hash_text_nocase(&mut hasher, text.as_str());
-                    }
-                    CollationSeq::Rtrim => {
-                        let trimmed = text.as_str().trim_end_matches(' ');
-                        hasher.write(trimmed.as_bytes());
-                    }
-                    CollationSeq::Binary | CollationSeq::Unset => {
-                        hasher.write(text.as_bytes());
-                    }
-                    CollationSeq::Locale(_) => {
-                        hasher.write(&collation.hash_key(text.as_str()));
-                    }
-                    CollationSeq::Custom(_) => {
-                        unreachable!(
-                            "custom collations are rejected before hash table construction"
-                        )
-                    }
-                }
-            }
-            ValueRef::Blob(blob) => {
-                hasher.write_u8(BLOB_HASH);
-                hasher.write(blob);
-            }
-        }
+        hash_key_part(&mut hasher, idx, value, collations);
     }
     hasher.finish()
+}
+
+/// AUDIT 3.1: [hash_join_key] of keys as a probe holds them, without a `ValueRef` copy of them.
+fn hash_join_values(key_values: &[Value], collations: &[CollationSeq]) -> u64 {
+    let mut hasher = RapidHasher::new(DEFAULT_SEED);
+    for (idx, value) in key_values.iter().enumerate() {
+        hash_key_part(&mut hasher, idx, &value.as_ref(), collations);
+    }
+    hasher.finish()
+}
+
+#[inline]
+fn hash_key_part(
+    hasher: &mut RapidHasher,
+    idx: usize,
+    value: &ValueRef,
+    collations: &[CollationSeq],
+) {
+    match value {
+        ValueRef::Null => {
+            hasher.write_u8(NULL_HASH);
+        }
+        ValueRef::Numeric(Numeric::Integer(i)) => {
+            // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
+            let f = *i as f64;
+            if (f as i64) == *i && f.is_finite() {
+                hasher.write_u8(FLOAT_HASH);
+                let bits = normalized_f64_bits(f);
+                hasher.write(&bits.to_le_bytes());
+            } else {
+                // Fallback to the integer domain when the float representation would lose precision.
+                hasher.write_u8(INT_HASH);
+                hasher.write_i64(*i);
+            }
+        }
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            hasher.write_u8(FLOAT_HASH);
+            let bits = normalized_f64_bits(f64::from(*f));
+            hasher.write(&bits.to_le_bytes());
+        }
+        ValueRef::Text(text) => {
+            let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
+            hasher.write_u8(TEXT_HASH);
+            match *collation {
+                CollationSeq::NoCase => {
+                    hash_text_nocase(hasher, text.as_str());
+                }
+                CollationSeq::Rtrim => {
+                    let trimmed = text.as_str().trim_end_matches(' ');
+                    hasher.write(trimmed.as_bytes());
+                }
+                CollationSeq::Binary | CollationSeq::Unset => {
+                    hasher.write(text.as_bytes());
+                }
+                CollationSeq::Locale(_) => {
+                    hasher.write(&collation.hash_key(text.as_str()));
+                }
+                CollationSeq::Custom(_) => {
+                    unreachable!("custom collations are rejected before hash table construction")
+                }
+            }
+        }
+        ValueRef::Blob(blob) => {
+            hasher.write_u8(BLOB_HASH);
+            hasher.write(blob);
+        }
+    }
 }
 
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
@@ -148,6 +164,34 @@ fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) ->
         }
     }
     true
+}
+
+/// AUDIT 3.1: `buf` becomes a copy of `keys` in place, its text and blob values reusing their own
+/// allocations, so a refill allocates nothing once `buf` has held keys this size.
+fn refill_keys<'a>(
+    buf: &mut Vec<Value>,
+    keys: impl ExactSizeIterator<Item = &'a Value>,
+) -> Result<()> {
+    let n = keys.len();
+    buf.truncate(n);
+    buf.try_reserve(
+        n.checked_sub(buf.len())
+            .ok_or(LimboError::IntegerOverflow)?,
+    )?;
+    buf.resize(n, Value::Null);
+    for (kept, key) in buf.iter_mut().zip(keys) {
+        kept.try_clone_from(key)?;
+    }
+    Ok(())
+}
+
+/// [keys_equal] of two keys as they are held, without a `ValueRef` copy of either.
+fn keys_equal_values(key1: &[Value], key2: &[Value], collations: &[CollationSeq]) -> bool {
+    key1.len() == key2.len()
+        && key1.iter().zip(key2).enumerate().all(|(idx, (v1, v2))| {
+            let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
+            values_equal(v1.as_ref(), v2.as_ref(), collation)
+        })
 }
 
 /// Check if two values are equal, using the specified collation for text comparison.
@@ -319,7 +363,11 @@ impl HashEntry {
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
         let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + Self::FIXED_BYTES
+        // A budgeting estimate: held at usize::MAX, a size too large to count stays over every
+        // budget, so the entry spills as one that large would.
+        key_size
+            .saturating_add(payload_size)
+            .saturating_add(Self::FIXED_BYTES)
     }
 
     /// Calculate the serialized size of a single Value.
@@ -1168,7 +1216,12 @@ impl HashTable {
         let bytes = self
             .num_entries
             .saturating_mul(std::mem::size_of::<(usize, usize)>());
-        if self.mem_used.saturating_add(self.bucket_mem).saturating_add(bytes) > self.mem_budget {
+        if self
+            .mem_used
+            .saturating_add(self.bucket_mem)
+            .saturating_add(bytes)
+            > self.mem_budget
+        {
             return Ok(false);
         }
         let mut order: Vec<(usize, usize)> = vec![];
@@ -1230,9 +1283,10 @@ impl HashTable {
             if forward {
                 let mut pos = start;
                 while order.get(pos).is_some_and(below_probe) {
-                    pos += 1;
+                    pos = pos.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
                 }
-                (pos, u64::try_from(pos - start).unwrap_or(u64::MAX), false)
+                let steps = pos.checked_sub(start).ok_or(LimboError::IntegerOverflow)?;
+                (pos, u64::try_from(steps).unwrap_or(u64::MAX), false)
             } else {
                 (
                     order.partition_point(|position| below_probe(position)),
@@ -1252,10 +1306,9 @@ impl HashTable {
 
     /// A merge's next match: the run's next entry, while its key is the probe key's.
     fn merge_next_match(&mut self) -> Result<Option<&HashEntry>> {
-        let Some(probe_keys) = self.current_probe_keys.as_ref() else {
+        let Some(probe_keys) = self.current_probe_keys.as_deref() else {
             return Ok(None);
         };
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
         let Some(&(bucket_idx, entry_idx)) = self.merge_order.get(self.merge_next) else {
             return Ok(None);
         };
@@ -1263,13 +1316,20 @@ impl HashTable {
             .buckets
             .get(bucket_idx)
             .and_then(|bucket| bucket.entries.get(entry_idx))
-            .is_some_and(|entry| keys_equal(&entry.key_values, &key_refs, &self.collations));
+            .is_some_and(|entry| {
+                keys_equal_values(&entry.key_values, probe_keys, &self.collations)
+            });
         if !matches {
             return Ok(None);
         }
-        self.merge_next += 1;
+        self.merge_next = self
+            .merge_next
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         self.probe_bucket_idx = bucket_idx;
-        self.probe_entry_idx = entry_idx + 1;
+        self.probe_entry_idx = entry_idx
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         Ok(self
             .buckets
             .get(bucket_idx)
@@ -1370,7 +1430,7 @@ impl HashTable {
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
-        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
+        if self.over_budget(entry_size) {
             if self.spill_state.is_none() {
                 tracing::debug!(
                     "Hash table memory budget exceeded (used: {}, budget: {}), spilling to disk",
@@ -1525,7 +1585,7 @@ impl HashTable {
         }
 
         let entry_size = HashEntry::size_from_values(key_values, &[]);
-        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
+        if self.over_budget(entry_size) {
             if self.spill_state.is_none() {
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
@@ -1558,8 +1618,19 @@ impl HashTable {
     /// (`new`, `grow_buckets`), so this is the hash's low bits; the spill partitions take its
     /// high bits (`Partitioning::index`), so the two stay independent.
     #[inline(always)]
-    const fn bucket_of(hash: u64, buckets: usize) -> usize {
-        (hash as usize) & (buckets - 1)
+    fn bucket_of(hash: u64, buckets: usize) -> usize {
+        let mask = buckets.wrapping_sub(1);
+        // The masked bits are at most `mask`, a usize, so they fit one.
+        usize::try_from(hash & u64::try_from(mask).unwrap_or(u64::MAX)).unwrap_or(mask)
+    }
+
+    /// Whether an entry of `entry_size` bytes would take the table past its memory budget. A sum
+    /// past usize::MAX is past every budget.
+    fn over_budget(&self, entry_size: usize) -> bool {
+        self.mem_used
+            .checked_add(self.bucket_mem)
+            .and_then(|used| used.checked_add(entry_size))
+            .is_none_or(|used| used > self.mem_budget)
     }
 
     /// AUDIT 3.1: doubles the in-memory bucket array once the table holds as many entries as it
@@ -2157,14 +2228,7 @@ impl HashTable {
             return self.merge_probe(metrics);
         }
 
-        // Compute hash of probe keys using collations
-        let hash = {
-            let key_refs: Vec<ValueRef> = probe_keys
-                .iter()
-                .map(|value| value.as_ref())
-                .try_collect()?;
-            hash_join_key(&key_refs, &self.collations)
-        };
+        let hash = hash_join_values(&probe_keys, &self.collations);
         self.current_probe_keys = Some(probe_keys);
         self.current_probe_hash = Some(hash);
 
@@ -2197,13 +2261,7 @@ impl HashTable {
             self.current_spill_partition_idx = target_partition;
 
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
-                    .current_probe_keys
-                    .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                let key = self.current_probe_keys.as_deref().unwrap_or_default();
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                 let Some(partition) = spill_state.find_partition(target_partition) else {
                     return Ok(None);
@@ -2212,7 +2270,7 @@ impl HashTable {
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal_values(&entry.key_values, key, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2237,18 +2295,12 @@ impl HashTable {
             let bucket_idx = Self::bucket_of(hash, self.buckets.len());
             self.probe_bucket_idx = bucket_idx;
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
-                    .current_probe_keys
-                    .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                let key = self.current_probe_keys.as_deref().unwrap_or_default();
                 let bucket = &self.buckets[bucket_idx];
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal_values(&entry.key_values, key, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2265,6 +2317,18 @@ impl HashTable {
         }
     }
 
+    /// AUDIT 3.1: `keys` copied into the last probe's key buffer, for [Self::probe]: a probe row
+    /// allocates nothing once the buffer has held keys its size.
+    pub fn probe_keys_from<'a>(
+        &mut self,
+        keys: impl ExactSizeIterator<Item = &'a Value>,
+    ) -> Result<Vec<Value>> {
+        self.current_probe_hash = None;
+        let mut buf = self.current_probe_keys.take().unwrap_or_default();
+        refill_keys(&mut buf, keys)?;
+        Ok(buf)
+    }
+
     /// Get the next matching entry for the current probe keys.
     pub fn next_match(&mut self) -> Result<Option<&HashEntry>> {
         turso_assert!(
@@ -2277,14 +2341,13 @@ impl HashTable {
         if !self.merge_order.is_empty() {
             return self.merge_next_match();
         }
-        let Some(probe_keys) = self.current_probe_keys.as_ref() else {
+        let Some(probe_keys) = self.current_probe_keys.as_deref() else {
             return Ok(None);
         };
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
         let hash = match self.current_probe_hash {
             Some(h) => h,
             None => {
-                let h = hash_join_key(&key_refs, &self.collations);
+                let h = hash_join_values(probe_keys, &self.collations);
                 self.current_probe_hash = Some(h);
                 h
             }
@@ -2305,7 +2368,8 @@ impl HashTable {
             // Continue from where we left off
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash
+                    && keys_equal_values(&entry.key_values, probe_keys, &self.collations)
                 {
                     self.probe_entry_idx = idx + 1;
                     return Ok(Some(entry));
@@ -2317,7 +2381,8 @@ impl HashTable {
             let bucket = &self.buckets[self.probe_bucket_idx];
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash
+                    && keys_equal_values(&entry.key_values, probe_keys, &self.collations)
                 {
                     // update probe entry index for next call
                     self.probe_entry_idx = idx + 1;
@@ -2865,17 +2930,12 @@ impl HashTable {
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<Option<&HashEntry>> {
         // Skip probing if any key is NULL - NULL can never match anything in SQL
+        self.keep_probe_keys(probe_keys)?;
         if has_null_key(probe_keys) {
-            self.current_probe_keys = Some(probe_keys.iter().cloned().try_collect()?);
             self.current_probe_hash = None;
             return Ok(None);
         }
-
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
-
-        // Store probe keys for subsequent next_match calls
-        self.current_probe_keys = Some(probe_keys.iter().cloned().try_collect()?);
+        let hash = hash_join_values(probe_keys, &self.collations);
         self.current_probe_hash = Some(hash);
 
         self.record_probe_call(metrics);
@@ -2898,12 +2958,22 @@ impl HashTable {
         self.current_spill_partition_idx = partition_idx;
 
         for (idx, entry) in bucket.entries.iter().enumerate() {
-            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations) {
+            if entry.hash == hash
+                && keys_equal_values(&entry.key_values, probe_keys, &self.collations)
+            {
                 self.probe_entry_idx = idx + 1;
                 return Ok(Some(entry));
             }
         }
         Ok(None)
+    }
+
+    /// AUDIT 3.1: keeps a partition probe's keys for [Self::next_match], copied into the kept buffer.
+    fn keep_probe_keys(&mut self, probe_keys: &[Value]) -> Result<()> {
+        refill_keys(
+            self.current_probe_keys.get_or_insert_default(),
+            probe_keys.iter(),
+        )
     }
 
     /// Get the partition index for a given probe key hash.
@@ -2912,9 +2982,7 @@ impl HashTable {
             self.spill_state.is_some(),
             "partition_for_keys requires spill state"
         );
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
-        Ok(self.partition_index(hash))
+        Ok(self.partition_index(hash_join_values(probe_keys, &self.collations)))
     }
 
     /// Returns true if the hash table has spilled to disk.
@@ -3609,6 +3677,93 @@ mod hashtests {
     use crate::io::Buffer;
     use crate::MemoryIO;
 
+    /// The allocations a thread makes while it counts (AUDIT 3.1's probe test).
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct Counting;
+
+        thread_local! {
+            static COUNTING: Cell<bool> = const { Cell::new(false) };
+            static COUNT: Cell<u64> = const { Cell::new(0) };
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = COUNTING.try_with(|on| {
+                    if on.get() {
+                        let _ = COUNT.try_with(|n| n.set(n.get() + 1));
+                    }
+                });
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let _ = COUNTING.try_with(|on| {
+                    if on.get() {
+                        let _ = COUNT.try_with(|n| n.set(n.get() + 1));
+                    }
+                });
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOC: Counting = Counting;
+
+        pub(super) fn counted<T>(work: impl FnOnce() -> T) -> (u64, T) {
+            COUNT.with(|n| n.set(0));
+            COUNTING.with(|on| on.set(true));
+            let out = work();
+            COUNTING.with(|on| on.set(false));
+            (COUNT.with(|n| n.get()), out)
+        }
+    }
+
+    /// AUDIT 3.1: once the probe's key buffer has held a key its size, a probe row allocates
+    /// nothing: not its keys (integer and NOCASE text), not their hash, not a hit, a miss, or any
+    /// further match.
+    #[test]
+    fn audit_3_1_probe_rows_allocate_nothing() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 64 * 1024 * 1024,
+            num_keys: 2,
+            collations: vec![CollationSeq::Binary, CollationSeq::NoCase],
+            temp_store: crate::TempStore::Memory,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let key = |i: i64| [Value::from_i64(i), Value::from_text(format!("Key-{i}"))];
+        for i in 0..1000i64 {
+            let _ = ht
+                .insert(key(i % 500).to_vec(), i + 1, vec![], None)
+                .unwrap();
+        }
+        let _ = ht.finalize_build(None);
+        let probes: std::vec::Vec<[Value; 2]> = (0..1000).map(key).collect();
+        let probe = |ht: &mut HashTable, k: &[Value]| -> usize {
+            let keys = ht.probe_keys_from(k.iter()).unwrap();
+            let mut matched = usize::from(ht.probe(keys, None).unwrap().is_some());
+            while ht.next_match().unwrap().is_some() {
+                matched += 1;
+            }
+            matched
+        };
+        assert_eq!(probe(&mut ht, &probes[999]), 0);
+        let (allocations, matched) =
+            counting::counted(|| probes.iter().map(|k| probe(&mut ht, k)).sum::<usize>());
+        assert_eq!(matched, 1000, "each of keys 0-499 twice, 500-999 never");
+        assert_eq!(allocations, 0, "allocations over 1,000 probe rows");
+    }
+
     #[test]
     fn test_hash_table_rejects_custom_collations() {
         let io = Arc::new(MemoryIO::new());
@@ -3724,7 +3879,9 @@ mod hashtests {
             let mut ht = HashTable::new(config, io).unwrap();
             let n = 10_000i64;
             for i in 0..n {
-                let _ = ht.insert(vec![Value::from_i64(i)], i + 1, vec![], None).unwrap();
+                let _ = ht
+                    .insert(vec![Value::from_i64(i)], i + 1, vec![], None)
+                    .unwrap();
             }
             assert!(!ht.has_spilled());
             assert!(ht.buckets.len() >= n as usize, "{}", ht.buckets.len());
@@ -3784,7 +3941,9 @@ mod hashtests {
         };
         let mut ht = HashTable::new(small, Arc::new(MemoryIO::new())).unwrap();
         for i in 0..64i64 {
-            let _ = ht.insert(vec![Value::from_i64(i)], i, vec![], None).unwrap();
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap();
             assert!(ht.has_spilled() || ht.mem_used + ht.bucket_mem <= ht.mem_budget);
         }
     }

@@ -63,3 +63,25 @@ calibration measured; another CPU record (model, stepping, microcode, flags, bug
 executable (path, length, mtime) is another key and is measured again. Linux only: macOS and
 Windows name their CPU through calls this crate doesn't make (no unsafe), so they calibrate each
 process, as before.
+
+## AUDIT §7.6, first half (perf-H3 code, perf-H4 run): a compacted log's member opens without its image
+
+PRELIMINARY, not a verdict. One partial run of `GIBS="1 10" sh .perf/u1_bench.sh` on adacachy2, started before
+RULES rule 6's revision (03:35Z): no `needs`, load average 69-89 at its start and 81-130 at its end from other
+lanes, built from the synced clone (perf/coldstart 4117e676 with a code motion of `Machine::image` since reverted;
+the image path did the same work). The 10 GiB arm was stopped during its fill. Rerun under rule 6 (cpus=16, both
+arms from fixed SHAs in worktrees under ~/.cache/coldstart-ab, load beside every run) before quoting a number.
+
+`image` = `Machine::open` then the whole image made in memory (what `Replica::open` did for a compacted log);
+`count` = `Machine::open` then `image_bytes` (what it does now). 1 GiB database (1,082,327,040 bytes), page cache
+warm, alternated, 5 runs a side:
+
+| side | open_ms runs | median | image step (open_ms - machine_open_ms) | peak RSS |
+|---|---|---|---|---|
+| image (before) | 1857.4 2012.6 2155.8 1865.1 1487.3 | 1865.1 | 930.0 904.8 890.3 892.0 910.5 (median 904.8) | 3,245-3,246 MiB |
+| count (after) | 740.8 1577.3 1177.1 1650.9 1356.8 | 1356.8 | 0 | 69-70 MiB |
+
+Both sides state image_bytes=1083631733 (the count equals the bytes `image` wrote). The image step is a steady
+~0.9 s a GiB (about 1.2 GB/s, page cache warm) and 3x the image in memory (pages, their encoding, the copy).
+`Machine::open` itself took 577-1651 ms under the host's load and dominates the total's spread, so the total's
+gap (median 1865 -> 1357 ms) is inside that noise; the image step and the memory are the measured change.

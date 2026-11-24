@@ -1511,7 +1511,7 @@ mod inproc {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use amphora::database::{Database, ReadMode};
+    use amphora::database::{AnswerMax, Database, ReadMode};
     use amphora::xgroup;
     use amphora_api::Value;
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
@@ -1649,70 +1649,6 @@ mod inproc {
 
     fn value_of(v: &str) -> Value {
         Value::Text(v.to_owned())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        // Lane scaleout-harness-10 (T-SH.10): a write's session token makes the warm-up's read and
-        // the region's catch-up wait for that write, by the replica's own events. Do: three
-        // members, one group; write a row and take its mark; read it once on the leader and once
-        // as a follower read; cut a member off, write a second row, put the member back and count
-        // on its own copy once. Expect: a mark; both reads find the row; the member's one count
-        // holds both rows, no poll in between.
-        #[test]
-        fn scaleout_harness_10_a_token_read_waits_for_its_write() {
-            let dir = std::env::temp_dir().join(format!("amphora-sh10-{}", std::process::id()));
-            let o = parse(
-                &format!("--scale follower --system amphora-inproc --nodes 3 --groups 1 --writers 1 --deadline-s 60 --batch 1 --text-bytes 8 --rows 2 --warmup-s 1 --seconds 1 --class persisted --relay-records 64 --relay-pending 4096 --dir {}", dir.display())
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            let a = Amphora::open(&o).unwrap();
-            a.prepare(&o).unwrap();
-            let mut w = Writer::new(0, 0);
-            let mut s = a.connect(0).unwrap();
-            let first = w.next(1, 8);
-            let mark = s.write_marked(false, &first).unwrap();
-            assert!(mark.is_some(), "a replicated write gives its session token");
-            assert!(s.read_after(&session_name(0), 1, false, mark).unwrap());
-            assert!(s.read_after(&session_name(0), 1, true, mark).unwrap());
-            let (back, _) = a.follower(0).unwrap();
-            a.kill(back).unwrap();
-            // The second write through a node still up: it goes to the group's leader.
-            let mut up = a.connect((back + 1) % 3).unwrap();
-            let second = w.next(1, 8);
-            let mark = up.write_marked(false, &second).unwrap();
-            a.start(back).unwrap();
-            let mut own = a.connect(back).unwrap();
-            assert_eq!(own.count_own_after(&session_name(0), 2, mark).unwrap(), 2);
-            drop((s, up, own));
-            drop(a);
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        // Lane scaleout-harness-9 (AC-SH.5): the relay's bell keeps a ring given before its wait,
-        // a due time ends a wait no ring came to, and the stop ends the relay, its own ring kept
-        // as well. Do: ring then wait; wait on a due time already past; stop then wait, from
-        // another thread too. Expect: go on, go on, then stopped.
-        #[test]
-        fn scaleout_harness_9_the_relays_bell_keeps_a_ring_and_stops() {
-            let bell = Arc::new(Bell::default());
-            bell.ring();
-            assert!(bell.wait(None), "a ring before the wait is kept");
-            assert!(bell.wait(Some(Instant::now())), "a due time ends the wait");
-            assert!(bell.going());
-            let b = Arc::clone(&bell);
-            let stopper = std::thread::spawn(move || b.stop());
-            assert!(!bell.wait(None), "the stop ends the wait");
-            stopper.join().unwrap();
-            assert!(!bell.going());
-            std::task::Waker::from(Arc::clone(&bell)).wake();
-            assert!(!bell.wait(None), "a ring after the stop doesn't undo it");
-        }
     }
 
     impl Amphora {
@@ -1867,12 +1803,16 @@ mod inproc {
         /// (Database::call_session).
         fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<Mark> {
             self.leader(g)?
-                .call_session(Instant::now() + self.deadline, move |c| {
-                    for (sql, args) in rows {
-                        c.prepare_cached(&sql)?.execute(args)?;
-                    }
-                    Ok(())
-                })
+                .call_session(
+                    Instant::now() + self.deadline,
+                    AnswerMax::fixed(),
+                    move |c| {
+                        for (sql, args) in rows {
+                            c.prepare_cached(&sql)?.execute(args)?;
+                        }
+                        Ok(())
+                    },
+                )
                 .map(|((), token)| token)
                 .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))
         }
@@ -2016,6 +1956,7 @@ mod inproc {
                         ReadMode::Session,
                         Some(token),
                         until,
+                        AnswerMax::fixed(),
                         counted!(ONE, session, seq),
                     )
                     .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
@@ -2128,7 +2069,9 @@ mod inproc {
                             m
                         }
                     };
-                    let refused = match member.call(until, |c| Ok(c.execute_batch(EVENTS)?)) {
+                    let refused = match member
+                        .call(until, AnswerMax::fixed(), |c| Ok(c.execute_batch(EVENTS)?))
+                    {
                         Ok(()) => break,
                         Err(e) => e,
                     };
@@ -2219,6 +2162,71 @@ mod inproc {
     fn no_reshard_shell() -> anyhow::Error {
         anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Lane scaleout-harness-10 (T-SH.10): a write's session token makes the warm-up's read and
+        // the region's catch-up wait for that write, by the replica's own events. Do: three
+        // members, one group; write a row and take its mark; read it once on the leader and once
+        // as a follower read; cut a member off, write a second row, put the member back and count
+        // on its own copy once. Expect: a mark; both reads find the row; the member's one count
+        // holds both rows, no poll in between.
+        #[test]
+        fn scaleout_harness_10_a_token_read_waits_for_its_write() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("amphora-sh10");
+            let o = parse(
+                &format!("--scale follower --system amphora-inproc --nodes 3 --groups 1 --writers 1 --deadline-s 60 --batch 1 --text-bytes 8 --rows 2 --warmup-s 1 --seconds 1 --class persisted --relay-records 64 --relay-pending 4096 --dir {}", dir.display())
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let a = Amphora::open(&o).unwrap();
+            a.prepare(&o).unwrap();
+            let mut w = Writer::new(0, 0);
+            let mut s = a.connect(0).unwrap();
+            let first = w.next(1, 8);
+            let mark = s.write_marked(false, &first).unwrap();
+            assert!(mark.is_some(), "a replicated write gives its session token");
+            assert!(s.read_after(&session_name(0), 1, false, mark).unwrap());
+            assert!(s.read_after(&session_name(0), 1, true, mark).unwrap());
+            let (back, _) = a.follower(0).unwrap();
+            a.kill(back).unwrap();
+            // The second write through a node still up: it goes to the group's leader.
+            let mut up = a.connect((back + 1) % 3).unwrap();
+            let second = w.next(1, 8);
+            let mark = up.write_marked(false, &second).unwrap();
+            a.start(back).unwrap();
+            let mut own = a.connect(back).unwrap();
+            assert_eq!(own.count_own_after(&session_name(0), 2, mark).unwrap(), 2);
+            drop((s, up, own));
+            drop(a);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Lane scaleout-harness-9 (AC-SH.5): the relay's bell keeps a ring given before its wait,
+        // a due time ends a wait no ring came to, and the stop ends the relay, its own ring kept
+        // as well. Do: ring then wait; wait on a due time already past; stop then wait, from
+        // another thread too. Expect: go on, go on, then stopped.
+        #[test]
+        fn scaleout_harness_9_the_relays_bell_keeps_a_ring_and_stops() {
+            let bell = Arc::new(Bell::default());
+            bell.ring();
+            assert!(bell.wait(None), "a ring before the wait is kept");
+            assert!(bell.wait(Some(Instant::now())), "a due time ends the wait");
+            assert!(bell.going());
+            let b = Arc::clone(&bell);
+            let stopper = std::thread::spawn(move || b.stop());
+            assert!(!bell.wait(None), "the stop ends the wait");
+            stopper.join().unwrap();
+            assert!(!bell.going());
+            std::task::Waker::from(Arc::clone(&bell)).wake();
+            assert!(!bell.wait(None), "a ring after the stop doesn't undo it");
+        }
+    }
 }
 
 /// Amphora as its own server (`amphora serve`, CP-T1.13), one member a node, brought up and down by
@@ -2288,7 +2296,11 @@ mod served {
                 .members
                 .get(node)
                 .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
-            Link::connect(addr, &amphora::serve::Keys::plain(secret.clone()), self.deadline)
+            Link::connect(
+                addr,
+                &amphora::serve::Keys::plain(secret.clone()),
+                self.deadline,
+            )
         }
 
         /// The node that leads, as node `via` names it.
@@ -2312,7 +2324,7 @@ mod served {
     }
 
     impl S<'_> {
-        fn to_leader(&mut self, line: &str) -> anyhow::Result<String> {
+        fn ask_leader(&mut self, line: &str) -> anyhow::Result<String> {
             if self.lead.is_none() {
                 let l = self.a.leader(&mut self.own)?;
                 self.lead = Some((l, self.a.link(l)?));
@@ -2336,7 +2348,7 @@ mod served {
             if rows.is_empty() {
                 return Ok(());
             }
-            self.to_leader(&format!("exec {}", Dialect::Standard.upsert(false, rows)))
+            self.ask_leader(&format!("exec {}", Dialect::Standard.upsert(false, rows)))
                 .map(|_| ())
         }
 
@@ -2345,7 +2357,7 @@ mod served {
                 return Err(no_concept("follower reads"));
             }
             let n: u64 = self
-                .to_leader(&format!(
+                .ask_leader(&format!(
                     "count {}",
                     Dialect::Standard.count("events", session, seq, false)
                 ))?
@@ -2365,7 +2377,7 @@ mod served {
             Ok(if own {
                 self.own.ask(&q)?
             } else {
-                self.to_leader(&q)?
+                self.ask_leader(&q)?
             }
             .parse()?)
         }
@@ -2893,6 +2905,10 @@ pub mod sql {
                                 Instant::now() < until,
                                 "TiDB's placement wasn't scheduled within --deadline-s: {states:?}"
                             );
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period"
+                            )]
                             std::thread::sleep(patrol);
                         }
                     }
@@ -3199,6 +3215,10 @@ pub mod sql {
                     Instant::now() < until,
                     "Region {region}'s {what:?} operation didn't take effect within --deadline-s"
                 );
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period"
+                )]
                 std::thread::sleep(patrol);
             }
         }

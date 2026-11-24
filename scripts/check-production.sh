@@ -5,6 +5,9 @@
 #
 # The engine (crates/engine*) came from Turso with code that predates the rule: its crates are
 # counted instead, lint by lint, against scripts/engine-ratchet.toml, and a count may only fall.
+# They are counted with the engine features the binary Amphora ships turns on (`cargo build --release
+# --locked -p amphora`: docs/runbook.md, scripts/cluster.sh), in the dev profile; what only tests,
+# simulators, fuzzers or a build of the whole workspace turn on doesn't ship.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 rule=(
@@ -27,6 +30,7 @@ rule=(
   clippy::exit
 )
 engine=(amphora-engine amphora-engine-parser amphora-engine-macros amphora-engine-ext)
+ship=(-p amphora)
 forbid=(-D warnings)
 count=()
 for lint in "${rule[@]}"; do
@@ -34,14 +38,13 @@ for lint in "${rule[@]}"; do
   count+=(-W "$lint")
 done
 apart=()
-only=()
 for crate in "${engine[@]}"; do
   apart+=(--exclude "$crate")
-  only+=(-p "$crate")
 done
 # --no-deps: only the crates named are linted (else every workspace crate built, the engine's build
 # script and macros among them).
 cargo clippy --workspace "${apart[@]}" --locked --no-deps "$@" -- "${forbid[@]}"
-# The engine's crates hold a clippy.toml of their own; this pass reads Amphora's.
-CLIPPY_CONF_DIR="$PWD" cargo clippy "${only[@]}" --locked --no-deps --message-format=json "$@" -- "${count[@]}" |
+# Without --no-deps the engine's crates are linted as dependencies of what ships, with the features
+# it resolves. They hold a clippy.toml of their own; this pass reads Amphora's.
+CLIPPY_CONF_DIR="$PWD" cargo clippy "${ship[@]}" --locked --message-format=json "$@" -- "${count[@]}" |
   python3 scripts/engine-ratchet.py scripts/engine-ratchet.toml "$(rustc -vV | sed -n 's/^host: //p')" "${rule[@]}"

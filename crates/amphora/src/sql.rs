@@ -238,6 +238,12 @@ impl Session for Db {
         self.give_back(held).map_err(failed)?;
         Ok(columns)
     }
+    fn column_names(&self, sql: &str) -> Result<Vec<String>> {
+        let held = held(self, sql)?;
+        let names = held.column_names();
+        self.give_back(held).map_err(failed)?;
+        Ok(names)
+    }
     fn changes(&self) -> i64 {
         Db::changes(self)
     }
@@ -262,6 +268,18 @@ impl Prepared for Kept<'_> {
             db.run_held(held, params, each)
         })
     }
+    fn each(
+        &mut self,
+        params: Vec<Value>,
+        each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
+        let db = self.db;
+        let held = self
+            .held
+            .as_mut()
+            .ok_or_else(|| failed("a prepared statement ran after it was given back"))?;
+        stream(params, |params, row| db.run_held(held, params, row), each)
+    }
 }
 impl Drop for Kept<'_> {
     fn drop(&mut self) {
@@ -274,8 +292,28 @@ impl Drop for Kept<'_> {
     }
 }
 
-/// A validated statement's rows, each value owned, within the transport's result bounds: `run`
-/// steps the statement with its parameters, handing each row on.
+/// The memory `values` take once owned: each value and what it points to, and the row's vector.
+/// The transport's decoders count a row the same way (`transport::bounded::rows`).
+pub(crate) fn row_bytes(values: &[Value]) -> Option<usize> {
+    values
+        .iter()
+        .try_fold(std::mem::size_of::<Vec<Value>>(), |bytes, value| {
+            bytes
+                .checked_add(std::mem::size_of::<Value>())?
+                .checked_add(payload(value))
+        })
+}
+
+fn payload(value: &Value) -> usize {
+    match value {
+        Value::Text(text) => text.len(),
+        Value::Blob(bytes) => bytes.len(),
+        Value::Null | Value::Integer(_) | Value::Real(_) => 0,
+    }
+}
+
+/// A validated statement's rows, every row, or the first alone, within the transport's result
+/// bounds: `run` steps the statement with its parameters, handing each row on.
 fn rows(
     params: Vec<Value>,
     first: bool,
@@ -284,16 +322,40 @@ fn rows(
         &mut dyn FnMut(&NativeRow) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()>,
 ) -> Result<Vec<Vec<Value>>> {
-    let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    run(params, &mut |row| {
+    stream(params, run, &mut |values| {
         // Match the transport decoder's owned-allocation budget before acknowledging
         // a write with RETURNING: a locally accepted result must fit remotely too.
-        bytes = bytes
-            .checked_add(std::mem::size_of::<Vec<Value>>())
-            .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
-        let mut values = Vec::new();
+        bytes = row_bytes(&values)
+            .and_then(|row| bytes.checked_add(row))
+            .ok_or_else(|| failed("SQL result size overflow"))?;
+        amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
+        let count = rows
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| failed("SQL result row count overflow"))?;
+        amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
+        rows.push(values);
+        Ok(!first)
+    })?;
+    Ok(rows)
+}
+
+/// A validated statement's rows, each handed to `each` as `run` steps it, its values copied out
+/// of the engine once. A row past the result bound, which no answer could carry, is refused
+/// before its values are copied.
+fn stream(
+    params: Vec<Value>,
+    run: impl FnOnce(
+        Vec<Native>,
+        &mut dyn FnMut(&NativeRow) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()>,
+    each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+) -> Result<()> {
+    let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
+    run(params, &mut |row| {
+        let mut bytes = std::mem::size_of::<Vec<Value>>();
         for value in row.get_values() {
             let payload = match value {
                 Native::Text(s) => s.as_str().len(),
@@ -305,19 +367,16 @@ fn rows(
                 .and_then(|n| n.checked_add(payload))
                 .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
             amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-            values.push(owned(value));
         }
-        amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-        let count = rows
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("SQL result row count overflow"))?;
-        amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
-        rows.push(values);
-        Ok(!first)
+        Ok(each(row.get_values().map(owned).collect())?)
     })
-    .map_err(failed)?;
-    Ok(rows)
+    .map_err(|e| match e.downcast::<Error>() {
+        Ok(e) => e,
+        Err(e) => match e.downcast::<amphora_api::Refusal>() {
+            Ok(refusal) => Error::Refusal(refusal),
+            Err(e) => failed(e),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +407,82 @@ mod tests {
                 value: value.to_vec(),
             }],
         }
+    }
+
+    /// CP-T1.13, AC-T1.2.3: do run a statement whose parameters pass the request bound; expect
+    /// the refusal typed TooLarge, not text.
+    #[test]
+    fn cp_t1_13_a_request_past_its_bound_is_refused_too_large_typed() {
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let half = || amphora_api::Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
+        db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
+            let refused = c.execute("SELECT ?1, ?2", [half(), half()]);
+            assert!(
+                matches!(
+                    refused,
+                    Err(super::Error::Refusal(Refusal::TooLarge { .. }))
+                ),
+                "{refused:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do step a statement's rows through
+    /// `Statement::each`; expect each row handed over in order as stepped, the stream stopping
+    /// when told, and a row past the result bound refused TooLarge after the rows before it.
+    #[test]
+    fn cp_t1_13_each_hands_rows_over_as_stepped() {
+        use amphora_api::Value;
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
+            for id in 1..=3i64 {
+                c.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    [Value::Integer(id), Value::Blob(vec![1; 8])],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO t VALUES (4, ?1)",
+                [Value::Blob(vec![1; amphora_api::RESULT_MAX / 2 + 1])],
+            )?;
+            let mut statement = c.prepare("SELECT id, v FROM t WHERE id < 4 ORDER BY id")?;
+            let mut seen = Vec::new();
+            statement.each([(); 0], |row| {
+                seen.push(row);
+                Ok(true)
+            })?;
+            assert_eq!(
+                seen,
+                (1..=3)
+                    .map(|id| vec![Value::Integer(id), Value::Blob(vec![1; 8])])
+                    .collect::<Vec<_>>()
+            );
+            let mut first = Vec::new();
+            statement.each([(); 0], |row| {
+                first.push(row);
+                Ok(false)
+            })?;
+            assert_eq!(first.len(), 1, "stopped when told");
+            let mut before = 0;
+            let mut wide = c.prepare("SELECT id, v, v FROM t ORDER BY id")?;
+            let refused = wide.each([(); 0], |_| {
+                before += 1;
+                Ok(true)
+            });
+            assert!(
+                matches!(
+                    refused,
+                    Err(super::Error::Refusal(Refusal::TooLarge { .. }))
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(before, 3, "the rows before it");
+            Ok(())
+        })
+        .unwrap();
     }
 
     // U05/U06: public SQL cannot alter the metadata that enforces Records and commit fences.
@@ -384,7 +519,7 @@ mod tests {
         }
 
         let db = crate::database::Database::in_memory(until()).unwrap();
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE ordinary(value TEXT)")?;
             c.execute("INSERT INTO ordinary VALUES (?1)", ["__amphora_versions"])?;
             assert!(matches!(c.execute("DELETE FROM __amphora_versions", []), Err(super::Error::Refusal(Refusal::Invalid { .. }))));
@@ -425,7 +560,7 @@ mod tests {
         {
             let db = crate::database::Database::open(&path, until()).unwrap();
             let first = db
-                .call(until(), |c| {
+                .call(until(), crate::database::AnswerMax::fixed(), |c| {
                     c.execute_batch("CREATE TABLE reservations(id INTEGER PRIMARY KEY)")?;
                     let rev = c.records_commit("tenant", policy(None, b"initial"))?;
                     assert_eq!(
@@ -439,7 +574,7 @@ mod tests {
             assert_eq!(records.wait("policy", 0, until()).unwrap(), first);
 
             committed = db
-                .call(until(), move |c| {
+                .call(until(), crate::database::AnswerMax::fixed(), move |c| {
                     let row = c.records_get("tenant", "policy", b"active")?.unwrap();
                     c.execute("INSERT INTO reservations VALUES (1)", [])?;
                     let next = c.records_commit("tenant", policy(Some(row.rev), b"reserved"))?;
@@ -449,23 +584,25 @@ mod tests {
                 .unwrap();
             assert_eq!(records.wait("policy", first, until()).unwrap(), committed);
 
-            let stale: std::result::Result<(), Refusal> = db.call(until(), move |c| {
-                c.execute("INSERT INTO reservations VALUES (2)", [])?;
-                c.records_commit("tenant", policy(Some(first), b"stale"))?;
-                Ok(())
-            });
+            let stale: std::result::Result<(), Refusal> =
+                db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
+                    c.execute("INSERT INTO reservations VALUES (2)", [])?;
+                    c.records_commit("tenant", policy(Some(first), b"stale"))?;
+                    Ok(())
+                });
             assert!(
                 matches!(stale, Err(Refusal::Conflict { at: Some(at), .. }) if at == committed)
             );
 
-            let failed: std::result::Result<(), Refusal> = db.call(until(), move |c| {
-                c.execute("INSERT INTO reservations VALUES (3)", [])?;
-                c.records_commit("tenant", policy(Some(committed), b"discarded"))?;
-                anyhow::bail!("policy decision refused")
-            });
+            let failed: std::result::Result<(), Refusal> =
+                db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
+                    c.execute("INSERT INTO reservations VALUES (3)", [])?;
+                    c.records_commit("tenant", policy(Some(committed), b"discarded"))?;
+                    anyhow::bail!("policy decision refused")
+                });
             assert!(failed.is_err());
             // A nested savepoint discards both APIs and must not publish its provisional revision.
-            db.call(until(), move |c| {
+            db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
                 let nested = c.unchecked_transaction()?;
                 nested.execute("INSERT INTO reservations VALUES (4)", [])?;
                 nested.records_commit("tenant", policy(Some(committed), b"nested"))?;
@@ -478,7 +615,7 @@ mod tests {
                 records.wait("policy", committed, Instant::now()),
                 Err(Refusal::Timeout)
             ));
-            db.call(until(), |c| {
+            db.call(until(), crate::database::AnswerMax::fixed(), |c| {
                 let count: i64 =
                     c.query_row("SELECT count(*) FROM reservations", [], |r| r.get(0))?;
                 assert_eq!(count, 1);
@@ -501,7 +638,7 @@ mod tests {
                 .value,
             b"reserved"
         );
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             let ids: i64 = c.query_row("SELECT sum(id) FROM reservations", [], |r| r.get(0))?;
             assert_eq!(ids, 1);
             Ok(())
@@ -519,7 +656,7 @@ mod tests {
         use amphora_api::Value;
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (columns, rows) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE held(a INTEGER); INSERT INTO held VALUES (1)")?;
                 let mut all = c.prepare_cached("SELECT * FROM held")?;
                 let before = all.query_row([], |r| Ok(r.column_count()))?;
@@ -566,7 +703,7 @@ mod tests {
         FROM ci_log_grams p WHERE p.gram=?1 AND (p.finished,p.leg_order,p.leg,p.block)<(?5,?6,?7,?8) ORDER BY p.finished DESC,p.leg_order DESC,p.leg DESC,p.block DESC LIMIT 8";
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (pages, prepared, text) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
                 c.execute_batch(
                     "CREATE TABLE parsed_once(a INTEGER, b TEXT);
                      CREATE TABLE ci_log_grams(gram TEXT, finished INTEGER, leg_order INTEGER, leg TEXT, block INTEGER, bits BLOB);
@@ -642,7 +779,7 @@ mod tests {
         }
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (texts, refusals) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE marked(a INTEGER)")?;
                 for i in 0..3i64 {
                     c.execute(INSERT, vec![Value::Integer(i)])?;
@@ -671,7 +808,7 @@ mod tests {
             "a refused text is parsed again each time: it's never marked"
         );
         let (count, after) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute(INSERT, vec![Value::Integer(3)])?;
                 let count = select(c)?;
                 let again = [super::parses(INSERT), super::parses(SELECT)];
@@ -752,7 +889,7 @@ mod tests {
         const SAVEPOINT: &str = "SAVEPOINT s /* marked by a session */";
         const RELEASE: &str = "RELEASE s /* marked by a session */";
         let db = crate::database::Database::in_memory(until()).unwrap();
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             for _ in 0..2 {
                 c.execute(SAVEPOINT, [])?;
                 c.execute(RELEASE, [])?;

@@ -31,12 +31,12 @@
 //! left in `--dir` instead of loading again, and AMPHORA_PERF_CTL turns perf's counting on and off
 //! around each measured window (`perf_ctl`), so a profile holds that window alone.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::suite_db::{self, Target};
-use crate::{summary, Hist, Rng, WORDS};
+use crate::{Hist, Rng, WORDS, summary};
 
 /// A statement's parameter, whatever the database: each driver binds it in its own type.
 #[derive(Clone, Debug)]
@@ -75,7 +75,12 @@ pub struct Shape {
 
 impl Shape {
     fn new(items: i64) -> Self {
-        Self { items, owners: (items / 50).max(1), regions: 20, next: AtomicI64::new(items + 1) }
+        Self {
+            items,
+            owners: (items / 50).max(1),
+            regions: 20,
+            next: AtomicI64::new(items + 1),
+        }
     }
 
     /// An id the load wrote.
@@ -124,7 +129,11 @@ fn k_of(id: i64) -> i64 {
 }
 
 fn name_of(id: i64) -> String {
-    format!("{}-{:06x}", WORDS[(mix(id as u64 ^ 0x6666) % WORDS.len() as u64) as usize], mix(id as u64 ^ 0x7777) & 0xff_ffff)
+    format!(
+        "{}-{:06x}",
+        WORDS[(mix(id as u64 ^ 0x6666) % WORDS.len() as u64) as usize],
+        mix(id as u64 ^ 0x7777) & 0xff_ffff
+    )
 }
 
 /// A row of `items`, its columns in `ITEM_COLUMNS`' order.
@@ -148,7 +157,14 @@ pub fn item_params(id: i64, owners: i64) -> Vec<P> {
         data.extend_from_slice(&d.to_le_bytes());
     }
     let qty = (m(0x4444) % 100) as i64;
-    let doc = format!(r#"{{"a":{},"b":"{}","c":[{},{},{}]}}"#, qty, WORDS[(m(0xdddd) % WORDS.len() as u64) as usize], m(1) % 10, m(2) % 10, m(3) % 10);
+    let doc = format!(
+        r#"{{"a":{},"b":"{}","c":[{},{},{}]}}"#,
+        qty,
+        WORDS[(m(0xdddd) % WORDS.len() as u64) as usize],
+        m(1) % 10,
+        m(2) % 10,
+        m(3) % 10
+    );
     vec![
         P::I(id),
         P::I(k_of(id)),
@@ -162,14 +178,24 @@ pub fn item_params(id: i64, owners: i64) -> Vec<P> {
         P::T(body),
         P::B(data),
         P::T(doc),
-        if m(0x8888) & 1 == 0 { P::N } else { P::T(WORDS[(m(0x9999) % WORDS.len() as u64) as usize].to_owned()) },
+        if m(0x8888) & 1 == 0 {
+            P::N
+        } else {
+            P::T(WORDS[(m(0x9999) % WORDS.len() as u64) as usize].to_owned())
+        },
     ]
 }
 
-const ITEM_COLUMNS: &str = "id, k, grp, owner, price, qty, flag, created, name, body, data, doc, note";
+const ITEM_COLUMNS: &str =
+    "id, k, grp, owner, price, qty, flag, created, name, body, data, doc, note";
 
 fn owner_params(id: i64, regions: i64) -> Vec<P> {
-    vec![P::I(id), P::T(format!("owner-{id}")), P::I((mix(id as u64 ^ 0x1234) % regions as u64) as i64 + 1), P::F((mix(id as u64 ^ 0x4321) % 10_000) as f64 / 100.0)]
+    vec![
+        P::I(id),
+        P::T(format!("owner-{id}")),
+        P::I((mix(id as u64 ^ 0x1234) % regions as u64) as i64 + 1),
+        P::F((mix(id as u64 ^ 0x4321) % 10_000) as f64 / 100.0),
+    ]
 }
 
 fn region_params(id: i64) -> Vec<P> {
@@ -241,27 +267,51 @@ fn item_values(d: Dialect) -> &'static str {
 }
 
 fn insert_items(d: Dialect, rows: usize) -> String {
-    format!("INSERT INTO items ({ITEM_COLUMNS}) VALUES {}", vec![item_values(d); rows].join(", "))
+    format!(
+        "INSERT INTO items ({ITEM_COLUMNS}) VALUES {}",
+        vec![item_values(d); rows].join(", ")
+    )
 }
 
 /// The load, a batch of rows a statement and many to a transaction, each transaction handed to
 /// `each` as it is made (so the harness never holds the whole load): (statement, its parameters).
-pub fn load(d: Dialect, shape: &Shape, batch: usize, mut each: impl FnMut(Vec<(String, Vec<P>)>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub fn load(
+    d: Dialect,
+    shape: &Shape,
+    batch: usize,
+    mut each: impl FnMut(Vec<(String, Vec<P>)>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut txn = Vec::new();
     let regions: Vec<P> = (1..=shape.regions).flat_map(region_params).collect();
-    txn.push((format!("INSERT INTO regions (id, name) VALUES {}", vec!["(?, ?)"; shape.regions as usize].join(", ")), regions));
+    txn.push((
+        format!(
+            "INSERT INTO regions (id, name) VALUES {}",
+            vec!["(?, ?)"; shape.regions as usize].join(", ")
+        ),
+        regions,
+    ));
     let mut id = 1;
     while id <= shape.owners {
         let last = (id + batch as i64 - 1).min(shape.owners);
-        let params: Vec<P> = (id..=last).flat_map(|i| owner_params(i, shape.regions)).collect();
-        txn.push((format!("INSERT INTO owners (id, name, region, score) VALUES {}", vec!["(?, ?, ?, ?)"; (last - id + 1) as usize].join(", ")), params));
+        let params: Vec<P> = (id..=last)
+            .flat_map(|i| owner_params(i, shape.regions))
+            .collect();
+        txn.push((
+            format!(
+                "INSERT INTO owners (id, name, region, score) VALUES {}",
+                vec!["(?, ?, ?, ?)"; (last - id + 1) as usize].join(", ")
+            ),
+            params,
+        ));
         id = last + 1;
     }
     each(std::mem::take(&mut txn))?;
     let mut id = 1;
     while id <= shape.items {
         let last = (id + batch as i64 - 1).min(shape.items);
-        let params: Vec<P> = (id..=last).flat_map(|i| item_params(i, shape.owners)).collect();
+        let params: Vec<P> = (id..=last)
+            .flat_map(|i| item_params(i, shape.owners))
+            .collect();
         txn.push((insert_items(d, (last - id + 1) as usize), params));
         if txn.len() >= 50 {
             each(std::mem::take(&mut txn))?;
@@ -289,11 +339,19 @@ pub struct Op {
 }
 
 const fn r(name: &'static str, what: &'static str) -> Op {
-    Op { name, kind: Kind::Read, what }
+    Op {
+        name,
+        kind: Kind::Read,
+        what,
+    }
 }
 
 const fn w(name: &'static str, what: &'static str) -> Op {
-    Op { name, kind: Kind::Write, what }
+    Op {
+        name,
+        kind: Kind::Write,
+        what,
+    }
 }
 
 /// Every statement of the suite, reads first.
@@ -304,35 +362,80 @@ pub const OPS: &[Op] = &[
     r("point_text", "rows by an indexed text column"),
     r("in_list_10", "ten rows by primary key in an IN list"),
     r("range_pk_100", "a hundred rows by a primary-key range"),
-    r("range_secondary_100", "about a hundred rows by a secondary-index range"),
-    r("filter_multi_column", "an indexed equality, a range and a boolean, LIMIT"),
-    r("filter_no_index", "COUNT(*) of a filter no index serves: a whole scan"),
+    r(
+        "range_secondary_100",
+        "about a hundred rows by a secondary-index range",
+    ),
+    r(
+        "filter_multi_column",
+        "an indexed equality, a range and a boolean, LIMIT",
+    ),
+    r(
+        "filter_no_index",
+        "COUNT(*) of a filter no index serves: a whole scan",
+    ),
     r("filter_is_null", "an indexed equality and IS NULL, LIMIT"),
-    r("like_prefix", "a case-sensitive prefix match on an indexed text column: LIKE, GLOB where LIKE ignores case"),
+    r(
+        "like_prefix",
+        "a case-sensitive prefix match on an indexed text column: LIKE, GLOB where LIKE ignores case",
+    ),
     r("like_substring", "LIKE '%word%' on long text: a whole scan"),
-    r("order_by_index", "ORDER BY an index's second column, DESC, LIMIT 20"),
-    r("order_by_sort", "ORDER BY an unindexed column, LIMIT 20: a sort"),
+    r(
+        "order_by_index",
+        "ORDER BY an index's second column, DESC, LIMIT 20",
+    ),
+    r(
+        "order_by_sort",
+        "ORDER BY an unindexed column, LIMIT 20: a sort",
+    ),
     r("offset_deep", "LIMIT 20 OFFSET up to the table's size"),
-    r("count_range", "COUNT(*) over a range of a timestamp: 10,000 rows"),
+    r(
+        "count_range",
+        "COUNT(*) over a range of a timestamp: 10,000 rows",
+    ),
     r("aggregates_range", "SUM, AVG, MIN, MAX over 1,000 rows"),
     r("group_by_range", "GROUP BY over 10,000 rows"),
-    r("group_by_having", "GROUP BY, HAVING, ORDER BY the count, LIMIT"),
+    r(
+        "group_by_having",
+        "GROUP BY, HAVING, ORDER BY the count, LIMIT",
+    ),
     r("distinct_range", "DISTINCT over 10,000 rows"),
-    r("count_distinct", "COUNT(DISTINCT) within an indexed equality"),
+    r(
+        "count_distinct",
+        "COUNT(DISTINCT) within an indexed equality",
+    ),
     r("join_pk", "20 rows joined to another table by its key"),
-    r("join_group", "a join filtered on the other table, grouped and ordered"),
+    r(
+        "join_group",
+        "a join filtered on the other table, grouped and ordered",
+    ),
     r("join_three", "three tables joined over 1,000 rows, grouped"),
-    r("left_join_anti", "LEFT JOIN ... IS NULL: rows with no match"),
+    r(
+        "left_join_anti",
+        "LEFT JOIN ... IS NULL: rows with no match",
+    ),
     r("subquery_in", "IN (SELECT ...) beside an indexed equality"),
     r("exists_subquery", "EXISTS (SELECT ...) correlated"),
-    r("group_correlated", "a correlated subquery in a grouped query's output"),
-    r("group_correlated_row", "a correlated subquery no join replaces, in a grouped query's output"),
+    r(
+        "group_correlated",
+        "a correlated subquery in a grouped query's output",
+    ),
+    r(
+        "group_correlated_row",
+        "a correlated subquery no join replaces, in a grouped query's output",
+    ),
     r("cte", "WITH ... a grouped CTE joined and ordered"),
     r("union_all", "UNION ALL of two index lookups"),
     r("case_aggregate", "SUM(CASE ...) over 1,000 rows"),
-    r("window_row_number", "ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) over 1,000 rows"),
+    r(
+        "window_row_number",
+        "ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) over 1,000 rows",
+    ),
     r("string_functions", "UPPER, LENGTH, SUBSTR over 100 rows"),
-    r("date_bucket", "rows counted by month from a timestamp, 10,000 rows"),
+    r(
+        "date_bucket",
+        "rows counted by month from a timestamp, 10,000 rows",
+    ),
     r("json_field", "a JSON document's field, by primary key"),
     r("json_filter", "rows filtered on a JSON document's field"),
     r("blob_read", "a 64-byte blob by primary key"),
@@ -346,10 +449,22 @@ pub const OPS: &[Op] = &[
     w("update_text", "400 bytes of text of a row by key"),
     w("update_json", "a JSON document of a row by key"),
     w("update_range", "a boolean of ten rows by a key range"),
-    w("upsert", "INSERT ... ON CONFLICT DO UPDATE on an existing key"),
-    w("delete_insert", "a row deleted by key and put back, one transaction"),
-    w("delete_range_insert", "ten rows deleted by range and put back, one transaction"),
-    w("txn_read_write", "a transaction that reads two rows, updates them and inserts one"),
+    w(
+        "upsert",
+        "INSERT ... ON CONFLICT DO UPDATE on an existing key",
+    ),
+    w(
+        "delete_insert",
+        "a row deleted by key and put back, one transaction",
+    ),
+    w(
+        "delete_range_insert",
+        "ten rows deleted by range and put back, one transaction",
+    ),
+    w(
+        "txn_read_write",
+        "a transaction that reads two rows, updates them and inserts one",
+    ),
 ];
 
 /// `sql` (SQLite's `?` placeholders) in `d`'s: PostgreSQL's `$n`.
@@ -484,9 +599,19 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
 
 /// The parameters of each of `op`'s statements, drawn for one run of it by client `c.0` of `c.1`:
 /// reads anywhere in the table, writes in the client's own slice of it.
-pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dialect) -> Vec<Vec<P>> {
+pub fn params(
+    op: &str,
+    rng: &mut Rng,
+    shape: &Shape,
+    c: (usize, usize),
+    d: Dialect,
+) -> Vec<Vec<P>> {
     let write = OPS.iter().any(|o| o.name == op && o.kind == Kind::Write);
-    let id = if write { shape.own(rng, c) } else { shape.id(rng) };
+    let id = if write {
+        shape.own(rng, c)
+    } else {
+        shape.id(rng)
+    };
     let grp = || P::I((mix(id as u64 ^ 0x1111) % 100) as i64);
     let region = (rng.next() % shape.regions as u64) as i64 + 1;
     let word = WORDS[(rng.next() % WORDS.len() as u64) as usize];
@@ -495,7 +620,9 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dial
     let new_id = || shape.next.fetch_add(1, Ordering::Relaxed);
     let one = |p: Vec<P>| vec![p];
     match op {
-        "point_pk" | "point_pk_one_column" | "json_field" | "blob_read" | "text_read" => one(vec![P::I(id)]),
+        "point_pk" | "point_pk_one_column" | "json_field" | "blob_read" | "text_read" => {
+            one(vec![P::I(id)])
+        }
         "point_secondary" => one(vec![P::I(k_of(id))]),
         "point_text" => one(vec![P::T(name_of(id))]),
         "in_list_10" => one((0..10).map(|_| P::I(shape.id(rng))).collect()),
@@ -508,17 +635,27 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dial
             one(vec![P::I(a), P::I(a.saturating_add(k_span))])
         }
         "filter_multi_column" => one(vec![grp(), P::F((rng.next() % 10_000) as f64)]),
-        "filter_no_index" => one(vec![P::I((rng.next() % 100) as i64), P::F((rng.next() % 1000) as f64)]),
-        "filter_is_null" | "order_by_index" | "order_by_sort" | "count_distinct" | "cte" | "group_by_having" => one(vec![grp()]),
+        "filter_no_index" => one(vec![
+            P::I((rng.next() % 100) as i64),
+            P::F((rng.next() % 1000) as f64),
+        ]),
+        "filter_is_null" | "order_by_index" | "order_by_sort" | "count_distinct" | "cte"
+        | "group_by_having" => one(vec![grp()]),
         "like_prefix" => {
             let wildcard = if d == Dialect::Sqlite { '*' } else { '%' };
-            one(vec![P::T(format!("{word}-{:x}{wildcard}", rng.next() % 16))])
+            one(vec![P::T(format!(
+                "{word}-{:x}{wildcard}",
+                rng.next() % 16
+            ))])
         }
         "like_substring" => one(vec![P::T("%zephyr%".into())]),
         "offset_deep" => one(vec![P::I(shape.range(rng, 20) - 1)]),
         "count_range" => {
             let a = shape.range(rng, 10_000);
-            one(vec![P::I(BASE_US + a * 1_000_000), P::I(BASE_US + (a + 9_999) * 1_000_000)])
+            one(vec![
+                P::I(BASE_US + a * 1_000_000),
+                P::I(BASE_US + (a + 9_999) * 1_000_000),
+            ])
         }
         "aggregates_range" | "join_three" | "case_aggregate" | "window_row_number" => {
             let a = shape.range(rng, 1000);
@@ -546,23 +683,38 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dial
         "insert_one" => one(item_params(new_id(), shape.owners)),
         "insert_batch_100" => {
             let first = shape.next.fetch_add(100, Ordering::Relaxed);
-            one((first..first + 100).flat_map(|i| item_params(i, shape.owners)).collect())
+            one((first..first + 100)
+                .flat_map(|i| item_params(i, shape.owners))
+                .collect())
         }
-        "update_plain" => one(vec![P::F((rng.next() % 1_000_000) as f64 / 100.0), P::I(id)]),
+        "update_plain" => one(vec![
+            P::F((rng.next() % 1_000_000) as f64 / 100.0),
+            P::I(id),
+        ]),
         "update_indexed" => one(vec![P::I((rng.next() >> 1) as i64), P::I(id)]),
         "update_text" => {
             let mut p = item_params(id, shape.owners);
             let body = std::mem::replace(&mut p[9], P::N);
-            one(vec![match body {
-                P::T(mut b) => {
-                    b.insert_str(0, word);
-                    b.truncate(400);
-                    P::T(b)
-                }
-                other => other,
-            }, P::I(id)])
+            one(vec![
+                match body {
+                    P::T(mut b) => {
+                        b.insert_str(0, word);
+                        b.truncate(400);
+                        P::T(b)
+                    }
+                    other => other,
+                },
+                P::I(id),
+            ])
         }
-        "update_json" => one(vec![P::T(format!(r#"{{"a":{},"b":"{word}","c":[{}]}}"#, rng.next() % 100, rng.next() % 10)), P::I(id)]),
+        "update_json" => one(vec![
+            P::T(format!(
+                r#"{{"a":{},"b":"{word}","c":[{}]}}"#,
+                rng.next() % 100,
+                rng.next() % 10
+            )),
+            P::I(id),
+        ]),
         "update_range" => {
             let a = shape.own_range(rng, c, 10);
             one(vec![P::I(a), P::I(a + 9)])
@@ -575,11 +727,22 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dial
         "delete_insert" => vec![vec![P::I(id)], item_params(id, shape.owners)],
         "delete_range_insert" => {
             let a = shape.own_range(rng, c, 10);
-            vec![vec![P::I(a), P::I(a + 9)], (a..a + 10).flat_map(|i| item_params(i, shape.owners)).collect()]
+            vec![
+                vec![P::I(a), P::I(a + 9)],
+                (a..a + 10)
+                    .flat_map(|i| item_params(i, shape.owners))
+                    .collect(),
+            ]
         }
         "txn_read_write" => {
             let b = shape.own(rng, c);
-            vec![vec![P::I(id)], vec![P::I(id)], vec![P::I(b)], vec![P::I(b)], item_params(new_id(), shape.owners)]
+            vec![
+                vec![P::I(id)],
+                vec![P::I(id)],
+                vec![P::I(b)],
+                vec![P::I(b)],
+                item_params(new_id(), shape.owners),
+            ]
         }
         _ => vec![],
     }
@@ -600,13 +763,31 @@ struct Opts {
     /// new one: a statement profiled again without loading ten million rows again. A diagnosis,
     /// never a record (its runs follow whatever the last run's writes left).
     reuse: bool,
+    /// Amphora's tables declared `COLUMNAR`: on its versioned storage they keep column copies
+    /// (docs/design/columnar.md, decision 1, item 1).
+    columnar: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false, reuse: false };
+    let mut o = Opts {
+        target: String::new(),
+        dir: "/tmp/amphora-suite".into(),
+        dsn: None,
+        items: 200_000,
+        clients: vec![1, 32],
+        seconds: 5.0,
+        warmup: 1.0,
+        only: None,
+        explain: false,
+        reuse: false,
+        columnar: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--suite" => {}
             "--target" => o.target = v()?,
@@ -619,8 +800,17 @@ fn opts() -> anyhow::Result<Opts> {
             "--only" => o.only = Some(v()?),
             "--explain" => o.explain = true,
             "--reuse" => o.reuse = true,
-            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain, --reuse)"),
+            "--columnar" => o.columnar = true,
+            other => anyhow::bail!(
+                "unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain, --reuse, --columnar)"
+            ),
         }
+    }
+    if o.columnar && o.target != "amphora" {
+        anyhow::bail!(
+            "--columnar declares Amphora's tables COLUMNAR; target {} has no such option",
+            o.target
+        );
     }
     Ok(o)
 }
@@ -646,7 +836,18 @@ struct Outcome {
 /// conflicts, a locked database).
 fn retryable(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
-    ["could not serialize", "deadlock", "conflict with concurrent", "lock wait timeout", "database is locked", "busy", "try restarting transaction", "concurrently modified"].iter().any(|m| s.contains(m))
+    [
+        "could not serialize",
+        "deadlock",
+        "conflict with concurrent",
+        "lock wait timeout",
+        "database is locked",
+        "busy",
+        "try restarting transaction",
+        "concurrently modified",
+    ]
+    .iter()
+    .any(|m| s.contains(m))
 }
 
 /// This process's user and system CPU seconds, every thread's, ended ones too: Linux's
@@ -667,13 +868,23 @@ fn cpu_times() -> Option<(f64, f64)> {
 /// another statement. Each command waits for perf's ack before the window goes on.
 fn perf_ctl(cmd: &str) {
     use std::io::{Read, Write};
-    let Some(spec) = std::env::var("AMPHORA_PERF_CTL").ok() else { return };
+    let Some(spec) = std::env::var("AMPHORA_PERF_CTL").ok() else {
+        return;
+    };
     let Some((ctl, ack)) = spec.split_once(',') else {
         eprintln!("AMPHORA_PERF_CTL takes <control fifo>,<ack fifo>");
         return;
     };
-    let fifo = |path: &str| std::fs::OpenOptions::new().read(true).write(true).open(path);
-    let done = fifo(ctl).and_then(|mut f| f.write_all(format!("{cmd}\n").as_bytes())).and_then(|()| fifo(ack)).and_then(|mut f| f.read_exact(&mut [0u8; 4]));
+    let fifo = |path: &str| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    };
+    let done = fifo(ctl)
+        .and_then(|mut f| f.write_all(format!("{cmd}\n").as_bytes()))
+        .and_then(|()| fifo(ack))
+        .and_then(|mut f| f.read_exact(&mut [0u8; 4]));
     if let Err(e) = done {
         eprintln!("perf {cmd}: {e}");
     }
@@ -681,39 +892,130 @@ fn perf_ctl(cmd: &str) {
 
 /// Runs `op` from `clients` clients for the warmup and then `seconds`, each client on a session of
 /// its own, closed loop.
-fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &Arc<Shape>, clients: usize, warmup: f64, seconds: f64) -> Outcome {
-    let stop = Arc::new(AtomicBool::new(false));
+/// Client `c`'s stream of draws for statement `op`, the same at every client count. Each
+/// statement's clients draw from streams of their own: mix is a bijection, so no two clients' seeds
+/// are equal (adding the client's number and then XORing it in made clients 0, 2, 4, ... draw the
+/// same parameters, and statements whose names were as long drew the same).
+fn client_rng(op: &str, c: usize) -> Rng {
+    let base = op
+        .bytes()
+        .fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
+    Rng(mix(base ^ mix(c as u64 + 1)) | 1)
+}
+
+fn param_json(p: &P) -> serde_json::Value {
+    match p {
+        P::I(i) => serde_json::json!(i),
+        P::F(f) => serde_json::json!(f),
+        P::T(t) => serde_json::json!(t),
+        P::B(b) => serde_json::json!(suite_db::Cell::Blob(b).text()),
+        P::Z(z) => serde_json::json!(z),
+        P::N => serde_json::Value::Null,
+    }
+}
+
+/// The answer check's answers: each read's rows, every value, for the first parameters each client
+/// of the largest client count draws in its timed runs (`client_rng`), a parameter list once.
+/// Taken before any write runs, so every database answers over the same rows.
+fn answers(
+    target: &Arc<dyn Target>,
+    only: Option<&str>,
+    shape: &Shape,
+    clients: usize,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let d = target.dialect();
+    let mut session = target.session()?;
+    let mut out = Vec::new();
+    for op in OPS
+        .iter()
+        .filter(|op| op.kind == Kind::Read && selected(only, op.name))
+    {
+        let Some(stmts) = statements(op.name, d) else {
+            continue;
+        };
+        let stmts: Vec<String> = stmts.iter().map(|s| placeholders(d, s)).collect();
+        let mut seen = std::collections::HashSet::new();
+        for c in 0..clients {
+            let p = params(op.name, &mut client_rng(op.name, c), shape, (c, clients), d);
+            let shown: Vec<Vec<serde_json::Value>> = p
+                .iter()
+                .map(|ps| ps.iter().map(param_json).collect())
+                .collect();
+            if !seen.insert(serde_json::json!(shown).to_string()) {
+                continue;
+            }
+            let answer = match session.answer(&stmts, &p) {
+                Ok(rows) => serde_json::json!({ "rows": rows }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            };
+            out.push(serde_json::json!({ "op": op.name, "client": c, "sql": stmts, "params": shown, "answer": answer }));
+        }
+    }
+    Ok(out)
+}
+
+fn run_op(
+    target: &Arc<dyn Target>,
+    op: &Op,
+    stmts: &Arc<Vec<String>>,
+    shape: &Arc<Shape>,
+    clients: usize,
+    warmup: f64,
+    seconds: f64,
+) -> Outcome {
+    let stop = Arc::new(crate::Stop::default());
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
-    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None }));
-    // Each statement's clients draw from streams of their own: mix is a bijection, so no two
-    // clients' seeds are equal (adding the client's number and then XORing it in made clients 0, 2,
-    // 4, ... draw the same parameters, and statements whose names were as long drew the same).
-    let base = op.name.bytes().fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
+    let total = Arc::new(Mutex::new(Outcome {
+        hist: Hist::new(),
+        rows: 0,
+        errors: 0,
+        error: None,
+        retries: 0,
+        longest_us: 0,
+        cpu: None,
+    }));
     let d = target.dialect();
     let cpu = std::thread::scope(|s| {
         // The measured window's own thread: the process's CPU time in it, and perf on and off
         // around it (perf_ctl).
+        let window_stop = stop.clone();
         let window = s.spawn(move || {
-            std::thread::sleep(count_from.saturating_duration_since(Instant::now()));
+            window_stop.wait_until(count_from);
             let before = cpu_times();
             // An empty window turns nothing on, so perf counts nothing for it.
             let counted = until > count_from;
             if counted {
                 perf_ctl("enable");
             }
-            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            window_stop.wait_until(until);
             if counted {
                 perf_ctl("disable");
             }
-            before.zip(cpu_times()).map(|((u0, s0), (u1, s1))| (u1 - u0, s1 - s0))
+            before
+                .zip(cpu_times())
+                .map(|((u0, s0), (u1, s1))| (u1 - u0, s1 - s0))
         });
         for c in 0..clients {
-            let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
-            let mut rng = Rng(mix(base ^ mix(c as u64 + 1)) | 1);
+            let (target, stmts, shape, stop, total) = (
+                target.clone(),
+                stmts.clone(),
+                shape.clone(),
+                stop.clone(),
+                total.clone(),
+            );
+            let mut rng = client_rng(op.name, c);
             s.spawn(move || {
-                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None };
+                let mut mine = Outcome {
+                    hist: Hist::new(),
+                    rows: 0,
+                    errors: 0,
+                    error: None,
+                    retries: 0,
+                    longest_us: 0,
+                    cpu: None,
+                };
                 match target.session() {
                     Err(e) => {
                         mine.errors += 1;
@@ -721,10 +1023,10 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                     }
                     Ok(mut session) => {
                         let mut failing = 0u32;
-                        while !stop.load(Ordering::Relaxed) {
+                        while !stop.stopped() {
                             let now = Instant::now();
                             if now >= until {
-                                stop.store(true, Ordering::Relaxed);
+                                stop.stop();
                                 break;
                             }
                             let p = params(op.name, &mut rng, &shape, (c, clients), d);
@@ -740,7 +1042,8 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                                 }
                             }
                             let ended = Instant::now();
-                            let us = u64::try_from(ended.duration_since(t).as_micros()).unwrap_or(u64::MAX);
+                            let us = u64::try_from(ended.duration_since(t).as_micros())
+                                .unwrap_or(u64::MAX);
                             mine.longest_us = mine.longest_us.max(us);
                             match got {
                                 Ok(rows) => {
@@ -757,7 +1060,8 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                                 Err(e) => {
                                     mine.errors += 1;
                                     if mine.error.is_none() {
-                                        mine.error = Some(format!("{e:#}").chars().take(300).collect());
+                                        mine.error =
+                                            Some(format!("{e:#}").chars().take(300).collect());
                                     }
                                     // A statement refused again and again isn't run for the rest of
                                     // its time: its first error is the finding.
@@ -784,8 +1088,19 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
         }
         window.join().ok().flatten()
     });
-    let lost = || Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0, longest_us: 0, cpu: None };
-    let mut out = Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or_else(lost);
+    let lost = || Outcome {
+        hist: Hist::new(),
+        rows: 0,
+        errors: 0,
+        error: Some("lost the run's outcome".into()),
+        retries: 0,
+        longest_us: 0,
+        cpu: None,
+    };
+    let mut out = Arc::try_unwrap(total)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_else(lost);
     out.cpu = cpu;
     out
 }
@@ -794,19 +1109,40 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
 /// comma-separated names begin, or with a trailing `$` the one it names (`point_pk$`, not
 /// `point_pk_one_column`).
 fn selected(only: Option<&str>, name: &str) -> bool {
-    only.is_none_or(|only| only.split(',').any(|n| n.strip_suffix('$').map_or(name.starts_with(n), |exact| name == exact)))
+    only.is_none_or(|only| {
+        only.split(',').any(|n| {
+            n.strip_suffix('$')
+                .map_or(name.starts_with(n), |exact| name == exact)
+        })
+    })
 }
 
 /// Makes the suite's tables, loads them, builds their indexes and settles the database: each
 /// step's seconds.
-fn load_all(target: &Arc<dyn Target>, d: Dialect, shape: &Shape, cedardb: bool) -> anyhow::Result<(f64, f64, f64)> {
+fn load_all(
+    target: &Arc<dyn Target>,
+    d: Dialect,
+    shape: &Shape,
+    cedardb: bool,
+    columnar: bool,
+) -> anyhow::Result<(f64, f64, f64)> {
     let began = Instant::now();
-    target.setup(&tables(d, cedardb).into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
+    let declare = |s: String| if columnar { format!("{s} COLUMNAR") } else { s };
+    target.setup(
+        &tables(d, cedardb)
+            .into_iter()
+            .map(|s| (declare(s), vec![]))
+            .collect::<Vec<_>>(),
+    )?;
     // A hundred rows a statement keeps every placeholder-bound engine under its parameter limit
     // (SQLite 32,766, PostgreSQL's and MySQL's 65,535). ClickHouse makes each INSERT a part it then
     // merges, and asks for bulk inserts of at least 1,000 rows, better 10,000 to 100,000 (its
     // documentation, "Bulk inserts"): at ten million rows, a hundred a statement is 100,000 parts.
-    let batch = if d == Dialect::ClickHouse { 20_000 } else { 100 };
+    let batch = if d == Dialect::ClickHouse {
+        20_000
+    } else {
+        100
+    };
     load(d, shape, batch, |txn| target.setup(&txn))?;
     let loaded_s = began.elapsed().as_secs_f64();
     for s in indexes(d) {
@@ -828,11 +1164,16 @@ pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let shape = Arc::new(Shape::new(o.items));
     let readers = o.clients.iter().copied().max().unwrap_or(1);
-    let target: Arc<dyn Target> = suite_db::open(&o.target, &o.dir, o.dsn.as_deref(), readers, o.reuse)?;
+    let target: Arc<dyn Target> =
+        suite_db::open(&o.target, &o.dir, o.dsn.as_deref(), readers, o.reuse)?;
     let d = target.dialect();
 
     // --reuse: the database a run left, as that run loaded, indexed and settled it.
-    let (loaded_s, indexed_s, settle_s) = if o.reuse { (0.0, 0.0, 0.0) } else { load_all(&target, d, &shape, o.target == "cedardb")? };
+    let (loaded_s, indexed_s, settle_s) = if o.reuse {
+        (0.0, 0.0, 0.0)
+    } else {
+        load_all(&target, d, &shape, o.target == "cedardb", o.columnar)?
+    };
     target.ready()?;
     let rss_after_load_mb = crate::rss_mb();
     forget_peaks();
@@ -845,19 +1186,27 @@ pub fn main() -> anyhow::Result<()> {
             if !selected(o.only.as_deref(), op.name) {
                 continue;
             }
-            let Some(stmts) = statements(op.name, d) else { continue };
+            let Some(stmts) = statements(op.name, d) else {
+                continue;
+            };
             let p = params(op.name, &mut rng, &shape, (0, 1), d);
-            let (Some(sql), Some(first)) = (stmts.first(), p.first()) else { continue };
+            let (Some(sql), Some(first)) = (stmts.first(), p.first()) else {
+                continue;
+            };
             let plan = match session.explain(&placeholders(d, sql), first) {
                 Ok(lines) => serde_json::json!(lines),
                 Err(e) => serde_json::json!(format!("error: {e:#}")),
             };
             plans.insert(op.name.to_owned(), plan);
         }
-        println!("{}", serde_json::json!({ "suite": 1, "explain": true, "target": o.target, "items": shape.items, "plans": plans }));
+        println!(
+            "{}",
+            serde_json::json!({ "suite": 1, "explain": true, "target": o.target, "items": shape.items, "plans": plans })
+        );
         return Ok(());
     }
 
+    let answers = answers(&target, o.only.as_deref(), &shape, readers)?;
     let mut results = Vec::new();
     for op in OPS {
         if !selected(o.only.as_deref(), op.name) {
@@ -881,7 +1230,10 @@ pub fn main() -> anyhow::Result<()> {
             };
             let out = run_op(&target, op, &stmts, &shape, clients, o.warmup, o.seconds);
             if let (Some(prefix), Some(guard)) = (&profile, profiler) {
-                crate::write_profile(&format!("{prefix}-{}-{}-{clients}", o.target, op.name), &guard)?;
+                crate::write_profile(
+                    &format!("{prefix}-{}-{}-{clients}", o.target, op.name),
+                    &guard,
+                )?;
             }
             let n = out.hist.n;
             results.push(serde_json::json!({
@@ -915,6 +1267,7 @@ pub fn main() -> anyhow::Result<()> {
         "settle_s": settle_s,
         "reused": o.reuse,
         "results": results,
+        "answers": answers,
         "rss_after_load_mb": rss_after_load_mb,
         "rss_max_mb": crate::rss_max_mb(),
         "heap_peak_mb": crate::heap_mb(&crate::HEAP_PEAK),

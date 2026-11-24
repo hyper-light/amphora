@@ -37,9 +37,11 @@ fn a_kept_side_merge_join_stays_serial() {
     let mut rng = ChaCha8Rng::seed_from_u64(518);
     fill(&conn, &mut rng, "t", 64);
     fill(&conn, &mut rng, "u", 48);
+    let sql = "SELECT count(*) FROM t LEFT JOIN u ON u.a = t.a";
+    conn.set_parallel_mode(ParallelMode::Off);
+    let serial = sql_rows(&conn, sql);
     conn.set_parallel_mode(ParallelMode::On);
     conn.set_parallel_outer_probe(crate::OuterJoinProbe::Kept);
-    let sql = "SELECT count(*) FROM t LEFT JOIN u ON u.a = t.a";
     for (method, morsels) in [
         (crate::JoinMethods::HashJoinsOnly, true),
         (crate::JoinMethods::MergeJoinsOnly, false),
@@ -59,6 +61,11 @@ fn a_kept_side_merge_join_stays_serial() {
             r.get(1)
                 .is_some_and(|v| v.to_string().contains("MorselAggregate"))
         });
+        assert_eq!(
+            sql_rows(&conn, sql),
+            serial,
+            "{method:?}: the serial answer"
+        );
         assert_eq!(hooked, morsels, "{method:?}");
     }
 }
@@ -213,6 +220,7 @@ fn to_sql(
                 };
                 format!("{} {op} {}", COLUMNS[*column], literal(value))
             }
+            Predicate::Parameter { .. } => panic!("the fuzz shapes bind no parameter"),
         })
         .collect();
     let mut sql = format!("SELECT {} FROM {name}", select.join(", "));
@@ -281,6 +289,7 @@ fn t_qt_6_7_leaf_morsels_answer_as_the_serial_vdbe() {
             filter: &filter,
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: crate::RealSums::Serial,
         };
         let pipeline = TableAggregate {
             table: &table,
@@ -429,6 +438,7 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
         filter: &filter,
         group_by: &[],
         aggregates: &aggregates,
+        sums: crate::RealSums::Serial,
     };
     let pipeline = TableAggregate {
         table: &table,
@@ -3234,9 +3244,12 @@ fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
 /// leaves that hold the range (`TableSource::restrict`), every term the search was made from
 /// tested on each row. Ranges open and closed at either end, through the INTEGER PRIMARY KEY and
 /// through rowid, with other terms, aggregates, groups, rows and a LIMIT, over a table with gaps,
-/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores; the body ran over some rows but
-/// fewer than the table holds (the leaves were cut). A backward search, and a range of bounds that
-/// aren't integer literals, stay the serial loop's.
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores; the body ran over some rows, and
+/// no more than the leaves the range touches hold (`TableSource::restrict`: the first leaf whose
+/// greatest rowid reaches the lower bound, through the first that reaches the upper), fewer than
+/// the table holds where the range leaves whole leaves out. A range whose bound falls in the
+/// first or last leaf touches them all (`id > 100`: the first leaf holds ids to ~115). A backward
+/// search, and a range of bounds that aren't integer literals, stay the serial loop's.
 #[test]
 fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
     let conn = open(":memory:qt-6-33");
@@ -3261,61 +3274,103 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
         .unwrap();
     }
     conn.execute("COMMIT").unwrap();
-    // The filter must exclude complete leaves. A bound in the first leaf and an
-    // upper bound beyond the last row can legitimately visit every leaf.
-    let grouped_range = format!(
-        "SELECT c, count(*) FROM t WHERE id > {} AND id < {} AND c IS NOT NULL GROUP BY c",
-        id / 3,
-        id - id / 3
-    );
-    // (statement, whether it returns rows, whether the hook takes it).
-    let queries: [(&str, bool, bool); 11] = [
+    // (statement, whether it returns rows, whether the hook takes it, its rowid bounds, each
+    // inclusive).
+    type Range = (Option<i64>, Option<i64>);
+    let queries: [(&str, bool, bool, Range); 11] = [
         (
             "SELECT count(*), sum(b), min(c), max(a) FROM t WHERE id > 4000",
             false,
             true,
+            (Some(4001), None),
         ),
         (
             "SELECT count(*), sum(a) FROM t WHERE id >= 1000 AND id <= 2000",
             false,
             true,
+            (Some(1000), Some(2000)),
         ),
         (
             "SELECT a % 5, count(*), avg(b) FROM t WHERE id BETWEEN 300 AND 5500 GROUP BY a % 5",
             false,
             true,
+            (Some(300), Some(5500)),
         ),
         (
             "SELECT count(*), total(b) FROM t WHERE rowid < 2500 AND a > 0",
             false,
             true,
+            (None, Some(2499)),
         ),
-        (grouped_range.as_str(), false, true),
+        (
+            "SELECT c, count(*) FROM t WHERE id > 100 AND id < 7000 AND c IS NOT NULL GROUP BY c",
+            false,
+            true,
+            (Some(101), Some(6999)),
+        ),
         (
             "SELECT id, a, b FROM t WHERE id > 6000 AND b > 0",
             true,
             true,
+            (Some(6001), None),
         ),
         (
             "SELECT id, c FROM t WHERE id >= 2500 AND id < 2600",
             true,
             true,
+            (Some(2500), Some(2599)),
         ),
         (
             "SELECT id, b FROM t WHERE id > 1234 LIMIT 20 OFFSET 5",
             true,
             true,
+            (Some(1235), None),
         ),
-        ("SELECT count(*) FROM t WHERE id > 100000", false, true),
+        (
+            "SELECT count(*) FROM t WHERE id > 100000",
+            false,
+            true,
+            (Some(100001), None),
+        ),
         // The serial loop's: a backward search, a bound that isn't a literal.
         (
             "SELECT id FROM t WHERE id > 8000 ORDER BY id DESC",
             true,
             false,
+            (Some(8001), None),
         ),
-        ("SELECT count(*) FROM t WHERE id > abs(-50)", false, false),
+        (
+            "SELECT count(*) FROM t WHERE id > abs(-50)",
+            false,
+            false,
+            (Some(51), None),
+        ),
     ];
-    for (sql, returns_rows, hooked) in queries {
+    let root = conn
+        .schema
+        .read()
+        .get_table("t")
+        .unwrap()
+        .get_root_page()
+        .unwrap();
+    // The rows of the leaves each range touches, as the hook cuts them.
+    conn.execute("BEGIN").unwrap();
+    let touched: Vec<u64> = queries
+        .iter()
+        .map(|(_, _, _, (lower, upper))| {
+            let mut leaves =
+                TableSource::open(conn.get_pager(), root, 5, Some(0), Vec::new()).unwrap();
+            leaves.restrict(*lower, *upper);
+            u64::try_from(leaves.rows().unwrap().len()).unwrap()
+        })
+        .collect();
+    conn.execute("COMMIT").unwrap();
+    // Non-vacuity: some ranges leave whole leaves out.
+    assert!(
+        touched.iter().any(|rows_touched| *rows_touched < rows),
+        "no range cut a leaf: {touched:?}"
+    );
+    for ((sql, returns_rows, hooked, _), touched) in queries.into_iter().zip(touched) {
         conn.set_parallel_mode(ParallelMode::Off);
         let serial = sql_rows(&conn, sql);
         conn.set_parallel_mode(ParallelMode::On);
@@ -3346,8 +3401,8 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
             let ran = after - before;
             if hooked {
                 assert!(
-                    ran < rows,
-                    "{sql} on {cores} cores: the body ran over {ran} rows of {rows}: the leaves weren't cut"
+                    ran <= touched,
+                    "{sql} on {cores} cores: the body ran over {ran} rows, its range's leaves hold {touched} of {rows}: the leaves weren't cut"
                 );
                 if !sql.contains("100000") {
                     assert!(ran > 0, "{sql} on {cores} cores: the hook didn't run");
@@ -3450,6 +3505,12 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-35");
     let mut rng = ChaCha8Rng::seed_from_u64(635);
     fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    // Morsels take an inner join only with at least one hash join in it (executor.md, lane
+    // qs6-10), and the planner promises none: hash joins are asked for, and ANALYZE counts the
+    // rows a range keeps. Without it a table counts as 1,000,000 rows, and a build read by a range
+    // as more than a hash join may materialize (`MAX_MATERIALIZED_BUILD_ROWS`).
+    conn.execute("ANALYZE").unwrap();
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let queries: [(&str, bool); 9] = [
         ("SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000", false),
         ("SELECT d.c, count(*), min(f.b) FROM f JOIN d ON f.c = d.c WHERE f.id BETWEEN 500 AND 1500 AND d.id < 300 GROUP BY d.c", false),
@@ -3486,4 +3547,927 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
         }
     }
     conn.set_parallel_mode(ParallelMode::Off);
+}
+
+/// Whether `rows` are in the order of their first values, each `descending` or not, NULLs least as
+/// in SQLite or where `nulls` puts them (`true`: NULLS LAST).
+fn in_stated_order(rows: &[Vec<Value>], descending: &[bool], nulls: Option<bool>) -> bool {
+    use std::cmp::Ordering;
+    rows.windows(2).all(|pair| {
+        for (key, desc) in descending.iter().enumerate() {
+            let order = match (&pair[0][key], &pair[1][key], nulls) {
+                (Value::Null, Value::Null, _) => Ordering::Equal,
+                (Value::Null, _, Some(true)) | (_, Value::Null, Some(false)) => Ordering::Greater,
+                (Value::Null, _, Some(false)) | (_, Value::Null, Some(true)) => Ordering::Less,
+                (a, b, _) if *desc => b.cmp(a),
+                (a, b, _) => a.cmp(b),
+            };
+            if order.is_ne() {
+                return order.is_lt();
+            }
+        }
+        true
+    })
+}
+
+/// T-QT.6.36: a statement whose ORDER BY the planner took out, because its loops give it (a
+/// forward or a backward scan, an outer join's kept table) or its GROUP BY does, comes out in that
+/// order from morsels, which run neither. Joins' rows ordered by one table's id and by both, up and
+/// down, inner and LEFT and FULL, over whole tables and rowid ranges, with and without a LIMIT and an
+/// OFFSET, and groups of a scan and of a join in their keys' order, up and down and with NULLS LAST,
+/// are in the order stated and answer as the serial loop at 1, 2, 3, 4 and 8 stated cores at each
+/// orientation of an outer join, planned by cost and by hash joins, and the hook ran joins and groups.
+#[test]
+fn t_qt_6_36_morsels_keep_an_order_the_planner_took_from_the_loops() {
+    let conn = open(":memory:qt-6-36");
+    let mut rng = ChaCha8Rng::seed_from_u64(636);
+    fill_with_ids(&conn, &mut rng, &[("f", 900), ("d", 200)]);
+    let mut queries: Vec<(String, Vec<bool>, Option<bool>)> = Vec::new();
+    for desc in [false, true] {
+        let dir = if desc { " DESC" } else { "" };
+        for join in ["JOIN", "LEFT JOIN", "FULL JOIN"] {
+            for filter in ["", " WHERE f.id > 850", " WHERE f.id < 60 AND d.id > 150"] {
+                let from = format!("FROM f {join} d ON f.a = d.a{filter}");
+                queries.push((
+                    format!("SELECT f.id, d.id, d.b {from} ORDER BY f.id{dir} -- keys 1"),
+                    vec![desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT d.id, f.id {from} ORDER BY d.id{dir}, f.id{dir} -- keys 2"),
+                    vec![desc, desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT f.id, d.id {from} ORDER BY f.id{dir}, d.id{dir} LIMIT 30 OFFSET 3 -- keys 2"),
+                    vec![desc, desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT f.id, count(*), sum(d.b) {from} GROUP BY f.id ORDER BY f.id{dir} -- keys 1"),
+                    vec![desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT d.c, count(*), min(f.b) {from} GROUP BY d.c ORDER BY d.c{dir} NULLS LAST -- keys 1"),
+                    vec![desc],
+                    Some(true),
+                ));
+            }
+        }
+        for (key, nulls, last) in [
+            ("c", "", None),
+            ("a", "", None),
+            ("a", " NULLS LAST", Some(true)),
+            ("a", " NULLS FIRST", Some(false)),
+        ] {
+            queries.push((
+                format!("SELECT {key}, count(*), sum(b) FROM f GROUP BY {key} ORDER BY {key}{dir}{nulls} -- keys 1"),
+                vec![desc],
+                last,
+            ));
+        }
+        queries.push((
+            format!("SELECT c, a, count(*) FROM f GROUP BY a, c ORDER BY c{dir}, a DESC -- keys 2"),
+            vec![desc, true],
+            None,
+        ));
+    }
+    let (mut joins, mut groups) = (0usize, 0usize);
+    for methods in [
+        crate::JoinMethods::ByCost,
+        crate::JoinMethods::HashJoinsOnly,
+    ] {
+        conn.set_join_methods(methods);
+        for (sql, descending, nulls) in &queries {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sql_rows(&conn, sql);
+            let stated = |rows: &[Vec<Value>]| in_stated_order(rows, descending, *nulls);
+            assert!(stated(&serial), "{sql}: the serial loop's order");
+            conn.set_parallel_mode(ParallelMode::On);
+            for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+                conn.set_parallel_outer_probe(probe);
+                for cores in [1usize, 2, 3, 4, 8] {
+                    *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                        NonZeroUsize::new(cores).unwrap(),
+                        1.0,
+                        1.0,
+                    ));
+                    let counts = || {
+                        [&conn.morsel_join_links, &conn.morsel_body_rows]
+                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    };
+                    let before = counts();
+                    let parallel = sql_rows(&conn, sql);
+                    let after = counts();
+                    let at = format!("on {cores} cores, {methods:?}, {probe:?}");
+                    assert!(stated(&parallel), "{sql} {at}: the order");
+                    if sql.contains("LIMIT") {
+                        // The keys hold both ids: the very rows.
+                        assert_eq!(parallel, serial, "{sql} {at}");
+                    } else {
+                        same_answer(sql, true, &parallel, &serial, &at);
+                    }
+                    joins += usize::from(after[0] > before[0]);
+                    groups += usize::from(sql.contains("GROUP BY") && after[1] > before[1]);
+                }
+            }
+            conn.set_parallel_outer_probe(crate::OuterJoinProbe::Padded);
+        }
+    }
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: joins and groups ran on morsels.
+    assert!(joins > queries.len(), "{joins} joins took the hook");
+    assert!(groups > queries.len() / 4, "{groups} groups took the hook");
+}
+
+/// Audit 3, prototypes 2 (morsel parallelism for REAL and NUMERIC): a one-table scan reading
+/// columns of REAL and NUMERIC affinity runs its loop body's copy in the workers, a REAL column's
+/// INTEGER loading as a REAL (`typeof` says so), GROUP BY values and MIN and MAX comparing as
+/// numbers, and answers as the serial loop at 1, 2, 4, 8 and 16 stated cores. A SUM, AVG or TOTAL
+/// over REALs still sends the statement to the serial loop (its compensated double sum is not the
+/// exact one), which answers the same.
+#[test]
+fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:audit-3-p2");
+    let mut rng = ChaCha8Rng::seed_from_u64(32);
+    let pad = "x".repeat(64);
+    let rows = 2500u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, r REAL, n NUMERIC, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "0", "-0.0", "1", "2.5", "-3", "3.0", "1e300", "-2.5", "'7'", "'x'",
+    ];
+    let numerics = [
+        "NULL", "0", "1", "'2'", "2.5", "'3.0'", "1e30", "-1.5", "'abc'", "4",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let a = rng.random_range(-50i64..50);
+        let r = reals[rng.random_range(0..reals.len())];
+        let n = numerics[rng.random_range(0..numerics.len())];
+        conn.execute(format!(
+            "INSERT INTO t(a, r, n, p) VALUES ({a}, {r}, {n}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let parallel_queries = [
+        "SELECT COUNT(*), MIN(r), MAX(r), MIN(n), MAX(n) FROM t",
+        "SELECT r, COUNT(*), SUM(a), MIN(n), MAX(n) FROM t GROUP BY r",
+        "SELECT n, COUNT(*), MIN(r), MAX(a) FROM t GROUP BY n",
+        "SELECT typeof(r), typeof(n), COUNT(*), MIN(r), MAX(n) FROM t GROUP BY typeof(r), typeof(n)",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE r < 2",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE n >= 2 AND r BETWEEN -3 AND 3",
+        "SELECT r * 2, COUNT(*) FROM t WHERE n <> 1 GROUP BY r * 2",
+        "SELECT COUNT(*) FROM t WHERE r = 3 OR n = 3",
+        "SELECT MIN(r + n), MAX(r - a) FROM t WHERE r IS NOT NULL",
+        "SELECT id, r, n, typeof(r) FROM t WHERE r > 0 AND n < 3",
+    ];
+    let serial_queries = [
+        "SELECT SUM(r) FROM t",
+        "SELECT AVG(r), TOTAL(n) FROM t WHERE a > 0",
+    ];
+    let mut hooked = 0usize;
+    for sql in parallel_queries.iter().chain(&serial_queries) {
+        let parallel_expected = parallel_queries.contains(sql);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 4, 8, 16] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, sql);
+            let after = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            if parallel_expected {
+                // The copied body ran over every row once: the parallel path answered.
+                assert_eq!(
+                    after - before,
+                    rows,
+                    "{sql} on {cores} cores: the body's rows"
+                );
+                if conn
+                    .morsel_costs
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|costs| costs.worker_start().samples() > 1)
+                {
+                    hooked += 1;
+                }
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: more than one worker ran the body for most statements.
+    assert!(
+        hooked > parallel_queries.len(),
+        "workers ran {hooked} times"
+    );
+}
+
+/// The answer at each stated core count, after the serial loop's, with the copied body run over
+/// every one of `rows` rows each time (the parallel path answered, not the serial loop).
+fn g8_answers_at_every_core_count(conn: &Arc<Connection>, sql: &str, rows: u64) -> String {
+    conn.set_parallel_mode(ParallelMode::Off);
+    let serial = format!("{:?}", sql_rows(conn, sql));
+    conn.set_parallel_mode(ParallelMode::On);
+    for cores in [1usize, 2, 4, 8, 16] {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+        let before = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let parallel = format!("{:?}", sql_rows(conn, sql));
+        let after = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(parallel, serial, "{sql} on {cores} cores");
+        assert_eq!(
+            after - before,
+            rows,
+            "{sql} on {cores} cores: the body's rows"
+        );
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    serial
+}
+
+/// Lane G8, arm (b) of the SUM-over-REAL A/B (`RealSums::Exact`): SUM, AVG and TOTAL over REALs,
+/// INTEGERs and both mixed run on the workers and answer bit for bit as the serial loop at 1, 2,
+/// 4, 8 and 16 stated cores, grouped or not, on prices, magnitudes from 1e-300 to 1e300 and
+/// integers past 2^53 before and after the first REAL.
+#[test]
+fn g8_exact_real_sums_answer_as_the_serial_loop_at_every_worker_count() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g8-exact");
+    conn.set_real_sums(crate::RealSums::Exact);
+    let mut rng = ChaCha8Rng::seed_from_u64(88);
+    let pad = "x".repeat(64);
+    let rows = 3000u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, r REAL, a INTEGER, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16",
+    ];
+    let integers = [
+        "NULL",
+        "0",
+        "1",
+        "-7",
+        "9007199254740993",
+        "-4611686018427387905",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let g = rng.random_range(0i64..4);
+        let r = if rng.random_range(0..3) == 0 {
+            reals[rng.random_range(0..reals.len())].to_string()
+        } else {
+            format!(
+                "{}.{:02}",
+                rng.random_range(-100_000i64..100_000),
+                rng.random_range(0..100)
+            )
+        };
+        let a = integers[rng.random_range(0..integers.len())];
+        conn.execute(format!(
+            "INSERT INTO t(g, r, a, p) VALUES ({g}, {r}, {a}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    for sql in [
+        "SELECT SUM(r), AVG(r), TOTAL(r) FROM t",
+        "SELECT g, SUM(r), AVG(r), TOTAL(r), COUNT(*) FROM t GROUP BY g",
+        "SELECT SUM(r * 3), AVG(r + a), TOTAL(r - g) FROM t WHERE g > 0",
+        "SELECT g, SUM(CASE WHEN id % 3 = 0 THEN a ELSE r END), TOTAL(a), AVG(a) FROM t GROUP BY g",
+    ] {
+        g8_answers_at_every_core_count(&conn, sql, rows);
+    }
+}
+
+/// Lane G9, arm (a) of the SUM-over-REAL A/B (`RealSums::RowOrder`): SUM, AVG and TOTAL over
+/// REALs, INTEGERs and both mixed run on the workers and answer bit for bit as today's serial loop
+/// (`RealSums::Serial`) at 1, 2, 4, 8 and 16 stated cores, grouped or not, on G8's data: prices,
+/// magnitudes from 1e-300 to 1e300, -0.0 and integers past 2^53 before and after the first REAL.
+#[test]
+fn g9_row_order_real_sums_answer_as_today_at_every_worker_count() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g9-row-order");
+    conn.set_real_sums(crate::RealSums::RowOrder);
+    let mut rng = ChaCha8Rng::seed_from_u64(88);
+    let pad = "x".repeat(64);
+    let rows = 3000u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, r REAL, a INTEGER, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16",
+    ];
+    let integers = [
+        "NULL",
+        "0",
+        "1",
+        "-7",
+        "9007199254740993",
+        "-4611686018427387905",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let g = rng.random_range(0i64..4);
+        let r = if rng.random_range(0..3) == 0 {
+            reals[rng.random_range(0..reals.len())].to_string()
+        } else {
+            format!(
+                "{}.{:02}",
+                rng.random_range(-100_000i64..100_000),
+                rng.random_range(0..100)
+            )
+        };
+        let a = integers[rng.random_range(0..integers.len())];
+        conn.execute(format!(
+            "INSERT INTO t(g, r, a, p) VALUES ({g}, {r}, {a}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    for sql in [
+        "SELECT SUM(r), AVG(r), TOTAL(r) FROM t",
+        "SELECT g, SUM(r), AVG(r), TOTAL(r), COUNT(*) FROM t GROUP BY g",
+        "SELECT SUM(r * 3), AVG(r + a), TOTAL(r - g) FROM t WHERE g > 0",
+        "SELECT g, SUM(CASE WHEN id % 3 = 0 THEN a ELSE r END), TOTAL(a), AVG(a) FROM t GROUP BY g",
+    ] {
+        let row_order = g8_answers_at_every_core_count(&conn, sql, rows);
+        conn.set_real_sums(crate::RealSums::Serial);
+        let today = format!("{:?}", sql_rows(&conn, sql));
+        conn.set_real_sums(crate::RealSums::RowOrder);
+        assert_eq!(row_order, today, "{sql}: RowOrder against Serial");
+    }
+}
+
+/// Lane G8, arm (b): the exact sum rounded once, on the serial loop and the workers alike, on the
+/// cases a compensated sum can get wrong or that SQLite gives meaning to: cancellation, huge with
+/// tiny, subnormals, both signs of zero, infinities (both met: NULL).
+#[test]
+fn g8_exact_real_sums_hold_the_hard_cases() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g8-hard");
+    conn.set_real_sums(crate::RealSums::Exact);
+    let pad = "x".repeat(64);
+    let rows = 1500usize;
+    // Each case's exact sum from the values as the engine parsed them (its decimal parsing is
+    // not this test's subject): `stored` in row order.
+    type Exact = fn(&[f64]) -> Option<f64>;
+    let cases: [(&str, &[&str], Exact); 11] = [
+        ("cancellation", &["1e16", "1.0", "-1e16"], |v| Some(v[1])),
+        ("tenths", &["0.1", "0.2", "-0.3"], |v| {
+            // Each is a multiple of 2^-60 below 2^4: their sum in 2^-60ths is exact in an i128,
+            // and an i128's conversion rounds to nearest, ties to even.
+            let sixtieths: i128 = v.iter().map(|x| (x * 2f64.powi(60)) as i128).sum();
+            Some(sixtieths as f64 * 2f64.powi(-60))
+        }),
+        ("huge with tiny", &["1e300", "1e-300", "-1e300"], |v| {
+            Some(v[1])
+        }),
+        ("subnormals", &["5e-324"; 7], |v| Some(v[0] * 7.0)),
+        ("zeros", &["-0.0", "-0.0"], |_| Some(0.0)),
+        ("plus infinity", &["9e999", "1.0"], |_| Some(f64::INFINITY)),
+        ("minus infinity", &["-9e999", "-1.0"], |_| {
+            Some(f64::NEG_INFINITY)
+        }),
+        ("both infinities", &["9e999", "-9e999", "1.0"], |_| None),
+        ("past 2^53", &["9007199254740992.0", "1.0", "1.0"], |v| {
+            Some(v[0] + 2.0)
+        }),
+        // Lane R4: R1's bigpairs, a short order's +1e308s unmatched: past the range, +inf, as
+        // SQLite answers; and a running sum that passes the range and comes back, exactly.
+        (
+            "bigpairs",
+            &["1e308", "1e308", "-1e308", "-1e308", "1e308", "1e308"],
+            |_| Some(f64::INFINITY),
+        ),
+        (
+            "overflow and back",
+            &["1e308", "1e308", "-1e308", "-1e308", "1.5"],
+            |v| Some(v[4]),
+        ),
+    ];
+    for (at, (name, values, exact)) in cases.iter().enumerate() {
+        let table = format!("h{at}");
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, r REAL, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for row in 0..rows {
+            // The case's values spread over the table's leaves, NULLs between them.
+            let place = (0..values.len()).find(|k| (k + 1) * rows / (values.len() + 1) == row);
+            let r = place.map_or("NULL", |k| values[k]);
+            conn.execute(format!("INSERT INTO {table}(r, p) VALUES ({r}, '{pad}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let sql = format!("SELECT SUM(r), TOTAL(r), AVG(r) FROM {table}");
+        let answer = g8_answers_at_every_core_count(&conn, &sql, rows as u64);
+        let stored: Vec<f64> = sql_rows(
+            &conn,
+            &format!("SELECT r FROM {table} WHERE r IS NOT NULL ORDER BY id"),
+        )
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Numeric(crate::numeric::Numeric::Float(f)) => f64::from(*f),
+            other => panic!("{name}: a stored REAL is {other:?}"),
+        })
+        .collect();
+        let sum = exact(&stored);
+        let real = |value: Option<f64>| match value {
+            Some(value) => Value::from_f64(value),
+            None => Value::Null,
+        };
+        let expected = vec![vec![
+            real(sum),
+            real(sum),
+            real(sum.map(|sum| sum / values.len() as f64)),
+        ]];
+        assert_eq!(answer, format!("{expected:?}"), "{name}");
+    }
+}
+
+/// Lane R2 (reals), the bounded check of R1's side finding (r1455): with the bench's ladder
+/// setting (parallel mode on, parallel LIMIT on, a core cap), `SELECT 1 FROM bench_loaded LIMIT 1`
+/// on a one-row table found no row or failed. Here in memory and on a file reopened by a fresh
+/// database, as the bench's next process opened it.
+#[test]
+fn r2_parallel_limit_finds_a_one_row_tables_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r2.db").to_str().unwrap().to_string();
+    let file = |path: &str| {
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new())
+        .unwrap()
+    };
+    let fill = |conn: &Arc<Connection>| {
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..20000 {
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("CREATE TABLE bench_loaded (done INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO bench_loaded VALUES (1)").unwrap();
+    };
+    let memory = open(":memory:r2-limit");
+    fill(&memory);
+    fill(&file(&path));
+    let reopened = file(&path);
+    let mut wrong = Vec::new();
+    for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let control = conn
+            .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+            .and_then(|mut s| s.run_collect_rows());
+        let all = conn
+            .prepare("SELECT count(*) FROM bench_loaded")
+            .and_then(|mut s| s.run_collect_rows());
+        eprintln!("r2 {name} serial control: {control:?}, count(*) {all:?}");
+        conn.set_parallel_mode(ParallelMode::On);
+        conn.set_parallel_limit(false);
+        conn.set_parallel_cores(NonZeroUsize::new(4));
+        let no_limit_switch = conn
+            .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+            .and_then(|mut s| s.run_collect_rows());
+        let no_limit = conn
+            .prepare("SELECT 1 FROM bench_loaded")
+            .and_then(|mut s| s.run_collect_rows());
+        eprintln!("r2 {name} parallel on, LIMIT switch off, 4 cores: {no_limit_switch:?}; no LIMIT: {no_limit:?}");
+        for cores in [1usize, 2, 4, 8, 16, 32] {
+            conn.set_parallel_mode(ParallelMode::On);
+            conn.set_parallel_limit(true);
+            conn.set_parallel_cores(NonZeroUsize::new(cores));
+            let got = conn
+                .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+                .and_then(|mut s| s.run_collect_rows());
+            eprintln!("r2 {name} at {cores} cores: {got:?}");
+            if !matches!(&got, Ok(rows) if rows.len() == 1) {
+                wrong.push(format!("{name} at {cores} cores: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// Lane R4 (reals), the cause R3 traced (r1585): a result column that is a constant is hoisted
+/// to the program's end, and the body copy's `keep` label followed it there, so every worker
+/// skipped every row. Do: select only constants (and a column before a constant) from a
+/// 20,000-row table in parallel mode at 1 to 32 cores, in memory and on a file reopened by a
+/// fresh database. Expect every row, as the serial loop returns them.
+#[test]
+fn r4_parallel_constant_columns_return_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r4.db").to_str().unwrap().to_string();
+    let file = |path: &str| {
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new())
+        .unwrap()
+    };
+    let fill = |conn: &Arc<Connection>| {
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..20000 {
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    };
+    let memory = open(":memory:r4-constants");
+    fill(&memory);
+    fill(&file(&path));
+    let reopened = file(&path);
+    let sorted = |rows: Vec<Vec<Value>>| {
+        let mut rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+        rows.sort();
+        rows
+    };
+    let mut wrong = Vec::new();
+    for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
+        for sql in [
+            "SELECT 1 FROM big",
+            "SELECT 1, 'two', 3.5, NULL FROM big",
+            "SELECT a, 7 FROM big",
+        ] {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sorted(sql_rows(conn, sql));
+            assert_eq!(serial.len(), 20000, "{name}: {sql} serially");
+            for cores in [1usize, 2, 4, 8, 16, 32] {
+                conn.set_parallel_mode(ParallelMode::On);
+                conn.set_parallel_cores(NonZeroUsize::new(cores));
+                match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+                    Ok(rows) if sorted(rows.clone()) == serial => {}
+                    Ok(rows) => wrong.push(format!(
+                        "{name}: {sql} at {cores} cores: {} rows",
+                        rows.len()
+                    )),
+                    Err(error) => wrong.push(format!("{name}: {sql} at {cores} cores: {error}")),
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Lane R5: the constant-column sweep's tables, as its SQLite probe builds them
+/// (`r5-scripts/sweep_sqlite.py`): `t` of 5,000 rows, `u` of 300, and `w`, an INSERT's target.
+fn r5_tables(name: &str) -> Arc<Connection> {
+    let conn = open(name);
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, c TEXT)",
+        "CREATE TABLE w (x, y, z)",
+        "INSERT INTO t SELECT value, value % 97, (value * 37) % 1000, 'k' || (value % 11) \
+         FROM generate_series(1, 5000)",
+        "INSERT INTO u SELECT value, (value * 7) % 97, 'c' || (value % 13) \
+         FROM generate_series(1, 300)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn
+}
+
+/// Rows as SQLite's shell lists them (`|` between columns, NULL empty), sorted unless the
+/// statement orders them: their count and FNV-1a 64 hash, as the probe takes SQLite's.
+fn r5_digest(rows: &[Vec<Value>], ordered: bool) -> (usize, u64) {
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    if !ordered {
+        lines.sort();
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in lines.join("\n").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (lines.len(), hash)
+}
+
+/// Lane R5: each statement (SQL, ordered, SQLite 3.54.0's count and hash from the probe on
+/// adacachy2) serially and in parallel mode on a machine stated as 1, 2, 4 and 8 cores, against
+/// SQLite's answer; an INSERT's answer is what `w` then holds. Returns the rows the workers ran
+/// the loop body over.
+fn r5_sweep(cases: &[(&str, bool, usize, u64)]) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let conn = r5_tables(":memory:r5-sweep");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let answer = |sql: &str, ordered: bool| -> Result<(usize, u64), String> {
+        let rows = if sql.starts_with("INSERT") {
+            conn.execute("DELETE FROM w").map_err(|e| e.to_string())?;
+            conn.execute(sql).map_err(|e| e.to_string())?;
+            sql_rows(&conn, "SELECT x, y, z FROM w")
+        } else {
+            conn.prepare(sql)
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string())?
+        };
+        Ok(r5_digest(&rows, ordered))
+    };
+    let mut wrong = Vec::new();
+    let mut body = 0u64;
+    for &(sql, ordered, count, hash) in cases {
+        let sqlite = Ok((count, hash));
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = answer(sql, ordered);
+        if serial != sqlite {
+            wrong.push(format!("{sql} serially: {serial:x?}, SQLite {sqlite:x?}"));
+        }
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 4, 8] {
+            conn.set_parallel_cores(NonZeroUsize::new(cores));
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn.morsel_body_rows.load(Relaxed);
+            let parallel = answer(sql, ordered);
+            body += conn.morsel_body_rows.load(Relaxed) - before;
+            if parallel != sqlite {
+                wrong.push(format!(
+                    "{sql} at {cores} cores: {parallel:x?}, SQLite {sqlite:x?}"
+                ));
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    body
+}
+
+/// Lane R5: a constant result column first, in the middle and last, over a plain scan. Do: run
+/// each serially and in parallel mode. Expect SQLite's rows, with the workers running the body.
+#[test]
+fn r5_constant_columns_over_a_scan_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        ("SELECT 7, a, s FROM t", false, 5000, 0xd0dcdf34374d0a58),
+        ("SELECT a, 'x', s FROM t", false, 5000, 0x0bc780edde2ba5c0),
+        ("SELECT a, s, 2.5 FROM t", false, 5000, 0x6daca8fafe52c888),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same over a filtered scan.
+#[test]
+fn r5_constant_columns_over_a_filtered_scan_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        (
+            "SELECT 7, a, s FROM t WHERE b < 300",
+            false,
+            1500,
+            0x0332bba8c11f5ac9,
+        ),
+        (
+            "SELECT a, 'x', s FROM t WHERE b < 300",
+            false,
+            1500,
+            0xdf7afb91c5df82f1,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t WHERE b < 300",
+            false,
+            1500,
+            0x26c32b876e4bad13,
+        ),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same over a hash join.
+#[test]
+fn r5_constant_columns_over_a_join_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        (
+            "SELECT 7, t.id, u.c FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0xfc3c2e2ce9a1f670,
+        ),
+        (
+            "SELECT t.id, 'x', u.c FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0x66e20388227c40a0,
+        ),
+        (
+            "SELECT t.id, u.c, 2.5 FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0xa947bd667b1dd3e6,
+        ),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same beside GROUP BY's aggregates.
+#[test]
+fn r5_constant_columns_beside_group_by_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, a, count(*) FROM t GROUP BY a",
+            false,
+            97,
+            0xe1f7c10968cb8970,
+        ),
+        (
+            "SELECT a, 'x', sum(b) FROM t GROUP BY a",
+            false,
+            97,
+            0x26276f59c3027b09,
+        ),
+        (
+            "SELECT a, count(*), 2.5 FROM t WHERE b < 500 GROUP BY a",
+            false,
+            97,
+            0x670ea407ffae021b,
+        ),
+    ]);
+}
+
+/// Lane R5: the same under ORDER BY with LIMIT, in order.
+#[test]
+fn r5_constant_columns_under_order_by_limit_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, id, s FROM t ORDER BY b, id LIMIT 1000",
+            true,
+            1000,
+            0xc9689f7ab1e72f0e,
+        ),
+        (
+            "SELECT id, 'x', s FROM t ORDER BY b DESC, id LIMIT 1000",
+            true,
+            1000,
+            0x1cf4d7104ab7c83c,
+        ),
+        (
+            "SELECT id, s, 2.5 FROM t WHERE b < 700 ORDER BY s, id LIMIT 1000",
+            true,
+            1000,
+            0xfd75b0a963e7378b,
+        ),
+    ]);
+}
+
+/// Lane R5: the same in each arm of a compound SELECT, UNION ALL and UNION.
+#[test]
+fn r5_constant_columns_in_a_compound_select_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, a, s FROM t WHERE b < 100 UNION ALL SELECT 8, a, c FROM u",
+            false,
+            800,
+            0x799eb35b14b8e082,
+        ),
+        (
+            "SELECT a, 'x', s FROM t WHERE b < 100 UNION ALL SELECT a, 'y', c FROM u",
+            false,
+            800,
+            0x55575c8b0d78681a,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t WHERE b < 100 UNION ALL SELECT a, c, 3.5 FROM u",
+            false,
+            800,
+            0xacb474c2deb3d47c,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t UNION SELECT a, c, 2.5 FROM u",
+            false,
+            1367,
+            0x1466c9c5ba51a191,
+        ),
+    ]);
+}
+
+/// Lane R5: the same inside a subquery in FROM, and outside one the planner can't flatten.
+#[test]
+fn r5_constant_columns_with_a_subquery_in_from_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT k, a, s FROM (SELECT 7 AS k, a, s FROM t WHERE b < 500)",
+            false,
+            2500,
+            0x68b803b21717e29c,
+        ),
+        (
+            "SELECT a, k, s FROM (SELECT a, 'x' AS k, s FROM t WHERE b < 500)",
+            false,
+            2500,
+            0xac9b4169d497366a,
+        ),
+        (
+            "SELECT a, s, k FROM (SELECT a, s, 2.5 AS k FROM t WHERE b < 500)",
+            false,
+            2500,
+            0x27f2aef530eed638,
+        ),
+        (
+            "SELECT 7, q.a, q.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0xe1f7c10968cb8970,
+        ),
+        (
+            "SELECT q.a, 'x', q.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0x3bec3e691717cd55,
+        ),
+        (
+            "SELECT q.a, q.n, 2.5 FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0xc1abb5df4e49981a,
+        ),
+    ]);
+}
+
+/// Lane R5: the same in INSERT ... SELECT. Expect the target to hold SQLite's rows.
+#[test]
+fn r5_constant_columns_in_insert_select_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "INSERT INTO w SELECT 7, a, s FROM t WHERE b < 600",
+            false,
+            3000,
+            0x4f30bb65bd3b3791,
+        ),
+        (
+            "INSERT INTO w SELECT a, 'x', s FROM t WHERE b < 600",
+            false,
+            3000,
+            0x03bf73a80161d1a3,
+        ),
+        (
+            "INSERT INTO w SELECT a, s, 2.5 FROM t WHERE b < 600",
+            false,
+            3000,
+            0x4b0ee3eddba05fc1,
+        ),
+    ]);
 }

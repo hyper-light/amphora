@@ -10,8 +10,10 @@
 //! build (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
 //! `btree_dump`, `sqlite_turso_types`).
 
+pub mod postgres;
 pub mod sqlite;
 
+pub use postgres::PostgresDialect;
 pub use sqlite::SqliteDialect;
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -92,14 +94,30 @@ pub trait Dialect: Send + Sync + 'static {
         body: &amphora_engine_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// The stored SQL of the table a CREATE TABLE makes, with the connection whose transaction it
+    /// runs in, for a dialect that reads what that transaction holds (the PostgreSQL dialect reads
+    /// the OIDs live tables hold): by default [`Dialect::format_table_sql`]'s.
+    fn format_created_table_sql(
+        &self,
+        _conn: &crate::sync::Arc<crate::Connection>,
+        input: &str,
+        tbl_name: &amphora_engine_parser::ast::QualifiedName,
+        body: &amphora_engine_parser::ast::CreateTableBody,
+    ) -> crate::Result<String> {
+        self.format_table_sql(input, tbl_name, body)
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
     /// longer describes the rewritten table. Dialects that need syntax beyond
     /// a marker around canonical SQL can override this to render their native
-    /// table definition from the rewritten AST.
+    /// table definition from the rewritten AST. `stored_sql` is the table's
+    /// stored SQL before the rewrite, so a dialect can carry what it keeps
+    /// beside the definition (the PostgreSQL dialect's `pg_class` OID).
     fn format_rewritten_table_sql(
         &self,
+        _stored_sql: &str,
         stmt: &amphora_engine_parser::ast::Stmt,
     ) -> crate::Result<String> {
         let amphora_engine_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
@@ -108,6 +126,12 @@ pub trait Dialect: Send + Sync + 'static {
             ));
         };
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
+    }
+
+    /// Produce stored SQL for a table ALTER TABLE ADD COLUMN or DROP COLUMN
+    /// changed, given its new definition as canonical SQLite text.
+    fn format_altered_table_sql(&self, canonical: String) -> crate::Result<String> {
+        Ok(canonical)
     }
 
     /// Install the dialect's catalog tables into a freshly constructed
@@ -126,6 +150,16 @@ pub trait Dialect: Send + Sync + 'static {
         schema: &mut crate::schema::Schema,
         enable_custom_types: bool,
     ) -> crate::Result<()>;
+
+    /// The next OID the database's header stores (`DatabaseHeader::pg_next_oid`), given as the
+    /// database opens: zero until a CREATE TABLE of a dialect with OIDs has stored one.
+    fn load_next_oid(&self, _stored: u32) {}
+
+    /// The next OID to store in the header, in the same transaction, with a table whose stored
+    /// definition [`Dialect::format_created_table_sql`] made: `None` for a dialect without OIDs.
+    fn next_oid_after(&self, _stored_sql: &str) -> crate::Result<Option<u32>> {
+        Ok(None)
+    }
 
     fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
         options

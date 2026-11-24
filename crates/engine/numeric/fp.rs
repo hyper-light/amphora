@@ -1,13 +1,44 @@
 //! A REAL as SQLite 3.54 writes it in text: `sqlite3FpDecode` and the `%!.17g` its
 //! `vdbeMemRenderNum` renders (REAL to TEXT), and `%!0.17g` (quote() and JSON: the same digits,
 //! infinity as `9.0e+999`), ported from its amalgamation (sqlite3.c 3.54.0, printf.c and util.c).
-//! The digits come from a fixed-point product with a power of ten (Russ Cox's fpfmt as SQLite adapts
-//! it), cut at 17 to the fewest that convert back to the same double; they aren't always the
-//! correctly rounded ones (1/3 is 0.33333333333333332), so only a port answers as SQLite does.
+//! The digits follow https://www.sqlite.org/floatingpoint.html 1.3.1 exactly: 15 significant digits
+//! when they convert back to the same double, else 17. Where SQLite 3.54.0 measures otherwise (its
+//! 3.54 shortcut tries fewer than 17 digits only after three zeros or two nines, so it writes
+//! 716936.91809735901 for 716936.918097359), Amphora answers as the document says
+//! (bench/records/2026-11-23-adacachy2-perf-numeric-g10.md). The 17 digits come from a fixed-point
+//! product with a power of ten (Russ Cox's fpfmt as SQLite adapts it), the first 18 rounded and then
+//! rounded at the 18th, which is the rounding the document's own example shows (2.8781999999999997).
+//!
+//! Past 17 digits the product runs out, so those are the double's exact digits (`exact_digits`).
 //!
 //! Every shift here moves by an amount the algorithm keeps within the word (SQLite asserts as much);
 //! a shift out of range, which no double reaches, ends the conversion with `None`, and the caller
 //! writes the double as Rust does.
+
+use crate::decimal::decimal_from_double;
+
+/// The most significant digits the page's rounding writes: "Rounding to 17 significant digits or
+/// more results in text that, when coverted back into binary-64, gives the exact same value"
+/// (floatingpoint.html 1.3), and 1.3.1's steps round to 15, else 17.
+const PAGE_DIGITS: i32 = 17;
+
+/// printf.html: "limited in precision to 16 significant digits or 26 significant digits if the "!"
+/// alternate-form-2 flag is used". SQLite 3.54.0 stops at 20 (`flag_altform2 ? 20 : 16`); the
+/// document wins.
+const ALT_FORM_2_DIGITS: i32 = 26;
+
+/// r's significant digits (0..=9) and where the point falls among them (|r| = 0.d1d2... x 10^point)
+/// when more than 17 are kept: its exact decimal expansion (decimal.c's decimalFromDouble), since
+/// the fixed-point products here and in printf carry 19 digits at most. `None` when 17 or fewer are
+/// kept, and for zero, NaN and infinity.
+pub(crate) fn exact_digits(r: f64, kept: i32) -> Option<(Vec<u8>, i32)> {
+    if kept <= PAGE_DIGITS {
+        return None;
+    }
+    let exact = decimal_from_double(r)?;
+    let (digits, point) = exact.significant_digits()?;
+    Some((digits.to_vec(), point))
+}
 
 /// The powers of ten the conversions scale by, from 10^-348 to 10^347.
 const POWERS_OF_10_FIRST: i32 = -348;
@@ -200,65 +231,6 @@ fn fp2_convert10(m: u64, e: i32, n: i32) -> Option<(u64, i32)> {
     Some((d, p.checked_neg()?))
 }
 
-/// The double nearest d * 10^p (sqlite3Fp10Convert2, after Russ Cox's fpfmt).
-fn fp10_convert2(d: u64, p: i32) -> Option<f64> {
-    if p < POWERS_OF_10_FIRST {
-        return Some(0.0);
-    }
-    if p > POWERS_OF_10_LAST {
-        return Some(f64::INFINITY);
-    }
-    let b = 64_i32.checked_sub(i32::try_from(d.leading_zeros()).ok()?)?;
-    let lp = pwr10to2(p);
-    let mut e = 53_i32.checked_sub(b)?.checked_sub(lp)?;
-    if e > 1074 {
-        if e >= 1130 {
-            return Some(0.0);
-        }
-        e = 1074;
-    }
-    let s = e
-        .checked_sub(64_i32.checked_sub(b)?)?
-        .checked_add(lp)?
-        .checked_add(3)?
-        .checked_neg()?;
-    let (mut pwr10h, mut pwr10l) = power_of_ten(p)?;
-    if pwr10l != 0 {
-        pwr10h = pwr10h.wrapping_add(1);
-        pwr10l = !pwr10l;
-    }
-    let x = d
-        .checked_shl(u32::try_from(64_i32.checked_sub(b)?).ok()?)
-        .unwrap_or(0);
-    let (mut hi, lo) = multiply128(x, pwr10h);
-    let mid1 = u32::try_from(lo.wrapping_shr(32)).ok()?;
-    let mut sticky = 1_u64;
-    let s_bits = shift_amount(s)?;
-    if hi & (1_u64.checked_shl(s_bits)?.wrapping_sub(1)) == 0 {
-        let (h2, _) = multiply128(x, u64::from(pwr10l).wrapping_shl(32));
-        let mid2 = u32::try_from(h2.wrapping_shr(32)).ok()?;
-        sticky = u64::from(mid1.wrapping_sub(mid2) > 1);
-        hi = hi.wrapping_sub(u64::from(mid1 < mid2));
-    }
-    let mut u = hi.checked_shr(s_bits)? | sticky;
-    if u >= 0x0080_0000_0000_0000_u64.wrapping_sub(2) {
-        u = u.wrapping_shr(1) | (u & 1);
-        e = e.checked_sub(1)?;
-    }
-    let mut m = u
-        .wrapping_add(1)
-        .wrapping_add(u.wrapping_shr(2) & 1)
-        .wrapping_shr(2);
-    if e <= -972 {
-        return Some(f64::INFINITY);
-    }
-    if m & 0x0010_0000_0000_0000 != 0 {
-        let exponent = u64::try_from(1075_i32.checked_sub(e)?).ok()?;
-        m = (m & !0x0010_0000_0000_0000_u64) | exponent.checked_shl(52)?;
-    }
-    Some(f64::from_bits(m))
-}
-
 /// A double's decimal digits (sqlite3FpDecode's FpDecode): `digits` its significant digits,
 /// `point` where the decimal point falls among them, `negative` its sign.
 struct Decoded {
@@ -273,9 +245,43 @@ enum Decode {
     NaN,
 }
 
+/// A positive double's digits from the fixed-point product (`bits` its encoding, `biased` its
+/// exponent field): the first `round` + 1, at most 18, behind a 0 kept for a carry, and where the
+/// point falls among them.
+fn fixed_point_digits(bits: u64, biased: i32, round: i32) -> Option<(Vec<u8>, i32)> {
+    let mut v = bits & 0x000f_ffff_ffff_ffff;
+    let e = if biased == 0 {
+        let nn = v.leading_zeros();
+        v = v.checked_shl(nn)?;
+        (-1074_i32).checked_sub(i32::try_from(nn).ok()?)?
+    } else {
+        v = v.wrapping_shl(11) | BIT63;
+        biased.checked_sub(1086)?
+    };
+    let (mut v, exp) = fp2_convert10(
+        v,
+        e,
+        if round >= 18 {
+            18
+        } else {
+            round.checked_add(1)?
+        },
+    )?;
+    let mut buf: Vec<u8> = Vec::with_capacity(21);
+    while v > 0 {
+        buf.push(b'0'.checked_add(u8::try_from(v.checked_rem(10)?).ok()?)?);
+        v = v.checked_div(10)?;
+    }
+    buf.push(b'0');
+    buf.reverse();
+    let n = i32::try_from(buf.len().checked_sub(1)?).ok()?;
+    Some((buf, n.checked_add(exp)?))
+}
+
 /// sqlite3FpDecode(r, round, max_round) for round > 0 (the `%g` its printf renders; `%f`'s round <= 0
-/// isn't needed here): `round` significant digits at most, or `max_round`; at exactly 17 (the `!`
-/// flag's), the fewest that convert back to r.
+/// isn't needed here): `round` significant digits at most, or `max_round`. 17 digits are the first 18
+/// rounded, then rounded at the 18th (5 or more rounds up): floatingpoint.html's "If you round to 17
+/// digits, you get 2.8781999999999997" for 6481130223748880 x 2^-51.
 fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
     let negative = r.is_sign_negative() && r != 0.0;
     let r = r.abs();
@@ -295,35 +301,20 @@ fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
             Decode::NaN
         });
     }
-    let mut v = bits & 0x000f_ffff_ffff_ffff;
-    let e = if biased == 0 {
-        let nn = v.leading_zeros();
-        v = v.checked_shl(nn)?;
-        (-1074_i32).checked_sub(i32::try_from(nn).ok()?)?
-    } else {
-        v = v.wrapping_shl(11) | BIT63;
-        biased.checked_sub(1086)?
-    };
-    let (mut v, exp) = fp2_convert10(
-        v,
-        e,
-        if round >= 18 {
-            18
-        } else {
-            round.checked_add(1)?
-        },
-    )?;
     // the digits, most significant first, with room for a carry into a new first digit
-    let mut buf: Vec<u8> = Vec::with_capacity(21);
-    while v > 0 {
-        buf.push(b'0'.checked_add(u8::try_from(v.checked_rem(10)?).ok()?)?);
-        v = v.checked_div(10)?;
-    }
-    buf.push(b'0');
-    buf.reverse();
+    let (mut buf, mut point) = match exact_digits(r, round.min(max_round)) {
+        Some((digits, point)) => {
+            let mut buf = Vec::with_capacity(digits.len().checked_add(1)?);
+            buf.push(b'0');
+            for d in digits {
+                buf.push(b'0'.checked_add(d)?);
+            }
+            (buf, point)
+        }
+        None => fixed_point_digits(bits, biased, round)?,
+    };
     let mut start = 1usize;
     let mut n = i32::try_from(buf.len().checked_sub(1)?).ok()?;
-    let mut point = n.checked_add(exp)?;
     let digit = |buf: &Vec<u8>, start: usize, i: i32| -> Option<u8> {
         buf.get(start.checked_add(usize::try_from(i).ok()?)?)
             .copied()
@@ -332,48 +323,6 @@ fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
     if round > 0 && (round < n || n > max_round) {
         if round > max_round {
             round = max_round;
-        }
-        if round == 17 {
-            // 17 digits only with the `!` flag: fewer, when they convert back to r (49.47, not
-            // 49.469999999999999)
-            if digit(&buf, start, 15)? == b'9' && digit(&buf, start, 14)? == b'9' {
-                let mut jj: i32 = 14;
-                while jj > 0 && digit(&buf, start, jj.checked_sub(1)?)? == b'9' {
-                    jj = jj.checked_sub(1)?;
-                }
-                let v2 = if jj == 0 {
-                    1_u64
-                } else {
-                    let mut v2 = 0_u64;
-                    for kk in 0..jj {
-                        v2 = v2
-                            .checked_mul(10)?
-                            .checked_add(u64::from(digit(&buf, start, kk)?.checked_sub(b'0')?))?;
-                    }
-                    v2.checked_add(1)?
-                };
-                if fp10_convert2(v2, exp.checked_add(n)?.checked_sub(jj)?) == Some(r) {
-                    round = jj.checked_add(1)?;
-                }
-            } else if point >= n
-                || (digit(&buf, start, 15)? == b'0'
-                    && digit(&buf, start, 14)? == b'0'
-                    && digit(&buf, start, 13)? == b'0')
-            {
-                let mut jj: i32 = 13;
-                while digit(&buf, start, jj.checked_sub(1)?)? == b'0' {
-                    jj = jj.checked_sub(1)?;
-                }
-                let mut v2 = 0_u64;
-                for kk in 0..jj {
-                    v2 = v2
-                        .checked_mul(10)?
-                        .checked_add(u64::from(digit(&buf, start, kk)?.checked_sub(b'0')?))?;
-                }
-                if fp10_convert2(v2, exp.checked_add(n)?.checked_sub(jj)?) == Some(r) {
-                    round = jj.checked_add(1)?;
-                }
-            }
         }
         n = round;
         if digit(&buf, start, round)? >= b'5' {
@@ -410,11 +359,125 @@ fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
     }))
 }
 
-/// `%!.17g` of r, as SQLite's printf writes it (`zero_pad`: `%!0.17g`, infinity as 9.0e+999 and
-/// NaN as null): fixed notation for exponents from -4 to 16, else d.ddde±XX; trailing zeros dropped
-/// but one after the point.
-fn render(r: f64, zero_pad: bool) -> Option<String> {
-    let s = match decode(r, 17, 20)? {
+/// floatingpoint.html 1.3.1's steps (a) and (b): r rounded to 15 significant digits, when that text
+/// converts back to r ("Round to 15 digits. Convert the text result back to binary-64."); `None`
+/// sends it to step (c), 17-digit rounding.
+///
+/// For a normal double the two steps are answered by its shortest round-trip digits (Rust's `{:e}`,
+/// exact), without writing 15 digits and parsing them back: half an ulp is at most 2^-53 of r, below
+/// half a unit in the 15th digit (at least 5 x 10^-16 of r), so a 15-digit text converts back exactly
+/// when the shortest text has 15 digits or fewer, and then rounding r to 15 digits gives the shortest
+/// text's digits. A subnormal's ulp is too wide for that (5e-324 converts back; the page's 15 digits
+/// are 4.94065645841247e-324), so it takes the steps as written: Rust's `{:.14e}` rounds the exact
+/// value, and its parse takes the nearest double (1.2.1: "The first number is closer to the desired
+/// value of 47.49, so that is the one that gets used").
+fn fifteen_digits(r: f64) -> Option<Decoded> {
+    if r.is_subnormal() {
+        return fifteen_digits_written(r);
+    }
+    if !r.is_normal() {
+        return None;
+    }
+    let mut text = Text::default();
+    std::fmt::write(&mut text, format_args!("{:e}", r.abs())).ok()?;
+    let (mantissa, exp) = text.as_str()?.split_once('e')?;
+    let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+    if digits.len() > 15 {
+        return None;
+    }
+    Some(Decoded {
+        negative: r.is_sign_negative(),
+        digits,
+        point: exp.parse::<i32>().ok()?.checked_add(1)?,
+    })
+}
+
+/// Steps (a) and (b) as written, for a subnormal: a tie at 15 digits never converts back, so the tie
+/// rule of `{:.14e}` can't show.
+fn fifteen_digits_written(r: f64) -> Option<Decoded> {
+    let text = format!("{:.14e}", r.abs());
+    if text.parse::<f64>().ok()? != r.abs() {
+        return None;
+    }
+    let (mantissa, exp) = text.split_once('e')?;
+    let mut digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+    while digits.len() > 1 && digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    Some(Decoded {
+        negative: r.is_sign_negative(),
+        digits,
+        point: exp.parse::<i32>().ok()?.checked_add(1)?,
+    })
+}
+
+/// A double's shortest `{:e}` text, on the stack: at most 17 digits, a point, a sign and `e-324`.
+#[derive(Default)]
+struct Text {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl Text {
+    fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.bytes.get(..self.len)?).ok()
+    }
+}
+
+impl std::fmt::Write for Text {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len.checked_add(s.len()).ok_or(std::fmt::Error)?;
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(std::fmt::Error)?
+            .copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// SQLITE_DBCONFIG_FP_DIGITS (c3ref/c_dbconfig_defensive.html): "a small integer that determines the
+/// number of significant digits that SQLite will attempt to preserve when converting floating point
+/// numbers (IEEE 754 "doubles") into text. The default value 17, as of SQLite version 3.52.0."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpDigits(u8);
+
+impl FpDigits {
+    pub const DEFAULT: Self = Self(17);
+
+    /// "The first argument is a small integer, between 3 and 23, or zero. The FP_DIGITS setting is
+    /// changed to that small integer, or left unaltered if the first argument is zero or out of
+    /// range." `None` leaves it unaltered. The page's "between 3 and 23" takes 3; SQLite 3.54.0's
+    /// `nIn>3 && nIn<24` refuses it (bench/records/2026-11-23-adacachy2-perf-numeric-g11.md).
+    pub fn new(n: i32) -> Option<Self> {
+        u8::try_from(n)
+            .ok()
+            .filter(|n| (3..=23).contains(n))
+            .map(Self)
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// `%!.*g` of r at `digits` significant digits, as SQLite's printf writes it (`zero_pad`: `%!0.*g`,
+/// infinity as 9.0e+999 and NaN as null): fixed notation for exponents from -4 to digits - 1, else
+/// d.ddde±XX; trailing zeros dropped but one after the point. At 17, floatingpoint.html 1.3.1's steps
+/// (15 digits when they convert back); at any other setting, rounded to that many: "If you do not want
+/// the (negligible) overhead of step (b) and (c), just set SQLITE_DBCONFIG_FP_DIGITS to 15." Past 17,
+/// the double's exact digits rounded to that many, where SQLite 3.54.0 writes 19 at most.
+fn render(r: f64, zero_pad: bool, digits: FpDigits) -> Option<String> {
+    let round = i32::from(digits.get());
+    let decoded = if digits == FpDigits::DEFAULT {
+        fifteen_digits(r).map_or_else(
+            || decode(r, round, ALT_FORM_2_DIGITS),
+            |s| Some(Decode::Finite(s)),
+        )
+    } else {
+        decode(r, round, ALT_FORM_2_DIGITS)
+    };
+    let s = match decoded? {
         Decode::Finite(s) => s,
         Decode::NaN => return Some(if zero_pad { "null" } else { "NaN" }.to_owned()),
         Decode::Infinite { negative } if zero_pad => Decoded {
@@ -423,12 +486,12 @@ fn render(r: f64, zero_pad: bool) -> Option<String> {
             point: 1000,
         },
         Decode::Infinite { negative } => {
-            return Some(if negative { "-Inf" } else { "Inf" }.to_owned())
+            return Some(if negative { "-Inf" } else { "Inf" }.to_owned());
         }
     };
     let n = i32::try_from(s.digits.len()).ok()?;
     let exp = s.point.checked_sub(1)?;
-    let mut precision: i32 = 16;
+    let mut precision: i32 = round.checked_sub(1)?;
     let scientific = exp < -4 || exp > precision;
     if !scientific {
         precision = precision.checked_sub(exp)?;
@@ -510,12 +573,17 @@ fn render(r: f64, zero_pad: bool) -> Option<String> {
     Some(out)
 }
 
-/// A REAL as text, as SQLite 3.54 converts one (`%!.17g`).
+/// A REAL as text, as SQLite converts one at the default FP_DIGITS (`%!.17g`).
 pub fn real_to_text(r: f64) -> String {
-    render(r, false).unwrap_or_else(|| format!("{r:e}"))
+    real_to_text_digits(r, FpDigits::DEFAULT)
+}
+
+/// A REAL as text at a connection's FP_DIGITS (`vdbeMemRenderNum`'s `%!.*g`).
+pub fn real_to_text_digits(r: f64, digits: FpDigits) -> String {
+    render(r, false, digits).unwrap_or_else(|| format!("{r:e}"))
 }
 
 /// A REAL as quote() and JSON write it (`%!0.17g`): infinity as 9.0e+999.
 pub fn real_to_quoted(r: f64) -> String {
-    render(r, true).unwrap_or_else(|| format!("{r:e}"))
+    render(r, true, FpDigits::DEFAULT).unwrap_or_else(|| format!("{r:e}"))
 }

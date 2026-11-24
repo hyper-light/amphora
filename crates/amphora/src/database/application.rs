@@ -119,19 +119,17 @@ impl Database {
             version: required,
         };
         let outcome = database
-            .call_db(until, move |db| raise(db, wanted, replicated))
-            .map_err(|refusal| {
-                let Writer::Replicated { client, .. } = &self.shared.writer else {
-                    return refusal;
-                };
-                let stale = matches!(&refusal, Refusal::Invalid { what, .. } if what == "prepared transaction");
-                let refusal = overtaken(refusal);
-                if stale {
+            .call_db(until, AnswerMax::bytes(RAISE_MAX), move |db| {
+                raise(db, wanted, replicated)
+            })
+            .inspect_err(|refusal| {
+                if let Writer::Replicated { client, .. } = &self.shared.writer
+                    && matches!(refusal, Refusal::Serialization { .. })
+                {
                     client
                         .handle()
-                        .floor_refused(FloorRefusal::StaleBase, &refusal);
+                        .floor_refused(FloorRefusal::StaleBase, refusal);
                 }
-                refusal
             })?;
         match outcome {
             Ok(floor) => Ok(WriterBoundary { database, floor }),
@@ -194,6 +192,22 @@ impl FloorRefused {
     }
 }
 
+/// A floor raise's answer at its bound: an application's name is family-shaped, so at most
+/// `api::FAMILY_MAX` bytes (`Application::validate`); a refusal's text is one of `raise`'s own.
+const RAISE_MAX: usize = std::mem::size_of::<Result<Application, FloorRefused>>() + api::FAMILY_MAX;
+
+impl AnswerBytes for FloorRefused {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(heap_bytes(&self.refusal))
+    }
+}
+
+impl AnswerBytes for Application {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.name.capacity())
+    }
+}
+
 /// The raise's session: the floor becomes `wanted`'s version, or stays above it, for `wanted`'s
 /// application; on a replica only on the members' proof (replication.md, "Raising the floor"). A
 /// refusal is its value, typed, so its caller counts it; it writes nothing.
@@ -234,22 +248,6 @@ pub(crate) fn raise(
         name: wanted.name,
         version,
     }))
-}
-
-/// What a replicated raise answers when the stale-base rule refuses it: the group changed
-/// between its proof and its index, so it is to be asked again, `Unavailable`, the class for
-/// "retry later" (amphora-seam-owner's ruling on step 4, a). Every other answer is its own: a
-/// displaced entry stays UnknownOutcome.
-pub(super) fn overtaken(refusal: Refusal) -> Refusal {
-    match refusal {
-        Refusal::Invalid { what, why }
-            if what == "prepared transaction"
-                && why == "the database advanced since preparation" =>
-        {
-            Refusal::Unavailable("the database advanced since preparation: the group changed while the raise was proven; raise again".into())
-        }
-        other => other,
-    }
 }
 
 /// The members' proof of a raise to `version` on a replica, read at this session's base; the

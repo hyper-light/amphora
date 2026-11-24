@@ -6,12 +6,13 @@
 //! value, so the answer never depends on the switch.
 //!
 //! Only the shapes whose answers equal the serial loop's value for value qualify: one rowid
-//! table read whole, no index, every column it reads stored as written (INTEGER, TEXT or BLOB
-//! affinity, BINARY collation, no generated column, a short row padded with its defaults); terms
-//! comparing a column with an integer or text literal of its own kind, or testing it for NULL;
-//! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX (and in the loop
-//! body's copy, AVG and TOTAL over integers); no HAVING, ORDER
-//! BY, LIMIT, DISTINCT, window or subquery.
+//! table read whole or by a rowid range between integer literals or bound parameters (lane R11),
+//! no index, every column it reads stored as written (INTEGER, TEXT or BLOB affinity, BINARY
+//! collation, no generated column, a short row padded with its defaults); terms comparing a
+//! column with an integer or text literal of its own kind, or testing it for NULL; plain-column
+//! GROUP BY keys; COUNT, SUM and AVG over INTEGER or REAL columns (lane R11), MIN and MAX (and in
+//! the loop body's copy, AVG and TOTAL over integers); no HAVING, ORDER BY, LIMIT, DISTINCT,
+//! window or subquery.
 //!
 //! A join's probe with its aggregates qualifies too (`shape_join`): two or more rowid tables the
 //! planner joins inner, by hash joins and scans, keyed by equalities of columns of one affinity;
@@ -34,9 +35,9 @@ use crate::translate::expr::{
 };
 use crate::translate::plan::{
     Distinctness, HashJoinType, IterationDirection, JoinType, JoinedTable, Operation,
-    QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, WhereTermOrigin,
+    QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, WhereTermOrigin,
 };
-use crate::types::Value;
+use crate::types::{KeyInfo, SeekOp, Value};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{
@@ -58,7 +59,7 @@ pub(crate) fn emit_morsel_hook(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> crate::Result<Option<MorselHook>> {
-    let Some(window) = window(plan) else {
+    let (Some(window), Some(group_order)) = (window(plan), group_order(plan)) else {
         return Ok(None);
     };
     // A one-table scan runs a copy of its loop body in the workers (lane qs6-7), and so does a
@@ -76,10 +77,12 @@ pub(crate) fn emit_morsel_hook(
                 root_page: looped.table.root_page,
                 columns: looped.table.columns().len(),
                 rowid_alias: rowid_alias(looped.table),
+                reals: Vec::new(),
                 defaults: defaults(looped.table),
                 rowid_range: looped.rowid_range,
                 filter: Vec::new(),
                 group_by: looped.group_by.clone(),
+                group_order: Vec::new(),
                 aggregates: looped.aggregates.clone(),
                 result_map: looped.result_map.clone(),
                 joins: Vec::new(),
@@ -102,6 +105,13 @@ pub(crate) fn emit_morsel_hook(
             None => return Ok(None),
         },
     };
+    // On the versioned storage the hook is the column copy's, which only a table declared
+    // COLUMNAR keeps (docs/design/columnar.md, decision 1, item 1).
+    if resolver.morsel_hook() == crate::translate::emitter::MorselHookFor::Copies
+        && !declared(plan, data.root_page)
+    {
+        return Ok(None);
+    }
     let body = looped.as_ref().map(|looped| MorselBody {
         on: (!looped.on.is_empty()).then(|| program.allocate_label()),
         links_on: looped
@@ -115,6 +125,7 @@ pub(crate) fn emit_morsel_hook(
         keep: program.allocate_label(),
         skip: program.allocate_label(),
         columns_start: program.alloc_registers(looped.width),
+        reals: real_places(&looped.places),
         rowid: program.alloc_register(),
         out_start: program.alloc_registers(looped.outs.len()),
         out_count: looped.outs.len(),
@@ -188,6 +199,7 @@ pub(crate) fn emit_morsel_hook(
         data: Box::new(MorselAggregateData {
             target_pc_serial: serial,
             body: body.clone().map(Box::new),
+            group_order,
             ..data
         }),
     });
@@ -434,10 +446,36 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
     })
 }
 
+/// The places in the joined row of the columns of REAL affinity (audit 3, prototypes 2), which
+/// the workers turn from INTEGER to REAL as they load a row ([`MorselBody::reals`]).
+fn real_places(places: &[BodyTable]) -> Vec<usize> {
+    places
+        .iter()
+        .flat_map(|p| {
+            p.table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.affinity() == Affinity::Real)
+                .filter_map(move |(at, _)| p.offset.checked_add(at))
+        })
+        .collect()
+}
+
 /// Whether every column `exprs` read is one of `places`' tables', stored as written and compared
 /// bytewise (the pipeline compares GROUP BY values and MIN and MAX bytewise), every rowid one the
 /// row holds; no COLLATE, no subquery.
 fn body_reads(exprs: &[&Expr], places: &[BodyTable]) -> Option<()> {
+    body_reads_numeric(exprs, places, false)
+}
+
+/// [`body_reads`], with `numeric` also columns of REAL and NUMERIC affinity (audit 3, prototypes
+/// 2): a one-table scan's, whose workers load a REAL column's INTEGER as a REAL
+/// ([`MorselBody::reals`]), compare GROUP BY values as numbers (`morsel::key_part`: an integral
+/// REAL is its INTEGER) and MIN and MAX by `Value`'s order (an INTEGER against a REAL by value),
+/// ties keeping the earliest row in scan order as the serial loop does. A join keeps them out:
+/// its probe row's matches come in its hash tables' order, not the serial loop's.
+fn body_reads_numeric(exprs: &[&Expr], places: &[BodyTable], numeric: bool) -> Option<()> {
     let place = |id: TableInternalId| places.iter().find(|p| p.id == id);
     for expr in exprs {
         let mut fine = true;
@@ -448,16 +486,18 @@ fn body_reads(exprs: &[&Expr], places: &[BodyTable]) -> Option<()> {
                 } => {
                     fine &= place(*t).is_some_and(|p| {
                         p.table.columns().get(*column).is_some_and(|col| {
-                            matches!(
+                            (matches!(
                                 col.affinity(),
                                 Affinity::Integer
                                     | Affinity::Text
                                     | Affinity::Blob
                                     | Affinity::None
-                            ) && matches!(
-                                col.collation(),
-                                CollationSeq::Binary | CollationSeq::Unset
-                            )
+                            ) || (numeric
+                                && matches!(col.affinity(), Affinity::Real | Affinity::Numeric)))
+                                && matches!(
+                                    col.collation(),
+                                    CollationSeq::Binary | CollationSeq::Unset
+                                )
                         })
                     });
                 }
@@ -518,9 +558,9 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         offset: 0,
         rowid: RowidAt::Own,
     }];
-    body_reads(&filter, &places)?;
-    body_reads(&outs, &places)?;
-    body_reads(&filter_exprs(&agg_filters), &places)?;
+    body_reads_numeric(&filter, &places, true)?;
+    body_reads_numeric(&outs, &places, true)?;
+    body_reads_numeric(&filter_exprs(&agg_filters), &places, true)?;
     Some(BodyPlan {
         table,
         places,
@@ -631,6 +671,89 @@ fn scanned_rowids(op: &Operation) -> Option<(Option<i64>, Option<i64>)> {
     }
 }
 
+/// A forward search of the table b-tree by a rowid range (lane R11), as terms on the rowid's
+/// alias column, which the serial loop reads its rows by: `alias >= x` or `alias > x` from its
+/// start, `alias <= y` or `alias < y` from its end (an end `GT` stops past `y`), each bound an
+/// integer literal or a bound parameter. The pipelines test each row's rowid by them, and read
+/// only the rowids they admit (`morsel::rowid_range`). None: another search, the serial loop's.
+///
+/// [`Predicate::bind`] converts a bound value as SQLite converts it, and [`Predicate::holds`]
+/// compares it, so each type answers as in SQLite 3.54.0 (its source, `vdbe.c` and
+/// `wherecode.c`):
+/// - The start, `OP_SeekGE` or `OP_SeekGT` on the table cursor: an integer seeks itself; a real,
+///   the rowids at or past it (`sqlite3IntFloatCompare` moves the seek past the integer it
+///   truncates to); text that reads as a number, that number (`applyNumericAffinity`); other text,
+///   a blob and NULL, no row (`jump_to_p2`).
+/// - The end, `OP_Gt` or `OP_Ge` of the rowid with it under NUMERIC affinity, `SQLITE_JUMPIFNULL`
+///   (`sqlite3WhereCodeOneLoopStart`, case 3): an integer, a real and text that reads as a number
+///   compare by value; other text and a blob are above every rowid, so none is past them; NULL,
+///   no row.
+fn rowid_bounds(seek_def: &SeekDef, alias: usize) -> Option<Vec<Predicate>> {
+    if !seek_def.prefix.is_empty()
+        || seek_def.skip != 0
+        || seek_def.iter_dir != IterationDirection::Forwards
+    {
+        return None;
+    }
+    let mut terms = Vec::new();
+    for (key, op) in [
+        (
+            &seek_def.start,
+            match seek_def.start.op {
+                SeekOp::GE { eq_only: false } => Some(CmpOp::Ge),
+                SeekOp::GT => Some(CmpOp::Gt),
+                _ => None,
+            },
+        ),
+        (
+            &seek_def.end,
+            match seek_def.end.op {
+                SeekOp::GT => Some(CmpOp::Le),
+                SeekOp::GE { eq_only: false } => Some(CmpOp::Lt),
+                _ => None,
+            },
+        ),
+    ] {
+        match &key.last_component {
+            SeekKeyComponent::None => {}
+            SeekKeyComponent::Expr(Expr::Variable(variable)) => {
+                terms.push(Predicate::Parameter {
+                    column: alias,
+                    op: op?,
+                    index: std::num::NonZeroUsize::new(
+                        usize::try_from(variable.index.get()).ok()?,
+                    )?,
+                    affinity: Affinity::Numeric,
+                });
+            }
+            SeekKeyComponent::Expr(expr) => terms.push(Predicate::Compare {
+                column: alias,
+                op: op?,
+                value: Value::from_i64(integer(expr)?),
+            }),
+            SeekKeyComponent::Row(_) | SeekKeyComponent::Null => return None,
+        }
+    }
+    Some(terms)
+}
+
+/// How a GROUP BY's groups come out (`MorselAggregateData::group_order`); none when the planner
+/// states no order for a key, the serial loop's.
+fn group_order(plan: &SelectPlan) -> Option<Vec<KeyInfo>> {
+    let Some(group) = &plan.group_by else {
+        return Some(Vec::new());
+    };
+    (0..group.exprs.len())
+        .map(|key| {
+            Some(KeyInfo {
+                sort_order: *group.sort_order.get(key)?,
+                collation: CollationSeq::Binary,
+                nulls_order: *group.nulls_order.get(key)?,
+            })
+        })
+        .collect()
+}
+
 /// A GROUP BY's HAVING terms as the hook's row loop tests them (lane qs6-17): each aggregate in
 /// them rewritten to the register its value is loaded into, `first + i` for the plan's aggregate
 /// `i`. Only terms over the aggregates and
@@ -704,7 +827,7 @@ fn emit_body(
         .chain(looped.on.iter())
         .chain(looped.filter.iter())
         .chain(looped.outs.iter())
-        .chain(looped.agg_filters.iter().map(|(_, expr)| expr))
+        .chain(looped.agg_filters.iter().map(|(_, filter)| filter))
     {
         walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
             match e {
@@ -852,6 +975,10 @@ fn emit_body(
         });
         program.preassign_label_to_next_insn(done);
     }
+    // A label lands after the instruction emitted before it, wherever that one moves, and an
+    // output that is a constant moves to the program's end (lane R4): `keep` is placed after a
+    // Noop of the body's own, so it stays on the body's next one.
+    program.emit_insn(Insn::Noop);
     program.preassign_label_to_next_insn(body.keep);
     program.emit_insn(Insn::Noop);
     program.preassign_label_to_next_insn(body.skip);
@@ -882,6 +1009,14 @@ fn integer(expr: &Expr) -> Option<i64> {
 /// The LIMIT and OFFSET when each is absent or an integer literal, read as SQLite reads them: a
 /// negative LIMIT is none, a negative OFFSET is none. LIMIT 0 and any other expression decline
 /// the hook; the serial loop answers them.
+/// Whether the table the hook reads, at `root`, is declared `COLUMNAR`.
+fn declared(plan: &SelectPlan, root: i64) -> bool {
+    plan.table_references
+        .joined_tables()
+        .iter()
+        .any(|t| matches!(&t.table, Table::BTree(b) if b.root_page == root && b.columnar))
+}
+
 fn window(plan: &SelectPlan) -> Option<Window> {
     let limit = match plan.limit.as_deref() {
         None => None,
@@ -905,10 +1040,15 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
     let [joined] = plan.table_references.joined_tables() else {
         return None;
     };
-    let Operation::Scan(Scan::BTreeTable { index: None, .. }) = &joined.op else {
-        return None;
-    };
     let table = stored(joined)?;
+    let mut filter = match &joined.op {
+        Operation::Scan(Scan::BTreeTable { index: None, .. }) => Vec::new(),
+        Operation::Search(Search::Seek {
+            index: None,
+            seek_def,
+        }) => rowid_bounds(seek_def, rowid_alias(table)?)?,
+        _ => return None,
+    };
     let columns = table.columns();
     let id = joined.internal_id;
     // A column the hook reads: of this table, stored as written, compared bytewise.
@@ -927,29 +1067,68 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
             col.affinity(),
             Affinity::Integer | Affinity::Text | Affinity::Blob | Affinity::None
         ) && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some(*column)
+        if plain {
+            Some(*column)
+        } else {
+            None
+        }
     };
-    let mut filter = Vec::new();
+    // A column a bound parameter is compared with: INTEGER or REAL (lane R10), which the copy and
+    // the morsels read as the serial loop does (`MorselAggregateData::reals`), compared bytewise.
+    let compared = |expr: &Expr| -> Option<usize> {
+        let Expr::Column {
+            table: t, column, ..
+        } = expr
+        else {
+            return None;
+        };
+        let col = columns.get(*column)?;
+        if *t == id
+            && matches!(col.affinity(), Affinity::Integer | Affinity::Real)
+            && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset)
+        {
+            Some(*column)
+        } else {
+            None
+        }
+    };
     for term in &plan.where_clause {
         if term.consumed {
             continue;
         }
-        filter.push(predicate(&term.expr, &column, table)?);
+        filter.push(
+            predicate(&term.expr, &column, table)
+                .or_else(|| parameter(&term.expr, &compared, &plan.table_references))?,
+        );
     }
-    let integer = |at: usize| {
-        columns
-            .get(at)
-            .is_some_and(|c| c.affinity() == Affinity::Integer)
+    // A column SUM and AVG take: INTEGER or REAL (lane R11), each value read as the serial loop
+    // reads it; a REAL met is the serial loop's under `RealSums::Serial`, which the copy and the
+    // morsels hand back.
+    let summed = |expr: &Expr| -> Option<usize> {
+        let Expr::Column {
+            table: t, column, ..
+        } = expr
+        else {
+            return None;
+        };
+        let col = columns.get(*column)?;
+        if *t == id && matches!(col.affinity(), Affinity::Integer | Affinity::Real) {
+            Some(*column)
+        } else {
+            None
+        }
     };
-    let (group_by, aggregates, result_map) = outputs(plan, &column, &integer)?;
+    let (group_by, aggregates, result_map) = outputs(plan, &column, &summed)?;
     Some(MorselAggregateData {
         root_page: table.root_page,
         columns: columns.len(),
         rowid_alias: rowid_alias(table),
+        reals: reals(table),
         defaults: defaults(table),
         rowid_range: (None, None),
         filter,
         group_by,
+        group_order: Vec::new(),
         aggregates,
         result_map,
         joins: Vec::new(),
@@ -962,6 +1141,17 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
 
 fn rowid_alias(table: &BTreeTable) -> Option<usize> {
     table.get_rowid_alias_column().map(|(at, _)| at)
+}
+
+/// The table's columns of REAL affinity ([`MorselAggregateData::reals`]).
+fn reals(table: &BTreeTable) -> Vec<usize> {
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.affinity() == Affinity::Real)
+        .map(|(at, _)| at)
+        .collect()
 }
 
 fn predicate(
@@ -1015,14 +1205,63 @@ fn predicate(
                 }
                 _ => false,
             };
-            same_kind.then_some(Predicate::Compare {
-                column: at,
-                op,
-                value,
-            })
+            if same_kind {
+                Some(Predicate::Compare {
+                    column: at,
+                    op,
+                    value,
+                })
+            } else {
+                None
+            }
         }
         _ => None,
     }
+}
+
+/// `column op ?` (lane R9), or `? op column`, against an INTEGER or REAL column (lane R10): the
+/// parameter's value is read when the statement runs and converted as the serial loop's comparison
+/// converts it, by the comparison's affinity (SQLite's datatype3 section 4.2: NUMERIC applied to
+/// the parameter, which has no affinity), so a row passes exactly where the serial loop's term
+/// holds.
+fn parameter(
+    expr: &Expr,
+    column: &impl Fn(&Expr) -> Option<usize>,
+    refs: &crate::translate::plan::TableReferences,
+) -> Option<Predicate> {
+    let Expr::Binary(left, op, right) = expr else {
+        return None;
+    };
+    let (at, op, variable) = match (column(left), column(right), left.as_ref(), right.as_ref()) {
+        (Some(at), None, _, Expr::Variable(v)) => (at, *op, v),
+        (None, Some(at), Expr::Variable(v), _) => (at, flip(*op)?, v),
+        _ => return None,
+    };
+    let op = match op {
+        Operator::Less => CmpOp::Lt,
+        Operator::LessEquals => CmpOp::Le,
+        Operator::Equals => CmpOp::Eq,
+        Operator::NotEquals => CmpOp::Ne,
+        Operator::Greater => CmpOp::Gt,
+        Operator::GreaterEquals => CmpOp::Ge,
+        _ => return None,
+    };
+    let affinity = crate::translate::expr::comparison_affinity(
+        left.as_ref(),
+        right.as_ref(),
+        Some(refs),
+        None,
+    );
+    if affinity != Affinity::Numeric {
+        return None;
+    }
+    let index = std::num::NonZeroUsize::new(usize::try_from(variable.index.get()).ok()?)?;
+    Some(Predicate::Parameter {
+        column: at,
+        op,
+        index,
+        affinity,
+    })
 }
 
 fn flip(op: Operator) -> Option<Operator> {
@@ -1137,12 +1376,12 @@ fn defaults(table: &BTreeTable) -> Vec<Value> {
 }
 
 /// The GROUP BY keys, the aggregates and each result column's place in the pipeline's row (the
-/// keys, then the aggregates), the columns read through `column`; `integer` says whether a column
-/// is one SUM may take (INTEGER affinity).
+/// keys, then the aggregates), the columns read through `column`, and those SUM and AVG take
+/// through `summed`.
 fn outputs(
     plan: &SelectPlan,
     column: &impl Fn(&Expr) -> Option<usize>,
-    integer: &impl Fn(usize) -> bool,
+    summed: &impl Fn(&Expr) -> Option<usize>,
 ) -> Option<(Vec<usize>, Vec<Aggregate>, Vec<usize>)> {
     let mut group_by = Vec::new();
     if let Some(group) = &plan.group_by {
@@ -1163,13 +1402,8 @@ fn outputs(
         aggregates.push(match (&aggregate.func, aggregate.args.as_slice()) {
             (AggFunc::Count0, []) => Aggregate::CountStar,
             (AggFunc::Count, [arg]) => Aggregate::Count(column(arg)?),
-            (AggFunc::Sum, [arg]) => {
-                let at = column(arg)?;
-                if !integer(at) {
-                    return None;
-                }
-                Aggregate::Sum(at)
-            }
+            (AggFunc::Sum, [arg]) => Aggregate::Sum(summed(arg)?),
+            (AggFunc::Avg, [arg]) => Aggregate::Avg(summed(arg)?),
             (AggFunc::Min, [arg]) => Aggregate::Min(column(arg)?),
             (AggFunc::Max, [arg]) => Aggregate::Max(column(arg)?),
             _ => return None,
@@ -1359,7 +1593,11 @@ fn shape_join(
         let col = table.columns().get(column)?;
         let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
             && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some((at, column))
+        if plain {
+            Some((at, column))
+        } else {
+            None
+        }
     };
     let affinity = |(at, column): (usize, usize)| {
         tables
@@ -1396,7 +1634,7 @@ fn shape_join(
             }
         }
         let found = (0..tables.len()).find_map(|at| {
-            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let on = |expr: &Expr| side(expr).filter(|&(t, _)| t == at).map(|(_, c)| c);
             let table: &BTreeTable = tables.get(at)?;
             predicate(&term.expr, &on, table).map(|p| (at, p))
         });
@@ -1508,10 +1746,12 @@ fn shape_join(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        reals: Vec::new(),
         defaults: defaults(probe_table),
         rowid_range: *ranges.get(probe_at)?,
         filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by: group_by.clone(),
+        group_order: Vec::new(),
         aggregates: aggregates.clone(),
         result_map: result_map.clone(),
         joins,
@@ -1562,6 +1802,12 @@ fn join_outputs<'p>(
     if !rows_mode {
         return Some((outputs, no_real, None));
     }
+    // The workers don't run the planner's loops, so an ORDER BY those give is the hook's to sort by.
+    let order_by = if plan.order_by.is_empty() {
+        &plan.loop_order
+    } else {
+        &plan.order_by
+    };
     // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
     // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
     // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10), a padded row's NULL keys
@@ -1572,7 +1818,7 @@ fn join_outputs<'p>(
                 .get(at)
                 .and_then(|table| rowid_alias(table))
                 .is_some_and(|alias| {
-                    plan.order_by
+                    order_by
                         .iter()
                         .any(|(expr, _, _)| side(expr) == Some((at, alias)))
                 })
@@ -1586,7 +1832,7 @@ fn join_outputs<'p>(
     // least, is the values' own order), so the workers' sort is the serial sorter's.
     let width = outputs.outs.len();
     let mut order = Vec::new();
-    for (expr, sort, nulls) in &plan.order_by {
+    for (expr, sort, nulls) in order_by {
         if nulls.is_some() {
             return None;
         }
@@ -1621,7 +1867,11 @@ fn join_side(
     let col = table.columns().get(column)?;
     let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
         && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-    plain.then_some((at, column))
+    if plain {
+        Some((at, column))
+    } else {
+        None
+    }
 }
 
 /// The last place in the FROM clause among the tables `expr` reads (0 when it reads none); none
@@ -1639,7 +1889,11 @@ fn reach(joined: &[JoinedTable], expr: &Expr) -> Option<usize> {
         Ok(WalkControl::Continue)
     })
     .ok()?;
-    known.then_some(last)
+    if known {
+        Some(last)
+    } else {
+        None
+    }
 }
 
 /// Joins of three or more tables with a RIGHT or FULL JOIN among them, or with more than one outer
@@ -1762,6 +2016,12 @@ fn shape_chain(
         if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
             return None;
         }
+        // An inferred equality fails a row a later link padded (T-QT.6.24: `u.a = v.a` from
+        // `u.a = t.a` and `v.a = t.a`, over a FULL JOIN's unmatched right row). The stated terms
+        // it came from are tested where they hold.
+        if term.origin == WhereTermOrigin::Implied {
+            continue;
+        }
         // An ON term's link: its join's right table; a WHERE term has none.
         let link = match term.origin.join_origin() {
             Some(origin) => {
@@ -1789,7 +2049,7 @@ fn shape_chain(
             }
         }
         let found = (0..tables.len()).find_map(|at| {
-            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let on = |expr: &Expr| side(expr).filter(|&(t, _)| t == at).map(|(_, c)| c);
             let table: &BTreeTable = tables.get(at)?;
             predicate(&term.expr, &on, table).map(|p| (at, p))
         });
@@ -1873,10 +2133,12 @@ fn shape_chain(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        reals: Vec::new(),
         defaults: defaults(probe_table),
         rowid_range: *ranges.first()?,
         filter: std::mem::take(filters.first_mut()?),
         group_by: group_by.clone(),
+        group_order: Vec::new(),
         aggregates: aggregates.clone(),
         result_map: result_map.clone(),
         joins,

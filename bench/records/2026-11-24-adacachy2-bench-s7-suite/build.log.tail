@@ -1,0 +1,5 @@
+   Compiling amphora-api v0.1.0 (/home/adalundhe/.cache/amphora-perf/bench-s/crates/api)
+   Compiling amphora-engine-parser v0.1.0 (/home/adalundhe/.cache/amphora-perf/bench-s/crates/engine-parser)
+   Compiling amphora v0.1.0 (/home/adalundhe/.cache/amphora-perf/bench-s/crates/amphora)
+   Compiling amphora-bench v0.1.0 (/home/adalundhe/.cache/amphora-perf/bench-s/bench)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4m 23s

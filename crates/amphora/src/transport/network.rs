@@ -380,6 +380,7 @@ pub(super) fn request(
     name: &ServerName<'static>,
     request: Request,
     until: Instant,
+    heard: impl FnOnce(u32) -> Result<(), Refusal>,
 ) -> Result<Answer, Error> {
     remaining(until)?;
     let auth_until = until.min(
@@ -395,6 +396,7 @@ pub(super) fn request(
     let mut stream = StreamOwned::new(connection, config, socket);
     let token = (|| -> Result<[u8; 32], Refusal> { Ok(handshake!(&mut stream, auth_until)) })()?;
     let version = common::greet_client(&mut stream, &token, until, auth_until)?;
+    heard(version)?;
     common::exchange(&mut stream, request, version, until)
 }
 
@@ -698,15 +700,24 @@ mod tests {
         let address = node.address().unwrap();
         let named = name("node-1").unwrap();
         assert!(matches!(
-            request(&dial, address, &named, Request::Probe, until()),
+            request(&dial, address, &named, Request::Probe, until(), |_| Ok(())),
             Ok(Answer::Done)
         ));
         assert!(matches!(
-            request(&dial, address, &named, Request::Identity, until()),
+            request(&dial, address, &named, Request::Identity, until(), |_| Ok(
+                ()
+            )),
             Err(Error::Refused(_))
         ));
         assert!(matches!(
-            request(&dial, address, &named, Request::Session, until()),
+            request(
+                &dial,
+                address,
+                &named,
+                Request::Session,
+                until(),
+                |_| Ok(())
+            ),
             Err(Error::Refused(_))
         ));
     }

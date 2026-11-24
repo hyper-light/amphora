@@ -9,8 +9,9 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 /// A cgroup v1 limit at or past this is "no limit" (the kernel reports its page-rounded
 /// `LONG_MAX`, 9,223,372,036,854,771,712 on 4 KiB pages).
@@ -169,17 +170,25 @@ pub fn resident() -> Option<u64> {
 /// What the process's memory is shared out to, each by its own measured use (MB.1): the owners'
 /// queues (commands waiting, messages going out), the images a replica makes and installs, the
 /// caches (the page pool and what else keeps data to read again), and the chunks of a database's
-/// file a backup copies and a restore fetches (T-T1.12.M1).
+/// file a backup copies and a restore fetches (T-T1.12.M1), and the PostgreSQL sessions, each its
+/// state and the frame it holds (docs/design/postgres.md, decision 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Use {
     Queues,
     Images,
     Caches,
     Chunks,
+    Sessions,
 }
 
 impl Use {
-    const ALL: [Self; 4] = [Self::Queues, Self::Images, Self::Caches, Self::Chunks];
+    const ALL: [Self; 5] = [
+        Self::Queues,
+        Self::Images,
+        Self::Caches,
+        Self::Chunks,
+        Self::Sessions,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -187,6 +196,7 @@ impl Use {
             Self::Images => "an image",
             Self::Caches => "the caches",
             Self::Chunks => "a backup's chunk",
+            Self::Sessions => "the PostgreSQL sessions",
         }
     }
 }
@@ -283,7 +293,9 @@ fn whole(file: &std::fs::File) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; IN_PLACE];
     loop {
-        let n = file.read_at(&mut buf, u64::try_from(out.len()).ok()?).ok()?;
+        let n = file
+            .read_at(&mut buf, u64::try_from(out.len()).ok()?)
+            .ok()?;
         if n == 0 {
             return Some(out);
         }
@@ -420,9 +432,15 @@ impl Readings for System {
 /// No share is picked: a use has what the others leave, as measured now.
 pub struct Budget {
     readings: Box<dyn Readings>,
-    held: [AtomicU64; 4],
+    held: [AtomicU64; 5],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
-    streams: [AtomicU64; 4],
+    streams: [AtomicU64; 5],
+    /// The holders waiting for room now ([`Budget::take_until`]): a charge given back with none
+    /// waiting takes no lock.
+    waiting: AtomicU64,
+    /// The charges given back while a holder waited, counted under this lock: a holder that found
+    /// no room waits on it until the count moves or its deadline passes.
+    given: (Mutex<u64>, Condvar),
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -475,12 +493,14 @@ impl amphora_engine::storage::versioned::memory::Source for StorageMemory {
         self.0
             .hold(Use::Caches, bytes)
             .map_err(|refusal| match refusal {
-                Refusal::TooLarge { limit, .. } => amphora_engine::LimboError::MemoryBudget {
-                    what,
-                    asked: bytes,
-                    held: self.0.held(Use::Caches),
-                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                },
+                Refusal::TooLarge { limit, .. } => {
+                    amphora_engine::LimboError::MemoryBudget(Box::new(amphora_engine::BudgetFull {
+                        what,
+                        asked: bytes,
+                        held: self.0.held(Use::Caches),
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    }))
+                }
                 other => amphora_engine::LimboError::InternalError(format!(
                     "versioned storage: {what}: {other}"
                 )),
@@ -508,6 +528,8 @@ impl Budget {
             readings,
             held: Default::default(),
             streams: Default::default(),
+            waiting: AtomicU64::new(0),
+            given: (Mutex::new(0), Condvar::new()),
         })
     }
 
@@ -521,13 +543,14 @@ impl Budget {
         Self::of(&self.streams, used)
     }
 
-    fn of(counters: &[AtomicU64; 4], used: Use) -> &AtomicU64 {
-        let [queues, images, caches, chunks] = counters;
+    fn of(counters: &[AtomicU64; 5], used: Use) -> &AtomicU64 {
+        let [queues, images, caches, chunks, sessions] = counters;
         match used {
             Use::Queues => queues,
             Use::Images => images,
             Use::Caches => caches,
             Use::Chunks => chunks,
+            Use::Sessions => sessions,
         }
     }
 
@@ -605,13 +628,91 @@ impl Budget {
             })
     }
 
-    /// `bytes` held by `used` ([`Budget::hold`]) given back.
+    /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
+    /// each charge given back anywhere in the budget ([`Budget::give`]), never by a timer, and
+    /// `waits` told (under the budget's lock) each time it waits. Refused [`Refusal::Full`], with
+    /// the room it last saw, once `until` has passed. Refused at once, never waited on: bytes past
+    /// the whole limit, [`Refusal::TooLarge`] naming it (no charge given back makes room for them;
+    /// lane perf-A19), and a refusal other than no room.
+    pub fn take_until(
+        self: &Arc<Self>,
+        used: Use,
+        bytes: u64,
+        until: Instant,
+        mut waits: impl FnMut(),
+    ) -> Result<Charge, Refusal> {
+        // Room found takes no lock, as Linux's `wait_event` looks before it joins the queue
+        // (include/linux/wait.h); the look under the lock below is the one a give can't slip past.
+        if let Ok(charge) = self.take(used, bytes) {
+            return Ok(charge);
+        }
+        let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
+        // [atomics.order], the single total order; Linux's include/linux/wait.h, `waitqueue_active`):
+        // either this look for room sees bytes given back, or their giver sees this holder waiting.
+        fence(Ordering::SeqCst);
+        let held = 'look: loop {
+            let seen = *given;
+            let room = match self.hold(used, bytes) {
+                Err(Refusal::TooLarge { limit, .. }) => limit,
+                other => break other,
+            };
+            if let Some(limit) = self.readings.read().limit.filter(|limit| bytes > *limit) {
+                break Err(Refusal::TooLarge {
+                    what: format!("memory for {}", used.name()),
+                    size: usize::try_from(bytes).unwrap_or(usize::MAX),
+                    limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                });
+            }
+            let refused = Refusal::Full { limit: room };
+            let mut left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(refused);
+            }
+            waits();
+            while *given == seen {
+                if left.is_zero() {
+                    break 'look Err(refused);
+                }
+                given = self
+                    .given
+                    .1
+                    .wait_timeout(given, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                left = until.saturating_duration_since(Instant::now());
+            }
+        };
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        drop(given);
+        held.map(|()| Charge {
+            budget: Arc::clone(self),
+            used,
+            bytes,
+        })
+    }
+
+    /// The holders waiting for room now ([`Budget::take_until`]).
+    #[must_use]
+    pub fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// `bytes` held by `used` ([`Budget::hold`]) given back, and the holders waiting for room
+    /// ([`Budget::take_until`]) woken to look again.
     pub fn give(&self, used: Use, bytes: u64) {
         let _ = self
             .slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+            *given = given.wrapping_add(1);
+            drop(given);
+            self.given.1.notify_all();
+        }
     }
 
     /// The room for one image: [`Use::Images`]' room, in the `usize` an image's bytes are
@@ -777,6 +878,39 @@ pub(crate) mod tests {
         assert_eq!(budget.room(Use::Caches).unwrap(), 100);
         drop(held);
         assert_eq!(budget.room(Use::Images).unwrap(), 100);
+    }
+
+    /// Lane perf-A19 (AUDIT 2026-11-23 §1, MB.1): a charge past the whole limit is refused at once,
+    /// never waited on. Do: on a budget with a 1 MiB limit and nothing held, take a byte past the
+    /// limit with a deadline an hour off; then, with the whole limit held, take a byte with a
+    /// deadline already passed; then, the limit given back, take the whole limit. Expect: the first
+    /// refused `TooLarge` naming its size and the limit, no wait told; the second refused `Full`
+    /// with no room, no wait told; the third taken; nothing held once it drops.
+    #[test]
+    fn a19_a_charge_past_the_whole_limit_is_refused_at_once_never_waited_on() {
+        let fed = Fed::new(Some(1 << 20), Some(0));
+        let budget = Budget::new(Box::new(fed));
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        let mut waits = 0u32;
+        let refused = budget.take_until(Use::Queues, (1 << 20) + 1, far, || waits += 1);
+        assert!(
+            matches!(&refused, Err(Refusal::TooLarge { what, size, limit })
+                if what.contains("queues") && *size == (1 << 20) + 1 && *limit == 1 << 20),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(waits, 0);
+        let image = budget.take(Use::Images, 1 << 20).unwrap();
+        let refused = budget.take_until(Use::Queues, 1, Instant::now(), || waits += 1);
+        assert_eq!(refused.err(), Some(Refusal::Full { limit: 0 }));
+        assert_eq!(waits, 0);
+        drop(image);
+        let whole = budget
+            .take_until(Use::Queues, 1 << 20, far, || waits += 1)
+            .unwrap();
+        assert_eq!((whole.bytes(), waits), (1 << 20, 0));
+        drop(whole);
+        assert_eq!(budget.held(Use::Queues), 0);
     }
 
     /// Do: read this process's limit and resident bytes where it runs (Linux, macOS, Windows).

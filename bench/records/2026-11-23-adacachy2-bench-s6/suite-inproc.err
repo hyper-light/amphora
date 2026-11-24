@@ -1,0 +1,4 @@
+== amphora load=31.17 11:59:43
+== turso load=39.20 12:01:08
+== sqlite load=74.91 12:02:57
+records: /home/adalundhe/.cache/amphora-perf/bench-s6-run/out/suite-inproc.jsonl

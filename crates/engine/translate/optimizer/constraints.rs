@@ -879,7 +879,7 @@ pub(super) fn add_implied_column_equalities(
                 ast::Operator::Equals,
                 Box::new(columns[member].expr.clone()),
             ),
-            origin: WhereTermOrigin::Where,
+            origin: WhereTermOrigin::Implied,
             // The inferred term can select an access path. The original
             // equalities still verify the result during execution.
             consumed: true,
@@ -3014,7 +3014,10 @@ fn apply_column_stats(
             let Some(value) = params.constant_value(operand) else {
                 return per_distinct;
             };
-            let value = match column.affinity().convert_for_compare(&value) {
+            let value = match column
+                .affinity()
+                .convert_for_compare(&value, crate::numeric::fp::FpDigits::DEFAULT)
+            {
                 Some(either::Either::Left(converted)) => match converted.to_owned() {
                     Ok(converted) => converted,
                     Err(_) => return per_distinct,
@@ -3062,7 +3065,8 @@ fn apply_column_stats(
                 table.table.get_name(),
                 fingerprint,
                 selectivity,
-                n as usize,
+                // A sample's row count, a whole number; `as` saturated past usize, as this does.
+                num_traits::ToPrimitive::to_usize(&n).unwrap_or(usize::MAX),
             ),
             _ => selectivity,
         };

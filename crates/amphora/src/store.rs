@@ -2,8 +2,11 @@
 //!
 //! - **One writer.** A thread owns the engine. Rows reach it by channel, never by lock, and are
 //!   committed as soon as it takes them, with whatever else came while it committed the last: a
-//!   group commit, no row waiting for a timer. A full queue refuses rows ([`Refused::Full`]) rather
-//!   than growing without bound; [`Store::put_wait`] waits for room instead.
+//!   group commit, no row waiting for a timer. A batch is charged its rows' bytes
+//!   ([`Engine::row_bytes`]) to the memory budget's room for queues (MB.1) until its commit ends:
+//!   past that room it is refused ([`Refused::Full`]) rather than queued; [`Store::put_wait`] waits
+//!   for room instead, until its deadline, woken by each charge given back anywhere in the budget.
+//!   A batch past the budget's whole limit is refused at once ([`Refused::TooLarge`]).
 //! - **Durable beside the writer.** A commit doesn't wait for the disk: a flusher thread flushes
 //!   what was committed, over and over, and a write is durable once a flush that began after its
 //!   commit ends ([`Store::durable`] waits for that, by the [`Ticket`] its batch was handed with).
@@ -23,9 +26,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::memory::Charge;
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
@@ -47,6 +51,12 @@ pub trait Engine: Send + 'static {
 
     /// The key a row is of: a read of a key waits for its writes handed over before it.
     fn key(row: &Self::Row) -> &str;
+
+    /// The bytes `row` holds from its hand-over until its commit ends, its own and what it owns:
+    /// what the store charges it to the memory budget's room for queues (MB.1) for that long. 0 for
+    /// a row its sender charged where it admitted it (a [`crate::database::Database`]'s command,
+    /// charged at its admission until it is answered).
+    fn row_bytes(row: &Self::Row) -> usize;
 
     /// The keys, in bytes, a store in groups routes `row` by, each given to `each` (CP-T1.9;
     /// docs/design/reshard.md, decision "The routing key is bytes"): every key it reads or writes,
@@ -272,8 +282,6 @@ pub enum ForReaders {
 /// A store's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Batches of rows waiting for the writer, at most.
-    pub queue: usize,
     /// Rows that make a commit at once, however many more wait. A commit of fewer rows still ends
     /// where its engine's commit is full (decision 23).
     pub commit_rows: usize,
@@ -288,20 +296,18 @@ pub struct Config {
     /// How often the writer asks its engine's upkeep while nothing comes, unless it asks sooner.
     pub idle_every: Duration,
     /// Flusher threads: with more than one, a commit that lands while a flush is under way starts
-    /// a flush of its own on an idle flusher instead of waiting for that one to end.
+    /// a flush of its own on an idle flusher instead of waiting for that one to end; it is durable
+    /// once that flush and every one begun before it have ended well.
     pub flushers: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // A channel of this bound takes its slots at once: a full queue refuses (`put`) or
-            // waits for room (`put_wait`), so it needn't be deep.
-            queue: 4096,
             // A commit's pages fit its writer's cache: at 10,000 writers a commit of 512 rows wrote
             // 35,000-41,000 rows a second, of 2,048 rows 22,000-24,000 (fedora, 2026-10-20).
             commit_rows: 512,
-            readers: 4,
+            readers: machine_readers(),
             checkpoint_every: Duration::from_millis(25),
             // Each restart of the log holds the writer for 10-14 ms (on fedora's btrfs: what is
             // left copied, the file flushed, a new header synced). At 32 writers, whose commits
@@ -316,11 +322,49 @@ impl Default for Config {
     }
 }
 
+/// The readers a store keeps at most, from the machine (AUDIT 2.5): one a core the operating system
+/// lets the process run on (a reader reads on its caller's thread, so more readers than cores only
+/// take turns on them), and no more than the share of memory the process's page pool may take
+/// ([`crate::db::default_pages`], a quarter, cited there) holds readers' own caches
+/// ([`crate::db::READER_PAGES`] pages each, 8 MiB). One at least; one a core when the system says
+/// nothing of its memory.
+#[must_use]
+pub fn reader_room(cores: Option<usize>, memory: Option<u64>) -> usize {
+    let cores = cores.unwrap_or(1).max(1);
+    let Some(memory) = memory else {
+        return cores;
+    };
+    let reader_bytes = u64::try_from(crate::db::READER_PAGES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::db::PAGE_BYTES);
+    let fit = u64::try_from(crate::db::default_pages(Some(memory)))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::db::PAGE_BYTES)
+        .checked_div(reader_bytes)
+        .unwrap_or(0);
+    cores.min(usize::try_from(fit).unwrap_or(usize::MAX)).max(1)
+}
+
+/// [`reader_room`] of this machine, read once a process, as the page pool it shares is sized
+/// ([`crate::db::process_pages`]).
+fn machine_readers() -> usize {
+    static ROOM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        reader_room(
+            std::thread::available_parallelism().ok().map(usize::from),
+            crate::memory::limit(),
+        )
+    })
+}
+
 /// Why a store didn't take or answer something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
-    /// Its writer's queue is full.
+    /// The memory budget's room for queues has no room for its batch (MB.1).
     Full,
+    /// Its batch's `size` in bytes is past the memory budget's whole `limit`: no room given back
+    /// can fit it (MB.1; lane perf-A19).
+    TooLarge { size: u64, limit: u64 },
     /// Its writer has stopped.
     Stopped,
     /// It didn't answer in time.
@@ -340,8 +384,15 @@ pub enum Refused {
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::TooLarge { size, limit } = self {
+            return write!(
+                f,
+                "the batch's {size} bytes are past the memory budget's whole limit of {limit}"
+            );
+        }
         f.write_str(match self {
             Self::Full => "the store's writer is full",
+            Self::TooLarge { .. } => "the batch is past the memory budget's whole limit",
             Self::Stopped => "the store's writer has stopped",
             Self::Timeout => "the store didn't answer in time",
             Self::Failed => "the batch couldn't be committed; nothing of it was written",
@@ -364,8 +415,9 @@ impl std::error::Error for Refused {}
 type Job<E> = Box<dyn FnOnce(&mut E) + Send>;
 
 enum Msg<E: Engine> {
-    /// Rows, the keys they are of, and what becomes of them.
-    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>),
+    /// Rows, the keys they are of, what becomes of them, and their charge (none: they charge
+    /// nothing, [`Engine::row_bytes`]).
+    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>, Option<Charge>),
     /// Run on the engine, between commits (what was sent before it is committed first).
     Run(Job<E>),
 }
@@ -447,19 +499,45 @@ struct Sends {
     stopping: AtomicBool,
     /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
     disk_failed: AtomicBool,
-    /// The writer took batches off its queue: a sender waiting for room looks again.
-    room: (Mutex<()>, Condvar),
-    /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
-    /// committed.
-    claimed: Mutex<u64>,
+    claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
-    /// Since when the writer has had nothing to do (nanoseconds past `began`; 0 while it is busy):
-    /// it committed what it had and found its queue empty.
-    idle_since: AtomicU64,
-    /// The times the writer went idle.
-    idles: AtomicU64,
-    began: Instant,
+}
+
+/// The flushes begun ([`flusher`]): a flush's target is made durable only once it and every flush
+/// begun before it have ended well (docs/design/store.md, decision 9). A flush that failed never ends
+/// well, so nothing begun after it is made durable: the disk may have dropped what it was writing,
+/// and a later flush that succeeds doesn't vouch for that.
+#[derive(Default)]
+struct Claims {
+    /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
+    /// committed.
+    batches: u64,
+    /// The flushes not yet made durable, in the order they began: each one's target, and whether it
+    /// ended well. A run of those that ended well is kept as its last, which makes the rest durable
+    /// with it, so at most two a flusher are kept.
+    under_way: VecDeque<(Progress, bool)>,
+}
+
+impl Claims {
+    /// The flush of `target` ended well: what is durable now, if anything is.
+    fn ended_well(&mut self, target: Progress) -> Option<Progress> {
+        let mut kept = VecDeque::with_capacity(self.under_way.len());
+        for (t, done) in self.under_way.drain(..) {
+            let done = done || t == target;
+            if done && kept.back().is_some_and(|&(_, d)| d) {
+                kept.pop_back();
+            }
+            kept.push_back((t, done));
+        }
+        let mut durable = None;
+        while let Some(&(t, true)) = kept.front() {
+            kept.pop_front();
+            durable = Some(t);
+        }
+        self.under_way = kept;
+        durable
+    }
 }
 
 /// A key's batches handed and committed, under its entry's number.
@@ -471,10 +549,6 @@ struct Counts {
 
 /// Shards of the keys' counts.
 const SHARDS: u64 = 64;
-
-/// A sender waiting for room looks again at least this often (a wakeup lost between its try and
-/// its wait costs no more).
-const ROOM_LOOK: Duration = Duration::from_millis(5);
 
 impl Default for Sends {
     fn default() -> Self {
@@ -490,13 +564,9 @@ impl Default for Sends {
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
-            room: (Mutex::new(()), Condvar::new()),
-            claimed: Mutex::new(0),
+            claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
-            idle_since: AtomicU64::new(0),
-            idles: AtomicU64::new(0),
-            began: Instant::now(),
         }
     }
 }
@@ -724,51 +794,6 @@ impl Sends {
         self.done.notify_all();
     }
 
-    /// Nanoseconds since the store began, never 0 (which `idle_since` keeps for busy).
-    fn now(&self) -> u64 {
-        u64::try_from(self.began.elapsed().as_nanos())
-            .unwrap_or(u64::MAX)
-            .max(1)
-    }
-
-    /// The writer committed what it had and found its queue empty: a flusher gathering looks again.
-    fn went_idle(&self) {
-        if self.idle_since.load(Ordering::Relaxed) == 0 {
-            self.idle_since.store(self.now(), Ordering::Relaxed);
-            self.idles.fetch_add(1, Ordering::Relaxed);
-            let _committed = locked(&self.committed);
-            self.done.notify_all();
-        }
-    }
-
-    /// The writer took something off its queue.
-    fn went_busy(&self) {
-        if self.idle_since.load(Ordering::Relaxed) != 0 {
-            self.idle_since.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// How much longer a flusher gathering since `since` waits before it begins a flush, its
-    /// flushes taking `flush` (smoothed): none once the writer has been idle for a 32nd of a flush
-    /// (what the last flush's senders send next has come in by then) or half a flush has gone by
-    /// (what waits already waits no more than that again).
-    fn gathering(&self, since: Instant, flush: Duration) -> Option<Duration> {
-        let most = flush.checked_div(2).unwrap_or_default();
-        let left = most.checked_sub(since.elapsed()).filter(|d| !d.is_zero())?;
-        match self.idle_since.load(Ordering::Relaxed) {
-            0 => Some(left),
-            idle => {
-                let idle = Duration::from_nanos(self.now().saturating_sub(idle));
-                let quiet = flush
-                    .checked_div(32)
-                    .unwrap_or_default()
-                    .checked_sub(idle)
-                    .filter(|d| !d.is_zero())?;
-                Some(quiet.min(left))
-            }
-        }
-    }
-
     /// A flush failed: whoever waits for a commit or a flush is told.
     fn disk_failed(&self) {
         self.disk_failed.store(true, Ordering::SeqCst);
@@ -845,76 +870,55 @@ fn notifier(sends: &Sends) {
 }
 
 /// A flusher: flushes what was committed as soon as there is some no flusher has begun a flush
-/// for, again and again; each flush makes durable what was committed before it began. With one
-/// flusher a commit waits for the flush under way and the next; with more, an idle one begins the
-/// next at once. A flush that fails is the last.
+/// for, again and again; each flush makes durable what was committed before it began, once every
+/// flush begun before it has ended well too ([`Claims`]). With one flusher a commit waits for the
+/// flush under way and the next; with more, an idle one begins the next at once. A flush that fails
+/// is the last.
 ///
-/// Under load the writer never runs out of work, and flushes follow one another. When it ran out
-/// during a flush, what comes next is mostly what that flush's senders send once told, and a flush
-/// begun at the first of it would leave the rest to the flush after (each sender then waits two
-/// flushes, half of them during each other's): so the flusher first gathers, waiting until the
-/// writer has taken it all in ([`Sends::gathering`]).
+/// Before it begins, it waits for the batches handed to the writer by the time it found something
+/// to flush to be committed or refused, each a commit of the writer away; what is handed after
+/// joins the next flush (docs/design/store.md, decision 14).
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
-    // The writer ran out of work during the last flush.
-    let mut kept_up = false;
-    // Flushes' time, smoothed (the first, then an eighth of each new one).
-    let mut flush_time = Duration::ZERO;
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
-            let mut gathering: Option<Instant> = None;
+            let mut handed: Option<u64> = None;
             loop {
-                let stopping = sends.stopping.load(Ordering::Relaxed);
-                if committed.batches > *locked(&sends.claimed) {
-                    let since = *gathering.get_or_insert_with(Instant::now);
-                    match sends
-                        .gathering(since, flush_time)
-                        .filter(|_| kept_up && !stopping)
-                    {
-                        Some(wait) => {
-                            committed = sends
-                                .done
-                                .wait_timeout(committed, wait)
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .0;
-                            continue;
+                let ending = sends.stopping.load(Ordering::Relaxed)
+                    || sends.disk_failed.load(Ordering::SeqCst);
+                {
+                    let mut claims = locked(&sends.claims);
+                    if committed.batches > claims.batches {
+                        let before =
+                            *handed.get_or_insert_with(|| sends.handed.load(Ordering::Relaxed));
+                        if committed.batches >= before || ending {
+                            claims.batches = committed.batches;
+                            claims.under_way.push_back((*committed, false));
+                            break *committed;
                         }
-                        None => {
-                            let mut claimed = locked(&sends.claimed);
-                            if committed.batches > *claimed {
-                                *claimed = committed.batches;
-                                break *committed;
-                            }
-                        }
+                    } else {
+                        handed = None;
                     }
                 }
-                if stopping || sends.disk_failed.load(Ordering::SeqCst) {
+                if ending {
                     return;
                 }
+                // Every batch settled, the store stopping and a failed flush wake it (`Sends::wake`,
+                // `stop`, `disk_failed`, each under this lock).
                 committed = sends
                     .done
-                    .wait_timeout(committed, Duration::from_secs(1))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
+                    .wait(committed)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        let idles = sends.idles.load(Ordering::Relaxed);
         let began = Instant::now();
         match flush() {
             Ok(()) => {
-                let took = began.elapsed();
-                let eighth = |d: Duration| d.checked_div(8).unwrap_or_default();
-                flush_time = if flush_time.is_zero() {
-                    took
-                } else {
-                    flush_time
-                        .saturating_sub(eighth(flush_time))
-                        .saturating_add(eighth(took))
-                };
-                kept_up = sends.idle_since.load(Ordering::Relaxed) != 0
-                    || sends.idles.load(Ordering::Relaxed) != idles;
-                meter.flushed(took);
-                sends.made_durable(target);
+                meter.flushed(began.elapsed());
+                let durable = locked(&sends.claims).ended_well(target);
+                if let Some(through) = durable {
+                    sends.made_durable(through);
+                }
             }
             Err(e) => {
                 // The last: after a failed flush the system may have dropped what it couldn't
@@ -961,9 +965,6 @@ struct Readers<R> {
     /// The checkpointer: a connection of its own copying the log into the file, never in a
     /// commit's way. It goes and comes back with the readers.
     checkpointer: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
-    /// Held by each read and checkpoint as it runs, and by the writer alone while it starts the log
-    /// again.
-    gate: Arc<RwLock<()>>,
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
@@ -996,7 +997,6 @@ impl<R: Send + 'static> Readers<R> {
             returned: Condvar::new(),
             most: most.max(1),
             checkpointer: Mutex::new(None),
-            gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
             slots: match checkout {
@@ -1018,8 +1018,7 @@ impl<R: Send + 'static> Readers<R> {
         let checkpointer = match open() {
             Ok(mut reader) => {
                 let (tx, rx) = mpsc::channel::<()>();
-                let (gate, restart, meter) =
-                    (self.gate.clone(), self.restart.clone(), self.meter.clone());
+                let (restart, meter) = (self.restart.clone(), self.meter.clone());
                 let thread = std::thread::Builder::new()
                     .name("amphora-checkpoint".into())
                     .spawn(move || {
@@ -1058,7 +1057,6 @@ impl<R: Send + 'static> Readers<R> {
                             {
                                 continue;
                             }
-                            let _copying = gate.read().unwrap_or_else(PoisonError::into_inner);
                             let began = Instant::now();
                             let copied = copy(&mut reader);
                             meter.checkpointed(began.elapsed());
@@ -1124,20 +1122,15 @@ impl<R: Send + 'static> Readers<R> {
         }
     }
 
-    /// Starts the log again with `restart`, if the checkpointer asked, holding the readers and the
-    /// checkpointer back meanwhile (each finishes what it is doing first).
+    /// Starts the log again with `restart`, if the checkpointer asked: the writer's switch to the
+    /// log's free segment, which waits for no read and no pass (decision 45).
     fn restart_if_asked(&self, restart: impl FnOnce() -> anyhow::Result<bool>) {
         if !self.restart.swap(false, Ordering::Relaxed) {
             return;
         }
-        let asked = Instant::now();
-        let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
-        // Slot readers hold no gate: holding every slot holds them back.
-        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
         let began = Instant::now();
         let restarted = restart();
-        self.meter
-            .restarted(began.saturating_duration_since(asked), began.elapsed());
+        self.meter.restarted(Duration::ZERO, began.elapsed());
         match restarted {
             Ok(true) => {}
             Ok(false) => self.restart.store(true, Ordering::Relaxed),
@@ -1188,10 +1181,7 @@ impl<R: Send + 'static> Readers<R> {
                     .0;
             }
         };
-        let answer = {
-            let _reading = self.gate.read().unwrap_or_else(PoisonError::into_inner);
-            f(&mut reader)
-        };
+        let answer = f(&mut reader);
         self.give_back(Some(reader), generation);
         Some(answer)
     }
@@ -1228,9 +1218,11 @@ impl<R: Send + 'static> Readers<R> {
     }
 }
 
-/// A handle to a store: cheap to clone, usable from any thread.
+/// A handle to a store: cheap to clone, usable from any thread. Its writer's queue counts nothing:
+/// its batches are bounded by their charge ([`Engine::row_bytes`]), its jobs by their callers, each
+/// waiting for its own.
 pub struct Store<E: Engine> {
-    tx: mpsc::SyncSender<Msg<E>>,
+    tx: mpsc::Sender<Msg<E>>,
     meter: Arc<Meter>,
     watchers: Arc<Mutex<Vec<Watcher>>>,
     sends: Arc<Sends>,
@@ -1257,7 +1249,7 @@ impl<E: Engine> Store<E> {
 
     /// [`Store::start`], its engine's flusher replaced by `flush` when given (tests).
     pub fn start_with(engine: E, config: Config, flush: Option<Flush>) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Msg<E>>(config.queue.max(1));
+        let (tx, rx) = mpsc::channel::<Msg<E>>();
         let meter: Arc<Meter> = Arc::default();
         let watchers: Arc<Mutex<Vec<Watcher>>> = Arc::default();
         let sends: Arc<Sends> = Arc::default();
@@ -1306,12 +1298,13 @@ impl<E: Engine> Store<E> {
         self.meter.counters()
     }
 
-    /// Rows to be committed with the next batch. Never blocks: a full queue refuses them, counted.
+    /// Rows to be committed with the next batch. Never waits: with no room for their charge they
+    /// are refused, counted.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<Ticket, Refused> {
         self.hand(rows, None, None)
     }
 
-    /// Rows to be committed with the next batch, waiting for room until `until`.
+    /// Rows to be committed with the next batch, waiting for room until `until` ([`Store::put`]).
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<Ticket, Refused> {
         self.hand(rows, Some(until), None)
     }
@@ -1343,6 +1336,9 @@ impl<E: Engine> Store<E> {
             }
             return Ok(Ticket(None));
         }
+        let queued = self.charge(&rows, until).inspect_err(|_| {
+            self.meter.dropped();
+        })?;
         let mut keys: Vec<String> = Vec::new();
         for r in &rows {
             let k = E::key(r);
@@ -1356,35 +1352,53 @@ impl<E: Engine> Store<E> {
             state: AtomicU64::new(UNSETTLED),
             then: Mutex::new(then),
         });
-        let mut m = Msg::Rows(rows, keys, fate.clone());
-        loop {
-            match self.tx.try_send(m) {
-                Ok(()) => return Ok(Ticket(Some(fate))),
-                Err(mpsc::TrySendError::Disconnected(back)) => {
-                    self.let_go(&back);
-                    return Err(Refused::Stopped);
+        self.tx
+            .send(Msg::Rows(rows, keys, fate.clone(), queued))
+            .map_err(|mpsc::SendError(back)| {
+                // Never committed: nothing waits on it.
+                if let Msg::Rows(_, keys, ..) = back {
+                    self.sends.settled(&keys);
+                    self.sends.wake(1, 0);
                 }
-                Err(mpsc::TrySendError::Full(back)) => m = back,
-            }
-            let left = until.map_or(Duration::ZERO, |u| {
-                u.saturating_duration_since(Instant::now())
-            });
-            if left.is_zero() {
-                self.let_go(&m);
-                self.meter.dropped();
-                return Err(Refused::Full);
-            }
-            let room = locked(&self.sends.room.0);
-            let _looked = self.sends.room.1.wait_timeout(room, left.min(ROOM_LOOK));
-        }
+                Refused::Stopped
+            })?;
+        Ok(Ticket(Some(fate)))
     }
 
-    /// A batch that will never be committed: nothing waits on it.
-    fn let_go(&self, m: &Msg<E>) {
-        if let Msg::Rows(_, keys, _) = m {
-            self.sends.settled(keys);
-            self.sends.wake(1, 0);
+    /// Charges `rows`' bytes ([`Engine::row_bytes`]) to the memory budget's room for queues
+    /// (MB.1) until their commit ends ([`Store::charge_queue`]; none: not waiting at all).
+    /// Refused [`Refused::Full`] past `until`, and [`Refused::TooLarge`] at once past the whole
+    /// limit.
+    fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Charge>, Refused> {
+        let bytes = rows.iter().fold(0u64, |n, row| {
+            n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
+        });
+        if bytes == 0 {
+            return Ok(None);
         }
+        self.charge_queue(bytes, until.unwrap_or_else(Instant::now))
+            .map(Some)
+            .map_err(|refusal| match refusal {
+                amphora_api::Refusal::TooLarge { size, limit, .. } => Refused::TooLarge {
+                    size: u64::try_from(size).unwrap_or(u64::MAX),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                },
+                _ => Refused::Full,
+            })
+    }
+
+    /// `bytes` charged to the memory budget's room for queues, this writer's queue among them, until
+    /// the charge drops: waiting until `until` for room given back anywhere in the budget
+    /// ([`crate::memory::Budget::take_until`]), each wait counted ([`Counters::room_waits`]). Its
+    /// rows' charge, or a request's admitted to a database on this store (lane perf-A19).
+    pub(crate) fn charge_queue(
+        &self,
+        bytes: u64,
+        until: Instant,
+    ) -> Result<Charge, amphora_api::Refusal> {
+        crate::memory::process().take_until(crate::memory::Use::Queues, bytes, until, || {
+            self.meter.waited_for_room();
+        })
     }
 
     /// Run `f` on a reader, on this thread, once the writes of `key` (of every key: None) handed
@@ -1411,6 +1425,23 @@ impl<E: Engine> Store<E> {
         }
     }
 
+    /// Waits until the writes of `key` (of every key: None) handed over before now are committed,
+    /// up to `until`: what [`Store::read`] waits for before it reads.
+    pub fn committed(&self, key: Option<&str>, until: Instant) -> Result<(), Refused> {
+        if self.sends.wait(key, until) {
+            Ok(())
+        } else {
+            self.meter.timed_out();
+            Err(Refused::Timeout)
+        }
+    }
+
+    /// The readers this store reads on at most ([`Config::readers`]).
+    #[must_use]
+    pub fn readers(&self) -> usize {
+        self.readers.most
+    }
+
     /// Run `f` on a reader, on this thread, on what is committed now, waiting for no write: what a
     /// reader that isn't the writer of what it reads sees in any database. Or `on_writer` on the
     /// writer when the store has no reader now (which runs once what was sent before is committed).
@@ -1421,14 +1452,24 @@ impl<E: Engine> Store<E> {
         f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
         on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
-        let asked = Instant::now();
-        match self.readers.with(until, f) {
-            Some(answer) => {
-                self.meter.waited(asked.elapsed());
-                answer
-            }
+        match self.on_reader(until, f) {
+            Some(answer) => answer,
             None => self.run(until, on_writer),
         }
+    }
+
+    /// Run `f` on a reader, on this thread, on what is committed now, as
+    /// [`Store::read_committed`] does: None when the store has no reader now, its caller to run it
+    /// on the writer ([`Store::run`]) as it admits it there. Blocking, until `until` at most.
+    pub fn on_reader<T>(
+        &self,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+    ) -> Option<anyhow::Result<T>> {
+        let asked = Instant::now();
+        let answer = self.readers.with(until, f)?;
+        self.meter.waited(asked.elapsed());
+        Some(answer)
     }
 
     /// Run `f` on the engine once what was sent before is committed. Blocking, until `until` at
@@ -1440,23 +1481,11 @@ impl<E: Engine> Store<E> {
     ) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
         let asked = Instant::now();
-        let mut m: Msg<E> = Msg::Run(Box::new(move |e| {
-            let _ = rtx.send(f(e));
-        }));
-        loop {
-            match self.tx.try_send(m) {
-                Ok(()) => break,
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(Refused::Stopped.into()),
-                Err(mpsc::TrySendError::Full(back)) => m = back,
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                self.meter.timed_out();
-                return Err(Refused::Timeout.into());
-            }
-            let room = locked(&self.sends.room.0);
-            let _looked = self.sends.room.1.wait_timeout(room, left.min(ROOM_LOOK));
-        }
+        self.tx
+            .send(Msg::Run(Box::new(move |e| {
+                let _ = rtx.send(f(e));
+            })))
+            .map_err(|_| Refused::Stopped)?;
         match rrx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -1508,11 +1537,12 @@ fn notify(watchers: &Mutex<Vec<Watcher>>) {
 }
 
 /// A batch taken off the queue and not yet committed: where its rows end among those pending, the
-/// keys they are of, and what becomes of them.
+/// keys they are of, what becomes of them, and their charge, given back once their commit ends.
 struct Batch {
     end: usize,
     keys: Vec<String>,
     fate: Arc<Fate>,
+    _queued: Option<Charge>,
 }
 
 /// The writer: rows are committed as soon as nothing else waits in the queue (or at the commit's
@@ -1631,14 +1661,13 @@ fn writer<E: Engine>(
         let began = Instant::now();
         let quiet = matches!(got, Err(mpsc::RecvTimeoutError::Timeout)) && pending.is_empty();
         match got {
-            Ok(Msg::Rows(rows, keys, fate)) => {
-                sends.went_busy();
-                sends.room.1.notify_all();
+            Ok(Msg::Rows(rows, keys, fate, queued)) => {
                 pending.extend(rows);
                 batches.push(Batch {
                     end: pending.len(),
                     keys,
                     fate,
+                    _queued: queued,
                 });
                 if pending.len() >= config.commit_rows {
                     commit(&mut engine, &mut pending, &mut batches, &mut commits);
@@ -1646,8 +1675,6 @@ fn writer<E: Engine>(
                 }
             }
             Ok(Msg::Run(job)) => {
-                sends.went_busy();
-                sends.room.1.notify_all();
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
                 job(&mut engine);
                 meter.ran();
@@ -1655,7 +1682,6 @@ fn writer<E: Engine>(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
                 readers.restart_if_asked(|| engine.restart_log());
-                sends.went_idle();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
@@ -1686,5 +1712,127 @@ fn writer<E: Engine>(
             }
         }
         meter.held(began.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::tests::{BUDGET, Fed, budget};
+
+    /// Rows kept in memory, in commit order.
+    struct Kept(Arc<Mutex<Vec<String>>>);
+
+    impl Engine for Kept {
+        type Row = String;
+        type Reader = ();
+
+        fn key(row: &String) -> &str {
+            row
+        }
+
+        fn row_bytes(row: &String) -> usize {
+            std::mem::size_of::<String>() + row.capacity()
+        }
+
+        fn apply(&mut self, rows: &[String]) -> anyhow::Result<usize> {
+            self.0.lock().unwrap().extend(rows.iter().cloned());
+            Ok(rows.len())
+        }
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1: a batch past the memory budget's room for queues is refused
+    /// typed and counted, and a sender waiting for room is woken by the commit that gives a batch's
+    /// bytes back, no timer. Do: with room for one row, hold the writer in a job, queue a row, put a
+    /// second, wait with a third until a deadline an hour off, then let the writer go. Expect: the
+    /// second refused Full and counted; the third taken once the first commits; all given back.
+    #[test]
+    fn mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back() {
+        let one = std::mem::size_of::<String>() + 1;
+        let fed = Fed::new(Some(u64::try_from(one).unwrap()), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let store = Store::start(Kept(Arc::clone(&kept)), Config::default()).unwrap();
+        let far = Instant::now() + Duration::from_secs(3600);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let busy = store.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(far, move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let first = store.put(vec!["a".to_owned()]).unwrap();
+        assert_eq!(store.put(vec!["b".to_owned()]).err(), Some(Refused::Full));
+        assert_eq!(store.counters().dropped, 1);
+        let (waiting, on_waiter) = (store.clone(), Arc::clone(&budget));
+        let waiter = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+            waiting.put_wait(vec!["c".to_owned()], far)
+        });
+        while store.counters().room_waits == 0 {
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        let third = waiter.join().unwrap().unwrap();
+        job.join().unwrap().unwrap();
+        store.durable(&first, far).unwrap();
+        store.durable(&third, far).unwrap();
+        store.sync(far).unwrap();
+        assert_eq!(*kept.lock().unwrap(), vec!["a".to_owned(), "c".to_owned()]);
+        assert!(store.counters().room_waits >= 1);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1: a sender waiting for room is woken by a charge given back
+    /// anywhere in the memory budget, not only by its own store's commits. Do: with room for one
+    /// row, hold store A's writer in a job and queue a row on A; on store B, which holds no charge,
+    /// wait with a row until a deadline an hour off; then let A's writer go. Expect: B's wait
+    /// counted, B's row taken once A's commit gives its charge back, none refused, all given back.
+    #[test]
+    fn mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back() {
+        let one = std::mem::size_of::<String>() + 1;
+        let fed = Fed::new(Some(u64::try_from(one).unwrap()), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let (kept_a, kept_b) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let a = Store::start(Kept(Arc::clone(&kept_a)), Config::default()).unwrap();
+        let b = Store::start(Kept(Arc::clone(&kept_b)), Config::default()).unwrap();
+        let far = Instant::now() + Duration::from_secs(3600);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let busy = a.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(far, move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let first = a.put(vec!["a".to_owned()]).unwrap();
+        let (waiting, on_waiter) = (b.clone(), Arc::clone(&budget));
+        let waiter = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+            waiting.put_wait(vec!["b".to_owned()], far)
+        });
+        while b.counters().room_waits == 0 && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        let second = waiter.join().unwrap().unwrap();
+        job.join().unwrap().unwrap();
+        a.durable(&first, far).unwrap();
+        b.durable(&second, far).unwrap();
+        assert_eq!(*kept_a.lock().unwrap(), vec!["a".to_owned()]);
+        assert_eq!(*kept_b.lock().unwrap(), vec!["b".to_owned()]);
+        assert_eq!(b.counters().room_waits, 1);
+        assert_eq!(a.counters().dropped + b.counters().dropped, 0);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
     }
 }

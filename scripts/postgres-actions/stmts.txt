@@ -1,0 +1,63 @@
+UPDATE pgbench_accounts SET abalance = abalance + -2741 WHERE aid = 34521;
+UPDATE pgbench_accounts SET abalance = abalance + 2741 WHERE aid = 34521;
+UPDATE pgbench_tellers SET tbalance = tbalance + -2741 WHERE tid = 7;
+UPDATE pgbench_branches SET bbalance = bbalance + -2741 WHERE bid = 1;
+UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2;
+UPDATE pgbench_tellers SET tbalance = tbalance + $1 WHERE tid = $2;
+UPDATE pgbench_branches SET bbalance = bbalance + $1 WHERE bid = $2;
+SELECT abalance FROM pgbench_accounts WHERE aid = 34521;
+SELECT abalance FROM pgbench_accounts WHERE aid = $1;
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (7, 1, 34521, -2741, CURRENT_TIMESTAMP);
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (7, 1, 34521, 2741, CURRENT_TIMESTAMP);
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP);
+insert into pgbench_branches(bid,bbalance) select bid, 0 from generate_series(1, 1) as bid
+insert into pgbench_tellers(tid,bid,tbalance) select tid, (tid - 1) / 10 + 1, 0 from generate_series(1, 10) as tid
+insert into pgbench_accounts(aid,bid,abalance,filler) select aid, (aid - 1) / 100000 + 1, 0, '' from generate_series(1, 100000) as aid
+insert into pgbench_accounts(aid,bid,abalance,filler) select aid, (aid - 1) / 100000 + 1, 0, '' from generate_series(1, 3000000000) as aid
+select count(*) from pgbench_branches
+select o.n, p.partstrat, pg_catalog.count(i.inhparent) from pg_catalog.pg_class as c join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) where c.relname = 'pgbench_accounts' and o.n is not null group by 1, 2 order by 1 asc limit 1
+drop table if exists pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers
+create table pgbench_history(tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22))
+create table pgbench_tellers(tid int not null,bid int,tbalance int,filler char(84)) with (fillfactor=100)
+create table pgbench_accounts(aid    int not null,bid int,abalance int,filler char(84)) with (fillfactor=100)
+create table pgbench_branches(bid int not null,bbalance int,filler char(88)) with (fillfactor=100)
+create table pgbench_history(tid int,bid int,aid bigint,delta int,mtime timestamp,filler char(22))
+create table pgbench_accounts(aid bigint not null,bid int,abalance int,filler char(84)) with (fillfactor=100)
+truncate table pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers
+begin
+copy pgbench_branches from stdin with (freeze on)
+copy pgbench_tellers from stdin with (freeze on)
+copy pgbench_accounts from stdin with (freeze on)
+copy pgbench_accounts from stdin
+commit
+vacuum analyze pgbench_branches
+vacuum analyze pgbench_tellers
+vacuum analyze pgbench_accounts
+vacuum analyze pgbench_history
+alter table pgbench_branches add primary key (bid)
+alter table pgbench_tellers add primary key (tid)
+alter table pgbench_accounts add primary key (aid)
+set client_encoding to 'UTF8'
+show password_encryption
+SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass
+SET application_name = 'PostgreSQL JDBC Driver'
+SET extra_float_digits = 3
+SET extra_float_digits = 3;SET application_name = 'PostgreSQL JDBC Driver'
+show transaction_read_only
+SHOW transaction_read_only
+select pg_is_in_recovery()
+SELECT pg_catalog.pg_is_in_recovery()
+BEGIN
+SET SESSION search_path TO 'public'
+SET SESSION search_path TO DEFAULT
+SET search_path TO "$user", public
+SET LOCAL statement_timeout = 0
+SET client_min_messages TO warning
+SET extra_float_digits = -1
+SET cursor_tuple_fraction = 0.5
+SET enable_seqscan = off
+SET standard_conforming_strings = on
+SET myapp.user_id = '42'
+RESET statement_timeout
+RESET ALL
+SHOW ALL

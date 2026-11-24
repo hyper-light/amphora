@@ -214,6 +214,7 @@ pub(crate) struct VacuumDbHeaderMeta {
     text_encoding: TextEncoding,
     user_version: i32,
     application_id: i32,
+    pg_next_oid: u32,
 }
 
 impl VacuumDbHeaderMeta {
@@ -226,6 +227,7 @@ impl VacuumDbHeaderMeta {
             text_encoding: source.text_encoding,
             user_version: source.user_version.get(),
             application_id: source.application_id.get(),
+            pg_next_oid: source.pg_next_oid.get(),
         }
     }
 
@@ -237,6 +239,7 @@ impl VacuumDbHeaderMeta {
         header.text_encoding = self.text_encoding;
         header.user_version = self.user_version.into();
         header.application_id = self.application_id.into();
+        header.pg_next_oid = self.pg_next_oid.into();
     }
 }
 
@@ -1521,16 +1524,22 @@ fn start_temp_batch_reads(
     let mut logical_pages: Vec<PageRef> = Vec::with_capacity(len);
     let mut pairs: Vec<(PageRef, u64)> = Vec::with_capacity(len);
 
+    let mut segment = None;
     for page_id in batch_start..batch_end {
         let page: PageRef = Arc::new(Page::new(page_id as i64));
         // todo: add find_frames at WAL where you can send batch of page ids and get all the frame ids
-        let frame_id = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
+        let frame = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
             LimboError::InternalError(format!(
                 "VACUUM: page {page_id} not found in target WAL (WAL-only invariant violated)"
             ))
         })?;
+        if *segment.get_or_insert(frame.segment) != frame.segment {
+            return Err(LimboError::InternalError(format!(
+                "VACUUM: page {page_id} is in another segment of the target WAL than the pages before it"
+            )));
+        }
         logical_pages.push(page.clone());
-        pairs.push((page, frame_id));
+        pairs.push((page, frame.frame));
     }
 
     // let's coalesce frame ids so that we can fetch maximum frames with a single pread
@@ -1559,8 +1568,14 @@ fn start_temp_batch_reads(
         } else {
             None
         };
+        let segment = segment.ok_or_else(|| {
+            LimboError::InternalError("VACUUM: a run of target WAL frames with no segment".into())
+        })?;
         let _c = wal.read_frames_batch(
-            *start_frame,
+            crate::storage::wal::FrameRef {
+                segment,
+                frame: *start_frame,
+            },
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
@@ -2719,6 +2734,7 @@ mod tests {
         source.text_encoding = TextEncoding::Utf8;
         source.user_version = 7.into();
         source.application_id = 12.into();
+        source.pg_next_oid = 16390.into();
 
         let VacuumDbHeaderMeta {
             read_version,
@@ -2728,7 +2744,12 @@ mod tests {
             text_encoding,
             user_version,
             application_id,
+            pg_next_oid,
         } = VacuumDbHeaderMeta::from_source_header(&source);
+        assert_eq!(
+            pg_next_oid, 16390,
+            "VACUUM keeps the PostgreSQL dialect's next OID"
+        );
 
         assert_eq!(read_version, source.read_version);
         assert_eq!(write_version, source.write_version);
@@ -2882,6 +2903,7 @@ mod tests {
             text_encoding: TextEncoding::Utf8,
             user_version: 17,
             application_id: 29,
+            pg_next_oid: 0,
         };
         match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
             crate::IOResult::Done(()) => {}

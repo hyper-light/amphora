@@ -48,3 +48,70 @@ unexplained, hence ignored.
 - Item 3: `Listener::accept` and `Dialer::connect` (transport/network.rs) build a fresh
   `ServerConfig`/`ClientConfig` and `RootCertStore` per connection. Holds. Caching them would also
   turn on rustls's in-memory TLS session resumption for the dialer (a behaviour change to decide).
+
+## The descriptor-limit test's module-run failure explained (perf-I3)
+
+Cause: Linux's accept reserves its descriptor before it waits for a connection (`do_accept` takes
+an unused descriptor first). The test let its first client connect before making the second's
+socket, so a listener that took the first and went back to accept ahead of the test thread held
+the last number below the lowered limit, and the second's socket was refused (EMFILE) at its
+`unwrap`. Alone, the test thread nearly always won that race; beside the module's suite, under
+load, it lost once. Not a product bug: the clients are the test's own, in the listener's process.
+Change: both client sockets are made before the first connects, and the test is no longer ignored.
+
+Forced (the race made likely: the child pinned to one core, `taskset -c 0`, 20 runs each):
+`taskset -c 0 cargo test -p amphora --lib --locked <test> -- --include-ignored --exact`
+
+| | passed | failed |
+|---|---|---|
+| after (this change) | 20 | 0 |
+
+`transport::common` module run with the test included, 5 runs: 15 of 15 each (1 measurement ignored).
+
+## The owner's waiting submits ordered by deadline (perf-I3, AUDIT 6 item 2)
+
+Verified: `deadline()` scanned every waiting submit each step, and `expire()` popped and pushed
+back every one each step, O(N) a step with N up to `command_bound()`.
+Change: `database/replicated/waiting.rs`: the waiting line keeps each submit by its place in line
+(a `BTreeMap`) and by its deadline (a `BTreeSet`, ties in line order). The soonest deadline is the
+set's first, the expired are taken from its front, pop/push are O(log N); the answers are the
+same (FIFO dispatch, a requeued submit first, expiry at `at >= until`, `Timeout` answers).
+
+Command (runner 00aad8daff2fa3c9daa65d53c425d450, release, 20,000 steps each, none due, both sides
+in each run, 6 runs; host load average 50-64 on 32 cores from other lanes):
+`cargo test --release -p amphora --lib audit6_measure_waiting -- --ignored --nocapture`
+
+| waiting | before (scan + rotate), median (range) | after, median (range) |
+|---|---|---|
+| 1 | 5 ns/step (3-15) | 2 ns/step (1-2) |
+| 100 | 758 ns/step (217-903) | 3 ns/step (2-4) |
+| 1,000 | 3,937 ns/step (2,146-5,575) | 4 ns/step (2-4) |
+| 10,000 | 36,950 ns/step (21,787-37,896) | 5 ns/step (2-5) |
+
+What it measures: the owner's per-step work on its waiting submits alone (the old loop's shape
+against the new line), not a whole step; the rest of a step doesn't depend on N. Before grows
+linearly (2.2-3.8 ns a waiting submit a step); after is flat at the sizes asked.
+
+## Verified for the successor (perf-I4)
+
+- Item 1, one proposal per group: still holds on main 62687f5d. `pending: Option<Pending>`
+  (replicated.rs:922) and `limits.proposals = 1` in `settings` (replicated.rs:2651). `prepare`
+  (replicated.rs:5117) takes the one pending submit through its barrier, slot, floor and bootstrap
+  rules and proposes it; the next waits until it applies. Batching means one entry carrying several
+  waiting submits, each under its own savepoint and answered apart. Verified by reading the code,
+  not measured. Harness for the A/B: `amphora-bench --repl commit --system amphora-replicated
+  --writers N` (bench/src/repl.rs:398) gives throughput and latency at N closed-loop writers.
+- TLS (coordinator's unit 3, revised 04:20Z): Amphora builds a config per connection, at
+  transport/network.rs:277 (`Listener::accept`), 295 (`Dialer::connect`), 322 (`listen`'s accept)
+  and 393 (`request`), and validates and drops one at 161, 255, 265 and 312. Their inputs never
+  change after `Credentials` is made. Node-to-node is one connection per request
+  (transport/common.rs:405, 454, 476). hyper-tls's identity (identity.rs) is minted once per built
+  config (client/builder.rs:172,176) and checked before resuming (client/hs.rs:1191-1193,
+  msgs/persist.rs:288-289), so a config kept for its life resumes its own sessions with no
+  hyper-tls change.
+- Constraint for "one ServerConfig per listener": `ServerConnection::new(&ServerConfig)` borrows
+  shared, but `process_new_packets(&mut Config)` (conn.rs:384) and `complete_io(.., &mut Config)`
+  (conn.rs:565) take it mutably on both sides, because the session stores live inside the config
+  (`split`, conn.rs:1257). Connections served on their own threads can't share one config by
+  borrow. `read_tls` and `write_tls` (conn.rs:729, 754) don't take the config, so a shared config
+  could be locked around `process_new_packets` alone, never across socket I/O.

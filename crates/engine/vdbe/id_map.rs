@@ -32,10 +32,9 @@ pub(crate) trait Id: Copy {
 /// an even slot, one at or above it at an odd one. Both stay dense, and distinct ids stay apart.
 const fn dense_slot(id: usize) -> usize {
     let base = crate::vdbe::builder::HASH_TABLE_ID_BASE;
-    if id >= base {
-        (id - base).saturating_mul(2).saturating_add(1)
-    } else {
-        id.saturating_mul(2)
+    match id.checked_sub(base) {
+        Some(above) => above.saturating_mul(2).saturating_add(1),
+        None => id.saturating_mul(2),
     }
 }
 
@@ -151,7 +150,11 @@ mod tests {
         map.insert(1usize, "internal".into());
         assert!(map.slots.len() <= 4, "{} slots", map.slots.len());
         assert_eq!(map.get(&base).map(String::as_str), Some("first allocated"));
-        assert_eq!(map.get(&u32::try_from(base + 1).unwrap()).map(String::as_str), Some("second allocated"));
+        assert_eq!(
+            map.get(&u32::try_from(base + 1).unwrap())
+                .map(String::as_str),
+            Some("second allocated")
+        );
         assert_eq!(map.get(&1usize).map(String::as_str), Some("internal"));
         assert_eq!(map.get(&0usize), None);
         map.insert(1usize, "d".into());

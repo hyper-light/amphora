@@ -1013,6 +1013,18 @@ before any decision or resolution. The storage tests open a snapshot at 25 while
 unpublished, publish it at 50, and reopen the writer. They also apply a proposal stamped 21 after
 closed time 49 on two replicas and reopen them after closed time reaches 90. Both retain vote 50.
 
+At the edges (lane D5, `xgroup/tests/lock_edges.rs`): the crash after every write, truncation and
+flush around a lock, its vote and its resolution, the process's (every write kept) and the machine's
+(what a flush covered), on a standalone backed-up group and on a replicated member that applies its
+log again: the lock and its vote come back together or not at all, the vote the one the reply
+carried, and never neither once the flush the reply waits for ended. Replies and a recovery's answers
+in each of their six orders and each twice; the first incarnation's decision and resolutions come
+late at an older stamp, fenced. Each of the eight sets of groups a resolution landed in, the decision
+landed or lost. A participant that keeps no clock, whose vote is none and whose rows take the
+others'. A participant that can't finish, refused before any lock (xgroup.md, "Over the transport").
+Each step's, reply's, frame's and entry's bytes as they were: the wire and the log only gain
+`LOCK_DELTA`'s prefix.
+
 **Falsified by.** A `Records::commit` across groups answering a stamp its rows don't carry; a
 condition naming a stamp at or past its row's newest version failing, or one before it holding; a
 recovered row whose stamp differs from the client answer, even when all recovered rows agree;

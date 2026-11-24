@@ -94,8 +94,11 @@ pub struct Scenario {
     pub grow: i64,
 }
 
+/// The `f` share of `need`, truncated; a share past `u64::MAX` is `u64::MAX` (saturating, as the
+/// room a cap can state stops there).
 fn share(need: u64, f: f64) -> u64 {
-    (need as f64 * f) as u64
+    let room = num_traits::ToPrimitive::to_u64(&(need as f64 * f));
+    room.unwrap_or(u64::MAX)
 }
 
 impl Scenario {
@@ -112,7 +115,7 @@ impl Scenario {
     /// The room left the copies at statement `k`.
     pub fn free_at(&self, k: usize, need: u64) -> Option<u64> {
         let base = self.free(need)?;
-        let round = k / self.tables.max(1);
+        let round = k.checked_div(self.tables).unwrap_or(k);
         Some(match self.press {
             Press::Bursty { piece } if k.is_multiple_of(2) => {
                 base.saturating_add(share(need, piece))
@@ -127,30 +130,36 @@ impl Scenario {
 
     /// The table statement `k` reads.
     pub fn table(&self, k: usize) -> usize {
-        k % self.tables.max(1)
+        k.checked_rem(self.tables).unwrap_or(0)
     }
 
     /// Statement `k`: the queries in turn, each on the table in turn.
     pub fn query(&self, k: usize) -> String {
         QUERIES
-            .get(k % QUERIES.len())
+            .get(k.checked_rem(QUERIES.len()).unwrap_or(0))
             .copied()
             .unwrap_or_default()
             .replace("FROM t", &format!("FROM t{}", self.table(k)))
     }
 }
 
+/// `base` scaled by `k`: None past `i64`.
+fn scaled(base: i64, k: i64) -> Option<i64> {
+    base.checked_mul(k)
+}
+
 /// The A/B's scenarios at scale `k`. "Many tables" is 64, past the 12 of the control with no cap,
-/// each table read four times a `k` so policy A pays its rent and buys again on every one.
-pub fn scenarios(k: i64) -> Vec<Scenario> {
+/// each table read four times a `k` so policy A pays its rent and buys again on every one. None
+/// when a scenario's size at `k` passes `i64`.
+pub fn scenarios(k: i64) -> Option<Vec<Scenario>> {
     let n = |s: i64| usize::try_from(s).unwrap_or(1);
-    vec![
+    Some(vec![
         Scenario {
             name: "laptop_cap_one_big_table",
             forces: "A: buys again and again, each a whole-table read, under room for half a copy",
             tables: 1,
-            rows: 2000 * k,
-            statements: n(12 * k),
+            rows: scaled(2000, k)?,
+            statements: n(scaled(12, k)?),
             press: Press::Steady { copies: 0.5 },
             grow: 0,
         },
@@ -158,8 +167,8 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "many_tables_small_cap",
             forces: "both: six copies competing for two copies' room",
             tables: 6,
-            rows: 300 * k,
-            statements: n(24 * k),
+            rows: scaled(300, k)?,
+            statements: n(scaled(24, k)?),
             press: Press::Steady { copies: 2.0 },
             grow: 0,
         },
@@ -167,8 +176,8 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "steady_pressure",
             forces: "A: two copies thrashing in one and a half copies' room",
             tables: 2,
-            rows: 500 * k,
-            statements: n(16 * k),
+            rows: scaled(500, k)?,
+            statements: n(scaled(16, k)?),
             press: Press::Steady { copies: 1.5 },
             grow: 0,
         },
@@ -176,8 +185,8 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "bursty_pressure",
             forces: "B: waits that never end, room freed in pieces that never add up to a copy",
             tables: 2,
-            rows: 500 * k,
-            statements: n(16 * k),
+            rows: scaled(500, k)?,
+            statements: n(scaled(16, k)?),
             press: Press::Bursty { piece: 0.125 },
             grow: 0,
         },
@@ -185,17 +194,17 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "growing_while_waiting",
             forces: "B: the room a waiting copy needs growing with its table, the room coming late",
             tables: 1,
-            rows: 500 * k,
-            statements: n(16 * k),
+            rows: scaled(500, k)?,
+            statements: n(scaled(16, k)?),
             press: Press::Grows,
-            grow: 20 * k,
+            grow: scaled(20, k)?,
         },
         Scenario {
             name: "huge_cap_many_tables",
             forces: "neither: the control, no cap",
             tables: 12,
-            rows: 300 * k,
-            statements: n(36 * k),
+            rows: scaled(300, k)?,
+            statements: n(scaled(36, k)?),
             press: Press::None,
             grow: 0,
         },
@@ -203,8 +212,8 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "many_tables_heavy_pressure",
             forces: "both at fleet scale: 64 tables in half a copy's room (A buys again on every table; B's waits never end)",
             tables: 64,
-            rows: 100 * k,
-            statements: n(256 * k),
+            rows: scaled(100, k)?,
+            statements: n(scaled(256, k)?),
             press: Press::Steady { copies: 0.5 },
             grow: 0,
         },
@@ -212,12 +221,12 @@ pub fn scenarios(k: i64) -> Vec<Scenario> {
             name: "many_tables_waves",
             forces: "both at fleet scale: room for every copy at once, then none, the tables growing (copies bought and let go together; B's waits all end at once)",
             tables: 64,
-            rows: 100 * k,
-            statements: n(256 * k),
+            rows: scaled(100, k)?,
+            statements: n(scaled(256, k)?),
             press: Press::Waves,
             grow: k,
         },
-    ]
+    ])
 }
 
 /// The copies' trace events (target `amphora::columns`), counted by their message, which says
@@ -284,7 +293,7 @@ mod tests {
     #[test]
     fn cb4_scenarios_press_as_defined() {
         let need = 1000u64;
-        for s in scenarios(1) {
+        for s in scenarios(1).expect("the scenarios at scale 1") {
             assert!(s.tables >= 1 && s.statements >= s.tables, "{}", s.name);
             let read: std::collections::BTreeSet<usize> =
                 (0..s.statements).map(|k| s.table(k)).collect();

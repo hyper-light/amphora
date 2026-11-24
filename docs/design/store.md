@@ -12,8 +12,7 @@ into `bench/`.
 
 **Decision.** One writer thread owns the engine and commits as soon as nothing more waits in its
 queue (or a commit reaches its row bound); what came while it committed shares the next commit.
-Nothing waits for a timer. (The flusher may wait, bounded by a flush's own time, before it begins a
-flush: decision 14.)
+Nothing waits for a timer, the flusher included (decision 14).
 
 **Sources.** Group commit in DeWitt et al., "Implementation Techniques for Main Memory Database
 Systems" (SIGMOD 1984); Helland et al., "Group Commit Timers and High Volume Transaction Systems"
@@ -220,7 +219,10 @@ a flush that began after its commit, and a failed batch's ticket refused.
 
 **Decision.** When a flush fails, the store makes nothing more durable: the flusher stops, every
 sender waiting for a batch to be durable is refused (`Refused::Disk`), and new batches are refused,
-until the store is started again on what its disk holds.
+until the store is started again on what its disk holds. With more than one flusher (decision 6), a
+flush's commits are made durable only once it and every flush begun before it have ended well
+(`Claims` in `store.rs`): a flush that failed never ends well, so another flusher's success after it
+makes nothing durable, however the two flushes overlap.
 
 **Sources.** Rebello et al., "Can Applications Recover from fsync Failures?" (USENIX ATC 2020):
 after a failed `fsync`, Linux file systems may mark the pages they couldn't write clean, so a later
@@ -229,7 +231,12 @@ after a failed `fsync`, Linux file systems may mark the pages they couldn't writ
 
 **Evidence.** The store retried a failed flush every 10 ms: a retry that then succeeded would have
 acknowledged writes the disk never took. The crash test cuts a disk's power mid-flush: the senders
-waiting are refused at once, where before they waited out their deadline.
+waiting are refused at once, where before they waited out their deadline. Lane W4, 2026-11-23: with
+two flushers, each flusher made durable what its own flush covered. The crash test's two-flusher
+case (`a_flush_that_succeeds_beside_a_failed_one_acknowledges_nothing_the_disk_dropped`) fails one
+flush on the simulated disk, which drops what it was writing, while the other flusher's flush, begun
+before the failure, succeeds: the store acknowledged both batches durable, and neither was on the
+disk after a restart. Made durable in the order the flushes began, both are refused.
 
 **Falsified by.** A file system that keeps failed pages dirty and reports a later flush truthfully,
 on every platform Amphora runs on (then a bounded retry could be safe).
@@ -357,39 +364,83 @@ test reaches frames left from before a restart.
 **Falsified by.** An acknowledged batch lost to a power cut (`tests/crash.rs`); on ext4 or XFS, the
 log's `fdatasync` no faster than its `fsync`.
 
-## 14. Gathering before a flush at low load
+## 14. A flush waits for the batches handed before it, never a clock
 
-**Decision.** When the writer ran out of work during a flush, the flusher doesn't begin the next
-flush at the first commit after it. It waits until the writer has been idle for a 32nd of a flush,
-or half a flush has gone by, whichever comes first (a flush's time smoothed: the first, then an
-eighth of each new one), and then flushes everything committed. When the writer never ran out of
-work, flushes follow one another as before.
+**Decision.** The flusher begins a flush on events alone. Once something is committed that no flush
+has begun for, it notes how many batches have been handed to the writer, and waits until that many
+are settled: committed, refused, or let go. Then it begins the flush, which covers everything
+committed by then. What is handed after the note joins the next flush.
 
-**Why.** Writers that each wait for their write to be durable send their next write when told. A
-flush begun at the first commit after the last flush covers the first few of those writes and
-leaves the rest to the flush after; the writers settle into two halves, each committing during the
-other's flush, and each write waits two flushes. At 32 writers on a 2.8 ms flush: 5.6 ms a write
-and 5,700 writes a second, predicted; 5.1–5.8 ms and 5,134–5,608 a second, measured.
+The events it waits on, and why each wait ends:
 
-**Sources.** Helland et al. (HPTS 1987; decision 1) on group commit timers: a fixed delay adds
-latency once commits arrive faster than they complete, which is why this one is taken only when the
-writer ran out of work, and is bounded by the flush's own time. PostgreSQL's `commit_delay` and
-`commit_siblings`: a delay before the flush when other transactions are active.
+1. **Something committed that no flush has begun for** (`Sends::wake`). With nothing committed
+   there is nothing to flush. Every batch settled wakes the flusher, and so do the store stopping
+   (`Sends::stop`) and a failed flush (`Sends::disk_failed`), each under the lock it waits with.
+2. **A batch handed before the note is settled.** Each such batch is a commit of the writer away:
+   committed, refused, or let go when its sender's wait for room ends. The store stopping or its
+   disk failing ends the wait. Batches handed after the note aren't waited for, so senders that keep
+   coming can't hold a flush.
 
-**Evidence.** fedora, 2026-10-20, 32 writers, one group, three runs each alternating with
-PostgreSQL 17 in the same windows, at load 4–12 with other work on the machine
-(`bench/records/2026-10-20-fedora-32-writers-flush-at-first-commit.jsonl`,
-`...-gathering.jsonl`). Flushing at the first commit: 5,134–5,608 writes a second, p50 5.12–5.76 ms,
-p99 9.3–9.7 ms, p99.9 14.6–20.7 ms, max 26–54 ms. Gathering: 7,390–7,605 writes a second, p50
-4.06–4.16 ms, p99 7.2–8.1 ms, p99.9 11.3–17.2 ms, max 21–38 ms, with about 5,000 flushes a run
-against 7,000. PostgreSQL: 5,803–6,164 writes a second, p50 5.06–5.44 ms, p99 7.4–8.1 ms, p99.9
-9.5–20.2 ms, max 10–29 ms. Crash injection: 10,000 power cuts, none lost. The two fractions are
-chosen, not yet tuned: a 16th and a 64th of a flush are to be measured against the 32nd on a quiet
-machine, and gathering at 1,000 writers and more against flushing at once.
+Nothing waits for a sender to send again, so a sender that stops sending holds no flush.
 
-**Falsified by.** A workload where gathering lengthens a write's p50 or tails against flushing at
-the first commit (an open-loop trickle pays up to a 32nd of a flush a write), or more writers where
-flushes stop following one another.
+**Why.** Writers that each wait for their own write send their next one as soon as they're told.
+A flush begun at the first commit after the last one ends covers only that commit, and the writers
+settle into two halves, each committing during the other's flush. Lane W4 measured it on Mac Studio
+2 (`bench/records/2026-11-23-macstudio2-perf-oltp.md`): rows a flush fell from 29.0 to 15.5 at 32
+clients and from 121 to 61 at 128, with a flush costing 4.6 to 4.9 ms either way, and writes a
+second fell 26 to 35%. Until 2026-11-23 a timer bridged that gap: the flusher waited until the
+writer had been idle a 32nd of a flush, or half a flush had gone by. Its fractions were picked, and
+at 1 client it added its whole length to every write (lane W2's trace, below). With the note, the
+flusher wakes at the first commit after a flush, while the writer commits the first batches the
+told writers send next, and the rest are handed during that commit: the note counts them, and one
+flush covers them all (rows a flush, below).
+
+**Designs weighed.** Lane W5, 2026-11-23, each a flush begun on events alone:
+
+- D1, this decision. Lane W6's A/B on Mac Studio 2 (r1959, five rounds, below): rows a flush 32.0
+  and 31.6 at 32 clients and 128.0 and 125.6 at 128, against main's 14.5, 15.6, 60.1 and 62.7.
+- D2: D1, and after a flush the flusher also waits for the senders it told to leave their wait in
+  `Store::durable`, counted by the commit each waits for. Each leaves on its own thread, so the
+  wait ends. Measured no better than D1 in lane W5's runs (r1815), so not taken: its registry is code with
+  nothing measured to show for it.
+- Waiting for the told senders to send again, by count: refused on paper. A sender that stops never
+  sends, and nothing else ends the wait.
+- Waiting for the writer to find its queue empty: refused on paper. Senders that don't wait for
+  their writes, a bulk load among them, can keep the queue from emptying, and nothing then ends the
+  wait.
+- A timer: refused. Nothing in the store waits for a timer (decision 1).
+
+**Sources.** Helland et al. (HPTS 1987; decision 1): a timer adds latency without adding throughput
+once commits arrive faster than they complete. DeWitt et al. (SIGMOD 1984): group commit.
+
+**Evidence.** Mac Studio 2, 2026-11-24, lane W6's A/B (r1959,
+`bench/records/2026-11-23-macstudio2-perf-oltp.md`): D1 (716ede4d) against main before it
+(f363d688) and the timer (98bd0fa9), insert_one and update_plain at 1, 32 and 128 clients, 5
+rounds alternated, each run a fresh process on a fresh database. Load 2.3 to 5.2 on 32 cores, every
+run's mean flush 4.14 to 5.34 ms, 0 errors, no run left out. Writes a second, median of 5, D1
+against main: +77.3% and +75.3% at 32 clients, +25.4% and +50.5% at 128 (exact rank-sum p 0.008
+each), +0.5% and +0.9% at 1 (p 0.81 and 0.86, no measurable difference). Against the timer: +29.1%
+and +27.3% at 1 client, +23.3% and +12.5% for insert_one at 32 and 128 (p 0.008 each);
+update_plain at 32 and 128 +20.4% and +8.8%, p 0.151, no measurable difference in 5 runs. p50 at
+32 clients 5.18 and 5.06 ms, against main's 8.45 and the timer's 6.21. The flush bounds every arm:
+writes a second are rows a flush times flushes a second within 3%. The binaries predate the
+flusher's one-second re-look's removal and main's memory-budget charge.
+
+adacachy2, 2026-11-23, insert_one at 1 client, traced with an `LD_PRELOAD` shim on the log's write,
+open, flush and close and on the threads' futex hand-offs (lane W2,
+`bench/records/2026-11-23-adacachy2-perf-oltp.md`): with the timer, between the log's write and its
+flush, the flusher sat in a `FUTEX_WAIT_BITSET` of 191.8 to 192.8 µs that returned timed out, in an
+insert of 2.9 to 3.3 ms at p50.
+
+The store's tests: a batch committed during a flush and one the busy writer had not yet taken are
+made durable by one flush, the next (`a_batch_handed_before_a_flush_begins_is_made_durable_by_it`);
+a sender told durable that sends nothing more holds no flush
+(`a_sender_told_durable_that_sends_nothing_more_holds_no_flush`).
+
+**Falsified by.** Writers that settle into two groups under it (rows a flush near half the writers
+at 32 or more); a flush begun on another event, never a timer, that gives more writes a second at
+32 writers and more with no longer a write's p50 at one; or a flush held by a sender that stopped
+sending (the second test).
 
 ## 15. The checkpoint copies what the flusher made durable
 
@@ -648,11 +699,12 @@ after; reads under writes slower than when every commit cleared the cache.
 
 ## 19. The page cache evicts the oldest page not looked at again
 
-**Decision.** A page new to a connection's cache joins at the head of its queue, and the clock
-hand sweeps from the tail toward the head (`crates/engine/storage/page_cache.rs`), as SIEVE has
-it: the hand evicts the first page it finds unmarked, taking a mark off each marked page it
-passes, so a page new to the cache is examined after every older one. Turso's cache inserted a new
-page just after the hand, where the sweep looks next.
+**Decision.** A page new to a connection's cache joins its queue just behind the clock hand, where
+the sweep looks last (`crates/engine/storage/page_cache.rs`): the hand evicts the first page it
+finds unmarked, taking a mark off each marked page it passes, so a page new to the cache is
+examined after every page already in it. Turso's cache inserted a new page just after the hand,
+where the sweep looks next. Until lane Q2 it joined at the head (the queue's back), as SIEVE has
+it, which puts it after only the pages between the hand and the head.
 
 **Why.** Inserted there, a page read once was the next the sweep examined: with the cache full,
 each miss evicted the page the previous miss brought in, the pages cached before stayed, and a new
@@ -667,7 +719,20 @@ Turn-Key Eviction Algorithm for Web Caches" (NSDI 2024): new objects are inserte
 the hand moves from the tail toward the head, evicting the first object not visited since it last
 passed.
 
-**Evidence.** `page_cache.rs`, `a_new_working_set_settles_in_a_full_cache`: a cache of 100 pages
+**Lane Q2 (2026-11-23).** At the head, the hand reached a new page after only the pages between it
+and the head. S8's `table_count` after `point_secondary` (adacachy2, 200,000 items, a census of each
+reader's cache before and after each count, record
+`bench/records/2026-11-23-adacachy2-perf-analytics-q2.md`): on 32 of 128 readers, later counts kept
+reading the file (95 of 383 counts, 57,564 pages). On the worst, the hand stood 143 pages from the
+head, all unmarked, with 1,857 pages behind it (254, 254, 177 and 1,172 at marks 0 to 3). The count's
+607 index pages evicted those 143, then one another: every count read 603-607 pages from the file,
+and the 1,861 pages behind the hand were never examined again (their marks unchanged across three
+counts). Just behind the hand, no reader's later count read the file (0 of 383).
+
+**Evidence.** `page_cache.rs`, `q2_counts_after_point_lookups_read_no_page_from_the_file`: 20,000
+point lookups through one index of a table larger than a 200-page cache, then four counts through
+another index: the counts after the first read no page from the file.
+`a_new_working_set_settles_in_a_full_cache`: a cache of 100 pages
 full of pages read once, then a working set of 40 read round after round: every read after the
 first round a hit; with the insertion after the hand, 360 misses in the 9 rounds after the first,
 every read. Two of Turso's tests asserted the old order (the newest page evicted first) and now
@@ -1832,7 +1897,7 @@ mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`)
 of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
 per record; a row read back other than as committed (the tests above).
 
-## 40. A page read finds its frame and the log's header without the shared locks (prototype, behind a switch)
+## 40. A page read finds its frame and the log's header without the shared locks
 
 G3 step 2 (kiln plan "G3 Point reads", step 2; docs/research/read-path.md fix 1(b)). Every page read
 took the read side of the `RwLock` over the log's shared state, then the frame index's lock
@@ -1840,10 +1905,8 @@ took the read side of the `RwLock` over the log's shared state, then the frame i
 hottest leaves: `find_frame` 26.9%, `wal_header` 23.4%, `RwLock::lock_shared_slow` 13.2%
 (bench/records/2026-10-23-adacachy-read-path.md).
 
-The prototype is `crates/engine/storage/log_index.rs`. Its switch is `LogReadIndex`:
-`AMPHORA_LOG_READ_INDEX` = `locked` (today's path, the default), `filtered`, `published` or
-`optimistic`, or `LogReadIndex::set_process_default`. Each connection holds the log's `ReadIndex`.
-The `ReadIndex` is never replaced, so reaching it takes no lock.
+The code is `crates/engine/storage/log_index.rs`. Each connection holds the log's `ReadIndex`. The
+`ReadIndex` is never replaced, so reaching it takes no lock.
 
 - **The header** is copied, all eight words, under a sequence number (a seqlock) each time its
   guard lets the lock go. A reader reads the copy and checks that the sequence didn't move. Only
@@ -1853,10 +1916,7 @@ The `ReadIndex` is never replaced, so reaching it takes no lock.
   reports a page as held when no frame holds it, except frames cut since the bitmap was built. It
   has no false-positive rate to choose, unlike a Bloom filter. The empty log (`max_frame <
   min_frame`) already skipped the index.
-- **Way (a), `published`**: the whole index is copied and published through an `ArcSwap`. A reader
-  whose snapshot reaches past the copy publishes a new one. Each new copy costs O(pages in the log).
-  While another reader publishes, it reads under the lock. A read-only workload publishes once.
-- **Way (b), `optimistic`**: a table of each page's latest frame, in shards. Each shard has its own
+- **A page the log holds** is answered from a table of each page's latest frame, in shards. Each shard has its own
   version, after LeanStore's optimistic latches (Leis et al., ICDE 2018): read the version, read
   the slot, check the version. There is one shard for each thread that can run at once
   (`available_parallelism`, the reader count where the process runs). There are twice as many slots
@@ -1872,14 +1932,37 @@ The `ReadIndex` is never replaced, so reaching it takes no lock.
 - Not taken: the multi-process backend (`ShmWalCoordination`). Its local index is filled from other
   processes' frames, so its fallback reads under the locks.
 
-Tests: `storage::wal::tests::g3_2_*` (the model, and readers beside a writer) and
-`crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint and of a log
-restart). The measurements are the coordinator's: the 32-client profiles, the suite at 10M rows
-and `bench/prof_parts.py`'s shares, with each way switched on. One way is kept and the others are
-removed, as the numbers favour. Falsified, as read-path.md has it, if with the log empty after the
-settle `point_pk`'s instructions per statement at one client fall by less than 15%, or if
-`table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
-point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
+**The way kept, by measurement.** Four ways were built behind a switch (`AMPHORA_LOG_READ_INDEX`) and
+measured on one binary each time, the ways alternated: the index read under its lock (`locked`, the
+old path); the bitmap in front of that (`filtered`); a read-only copy of the whole index, published
+per generation, which a reader whose snapshot passed it copied again under the lock while the
+others read under the lock (`published`); and the sharded table (`optimistic`). The table is kept.
+The switch and the other three are deleted.
+
+- The suite's point reads (lane Q4, bench/records/2026-11-23-adacachy2-perf-reads-q4.md): at 32
+  and 128 clients `find_frame`'s lock took 3.4-7.2% of the CPU samples under `locked`, 0.0% under the
+  other three, with no loss at 1 client. The three couldn't be told apart: the suite's settle
+  truncates the log, so the bitmap answers nearly every read.
+- K0's mixed phase (lane Q5, bench/records/2026-11-24-adacachy2-perf-reads-q5.md): N writers commit
+  events durably while N readers read sessions' latest pages, so the log holds the pages read and
+  every commit moves the snapshot on. `find_frame`'s share of the CPU samples, two rounds each:
+  1 client `locked` 8.8/9.4%, `filtered` 9.0/9.2%, `published` 7.7/10.9%, `optimistic` 5.8/5.5%;
+  32 clients 14.0/17.9%, 15.4/18.4%, 14.7/15.6%, 0.9/0.9%; 128 clients 16.3/24.2%, 20.7/28.7%,
+  33.6/29.6%, 1.9/1.9%. The lookup's lock alone took 12.5-24.4% under the first three at 32 and
+  128 clients, 0.1-0.2% under the table. `filtered` sends every page the log holds to the lock,
+  and a reader beside writers reads those. `published` copies the index once for each commit a
+  reader sees, under the lock: at 128 clients it cost the most of the four. Reads a second, median
+  of three rounds: 32 clients `locked` 22,437, `filtered` 31,989, `published` 22,344, `optimistic`
+  35,962 (its range above every other way's); 128 clients 12,698, 16,570, 8,312 and 18,403. Every
+  way's pages after the mixed phase matched SQLite's answers on the same rows (12,000 pages, 0
+  differ), with no failed or unanswered write.
+
+Tests: `storage::wal::tests::g3_2_*` (the model against the index read under its lock, and readers
+beside a writer) and `crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint
+and of a log restart). Falsified, as read-path.md has it, if with the log empty after the settle
+`point_pk`'s instructions per statement at one client fall by less than 15%, or if `table_count` at
+32 clients rises less than 3x. The step's own bars: the log's and locks' share of point reads at 32
+clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
 
 ## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch)
 
@@ -2073,6 +2156,129 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
 
+## Decision (lane perf-Q6): the log's record registry is read under a read lock (2026-11-24)
+
+**The decision.** The shared log's registry of packed records (`WalSharedRuntime::records`,
+`packed::Records`) is the engine's `sync::RwLock` (parking_lot's), no longer the spin lock
+(`fast_lock::SpinLock`). Its lookups, which only read (`slots_of`, `decoded`, `covering`), take it
+shared: a read's check that a frame holds a record (`holds_segment_record`), its chain's lookups
+(`RecordRead::drive`) and the refusal of a record's slot as a page frame. What changes it
+(`publish`, `keep`, `drop_after`, `clear`) takes it exclusive. A waiter spins briefly, then parks.
+
+**Why.** K0's mixed phase on main 111f0974 (adacachy2, 32 cores, load 28.6-35.3, AMPHORA_PROFILE at
+997 Hz): every spin sample attributed by its lock and caller. The registry's spin lock was 34.4% of
+all samples at 32 clients and 39.1% at 128 (86% and 93% of all spinning), reached from the readers'
+`holds_segment_record` and `RecordRead::drive`: every page a reader read of a packed or mixed
+generation took that exclusive lock twice for lookups that only read. Running holders were in the
+registry 1.24% and 2.40% of samples, while 6.1 and 4.2 cores spun on it. The bench's threads waited
+runnable 0.72x and 1.40x their CPU time, with 540k and 455k involuntary switches in the phase;
+weighed by the registry's share of their CPU, about a third of its held time was a holder off its
+CPU (an inference from those counters, not a per-acquisition measure), and a spin lock never
+yields, so every waiter spun through it (`bench/records/2026-11-24-adacachy2-perf-reads-q6.md`).
+Decision 29 reads the shared pages the same way.
+
+**Sources.** Ousterhout, "Scheduling Techniques for Concurrent Systems" (ICDCS 1982), and Karlin,
+Li, Manasse and Owicki, "Empirical Studies of Competitive Spinning for a Shared-Memory
+Multiprocessor" (SOSP 1991): a waiter that spins without bound wastes its processor whenever the
+holder is descheduled; spinning about as long as a block costs, then blocking, bounds the waste.
+parking_lot's `RwLock` (its documentation): readers share, a waiter spins a few rounds and then
+parks, and the lock is eventually fair, so a waiting writer is not starved by readers.
+
+**Evidence.** `storage::wal::test::q6_reads_of_the_record_registry_do_not_wait_for_each_other`:
+with one reader holding the registry, another reads a published record's slots and answers.
+
+**Falsified by.** A profile of the same phase after the change in which the registry's waits are not
+down, or reads a second at 32 and 128 clients no higher; any answer of K0's mixed phase differing
+from SQLite's on the same rows.
+
+## Decision (lane perf-Q8): the frame cache is read under a read lock, the record registry locked before it (2026-11-24)
+
+**The decision.** The shared log's frame cache (`WalSharedRuntime::frame_cache`, each page's frames in the
+log) is the engine's `sync::RwLock` (parking_lot's), no longer the spin lock (`fast_lock::SpinLock`). What
+only reads it (`page_frames`, `latest_frame`, `find_frame`'s locked path and the index it builds,
+`scan_latest_frames`) takes it shared; what changes it (`cache_frame`, `cache_record`, `rollback_cache`,
+recovery) takes it exclusive. A writer that needs the record registry too (`cache_record`, `cache_frame`'s
+rewind, `rollback_cache`, recovery) takes the registry first, so it never waits for the registry's readers
+while it holds the frame cache.
+
+**Why.** K0's mixed phase on main 2a4ccaa4 (adacachy2, load 48-51, AMPHORA_PROFILE at 997 Hz) had 11.5% and
+14.0% of samples at 32 and 128 clients waiting at the frame cache's spin lock, all of them page reads'
+`page_frames` (`begin_read_record` < `read_frame` < `read_page_no_cache`), and its holders on a CPU 1.2 and
+0.6%. A lock timed at each call site of a diagnostic build (record below) shows why a holder is
+long: of the 16.4 s of `page_frames` waits in one run, 9.0 s ended behind `cache_record`, whose hold was
+98 us on average and 4.2 ms at most, 43 us of it waiting for the record registry's write lock, and
+6.1 s behind another reader in `page_frames`, off its CPU. A spin lock that every reader takes alone has every
+reader wait for each of them.
+
+**Sources.** Ousterhout (ICDCS 1982) and Karlin, Li, Manasse and Owicki (SOSP 1991), as in the decision
+above (lane perf-Q6), and parking_lot's `RwLock` documentation: readers share; a waiter spins a few rounds, then
+parks; eventually fair.
+
+**Evidence.** `storage::wal::test::q8_reads_of_the_frame_cache_do_not_wait_for_each_other`: while one reader
+holds the frame cache, another reads a page's frames and its latest frame, and a writer's append after the first lets go is in the next answer.
+After the change the same profile has 0.0% of samples at the frame cache's lock (record
+`bench/records/2026-11-24-adacachy2-perf-reads-q8.md`, which also has the A/B on reads a second: no measurable difference
+at 1, 32 and 128 clients).
+
+**Falsified by.** A profile of the same phase after the change in which the frame cache's lock still waits; any
+answer of K0's mixed phase differing from SQLite's on the same rows.
+
+## Decision (lane perf-A18): a wait for room is woken by any charge given back (2026-11-24)
+
+A store's batch is charged its rows' bytes (`Engine::row_bytes`) to the budget's room for queues until its commit
+ends, and `Store::put_wait` waits for room until its deadline. That wait was woken only by its own store's commits, so
+a sender whose store held no charge was refused `Full` at once, though another store, an admitted request or the
+caches could give room back a moment later.
+
+**The decision.** The budget wakes its waiters. `Budget::take_until` looks for room and, finding none, waits until its
+holder's deadline, woken only by charges given back anywhere in the budget (`Budget::give`, which every `Charge`'s drop
+and the caches' give-back call), never by a timer. A refusal other than no room (`Unavailable`: the limit unread) is
+returned at once.
+- No wakeup is lost. A waiter reads the count of gives under the budget's lock in the same hold as its look for room,
+  and a giver that sees it waiting bumps that count under the same lock before it wakes it.
+- A give with no holder waiting takes no lock. Holders waiting are counted, and a giver locks and wakes only when the
+  count is above zero. The waiter counts itself, then puts a sequentially consistent fence before its look; the giver's
+  give-back and its read of the count are sequentially consistent operations. The single total order of those
+  operations and fences (C++ [atomics.order], which Rust's atomics follow) then lets either the look see the bytes
+  given back or the giver see the waiter, never neither. This is the pattern Linux documents for `waitqueue_active`
+  (include/linux/wait.h). On x86-64 the giver's sequentially consistent compare-and-swap and load are the same
+  instructions as before (a locked `cmpxchg` and a plain `mov`): a give with no waiter pays no fence.
+
+**What is left.** A batch past the whole limit waits out its deadline: no give can make room for it. Resident bytes
+that fall without a charge given back wake no one. A give wakes every waiter, and each looks again.
+
+**Tests.** `store::tests::mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back` (store B, holding no
+charge, waits with a deadline an hour off and is woken when store A's commit gives its charge back) and
+`store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back`.
+
+**Falsified if** a waiter sleeps to its deadline after a give made room for it: the tests above then hang to their
+hour-off deadlines.
+
+## Decision (lane perf-A9): a call is charged the answer bound its caller declares (2026-11-23)
+
+A request admitted to a database's writer is charged what it and its answer can hold (MB.1, `Admission::bytes_for`).
+A call's answer is whatever its closure returns, which no API bound holds, so `Database::call` was charged the full
+`REQUEST_MAX` (32 MiB): about 25 calls filled a 1 GiB scope.
+
+**The decision.** `Database::call`, `call_session` and `call_nowait` take the caller's bound on its answer,
+`AnswerMax<R>`: charged at admission, and checked inside the call's transaction before it commits (`AnswerBytes`, its
+bytes inline and on the heap), so an answer past it rolls the call back, refused `TooLarge`. A caller derives the bound:
+`AnswerMax::fixed()` for an answer that holds nothing on the heap (its type's size, checked by the type,
+`FixedAnswer`), a count of rows for a bounded read, or the API's own `RESULT_MAX` for an answer only it bounds (an SQL
+write's frames over the wire, as an SQL batch is charged, lane perf-A5).
+
+**Evidence.** Lane perf-A8's A/B (bench/records/2026-11-23-adacachy2-perf-cross.md, r949): 1k and 10k calls in
+flight, unconstrained and in a `MemoryMax=1G` scope, against the flat `REQUEST_MAX` and the answer's measured bytes
+charged on the writer. The flat charge refused 86-98k calls per 3 s in the scope; the declared bound beat the measured
+one on p50 (13-62%) and calls a second (10-36%) in all four cells and on the tails in three. Ada's decision: the
+declared bound, the only call charge.
+
+**What is left.** The cross-group steps' calls on the owner's own session (`call_internal`) and a replicated owner's
+command queue (replication.md, "A call is charged its worst case") still charge a call `REQUEST_MAX`.
+
+**Falsified if** a caller's derived bound refuses an answer its type or its read allows, or the declared bound loses
+p50, calls a second or the tails to another charge at 1k-10k calls in flight on the same machine.
+
 ## 44. A commit lays its chains' pages out in the buffer pool's frames, and finds its deltas in one buffer it reuses
 
 **Decision.** A mixed log's commit (`WalFile::lay_out`, decision 39) takes no buffer of its own for
@@ -2157,3 +2363,197 @@ buffer of a page; a row read back other than as committed (the tests above).
   could wait on the same event.
 - **Falsified by.** A busy statement that never wakes though the lock was released (a missed release); wake latency
   under `Release` above `Schedule`'s at any rung of the ladder.
+
+## 45. A restart switches the log to its second segment: no read holds a write back (decided 2026-11-23, not yet built)
+
+**What was there.** Decision 4 starts the log again (`Readers::restart_if_asked`, `crates/amphora/src/store.rs`) with
+the readers' gate taken for writing and every slot taken: the writer waits for every read under way, and a read that
+arrives meanwhile waits behind it. A read holds its snapshot, and the gate, until its answer is out; a streamed answer
+until its last frame is written to its client, which can take the request's whole deadline (`serve.rs`,
+`Answering::send`: each frame's write gets the request's time left and is refused past it). Lane P4 found the result:
+one slow streaming client holds every write, and every new read behind the waiting writer, for up to the deadline (5 s
+by default) at each restart. The writer waits because a restart writes the log again from its first frame: a read
+whose snapshot ends inside the log would read a later generation's frames in place of its own.
+
+**Decision (the coordinator, 2026-11-23).** The log is two segments, as in SQLite's wal2: the file it has today
+(`<db>-wal`) and a second (`<db>-wal2`). The writer appends to one of them, the current one. Where decision 4 starts
+the log again, the writer switches instead. It writes the other segment's header (new salts, the checkpoint sequence
+one past the current one's), syncs it before any frame follows (decision 13's rule), and appends there from its first
+frame. It takes no gate and waits for no read. The segment it left is now closing. Every frame in it was committed
+before any frame of the current one.
+
+- **The shape.** Each segment is `Current`, `Closing { reads, copied, shipped }` or `Free`. A switch turns the current
+  segment into `Closing` and a `Free` one into `Current`. A reset turns `Closing { reads: 0, copied: true, shipped:
+  true }` into `Free`. The writer switches only into a `Free` segment. A read begun while the closing segment is not
+  yet copied whole into a flushed file takes that segment whole in its snapshot, plus the current one up to its last
+  commit, and counts itself on both. A read begun once it is copied takes the current segment alone and reads the
+  rest from the file, where every closing frame now is, and counts itself on the current one only. Without that
+  rule, reads that overlap with no gap between them would keep the closing segment's count above zero for ever, and
+  the writer could never switch again (revised 2026-11-23, lane B6). A page is looked up in the current segment,
+  then the closing one if the read counts on it, then the file. A read takes read mark 0 (the file alone) only
+  when it counts on no closing segment (lane B10). Right after a switch the current segment is empty, so its
+  frames are all copied (0 of 0), and the one-log test would send the read to the file alone, which lacks the
+  closing segment's frames not yet copied. Each segment keeps its own frame index: the frame cache and decision 40's
+  lock-free index are per segment, because frame numbers start again in each.
+- **In one process, one word.** The segments, their flags and both read counts are one 64-bit word
+  (`log_segments::SegmentsCell`: 30 bits a count), changed by compare-and-swap, each change one step of the state machine
+  above applied whole; a read past a count's 30 bits is refused and tried again. A spin lock held them before, and
+  every read takes two steps (its begin and its end): at 32 and 128 point-read clients that lock was the hottest spin,
+  7.2-20.6% of the CPU samples (lane Q3, 2026-11-23; bench/records/2026-11-23-adacachy2-perf-reads-q3.md).
+- **Checkpoints.** The checkpointer copies the closing segment first and the current one's frames only after it. The
+  other order is wrong: a frame copied from the current segment would be overwritten by an older one copied after it.
+  It copies the current segment only once the closing one is reset (the coordinator, 2026-11-23, of lane B10's two
+  ways). A read begun before the switch searches the closing segment up to its mark and then the file, never the
+  current segment. When its mark is the closing segment's last frame, the closing segment's copy goes whole while it
+  reads, and a page of the current segment copied then would reach the file, where the read would find a version
+  newer than its snapshot. One log has no such case, because a read mark bounds every copy. Waiting for the reset
+  needs no new state, delays that copy by at most the bound below (2D plus one copy), and keeps the order above.
+  Counting the reads begun before the switch would allow it sooner, at the cost of one more counter.
+  Its passive copy of the closing segment stops at the oldest snapshot inside it, and only reads begun before the
+  switch hold one there. Reads begun after the switch see the whole closing segment and hold nothing back. The copy
+  and the file's flush that decision 4's restart made on the writer move to the checkpointer. A switch costs the
+  writer one header write and its sync, against today's copy of what is left, the file's flush and the header's sync
+  (10-14 ms on fedora, decision 4).
+- **The reset, on an event.** The closing segment is reset (`Free`) once it is copied whole, the file is flushed, a
+  backup has shipped it (decision 31's backup rule moves from the restart to the reset), and no read can look into
+  it. Each read counts itself on the segments its snapshot reaches (The shape). The reset is made by whichever of
+  its events comes last: the give-back of the last read counted on the segment (its count reaching zero), the
+  checkpointer's pass that copies its last frame and flushes the file, or, for a backed-up database, the backup's
+  word that it shipped the segment. Each already happens, so the reset needs no timer and no poll. It writes nothing.
+  The segment's frames stay until the next switch writes a new header over them (decision 13). Decision 31's cut of
+  a segment file past its bound comes when the writer next switches into that segment, never at the restart that
+  closed it or at its reset, because reads may still be reading it then; so the log's peak on disk is two segment
+  files (Ada, 2026-11-24, on lane B18's question). The writer never switches from a segment that holds no frame:
+  its header is written by its first commit, so a switch from it would leave two headers recovery refuses (lane B19).
+- **Bounded.** A read holds a segment for at most its request's deadline D. Reads begun before the switch end by D
+  after it. Reads begun before the closing segment's copy finished end by D after that, and no read begun after
+  it counts on the segment (The shape). So a closing segment is free
+  within 2D plus one copy of it after the switch. If the current segment reaches its bound first, the writer keeps
+  appending to it past the bound and switches at its first turn after the reset. It waits for nothing either way.
+  Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
+  that against today's twice-the-bound.
+
+**A replica's owner (the coordinator, 2026-11-24; lane V20).** The restart a replica's owner makes is this switch and
+waits for no local read (replication.md, "A replica's database log bounded by what it measures", B and D, which had it
+wait until no read was out and held reads for it). It calls the switch alone (`Db::switch_log`), never
+`Db::restart_log`, which copies on its caller's thread: the copy and the file's flush are the owner's flushing thread's
+passes', one asked as each switch is made. An open read keeps the segment it began on, to its end (its caller's deadline
+at most); the closed segment lives until it is copied whole and no read counts on it (the bound above). The log's peak
+disk is the two segments, each within the replica's room (replication.md, C and D).
+
+**On disk (revised 2026-11-23, Ada: "There are no 'older databases' besides any ones you've created for test.
+Amphora is not even released. This is not a concern.").** The two segments replace the one log outright. There is no
+upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
+Each segment's header is the log header the engine writes today (format, page size, checkpoint sequence, salts,
+checksums), so a log whose `-wal2` is absent, or holds no valid header, is one of the two-segment log's own states (one
+segment `Current`, the other `Free`), read by the same recovery.
+
+**What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question).** Three rules.
+- *Amphora opens the WAL-mode files SQLite writes.* Such a file is the one-segment state above, read at no cost.
+- *Plain SQLite refuses an open Amphora database, and one a crash left.* Bytes 18 and 19 of the database header carry
+  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If a database file with a read version
+  greater than 2 is encountered, then that database cannot be read or written", sqlite.org/fileformat2.html, 1.3.3;
+  `btree.c` `lockBtree` returns `SQLITE_NOTADB` for `page1[19]>2`; wal2.md: "Attempting to use any other version of
+  SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal` without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
+  (`crates/engine/database.rs`, 2272-2287), for a 1 and a 2 alike, in the database's first commit, before any other
+  frame. The header in memory then carries 3, so every later frame of page 1 does too. Whenever `-wal` exists and the
+  file is not empty, SQLite opens `-wal` before it reads page 1 (`pager.c` `pagerOpenWalIfPresent`, called from
+  `sqlite3PagerSharedLock`) and takes page 1 from its frame there if it has one, so the mark must be in the log's
+  frames of page 1 as well as in the file. From that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
+- *A cleanly closed Amphora database is a plain SQLite file.* The last connection's close (`Connection::close`,
+  `Pager::checkpoint_shutdown`) folds both segments into the file. It copies the closing segment, then the current
+  one, syncs the file, truncates both segments to nothing and syncs them. Only then does it write 2 into bytes 18 and
+  19 of the file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools
+  then read a WAL-mode file with an empty log. The order is the rule. A 2 that is durable while either segment still
+  holds frames, or while a truncation is not, lets SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the
+  closing segment's older frames over the newer pages in the file. A 2 written through the log is such a frame. A
+  crash before the 2 is written leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash.
+  A crash while it is written leaves 3 or 2, and with 2 every commit is already in the file and both segments are
+  empty. A close that cannot fold
+  (the shutdown checkpoint gives up after three `Busy` answers, as it does today) also leaves 3: that database was not
+  closed cleanly, and SQLite refuses it.
+
+**Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
+empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other
+closing: a switch writes the other's sequence plus one, and the sequence is a u32 that wraps (`wal.rs`
+`restart_wal_header` handles its wrap), so "the higher" is wrong at the wrap. A pair neither of which follows the
+other is no switch's, and is refused as corrupt (`storage::log_segments`, `Segments::recover`, on branch
+`perf/pagepath-d45`). Each segment's frames are recovered as one log's are today (salts and checksums, up to the last valid commit frame), the
+closing one's first. A recovered database has copied nothing of either segment, as one log's recovery does today, so
+the checkpointer copies the closing segment and then the current one. A crash at each step of a switch leaves:
+
+1. Before the other segment's header is synced: that segment holds its old header (two sequences back) or a torn
+   one. Nothing was appended after the switch began, so every commit is in the current segment.
+2. After the header's sync, before any frame: two valid segments, the new one empty. Every commit is in the closing
+   one.
+3. Frames in the new segment: its valid prefix, as one log's recovery finds today.
+4. After a reset: the reset wrote nothing, so recovery finds the closing segment valid and recovers its frames again.
+   They are already in the file, and copying them again writes the same pages before the current segment's newer
+   frames are copied.
+
+**Where it lands in the engine.** Today there is one log in every structure that keys on a frame number. These are
+the places a segment is added (`crates/engine/storage/`):
+- `wal.rs` `restart_wal_header` (8142-8183) becomes the switch. `begin_restart` and `end_restart` (1731-1757) take
+  every read mark exclusively and refuse a restart while any is held: that is the rule the switch drops, and both are
+  deleted with the rest of the one-segment restart (the rewrite of the log from its first frame, `Readers::
+  restart_if_asked`'s gate taken for writing and `Slots::take_all` in `store.rs` 1164-1183). No path starts a log
+  again from its first frame while a read can look into it, so none is kept beside the switch.
+- `WalSharedMetadata` and `WalSharedRuntime` (3703-3787) hold one header, one file, one frame cache, one `nbackfills`
+  and five read marks. Each becomes one per segment.
+- `try_begin_read_tx`'s read marks (1528-1604) and `WalSnapshot` (196-211): a snapshot names its segments.
+- `find_frame` (5343-5422, 1471-1498, 1324-1340), `log_index.rs` `ReadIndex` (387-627, which assumes no reader at a
+  restart, 23-25), and `frame_offset` and `read_frame` (6875-6879, 5426-5498): a frame is a segment's.
+- The pager's shared pages key a version by its generation and frame (`pager.rs` 4787-4790, `Version::Frame`), and
+  take the generation from the connection's position (`connection_wal_pos`), which is the current segment's. Frame n
+  of the closing segment and frame n of the current one would then share a key, and a read could be handed the other
+  segment's page. So `find_frame` answers with the segment its frame is in, and the key takes that segment's checkpoint
+  sequence (checked by lane B8, 2026-11-23). The page cache's forget rule needs no change (decision 18, `read_change`,
+  `wal.rs` 5114-5136): a switch changes the current segment's checkpoint sequence, so a connection whose last read was
+  in the other generation forgets every page, as after a restart today. A packed delta chains only from a version of
+  the same generation (`chains_from`, `wal.rs` 4430-4436, on both of the commit's paths), so none chains across a
+  switch.
+- The checkpoint (6977-7372, its safe frame 1701-1725) and the pager's phases (`pager.rs` 5906-6340): the closing
+  segment is copied first, and is reset only after the file's sync. Today a Restart's restart comes before that
+  sync, with the writer's guard held through it (7306-7317).
+- Recovery (`sqlite3_ondisk.rs` 1576-2188) reads two files and orders them by checkpoint sequence; `database.rs`
+  (1659-1663, 2366-2412) opens the second path beside `-wal`.
+- `crates/amphora/src/db.rs` `restart_log` and `hold_log` (505-566), the store's gate (`store.rs` 1129-1148), and the
+  backup, which reads frames out of `-wal` by offset for each generation (`backup/ship.rs` 754-872): it reads the
+  segment the generation is in. A segment whose header its first commit hasn't written yet
+  holds nothing to ship, and a base begins only once the closing segment is in the file, since a restore replays the
+  log from the base's own generation (backup.md, lane B22).
+
+**Sources.** SQLite's wal2 branch, `doc/wal2.md` (github.com/sqlite/sqlite, branch `wal2`): the files are
+"<database>-wal" and "<database>-wal2"; "Once the first wal file has grown large enough, writers switch to appending
+data to the second wal file"; "At this point the first wal file can be checkpointed (after which it can be
+overwritten)"; "once the second wal file has grown large enough and the first wal file has been checkpointed,
+writers switch back to the first wal file". Checkpoint starvation under overlapping readers, which the writer's wait
+prevents today: sqlite.org/wal.html, "Avoiding Excessively Large WAL Files". Decisions 4, 13, 15 and 31 here.
+
+**Tests (behaviour, none on elapsed time).**
+- `d45_a_write_commits_while_a_read_holds_the_closing_segment`: a read holds its snapshot across a switch (its closure
+  blocked on a channel). A write handed over then is acknowledged durable while the read still holds, and the read
+  then answers its snapshot's rows, without the write's.
+- `d45_the_closing_segment_is_reset_when_its_last_read_leaves`: copied whole and held by one read, the closing segment
+  is not reset. The read gives back, and it is reset with no other event between.
+- `d45_a_crash_at_each_step_of_a_switch_loses_no_commit`: `tests/crash.rs`'s power cut at each I/O of a switch, a
+  reset and a clean close (steps 1-4, and each step of the close). After reopening, every acknowledged batch is
+  present, nothing refused is found, and nothing is torn.
+- `d45_sqlite3_reads_a_cleanly_closed_database_and_refuses_an_open_one`: SQLite itself, not Amphora's reader, opens
+  a copy of an open database's files with commits in both segments (the files a crash leaves) and is refused; after a
+  clean close it opens the file and reads every committed row. The engine's workspace has no SQLite today: the bench
+  workspace's `rusqlite` (bundled) is one source of it.
+- `d45_the_log_stays_bounded_while_reads_overlap`: reads handed one to the next, so one is always under way, each
+  held across at most k of the writer's batches (counted, not timed), through many switches. No segment ever holds
+  more than its bound plus k batches' frames plus one copy, and the writer never finds the other segment not `Free`
+  at a switch it asks for once that segment's last read has left and its copy is done.
+
+**The A/B (main against the two segments, one binary each).** Writers at 32 and 128 clients with one slow reader
+present: a streamed read to a client that reads nothing (P4's test in `serve.rs`), held for its deadline and started
+again each time it ends. Commit p50, p99 and p99.9; read p50, p99 and p99.9; the log's largest size on disk; switches
+or restarts counted. 5 alternated rounds, cpus=16, load and pressure recorded beside each run.
+
+**Falsified by.** A write that waits for a read (the first test failing, or the A/B's commit p99.9 still at the
+deadline); SQLite reading an open or crashed Amphora database, or refusing a cleanly closed one; a closing segment
+never reset while reads come and go (the log growing without bound in the A/B); an
+acknowledged commit lost, or a database refused, after a crash in a switch.

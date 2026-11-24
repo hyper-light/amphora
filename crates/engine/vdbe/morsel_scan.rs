@@ -41,6 +41,8 @@ pub struct TableSource {
     rowid_alias: Option<usize>,
     /// Each column's value in a row written before it was added; empty when every one is NULL.
     defaults: Vec<Value>,
+    /// The columns whose INTEGER reads as a REAL ([`TableSource::read_reals`]); empty by default.
+    reals: Vec<usize>,
     /// Each leaf's greatest rowid in key order; `None` for the last leaf, which has no bound.
     upper: Vec<Option<i64>>,
     /// The greatest rowid before the first leaf `upper` holds; `None` when that is the table's
@@ -132,9 +134,29 @@ impl TableSource {
             columns,
             rowid_alias,
             defaults,
+            reals: Vec::new(),
             upper,
             floor: None,
         })
+    }
+
+    /// Reads an INTEGER in each of `reals`, columns of REAL affinity, as a REAL, as the serial
+    /// loop's `RealAffinity` makes it (lane R10: `MorselAggregateData::reals`).
+    pub fn read_reals(&mut self, reals: &[usize]) -> Result<(), MorselError> {
+        self.reals.clear();
+        self.reals.try_reserve_exact(reals.len())?;
+        self.reals.extend_from_slice(reals);
+        Ok(())
+    }
+
+    fn realify(&self, row: &mut [Value]) {
+        for at in &self.reals {
+            if let Some(slot) = row.get_mut(*at) {
+                if let Value::Numeric(crate::numeric::Numeric::Integer(i)) = *slot {
+                    *slot = Value::from_f64(i as f64);
+                }
+            }
+        }
     }
 
     /// Fills a short row out to the table's columns: a column added after the row was written
@@ -262,6 +284,7 @@ impl TableSource {
                 })?;
                 *slot = Value::from_i64(rowid);
             }
+            self.realify(&mut row);
             if !each(rowid, &row)? {
                 break;
             }
@@ -313,6 +336,7 @@ impl TableSource {
             })?;
             *slot = Value::from_i64(rowid);
         }
+        self.realify(row);
         Ok(true)
     }
 
@@ -376,6 +400,11 @@ impl Pipeline for TableAggregate<'_> {
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         self.table.scan(leaves, |rowid, row| {
+            if self.sums_a_real(row)? {
+                return Err(MorselError::Unsupported {
+                    kind: "a REAL to sum under RealSums::Serial",
+                });
+            }
             self.shape.fold(row, position(rowid)?, partial, budget)
         })
     }
@@ -391,6 +420,31 @@ impl Pipeline for TableAggregate<'_> {
 }
 
 impl TableAggregate<'_> {
+    /// Whether `row` passes the filter with a REAL for a SUM under [`crate::RealSums::Serial`]
+    /// (lane R11): SQLite's compensated sum in row order is the serial loop's to give, so the
+    /// statement goes back to it, as the body's workers send it (`no_real_outputs`). AVG and TOTAL
+    /// decline their REALs themselves outside `RealSums::Exact`; under `RowOrder` a SUM replays
+    /// the serial loop's steps.
+    fn sums_a_real(&self, row: &[Value]) -> Result<bool, MorselError> {
+        use super::morsel::Aggregate;
+        if self.shape.sums != crate::RealSums::Serial {
+            return Ok(false);
+        }
+        let real = self.shape.aggregates.iter().any(|aggregate| {
+            matches!(aggregate, Aggregate::Sum(at)
+                if matches!(row.get(*at), Some(Value::Numeric(crate::numeric::Numeric::Float(_)))))
+        });
+        if !real {
+            return Ok(false);
+        }
+        for term in self.shape.filter {
+            if !term.holds(row)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The answer as the switch and the measured costs pick the degree.
     pub fn run_mode(
         &self,
@@ -431,6 +485,30 @@ pub struct TableBodyAggregate<'a> {
     /// The body's direct reads when the connection's switch takes them (lane qs6-13,
     /// T-QT.6.21): a joined row's outputs copied from it, no code run.
     pub direct: Option<&'a [Option<usize>]>,
+    /// The outputs where a REAL sends the statement to the serial loop ([`no_real_outputs`]).
+    pub no_real: &'a [usize],
+}
+
+/// The outputs of `body` where a REAL sends the statement to the serial loop: its `no_real`,
+/// except under [`crate::RealSums::Exact`] (lane G8) and [`crate::RealSums::RowOrder`] (lane G9)
+/// the inputs of SUM, AVG and TOTAL, whose sums are then the serial loop's at any worker count.
+pub fn no_real_outputs(
+    body: &crate::vdbe::insn::MorselBody,
+    sums: crate::RealSums,
+) -> Result<Vec<usize>, MorselError> {
+    use super::morsel::Aggregate;
+    let mut kept = Vec::new();
+    kept.try_reserve_exact(body.no_real.len())?;
+    for at in &body.no_real {
+        let summed = matches!(sums, crate::RealSums::Exact | crate::RealSums::RowOrder)
+            && body.aggregates.iter().any(|aggregate| {
+                matches!(aggregate, Aggregate::Sum(x) | Aggregate::Avg(x) | Aggregate::Total(x) if x == at)
+            });
+        if !summed {
+            kept.push(*at);
+        }
+    }
+    Ok(kept)
 }
 
 /// A worker's own state for [`TableBodyAggregate`]: its registers, cursors and program counter,
@@ -475,13 +553,20 @@ impl TableBodyAggregate<'_> {
             worker.out.clear();
             for at in direct {
                 worker.out.push(match at {
-                    Some(at) => row
-                        .get(*at)
-                        .ok_or(MorselError::NoColumn {
+                    Some(at) => {
+                        let value = row.get(*at).ok_or(MorselError::NoColumn {
                             column: *at,
                             width: row.len(),
-                        })?
-                        .clone(),
+                        })?;
+                        match value {
+                            Value::Numeric(crate::numeric::Numeric::Integer(i))
+                                if self.body.reals.contains(at) =>
+                            {
+                                Value::from_f64(*i as f64)
+                            }
+                            _ => value.clone(),
+                        }
+                    }
                     None => Value::from_i64(rowid),
                 });
             }
@@ -559,6 +644,20 @@ impl TableBodyAggregate<'_> {
                 "the loop body's register is past the program's",
             ))?;
             *register = Register::Value(value.clone());
+        }
+        // A REAL column's INTEGER loads as a REAL, as the serial loop's `RealAffinity` makes it
+        // (audit 3, prototypes 2).
+        for at in &self.body.reals {
+            let reg = self
+                .body
+                .columns_start
+                .checked_add(*at)
+                .ok_or(MorselError::Overflow {
+                    what: "a column's register",
+                })?;
+            if let Some(register) = state.registers.get_mut(reg) {
+                crate::vdbe::execute::apply_real_affinity(register);
+            }
         }
         *state
             .registers
@@ -660,7 +759,7 @@ impl TableBodyAggregate<'_> {
 
     /// A REAL where `no_real` names sends the statement to the serial loop.
     fn no_real(&self, worker: &BodyWorker) -> Result<(), MorselError> {
-        for at in &self.body.no_real {
+        for at in self.no_real {
             if let Some(Value::Numeric(crate::numeric::Numeric::Float(_))) = worker.out.get(*at) {
                 return Err(MorselError::Unsupported { kind: "REAL" });
             }

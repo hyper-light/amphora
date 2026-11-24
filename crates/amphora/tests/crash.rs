@@ -20,8 +20,8 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use amphora::db::{Db, LogFormat, Sharing};
@@ -122,6 +122,9 @@ struct Disk {
     /// While true, a flush waits (after taking what it makes durable) until it is let go; with the
     /// number of flushes waiting.
     holding: (Mutex<(bool, u64)>, Condvar),
+    /// The next flush fails, and what it was making durable is dropped: Linux marks the pages it
+    /// couldn't write clean, so no later flush writes them (docs/design/store.md, decision 9).
+    failing: AtomicBool,
 }
 
 fn power_out() -> LimboError {
@@ -159,6 +162,7 @@ impl Disk {
                 rng: Mutex::new(Rng(seed | 1)),
                 told: Mutex::new(Vec::new()),
                 holding: (Mutex::new((false, 0)), Condvar::new()),
+                failing: AtomicBool::new(false),
             }
         })
     }
@@ -359,15 +363,27 @@ impl File for SimFile {
             disk.flushing();
         }
         pause(FLUSH_TAKES);
+        let fails = self
+            .disk
+            .upgrade()
+            .is_some_and(|d| d.failing.swap(false, Ordering::SeqCst));
         self.change(|held| {
             let n = usize::try_from(target.saturating_sub(held.flushed))
                 .unwrap()
                 .min(held.since.len());
             for change in held.since.drain(..n) {
-                apply(&mut held.durable, &change);
+                if !fails {
+                    apply(&mut held.durable, &change);
+                }
             }
             held.flushed += n as u64;
         })?;
+        if fails {
+            return Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "the disk failed the flush",
+            )));
+        }
         c.complete(0);
         Ok(c)
     }
@@ -453,6 +469,10 @@ impl Engine for Events {
 
     fn key(row: &Row) -> &str {
         &row.key
+    }
+
+    fn row_bytes(row: &Row) -> usize {
+        std::mem::size_of::<Row>().saturating_add(row.key.capacity())
     }
 
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
@@ -1216,6 +1236,10 @@ impl Engine for Mixed {
         "t"
     }
 
+    fn row_bytes(_: &Option<i64>) -> usize {
+        std::mem::size_of::<Option<i64>>()
+    }
+
     fn apply(&mut self, rows: &[Option<i64>]) -> anyhow::Result<usize> {
         self.db.transaction(|db| {
             for row in rows {
@@ -1797,4 +1821,132 @@ fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new() {
         old > 0 && new > 0,
         "old schema after {old} cuts, new after {new}"
     );
+}
+
+/// What the test tells a held flush of the store to do.
+enum Go {
+    Flush,
+    /// Fail on the disk, say on `failed` whether it did, and return the failure to the store only
+    /// once `tell` says to.
+    Fail {
+        failed: mpsc::Sender<bool>,
+        tell: mpsc::Receiver<()>,
+    },
+}
+
+/// Decision 9 of docs/design/store.md with two flushers (`Config::flushers`; T-T1.1.1, AC-T1.1.1).
+/// Do: P put and flushed; A put, its flush held on one flusher; C put, its flush held on the other;
+/// D put, with no flusher free. A's flush fails on the disk, which drops what it was making durable
+/// (as Linux marks the pages it couldn't write clean), and the store isn't told yet. C's flush, begun
+/// before the failure, succeeds, and its flusher begins D's. The store is asked whether A and C are
+/// durable; then A's failure reaches it; then the power is cut and the database opened again.
+/// Expect: P acknowledged and there; A and C refused (`Refused::Disk`); no batch acknowledged
+/// durable missing after the restart.
+#[test]
+fn a_flush_that_succeeds_beside_a_failed_one_acknowledges_nothing_the_disk_dropped() {
+    let disk = Disk::new(1, HashMap::new());
+    let path = std::path::Path::new(PATH);
+    let db = Db::open_with(path, disk.clone()).unwrap();
+    db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), batch INTEGER)")
+        .unwrap();
+    db.flusher()().unwrap();
+    let real = db.flusher();
+    let calls = AtomicUsize::new(0);
+    let (began_tx, began) = mpsc::channel::<usize>();
+    let began_tx = Mutex::new(began_tx);
+    let (go, go_rx): (Vec<_>, Vec<_>) = (0..4).map(|_| mpsc::channel::<Go>()).unzip();
+    let go_rx: Vec<Mutex<mpsc::Receiver<Go>>> = go_rx.into_iter().map(Mutex::new).collect();
+    let failing = disk.clone();
+    let flush: Flush = Box::new(move || {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let _ = began_tx.lock().unwrap().send(n);
+        let step = go_rx.get(n).map(|rx| rx.lock().unwrap().recv());
+        match step {
+            Some(Ok(Go::Fail { failed, tell })) => {
+                failing.failing.store(true, Ordering::SeqCst);
+                let flushed = real();
+                let _ = failed.send(flushed.is_err());
+                let _ = tell.recv();
+                flushed
+            }
+            _ => real(),
+        }
+    });
+    let config = Config {
+        flushers: 2,
+        ..Config::default()
+    };
+    let store = Store::start_with(Events { db }, config, Some(flush)).unwrap();
+    let soon = || Instant::now() + Duration::from_secs(10);
+    let rows = |key: &str, batch: usize| {
+        vec![Row {
+            key: key.to_owned(),
+            seq: 0,
+            batch,
+        }]
+    };
+    let flush_began = |n: usize| {
+        assert_eq!(
+            began.recv_timeout(Duration::from_secs(10)).unwrap(),
+            n,
+            "flush {n} began"
+        );
+    };
+
+    go[0].send(Go::Flush).unwrap();
+    let p = store.put(rows("p", 0)).unwrap();
+    let told_p = store.durable(&p, soon());
+    flush_began(0);
+    let a = store.put(rows("a", 1)).unwrap();
+    flush_began(1);
+    let c = store.put(rows("c", 2)).unwrap();
+    flush_began(2);
+    store.put(rows("d", 3)).unwrap();
+    store.committed(Some("d"), soon()).unwrap();
+    let (failed_tx, failed) = mpsc::channel();
+    let (tell, tell_rx) = mpsc::channel();
+    go[1]
+        .send(Go::Fail {
+            failed: failed_tx,
+            tell: tell_rx,
+        })
+        .unwrap();
+    assert!(
+        failed.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "the disk failed A's flush"
+    );
+    go[2].send(Go::Flush).unwrap();
+    flush_began(3);
+    let asked = std::thread::spawn({
+        let store = store.clone();
+        move || (store.durable(&a, soon()), store.durable(&c, soon()))
+    });
+    tell.send(()).unwrap();
+    let (told_a, told_c) = asked.join().unwrap();
+    assert_eq!(
+        store.sync(soon()),
+        Err(Refused::Disk),
+        "the failure reached the store"
+    );
+    let image = disk.image();
+    go[3].send(Go::Flush).unwrap();
+    drop(store);
+
+    let db = Db::open_with(path, Disk::new(1, image)).unwrap();
+    let mut found = Vec::new();
+    db.query("SELECT batch FROM events", [], |r| {
+        found.push(r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+        Ok(true)
+    })
+    .unwrap();
+    for (batch, told) in [(0, told_p), (1, told_a), (2, told_c)] {
+        assert!(
+            told != Ok(()) || found.contains(&batch),
+            "batch {batch} was acknowledged durable and isn't on the disk after a restart (there: {found:?})"
+        );
+    }
+    assert_eq!(told_p, Ok(()), "P, flushed before the failure, is durable");
+    assert!(found.contains(&0), "P is on the disk after a restart");
+    assert!(!found.contains(&1), "the failed flush dropped A");
+    assert_eq!((told_a, told_c), (Err(Refused::Disk), Err(Refused::Disk)));
 }

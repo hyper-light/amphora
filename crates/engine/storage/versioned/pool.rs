@@ -225,8 +225,11 @@ impl Fit {
         }
         let each = (self.k * self.nt - self.n * self.t) / det;
         let fixed = (self.t - each * self.n) / self.k;
-        (each.is_finite() && fixed.is_finite() && each > 0.0 && fixed > 0.0)
-            .then_some((fixed, each))
+        if each.is_finite() && fixed.is_finite() && each > 0.0 && fixed > 0.0 {
+            Some((fixed, each))
+        } else {
+            None
+        }
     }
 
     /// The pages a run reads: `ceil(fixed / each)`, the run whose transfer takes as long as the
@@ -241,8 +244,12 @@ impl Fit {
     /// ([`Pool::read_run`]).
     fn target(&self) -> u64 {
         match self.line() {
-            // A float's cast saturates: past `u64::MAX`, `u64::MAX`.
-            Some((fixed, each)) => (fixed / each).ceil() as u64,
+            // Both positive and finite, so the quotient is positive: past `u64::MAX` (or
+            // infinite), `u64::MAX`, saturating.
+            Some((fixed, each)) => {
+                let pages = num_traits::ToPrimitive::to_u64(&(fixed / each).ceil());
+                pages.unwrap_or(u64::MAX)
+            }
             None => self.largest.max(1).saturating_mul(2),
         }
     }
@@ -568,7 +575,7 @@ impl Pool {
         if i >= self.capacity {
             return None;
         }
-        let k = usize::BITS - 1 - i.checked_add(1)?.leading_zeros();
+        let k = i.checked_add(1)?.checked_ilog2()?;
         let start = run_start(k);
         let cell = self.runs.get(usize::try_from(k).ok()?)?;
         if let Some(run) = cell.get() {
@@ -605,12 +612,12 @@ impl Pool {
         let all = u64::try_from(self.frames_made())
             .unwrap_or(u64::MAX)
             .saturating_mul(each);
-        LimboError::MemoryBudget {
+        LimboError::MemoryBudget(Box::new(crate::BudgetFull {
             what,
             asked: each,
             held: all,
             limit: all,
-        }
+        }))
     }
 
     /// `page`, latched shared; read in first if it isn't resident.
@@ -1207,12 +1214,9 @@ mod tests {
         let b = pool.read(pages[1]).unwrap();
         assert!(matches!(
             pool.read(pages[2]),
-            Err(LimboError::MemoryBudget { .. })
+            Err(LimboError::MemoryBudget(_))
         ));
-        assert!(matches!(
-            pool.allocate(),
-            Err(LimboError::MemoryBudget { .. })
-        ));
+        assert!(matches!(pool.allocate(), Err(LimboError::MemoryBudget(_))));
         drop((a, b));
         assert!(pool.read(pages[2]).is_ok());
     }
@@ -1244,10 +1248,7 @@ mod tests {
         let none = Arc::new(Capped::new(frame_bytes() - 1));
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(6, 1).unwrap());
         let pool = Pool::backed_in(Room::Shared(none), disk, 0).unwrap();
-        assert!(matches!(
-            pool.allocate(),
-            Err(LimboError::MemoryBudget { .. })
-        ));
+        assert!(matches!(pool.allocate(), Err(LimboError::MemoryBudget(_))));
     }
 
     /// Do: write 12 pages in a pool of 3 frames, end the epoch, write some again (some evicted,

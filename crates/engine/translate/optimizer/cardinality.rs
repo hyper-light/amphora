@@ -387,7 +387,7 @@ impl<'a> JoinedSetRows<'a> {
             let joins_inner = !barrier
                 && matches!(
                     term.origin,
-                    WhereTermOrigin::Where | WhereTermOrigin::Join(_)
+                    WhereTermOrigin::Where | WhereTermOrigin::Implied | WhereTermOrigin::Join(_)
                 )
                 && !term.origin.is_outer_join()
                 && kind_of(&a) == Some(Kind::Inner)
@@ -558,7 +558,9 @@ impl<'a> JoinedSetRows<'a> {
                     (!not_a_filter(pos)
                         && matches!(
                             term.origin,
-                            WhereTermOrigin::Where | WhereTermOrigin::Join(_)
+                            WhereTermOrigin::Where
+                                | WhereTermOrigin::Implied
+                                | WhereTermOrigin::Join(_)
                         )
                         && !term.origin.is_outer_join()
                         && home.is_none_or(|home| home == table_idx))
@@ -647,7 +649,11 @@ impl<'a> JoinedSetRows<'a> {
                         if filters.terms.contains(&pos) {
                             Some(true)
                         } else {
-                            on.terms.contains(&pos).then_some(false)
+                            if on.terms.contains(&pos) {
+                                Some(false)
+                            } else {
+                                None
+                            }
                         }
                     },
                     schema,

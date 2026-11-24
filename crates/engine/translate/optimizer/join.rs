@@ -108,6 +108,9 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub allow_automatic_index: bool,
     /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
     pub join_methods: crate::JoinMethods,
+    /// Amphora (QT.5, lane T19): the star filters the connection allows
+    /// (`Connection::set_star_filters`), so the search prices those `lip::choose` keeps.
+    pub star_filters: crate::StarFilters,
     /// Amphora: whether a sorted fetch may be planned (`Connection::set_sorted_fetches`).
     pub sorted_fetches: bool,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
@@ -139,6 +142,7 @@ impl<'a> JoinPlanningContext<'a> {
             cost_limit: None,
             allow_automatic_index: true,
             join_methods: crate::JoinMethods::ByCost,
+            star_filters: crate::StarFilters::Off,
             sorted_fetches: false,
             row_goal: None,
             search_budget: super::search_budget::SearchBudget::FIXED,
@@ -614,7 +618,7 @@ impl JoinN {
                     }
                 };
                 *joined = Some(node);
-                if *end != position + 1 || open.len() == 1 {
+                if position.checked_add(1) != Some(*end) || open.len() == 1 {
                     break;
                 }
                 open.pop();
@@ -797,6 +801,29 @@ fn join_lhs_and_rhs<'a>(
     }
     let best_is_refused_whole_read =
         |best: &AccessMethod| whole_read_refused && reads_whole_table(best);
+
+    // Amphora (QT.5, T-QT.5.3; lane T19): the star filter this read would give a fact table the
+    // loops before it read whole, priced as `lip::choose` then keeps it: the read on the fact
+    // rows that pass the filter, plus the filter's build and checks.
+    if let Some(lhs) = lhs.filter(|_| input_cardinality > 0.0) {
+        let pass = set_rows.rows(&joined_mask) / input_cardinality;
+        if let Some((cost, price)) = super::lip::price_read(
+            planning_context.star_filters,
+            joined_tables,
+            where_clause,
+            lhs,
+            access_methods_arena.as_slice(),
+            rhs_table_number,
+            &best_access_method,
+            pass,
+            *rhs_base_rows,
+            params,
+        ) {
+            tracing::debug!(target: "amphora::join_search", rhs_table = rhs_table_reference.table.get_name(), lhs_mask = ?lhs_mask, input_cardinality, pass, read_cost = best_access_method.cost.0, filtered_cost = cost.0, price = ?price, "T19: a read priced with the star filter it gives");
+            best_access_method.cost = cost;
+            best_access_method.star_filter = Some(price);
+        }
+    }
 
     // If we already have a non-empty LHS (at least one table has been joined),
     // consider a hash-join alternative for the current RHS. This is a left-deep
@@ -1051,14 +1078,17 @@ fn join_lhs_and_rhs<'a>(
             // build input is materialized from the join prefix.
             // Amphora: one method only when the connection asks (QT.5);
             // the structural conditions below hold whichever it asks for.
-            // PL.8's test hook pins the plan: loops in the FROM order and one hash join, at the last
-            // table (`bushy_test_hook::PIN`).
+            // PL.8's test hook pins the plan: loops in the FROM order and hash joins at the tables
+            // it names, the last one unless it names others (`bushy_test_hook::PIN`).
             #[cfg(test)]
             let pinned = super::bushy_test_hook::PIN.with(std::cell::Cell::get);
             #[cfg(not(test))]
             let pinned = false;
-            let pinned_hash_here =
-                pinned && joined_tables.len().checked_sub(1) == Some(rhs_table_idx);
+            #[cfg(test)]
+            let pinned_hash_here = pinned
+                && super::bushy_test_hook::hash_join_pinned_at(rhs_table_idx, joined_tables.len());
+            #[cfg(not(test))]
+            let pinned_hash_here = false;
             let preferred_over_seek = if pinned {
                 pinned_hash_here
             } else {
@@ -1300,10 +1330,10 @@ fn join_lhs_and_rhs<'a>(
                                     );
                                 // The materialized input's visits are the merge's as well.
                                 let merge_join_cost = if *materialize_build_input {
-                                    merge_join_cost
-                                        + Cost(
-                                            effective_build_cardinality * params.cpu_cost_per_row,
-                                        )
+                                    Cost(
+                                        merge_join_cost.0
+                                            + effective_build_cardinality * params.cpu_cost_per_row,
+                                    )
                                 } else {
                                     merge_join_cost
                                 };
@@ -1357,6 +1387,7 @@ fn join_lhs_and_rhs<'a>(
                     );
                     let forced = pinned_hash_here
                         || (!pinned && planning_context.join_methods.hash_shaped_only());
+                    tracing::debug!(target: "amphora::join_search", rhs_table = rhs_table_reference.table.get_name(), build_table = build_table.table.get_name(), lhs_mask = ?lhs_mask, input_cardinality, lhs_cost = lhs_cost.0, best_cost = best_access_method.cost.0, best = ?best_access_method.params, best_rows_per_outer_row = best_access_method.estimated_rows_per_outer_row, hash_join_cost = hash_join_method.cost.0, hash_join_allowed, forced, "T18: a read weighed against a hash join");
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost
@@ -1392,6 +1423,7 @@ fn join_lhs_and_rhs<'a>(
             };
 
             let mut index_method = AccessMethod {
+                star_filter: None,
                 cost: fts_cost,
                 estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
                 consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
@@ -1755,6 +1787,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         bound = ?naive_plan.as_ref().map(|plan| plan.cost.0),
         executions = planning_context.search_budget.executions,
         tables = num_tables,
+        names = ?joined_tables.iter().map(|t| t.table.get_name()).collect::<Vec<_>>(),
         "join search budget"
     );
 
@@ -1868,8 +1901,18 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         HashMap::with_capacity_and_hasher(subsets.iter().map(Vec::len).sum(), Default::default());
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
-    // there were no other tables.
+    // there were no other tables. A table that must follow another (a LEFT JOIN's right table and
+    // the tables its ON reads) is the first table of no order, so it is no set of its own: the
+    // bushy pairs below take any set as their outer loops, and a LEFT JOIN's right table alone there
+    // would be read before the tables its ON reads, its NULL rows lost (T-PL.8.13, lane C6).
     for i in 0..num_tables {
+        let must_follow = required_lhs_by_table
+            .as_deref()
+            .and_then(|required| required.get(i))
+            .is_some_and(|required| !required.is_empty());
+        if must_follow {
+            continue;
+        }
         let mut mask = TableMask::default();
         mask.set(i)?;
         let table_ref = &joined_tables[i];
@@ -2068,6 +2111,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             let has_all_tables = mask.count() == num_tables;
             if has_all_tables {
                 for rel in best_for_mask_by_last.into_values() {
+                    tracing::debug!(target: "amphora::join_search", cost = rel.cost.0, plan = ?rel, methods = ?rel.data.iter().map(|&(_, method)| access_methods_arena.get(method).map(|m| &m.params)).collect::<Vec<_>>(), "a whole plan weighed");
                     if cost_upper_bound <= rel.cost {
                         continue;
                     }
@@ -2320,22 +2364,76 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         .get(probe)
                         .copied()
                         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-                    let probe_cost = estimate_hash_join_cost(
-                        build.output_cardinality,
-                        *probe_rows,
-                        rows,
-                        HashJoinType::Inner,
-                        mem_budget,
-                        outer_rows,
-                        // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
-                        &params.for_table(probe_table, analyze_stats),
-                    ) + Cost(build.output_cardinality * params.cpu_cost_per_row)
-                        + Cost(if left_join_probe {
-                            build.output_cardinality * outer_rows * params.cpu_cost_per_row
+                    // Lane T6 (TPC-H q05): the probe's match joins the run to the probe table
+                    // alone. A term reading the run and an outer table runs after the match, at
+                    // the probe's loop, as the emitter places it (no input's prefix holds it,
+                    // `prune_join_order_for_materialized_inputs`), so it cuts the join's rows but
+                    // not the rows the match visits: each outer row's probe rows times the run's
+                    // rows each of them matches.
+                    let after_match = where_terms.iter().any(|term| {
+                        term.table_mask.intersects(build_mask)
+                            && term.table_mask.intersects(&outer_mask)
+                    });
+                    let visited = if !after_match {
+                        rows
+                    } else {
+                        let mut outer_and_probe = outer_mask.try_clone()?;
+                        outer_and_probe.set(probe)?;
+                        let mut run_and_probe = build_mask.try_clone()?;
+                        run_and_probe.set(probe)?;
+                        let mut probe_alone = TableMask::default();
+                        probe_alone.set(probe)?;
+                        let probe_kept = set_rows.rows(&probe_alone);
+                        let matched = if probe_kept > 0.0 {
+                            set_rows.rows(&outer_and_probe) * set_rows.rows(&run_and_probe)
+                                / probe_kept
                         } else {
                             0.0
+                        };
+                        matched.max(rows)
+                    };
+                    // Lane T7 (TPC-H q05, option i): those late terms are the visit's work too.
+                    // Every visited row runs one of them at least, whichever the emitter puts
+                    // first, and the others run on no fewer than the join's rows; each step at a
+                    // WHERE step's measured cost (`Work::WhereStep`).
+                    let late_steps = where_clause
+                        .iter()
+                        .zip(&where_terms)
+                        .filter(|(term, info)| {
+                            !term.consumed
+                                && info.table_mask.intersects(build_mask)
+                                && info.table_mask.intersects(&outer_mask)
+                        })
+                        .map(|(_, info)| info.extra_steps.saturating_add(1) as f64);
+                    let (late_least, late_all) = late_steps
+                        .fold((f64::INFINITY, 0.0), |(least, all): (f64, f64), steps| {
+                            (least.min(steps), all + steps)
                         });
-                    let cost = outer.cost + build.cost + probe_cost;
+                    let late_work = if late_all > 0.0 {
+                        visited * late_least + rows * (late_all - late_least)
+                    } else {
+                        0.0
+                    };
+                    let probe_cost = Cost(
+                        estimate_hash_join_cost(
+                            build.output_cardinality,
+                            *probe_rows,
+                            visited,
+                            HashJoinType::Inner,
+                            mem_budget,
+                            outer_rows,
+                            // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
+                            &params.for_table(probe_table, analyze_stats),
+                        )
+                        .0 + late_work * params.cpu_cost_per_where_step
+                            + build.output_cardinality * params.cpu_cost_per_row
+                            + if left_join_probe {
+                                build.output_cardinality * outer_rows * params.cpu_cost_per_row
+                            } else {
+                                0.0
+                            },
+                    );
+                    let cost = Cost(outer.cost.0 + build.cost.0 + probe_cost.0);
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
                         access_methods_arena.truncate(arena_len);
                         continue;
@@ -2424,6 +2522,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         joined.inner_joins = vec![run];
                         plan = joined;
                     }
+                    tracing::debug!(target: "amphora::join_search", cost = plan.cost.0, plan = ?plan, "a whole bushy plan weighed");
                     let cheaper = plan.data.len() == num_tables
                         && plan.cost < cost_upper_bound
                         && best_plan.as_ref().is_none_or(|best| plan.cost < best.cost);
@@ -2508,7 +2607,11 @@ fn bushy_core(
             }
         })
     });
-    (core >= 3 && free && ordered).then_some(core)
+    if core >= 3 && free && ordered {
+        Some(core)
+    } else {
+        None
+    }
 }
 
 /// PL.8 (lane pl8-19): whether `table` is the right table of a LEFT JOIN the search may move, one
@@ -2533,8 +2636,8 @@ pub(crate) fn is_movable_left_join(table: &JoinedTable) -> bool {
 /// ON's test, where it would turn a NULL row into none. The right table is never the probe (an
 /// inner hash join's probe makes no NULL row), and an ON term holding a subquery keeps it out of
 /// the run (the emitter can't place the subquery's tables there). A LEFT JOIN outside the pair is
-/// one of the outer loops, where the subsets the search builds already hold its ON's tables before
-/// it.
+/// one of the outer loops, where the subsets the search builds hold its ON's tables before it: those
+/// grown past one table, and those of one table only where it must follow none (lane C6).
 ///
 /// Lane pl8-20 (T-PL.8.14), with `left_join_probes` (`Connection::set_bushy_left_join_probes`):
 /// the right table may be the probe, read by an outer hash join (`HashJoinType::LeftOuter`) whose
@@ -3619,6 +3722,7 @@ mod tests {
             equal((a_id, 1, false), (b_id, 1, false)),
         ];
         let scan = |index: Option<Arc<Index>>, iter_dir| AccessMethod {
+            star_filter: None,
             cost: Cost(0.0),
             estimated_rows_per_outer_row: 1.0,
             consumed_where_terms: Default::default(),
@@ -6371,5 +6475,113 @@ mod tests {
             matches!(start, Err(LimboError::PlanningError(_))),
             "{start:?}"
         );
+    }
+
+    /// Lane T19 (TPC-H q03 at SF1 settled on the hash join, 2.2 times the seeks' time): q03's
+    /// shape with statistics, at T17's S weights pinned (the set S's settled prepare read on
+    /// adacachy2). Customer gives orders' scan a star filter that drops 4 in 5 orders rows; the
+    /// join search prices it, customer's seeks on the orders rows that pass, so the planner reads
+    /// orders and seeks customer and lineitem by their keys, the filter the search priced runs,
+    /// and the answer is the nested loops'.
+    #[test]
+    fn t19_q03_star_filter_priced_in_the_search_seeks_customer() {
+        use crate::translate::optimizer::learned_costs::LearnedWeights;
+        let io = crate::sync::Arc::new(crate::io::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect))
+                .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let pad = "x".repeat(100);
+        for sql in [
+            "CREATE TABLE customer(c_custkey INTEGER PRIMARY KEY, c_mktsegment TEXT, c_pad TEXT)"
+                .to_string(),
+            "CREATE TABLE orders(o_orderkey INTEGER PRIMARY KEY, o_custkey INT, o_orderdate INT, \
+             o_shippriority INT, o_pad TEXT)"
+                .to_string(),
+            "CREATE TABLE lineitem(l_orderkey INT, l_linenumber INT, l_extendedprice REAL, \
+             l_discount REAL, l_shipdate INT, l_pad TEXT, PRIMARY KEY (l_orderkey, l_linenumber))"
+                .to_string(),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1500) \
+                 INSERT INTO customer SELECT i, CASE i % 5 WHEN 0 THEN 'BUILDING' \
+                 WHEN 1 THEN 'AUTOMOBILE' WHEN 2 THEN 'MACHINERY' WHEN 3 THEN 'HOUSEHOLD' \
+                 ELSE 'FURNITURE' END, '{pad}' FROM x"
+            ),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 15000) \
+                 INSERT INTO orders SELECT i, i * 7919 % 1500 + 1, i * 31 % 100, 0, '{pad}' FROM x"
+            ),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM x WHERE i < 59999) \
+                 INSERT INTO lineitem SELECT i / 4 + 1, i % 4, i % 1000 + 1.0, i % 10 / 100.0, \
+                 i * 37 % 100, '{pad}' FROM x"
+            ),
+            "ANALYZE".to_string(),
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let sql = "SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue, \
+                   o_orderdate, o_shippriority FROM customer, orders, lineitem \
+                   WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey \
+                   AND l_orderkey = o_orderkey AND o_orderdate < 48 AND l_shipdate > 52 \
+                   GROUP BY l_orderkey, o_orderdate, o_shippriority \
+                   ORDER BY revenue DESC, o_orderdate, l_orderkey LIMIT 10";
+        let lines = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect()
+        };
+        conn.set_join_methods(crate::JoinMethods::NestedLoopsOnly);
+        let nested_loops = lines(sql);
+        conn.set_join_methods(crate::JoinMethods::ByCost);
+        conn.pin_cost_weights(Some(LearnedWeights {
+            row_in_pages: Some(2.771e-4),
+            seek: 1274.07,
+            hash_build: 399.51,
+            hash_probe: 1393.33,
+            sort: 0.7174,
+            bloom_probe: 6.3695,
+            where_step: 11.0479,
+            page_miss: Some(0.2943),
+        }));
+        let plan = lines(&format!("EXPLAIN QUERY PLAN {sql}"));
+        let mut stmt = conn.prepare(sql).unwrap();
+        let chosen: Vec<String> = stmt
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        let metrics = stmt.metrics();
+        conn.pin_cost_weights(None);
+        let at = |step: &str| plan.iter().position(|line| line.contains(step));
+        let (orders, customer, lineitem) = (
+            at("SCAN orders"),
+            at("SEARCH customer USING INTEGER PRIMARY KEY"),
+            at("SEARCH lineitem USING INDEX"),
+        );
+        assert!(
+            orders.is_some() && orders < customer && customer < lineitem,
+            "{plan:?}"
+        );
+        assert!(
+            metrics.star_filter_rejects > 0,
+            "the filter the search priced did not run: {metrics:?} {plan:?}"
+        );
+        assert!(!nested_loops.is_empty());
+        assert_eq!(chosen, nested_loops, "{plan:?}");
     }
 }

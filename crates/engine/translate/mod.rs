@@ -218,17 +218,17 @@ pub fn translate(
     // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
     // storage don't keep a table's rows in.
     // On the versioned storage the hook reads a table's column copy instead (G11 step 5, CS.5),
-    // behind the planner's switch.
-    let copy_path = connection
-        .versioned
-        .as_ref()
-        .is_some_and(|v| v.storage().copies.on());
-    resolver.set_parallel(
-        !connection.mvcc_enabled()
-            && ((connection.parallel_mode() == crate::vdbe::morsel::ParallelMode::On
-                && connection.versioned.is_none())
-                || copy_path),
-    );
+    // for the tables declared COLUMNAR (docs/design/columnar.md, decision 1, item 1).
+    use crate::translate::emitter::MorselHookFor;
+    resolver.set_morsel_hook(if connection.mvcc_enabled() {
+        MorselHookFor::Off
+    } else if connection.versioned.is_some() {
+        MorselHookFor::Copies
+    } else if connection.parallel_mode() == crate::vdbe::morsel::ParallelMode::On {
+        MorselHookFor::Morsels
+    } else {
+        MorselHookFor::Off
+    });
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
     // A page is priced by how often the connection's recent fetches read a file (QT.5).
     // On the versioned storage (G7 step 2) every page is resident in its pool (`pool.rs`: a page
@@ -239,22 +239,18 @@ pub fn translate(
     } else {
         connection.get_pager().page_miss_ratio()
     };
-    resolver.set_learned_weights(connection.db.learned_costs.weights_at(page_miss));
-    // Amphora (PL.13): a test's pinned weights in their place (`Connection::pin_cost_weights`).
-    if let Some((seek, hash_build, hash_probe)) = connection.pinned_cost_weights() {
-        let pinned = match connection.db.learned_costs.weights_at(page_miss) {
-            Some(learned) => crate::translate::optimizer::learned_costs::LearnedWeights {
-                seek,
-                hash_build,
-                hash_probe,
-                ..learned
-            },
-            None => crate::translate::optimizer::adaptive::weights(seek, hash_build, hash_probe),
-        };
-        resolver.set_learned_weights(Some(pinned));
-    }
+    // Amphora (PL.13, lane T9): a test's whole set of pinned weights in their place
+    // (`Connection::pin_cost_weights`).
+    let weights = connection
+        .pinned_cost_weights()
+        .or_else(|| connection.db.learned_costs.weights_at(page_miss));
+    resolver.set_learned_weights(weights);
     // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
-    resolver.set_fitted_weights(connection.db.cost_fit.weights());
+    let fitted = connection.db.cost_fit.weights();
+    // Lane T12 (PL.13): what each plan is made on, so a plan that changes between two prepares
+    // of one statement can be traced to the input that moved.
+    tracing::debug!(target: "amphora::join_search", ?weights, ?page_miss, ?fitted, "the weights this plan is made on");
+    resolver.set_fitted_weights(fitted);
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

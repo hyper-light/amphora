@@ -3936,38 +3936,36 @@ mod versioned {
             }
             builder.execute("COMMIT").unwrap();
             let next = Arc::new(std::sync::atomic::AtomicU64::new(3001));
+            let refusals = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let threads: Vec<_> = (0..writers)
                 .map(|w| {
-                    let (db, next) = (db.clone(), next.clone());
+                    let (db, next, refusals) = (db.clone(), next.clone(), refusals.clone());
                     std::thread::spawn(move || {
                         let conn = db
                             .connect(ConnectOpts::new().with_versioned_storage())
                             .unwrap();
-                        let mut conflicts = 0usize;
                         for t in 0..txns {
                             let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let a = (w * 31 + t * 7) % 1000;
-                            let insert = format!(
-                                "INSERT INTO t (rowid, a, pad) VALUES ({id}, {a}, 'w')"
-                            );
-                            // Concurrent appends can validate the same end-of-table gap.
-                            // A serialization refusal rolled this insert back; repeat the
-                            // same row. Only the other writers' commits can invalidate it.
-                            let mut attempts = 0;
+                            let insert =
+                                format!("INSERT INTO t (rowid, a, pad) VALUES ({id}, {a}, 'w')");
+                            // A writer's probe for its new rowid keeps the span up to the next row,
+                            // or to the end (versioned/cursor.rs), so another writer's commit of a
+                            // higher rowid since its snapshot refuses it: decision 5 has the caller
+                            // run it again. Each refusal follows another's commit, so this ends.
                             loop {
                                 match conn.execute(&insert) {
                                     Ok(()) => break,
                                     Err(crate::LimboError::SerializationFailure) => {
-                                        conflicts += 1;
-                                        attempts += 1;
-                                        assert!(attempts <= writers.saturating_sub(1) * txns,
-                                            "a single row exceeded the other writers' total commits");
+                                        refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if !conn.get_auto_commit() {
+                                            conn.execute("ROLLBACK").unwrap();
+                                        }
                                     }
-                                    Err(error) => panic!("{insert}: {error}"),
+                                    Err(e) => panic!("writer {w}: {e}"),
                                 }
                             }
                         }
-                        conflicts
                     })
                 })
                 .collect();
@@ -3996,21 +3994,18 @@ mod versioned {
                     "{policy:?}"
                 );
             }
-            let conflicts: usize = threads
-                .into_iter()
-                .map(|thread| thread.join().unwrap())
-                .sum();
-            let total = builder
-                .prepare("SELECT count(*) FROM t")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            let mut count = builder.prepare("SELECT count(*) FROM t").unwrap();
             assert_eq!(
-                total,
+                count.run_collect_rows().unwrap(),
                 vec![vec![Value::from_i64(
-                    3000 + i64::try_from(writers * txns).unwrap()
-                )]]
+                    i64::try_from(3000 + writers * txns).unwrap()
+                )]],
+                "{policy:?}: every writer's row committed"
             );
+            let refusals = refusals.load(std::sync::atomic::Ordering::Relaxed);
             latencies.sort_unstable();
             // The latency at `per_mille` of the builds (nearest rank).
             let at = |per_mille: usize| {
@@ -4019,7 +4014,7 @@ mod versioned {
             };
             let (waits, rebuilds) = db.skipping.wait_counts();
             eprintln!(
-                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} serialization_refusals={conflicts} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read}",
+                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read} writer_refusals={refusals}",
                 at(500),
                 at(990),
                 at(999),

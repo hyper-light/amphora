@@ -4,6 +4,9 @@ pub mod decimal;
 pub mod fp;
 pub mod nonnan;
 
+#[cfg(test)]
+mod decimal_tests;
+
 use nonnan::NonNan;
 
 // TODO: Remove when https://github.com/rust-lang/libs-team/issues/230 is available
@@ -446,100 +449,7 @@ impl std::ops::Rem for NullableInteger {
     }
 }
 
-// Maximum u64 that can survive a f64 round trip
-const MAX_EXACT: u64 = u64::MAX << 11;
-
 const VERTICAL_TAB: char = '\u{b}';
-
-/// Encapsulates Dekker's arithmetic for higher precision. This is spiritually the same as using a
-/// f128 for arithmetic, but cross platform and compatible with sqlite.
-#[derive(Debug, Clone, Copy)]
-pub struct DoubleDouble(pub f64, pub f64);
-
-impl DoubleDouble {
-    pub const E100: Self = DoubleDouble(1.0e+100, -1.590_289_110_975_991_8e83);
-    pub const E10: Self = DoubleDouble(1.0e+10, 0.0);
-    pub const E1: Self = DoubleDouble(1.0e+01, 0.0);
-
-    pub const NEG_E100: Self = DoubleDouble(1.0e-100, -1.999_189_980_260_288_3e-117);
-    pub const NEG_E10: Self = DoubleDouble(1.0e-10, -3.643_219_731_549_774e-27);
-    pub const NEG_E1: Self = DoubleDouble(1.0e-01, -5.551_115_123_125_783e-18);
-}
-
-impl From<u64> for DoubleDouble {
-    fn from(value: u64) -> Self {
-        let r = value as f64;
-
-        // If the value is smaller than MAX_EXACT, the error isn't significant
-        let rr = if r <= MAX_EXACT as f64 {
-            let round_tripped = value as f64 as u64;
-            let sign = if value >= round_tripped { 1.0 } else { -1.0 };
-
-            // Error term is the signed distance of the round tripped value and itself
-            sign * value.abs_diff(round_tripped) as f64
-        } else {
-            0.0
-        };
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl From<DoubleDouble> for u64 {
-    fn from(value: DoubleDouble) -> Self {
-        if value.1 < 0.0 {
-            value.0 as u64 - value.1.abs() as u64
-        } else {
-            value.0 as u64 + value.1 as u64
-        }
-    }
-}
-
-impl From<DoubleDouble> for f64 {
-    fn from(DoubleDouble(a, aa): DoubleDouble) -> Self {
-        a + aa
-    }
-}
-
-impl std::ops::Mul for DoubleDouble {
-    type Output = Self;
-
-    /// Double-Double multiplication.  (self.0, self.1) *= (rhs.0, rhs.1)
-    ///
-    /// Reference:
-    ///   T. J. Dekker, "A Floating-Point Technique for Extending the Available Precision".
-    ///   1971-07-26.
-    ///
-    fn mul(self, rhs: Self) -> Self::Output {
-        // TODO: Better variable naming
-
-        let mask = u64::MAX << 26;
-
-        let hx = f64::from_bits(self.0.to_bits() & mask);
-        let tx = self.0 - hx;
-
-        let hy = f64::from_bits(rhs.0.to_bits() & mask);
-        let ty = rhs.0 - hy;
-
-        let p = hx * hy;
-        let q = hx * ty + tx * hy;
-
-        let c = p + q;
-        let cc = p - c + q + tx * ty;
-        let cc = self.0 * rhs.1 + self.1 * rhs.0 + cc;
-
-        let r = c + cc;
-        let rr = (c - r) + cc;
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl std::ops::MulAssign for DoubleDouble {
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
-}
 
 /// The integer a REAL is exactly, within 2^51 either side of zero: SQLite's sqlite3RealSameAsInt,
 /// whose margin under the 53-bit mantissa keeps the integer's text reading back the same REAL.
@@ -613,145 +523,53 @@ impl From<StrToF64> for f64 {
     }
 }
 
+/// The number at the start of `input`, past whitespace: SQLite's sqlite3AtoF grammar (sign,
+/// digits, an optional `.` and digits, an optional exponent), its value the correctly rounded
+/// double (round to nearest, ties to even) of every digit written.
 pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
-    let mut input = input
+    let input = input
         .as_ref()
-        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB)
-        .chars()
-        .peekable();
-
-    let sign = match input.next_if(|ch| matches!(ch, '-' | '+')) {
-        Some('-') => -1.0,
-        _ => 1.0,
+        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB);
+    let bytes = input.as_bytes();
+    let digits_end = |from: usize| {
+        from + bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
     };
 
-    let mut had_digits = false;
+    let mantissa = usize::from(matches!(bytes.first(), Some(b'-' | b'+')));
+    let mut end = digits_end(mantissa);
+    let had_digits = end > mantissa;
     let mut is_fractional = false;
 
-    let mut significant: u64 = 0;
-
-    // Copy as many significant digits as we can
-    while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
-        had_digits = true;
-
-        match significant
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(digit as u64))
-        {
-            Some(new) => significant = new,
-            None => break,
-        }
-
-        input.next();
+    if bytes.get(end) == Some(&b'.') {
+        let fraction_end = digits_end(end + 1);
+        is_fractional = had_digits || fraction_end > end + 1;
+        end = fraction_end;
     }
-
-    let mut exponent = 0;
-
-    // Increment the exponent for every non significant digit we skipped
-    while input.next_if(char::is_ascii_digit).is_some() {
-        exponent += 1
-    }
-
-    if input.next_if(|ch| matches!(ch, '.')).is_some() {
-        if had_digits {
-            is_fractional = true;
-        }
-
-        if input.peek().is_some_and(char::is_ascii_digit) {
-            is_fractional = true;
-        }
-
-        while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
-            if significant < (u64::MAX - 9) / 10 {
-                significant = significant * 10 + digit as u64;
-                exponent -= 1;
-            }
-
-            input.next();
-        }
-    };
-
-    let mut valid_exponent = true;
-
-    if (had_digits || is_fractional) && input.next_if(|ch| matches!(ch, 'e' | 'E')).is_some() {
-        let sign = match input.next_if(|ch| matches!(ch, '-' | '+')) {
-            Some('-') => -1,
-            _ => 1,
-        };
-
-        if input.peek().is_some_and(char::is_ascii_digit) {
-            is_fractional = true;
-            let mut e = 0;
-
-            while let Some(ch) = input.next_if(char::is_ascii_digit) {
-                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(1000);
-            }
-
-            exponent += sign * e;
-        } else {
-            valid_exponent = false;
-        }
-    };
 
     if !(had_digits || is_fractional) {
         return None;
     }
 
-    while exponent.is_positive() && significant < MAX_EXACT / 10 {
-        significant *= 10;
-        exponent -= 1;
-    }
-
-    while exponent.is_negative() && significant.is_multiple_of(10) {
-        significant /= 10;
-        exponent += 1;
-    }
-
-    let mut result = DoubleDouble::from(significant);
-
-    if exponent > 0 {
-        while exponent >= 100 {
-            exponent -= 100;
-            result *= DoubleDouble::E100;
-        }
-        while exponent >= 10 {
-            exponent -= 10;
-            result *= DoubleDouble::E10;
-        }
-        while exponent >= 1 {
-            exponent -= 1;
-            result *= DoubleDouble::E1;
-        }
-    } else {
-        while exponent <= -100 {
-            exponent += 100;
-            result *= DoubleDouble::NEG_E100;
-        }
-        while exponent <= -10 {
-            exponent += 10;
-            result *= DoubleDouble::NEG_E10;
-        }
-        while exponent <= -1 {
-            exponent += 1;
-            result *= DoubleDouble::NEG_E1;
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let exponent = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'-' | b'+')));
+        let exponent_end = digits_end(exponent);
+        if exponent_end > exponent {
+            is_fractional = true;
+            end = exponent_end;
         }
     }
 
-    let result = NonNan::new(f64::from(result) * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+    // Rust's parse rounds correctly over the whole digit string; the text before `end` is ASCII
+    // in its grammar, so it never fails.
+    let result = NonNan::new(input.get(..end)?.parse::<f64>().ok()?)?;
 
-    if !valid_exponent || input.count() > 0 {
-        if is_fractional {
-            return Some(StrToF64::FractionalPrefix(result));
-        } else {
-            return Some(StrToF64::DecimalPrefix(result));
-        }
-    }
-
-    Some(if is_fractional {
-        StrToF64::Fractional(result)
-    } else {
-        StrToF64::Decimal(result)
+    Some(match (is_fractional, end < bytes.len()) {
+        (true, false) => StrToF64::Fractional(result),
+        (false, false) => StrToF64::Decimal(result),
+        (true, true) => StrToF64::FractionalPrefix(result),
+        (false, true) => StrToF64::DecimalPrefix(result),
     })
 }
 
@@ -794,7 +612,7 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
 }
 
 /// A REAL as text, as SQLite converts one: CAST(x AS TEXT), TEXT affinity, printf's %s
-/// (numeric/fp.rs: SQLite 3.54's `%!.17g`, the fewest of up to 17 digits that round-trip).
+/// (numeric/fp.rs: floatingpoint.html 1.3.1, 15 digits when they convert back, else 17).
 pub fn format_float(v: f64) -> String {
     fp::real_to_text(v)
 }
@@ -806,13 +624,14 @@ pub fn format_float_for_quote(v: f64) -> String {
 
 #[test]
 fn test_decode_float() {
-    // SQLite 3.54.0's own text for each (CAST(x AS TEXT))
-    assert_eq!(format_float(9.93e-322), "9.9307194814090555e-322");
+    // floatingpoint.html 1.3.1: 15 digits when they convert back (the subnormals; SQLite 3.54.0
+    // writes 17 there), else 17
+    assert_eq!(format_float(9.93e-322), "9.93071948140906e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
-    assert_eq!(format_float(4.94e-322), "4.9406564584124654e-322");
+    assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
 }
 

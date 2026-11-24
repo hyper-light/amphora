@@ -1,0 +1,4 @@
+-- KBN's one error term loses a unit (lane R2): 1e36, 1e18, 1.0, -1e36, -1e18 on the first lines of
+-- orders 1, 1500000, 3000000, 4500000 and 6000000, a quarter of the table apart. SQLite's func.c
+-- steps give 0.0, the exact sum is 1.0, PostgreSQL's float8pl in row order -1e18.
+SELECT sum(CASE WHEN l_linenumber = 1 THEN CASE l_orderkey WHEN 1 THEN 1e36 WHEN 1500000 THEN 1e18 WHEN 3000000 THEN 1.0 WHEN 4500000 THEN -1e36 WHEN 6000000 THEN -1e18 ELSE 0.0 END ELSE 0.0 END), avg(CASE WHEN l_linenumber = 1 THEN CASE l_orderkey WHEN 1 THEN 1e36 WHEN 1500000 THEN 1e18 WHEN 3000000 THEN 1.0 WHEN 4500000 THEN -1e36 WHEN 6000000 THEN -1e18 ELSE 0.0 END ELSE 0.0 END), total(CASE WHEN l_linenumber = 1 THEN CASE l_orderkey WHEN 1 THEN 1e36 WHEN 1500000 THEN 1e18 WHEN 3000000 THEN 1.0 WHEN 4500000 THEN -1e36 WHEN 6000000 THEN -1e18 ELSE 0.0 END ELSE 0.0 END) FROM lineitem;

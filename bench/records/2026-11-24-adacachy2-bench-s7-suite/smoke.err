@@ -1,0 +1,4 @@
+== amphora load=18.16 22:06:58
+== turso load=22.99 22:07:23
+== sqlite load=79.11 22:08:30
+records: /home/adalundhe/.cache/amphora-perf/bench-s7-run/out/smoke.jsonl

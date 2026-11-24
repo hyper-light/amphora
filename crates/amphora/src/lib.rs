@@ -27,6 +27,8 @@
 //! - [`xgroup`]: transactions across groups (CP-T1.10): two-phase commit and Parallel Commits.
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
 //!   part of it).
+//! - [`postgres`]: PostgreSQL 19's wire protocol as a pure core (docs/design/postgres.md): the
+//!   opening, SCRAM, the session's parameters and the simple query loop.
 //!
 //! - [`serve`]: Amphora on its own (CP-T1.13): one member of a replicated database as a server,
 //!   its health, and the fire drills' load and loss count.
@@ -41,6 +43,7 @@ mod descriptors;
 pub mod groups;
 pub mod memory;
 pub mod meter;
+pub mod postgres;
 pub mod regions;
 pub mod replication;
 pub mod reshard;

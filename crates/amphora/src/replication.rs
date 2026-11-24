@@ -79,6 +79,55 @@ const fn varint_bytes(n: usize) -> usize {
     }
     bytes
 }
+/// The bytes `Machine::image` writes for `db` now, as postcard encodes it, counted without reading
+/// a page (CT.1): the baseline's prefix and declaration where one is declared, the list's length,
+/// and each page's id, length and bytes.
+fn image_len(
+    db: &mut Db,
+    declaration: Option<&api::replication::Bootstrap>,
+) -> Result<u64, Refusal> {
+    let size = db.image_bytes().map_err(unavailable)?;
+    let mut page = 0i64;
+    db.query("PRAGMA page_size", [], |row| {
+        page = row.get::<i64>(0).map_err(unavailable)?;
+        Ok(false)
+    })
+    .map_err(unavailable)?;
+    let page = usize::try_from(page).map_err(unavailable)?;
+    let count = size.checked_div(page).unwrap_or(0);
+    let pages = varint_bytes(count)
+        .saturating_add(ids_bytes(count))
+        .saturating_add(count.saturating_mul(varint_bytes(page)))
+        .saturating_add(size);
+    let baseline = match declaration {
+        Some(declaration) => BASELINE_SNAPSHOT.len().saturating_add(
+            postcard::to_allocvec(declaration)
+                .map_err(unavailable)?
+                .len(),
+        ),
+        None => 0,
+    };
+    Ok(u64::try_from(pages.saturating_add(baseline)).unwrap_or(u64::MAX))
+}
+/// The bytes postcard takes for the page ids `1..=count`: each id as `varint_bytes` counts it, a
+/// band of seven bits more taking a byte more.
+fn ids_bytes(count: usize) -> usize {
+    let (mut bytes, mut low, mut width) = (0usize, 1usize, 1usize);
+    while low <= count {
+        let high = low.saturating_mul(128).saturating_sub(1).min(count);
+        bytes = bytes.saturating_add(
+            high.saturating_sub(low)
+                .saturating_add(1)
+                .saturating_mul(width),
+        );
+        if high == count {
+            break;
+        }
+        low = high.saturating_add(1);
+        width = width.saturating_add(1);
+    }
+    bytes
+}
 /// The most bytes a declared baseline's encoding takes: its source node's varint and its 32-byte
 /// identity, which postcard writes without a length (`api::replication::Bootstrap`).
 const BOOTSTRAP_MOST: usize = U64_MOST.saturating_add(32);
@@ -121,6 +170,7 @@ pub(crate) type FreeSpace = Box<dyn FnMut() -> std::io::Result<u64> + Send>;
 pub struct Prepared {
     base_index: u64,
     base_term: u64,
+    #[serde(with = "page_images")]
     pages: Vec<(u32, Vec<u8>)>,
     #[serde(skip)]
     baseline: Option<api::replication::Bootstrap>,
@@ -130,6 +180,105 @@ pub struct Prepared {
     /// read more than its entry could carry, and for what isn't a caller's write.
     #[serde(skip)]
     reads: Option<readsets::ReadSet>,
+}
+
+/// The state a session is prepared at (`Machine::session_base`).
+pub(crate) struct SessionBase {
+    point: Point,
+    baseline: Option<api::replication::Bootstrap>,
+    timed: bool,
+}
+
+/// Runs `f` in a traced session on `db` at `base`, as the owner's own preparation does, on its
+/// connection or on one of its own (replication.md, "Decision (lane P6)"): the same bounds, and
+/// the transaction always rolled back.
+pub(crate) fn prepare_at<R>(
+    db: &mut Db,
+    base: &SessionBase,
+    f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
+) -> Result<(Prepared, R), Refusal> {
+    // Each page number takes at least one byte of the entry, so a session that read more
+    // pages than the entry has bytes could not carry its read set.
+    let bound = u64::try_from(COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE)).unwrap_or(u64::MAX);
+    let (answer, pages, traced) = db
+        .prepare_traced(COMMAND_BYTES, bound, f)
+        .map_err(|e| crate::database::refused(&e))?;
+    validate_pages(&pages, COMMAND_BYTES)?;
+    let page1 = match pages.iter().find(|(page, _)| *page == 1) {
+        Some((_, image)) => readsets::page1_change(&traced.page_one, image),
+        None => readsets::Page1::Unwritten,
+    };
+    Ok((
+        Prepared {
+            base_index: base.point.index,
+            base_term: base.point.term,
+            pages,
+            baseline: base.baseline.clone(),
+            lock: traced.lock,
+            // Only on a base whose state has the closed time's table: an apply that makes it
+            // (the group's first stamped entry) changes the schema beyond any entry's pages,
+            // so a write prepared before it must not move past it (`readsets`).
+            reads: traced
+                .reads
+                .filter(|_| base.timed && traced.lock.is_none())
+                .map(|reads| readsets::ReadSet { reads, page1 }),
+        },
+        answer,
+    ))
+}
+
+/// A write's pages, each image a byte string: postcard writes one as its varint length then its
+/// bytes, as it writes the same image as a sequence of `u8`, so an entry reads the same either
+/// side of this; serde handles a sequence a byte at a time, which was most of a large write's
+/// encode and every member's apply (lane P10's finding, CP-T1.13).
+mod page_images {
+    use serde::de::{Deserializer, Error, Visitor};
+    use serde::{Deserialize, Serialize, Serializer};
+
+    struct Image<'a>(&'a [u8]);
+    impl Serialize for Image<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    struct Owned(Vec<u8>);
+    impl<'de> Deserialize<'de> for Owned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_byte_buf(Bytes).map(Owned)
+        }
+    }
+
+    struct Bytes;
+    impl Visitor<'_> for Bytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a page image")
+        }
+        fn visit_bytes<E: Error>(self, image: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(image.to_vec())
+        }
+        fn visit_byte_buf<E: Error>(self, image: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(image)
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        pages: &[(u32, Vec<u8>)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(pages.iter().map(|(page, image)| (*page, Image(image))))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(u32, Vec<u8>)>, D::Error> {
+        let pages = Vec::<(u32, Owned)>::deserialize(deserializer)?;
+        Ok(pages
+            .into_iter()
+            .map(|(page, Owned(image))| (page, image))
+            .collect())
+    }
 }
 
 impl Prepared {
@@ -216,10 +365,10 @@ fn on_base(base_index: u64, base_term: u64, point: Point) -> Result<(), Refusal>
     if base_index == point.index && base_term == point.term {
         Ok(())
     } else {
-        Err(api::invalid(
-            "prepared transaction",
-            "the database advanced since preparation",
-        ))
+        Err(Refusal::Serialization {
+            what: "prepared transaction".into(),
+            why: "the database advanced since preparation".into(),
+        })
     }
 }
 
@@ -320,8 +469,9 @@ pub struct Machine {
     // A test's hold on this machine's flushes of its database's log.
     #[cfg(test)]
     flush_gate: std::sync::Arc<FlushGate>,
-    // The bytes of the image this machine opened with, its pages as `image` writes them: what the
-    // compaction rule weighs a log never compacted against (`StateMachine::image_bytes`; CT.1).
+    // The bytes of the image this machine opened with, as `image` writes it: what the compaction
+    // rule weighs the log against until the member makes or installs another
+    // (`StateMachine::image_bytes`; CT.1).
     opened_bytes: u64,
     // The bytes of the last image made, and of every entry applied since the machine opened: what
     // the owner times its images and its log's replay by (`database::compacting`; CT.1).
@@ -359,6 +509,10 @@ impl FlushGate {
     pub(crate) fn open(&self) {
         self.state.lock().unwrap().held = false;
         self.opened.notify_all();
+    }
+    /// Whether flushes are held: one from another thread than the holder's waits for the test.
+    pub(crate) fn is_held(&self) -> bool {
+        self.state.lock().unwrap().held
     }
     /// Fails every flush from now with the error a full disk gives (`ENOSPC`).
     pub(crate) fn fill(&self) {
@@ -590,8 +744,7 @@ impl Machine {
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
-        let opened_bytes = db.image_bytes().map_err(unavailable)?;
-        let opened_bytes = u64::try_from(opened_bytes).unwrap_or(u64::MAX);
+        let opened_bytes = image_len(&mut db, baseline.declaration())?;
         Ok(Self {
             db,
             point,
@@ -856,37 +1009,30 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
+        let base = self.session_base()?;
+        prepare_at(&mut self.db, &base, f)
+    }
+
+    /// A connection of its own for the owner's session worker, its page cache the owner's own: a
+    /// session's dirty pages stay in it until its image is taken, as on the owner's connection
+    /// (replication.md, "Decision (lane P6)").
+    pub(crate) fn session_connection(&self) -> anyhow::Result<Db> {
+        let db = self.db.reader()?;
+        db.keep_pages(self.db.cache_pages()?)?;
+        Ok(db)
+    }
+
+    /// What a session prepared on this machine's applied state is prepared at: its point, its
+    /// baseline, and whether that state has the closed time's table. Read once, as a session is
+    /// handed to a connection of its own, while the owner applies nothing (replication.md,
+    /// "Decision (lane P6)").
+    pub(crate) fn session_base(&self) -> Result<SessionBase, Refusal> {
         self.require_baseline()?;
-        // Each page number takes at least one byte of the entry, so a session that read more
-        // pages than the entry has bytes could not carry its read set.
-        let bound =
-            u64::try_from(COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE)).unwrap_or(u64::MAX);
-        let (answer, pages, traced) = self
-            .db
-            .prepare_traced(COMMAND_BYTES, bound, f)
-            .map_err(|e| crate::database::refused(&e))?;
-        validate_pages(&pages, COMMAND_BYTES)?;
-        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
-            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
-            None => readsets::Page1::Unwritten,
-        };
-        Ok((
-            Prepared {
-                base_index: self.point.index,
-                base_term: self.point.term,
-                pages,
-                baseline: self.baseline.declaration().cloned(),
-                lock: traced.lock,
-                // Only on a base whose state has the closed time's table: an apply that makes it
-                // (the group's first stamped entry) changes the schema beyond any entry's pages,
-                // so a write prepared before it must not move past it (`readsets`).
-                reads: traced
-                    .reads
-                    .filter(|_| self.time.is_some() && traced.lock.is_none())
-                    .map(|reads| readsets::ReadSet { reads, page1 }),
-            },
-            answer,
-        ))
+        Ok(SessionBase {
+            point: self.point,
+            baseline: self.baseline.declaration().cloned(),
+            timed: self.time.is_some(),
+        })
     }
 
     pub(crate) fn prepare_compaction(
@@ -1133,10 +1279,11 @@ impl Machine {
         self.db.keep_log(frames);
     }
 
-    /// Starts the database's log again on the machine's own connection, with no reader reading
-    /// (its owner holds them back): whether it did (`Db::restart_log`).
+    /// Starts the database's log again on the machine's own connection: its writer's switch to the
+    /// free segment, which copies nothing and waits for no read (`Db::switch_log`; store.md,
+    /// decision 45): whether it did.
     pub(crate) fn restart_log(&mut self) -> anyhow::Result<bool> {
-        self.db.restart_log()
+        self.db.switch_log()
     }
 
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
@@ -1359,9 +1506,9 @@ impl StateMachine for Machine {
         self.imaged_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         Ok((self.point, self.configuration.clone()))
     }
-    /// The image this machine opened with, its pages' bytes (the postcard framing a page's id and
-    /// length add is not counted): asked when a member opens on a log never compacted, so the log
-    /// is weighed against the state it opened with (CT.1).
+    /// The bytes of the image this machine opened with, as `image` writes it, counted without
+    /// making it: asked when a member opens, so the log is weighed against the state it opened
+    /// with (CT.1).
     fn image_bytes(&self) -> Option<u64> {
         Some(self.opened_bytes)
     }
@@ -1477,6 +1624,132 @@ mod envelope_tests {
         assert!(Prepared::decode(&bytes).is_ok());
     }
 
+    /// Lane P11 (CP-T1.13): a write's pages encode as they did before they were byte strings, and
+    /// an entry from either side decodes the same on the other. Do: encode pages whose images
+    /// take a length of one, two and three varint bytes, empty and whole, as a `Prepared` and as
+    /// the same fields with plain pages; decode each with the other. Expect: identical bytes, and
+    /// the same pages back.
+    #[test]
+    fn pages_encode_as_before_and_decode_across() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Before {
+            base_index: u64,
+            base_term: u64,
+            pages: Vec<(u32, Vec<u8>)>,
+        }
+        let pages: Vec<(u32, Vec<u8>)> = [0usize, 1, 127, 128, PAGE_BYTES, 16_383, 16_384]
+            .into_iter()
+            .zip(1u32..)
+            .map(|(len, page)| {
+                let image = (0..len).map(|at| u8::try_from(at % 251).unwrap());
+                (page, image.collect())
+            })
+            .collect();
+        let before = Before {
+            base_index: 7,
+            base_term: 3,
+            pages: pages.clone(),
+        };
+        let prepared = Prepared {
+            base_index: 7,
+            base_term: 3,
+            pages,
+            baseline: None,
+            lock: None,
+            reads: None,
+        };
+        let old = postcard::to_allocvec(&before).unwrap();
+        let new = prepared.encode().unwrap();
+        assert_eq!(new, old);
+        assert_eq!(postcard::from_bytes::<Before>(&new).unwrap(), before);
+        let read: Prepared = postcard::from_bytes(&old).unwrap();
+        assert_eq!(read.pages, before.pages);
+        let whole = widest_pages(64 * PAGE_BYTES);
+        let prepared = Prepared {
+            base_index: 1,
+            base_term: 1,
+            pages: whole.clone(),
+            baseline: Some(widest_declaration()),
+            lock: None,
+            reads: None,
+        };
+        assert_eq!(
+            Prepared::decode(&prepared.encode().unwrap()).unwrap().pages,
+            whole
+        );
+    }
+
+    /// T-T1.9.R30: an entry's encoding only grows (reshard.md, "Publication and recovery"). Do: encode
+    /// a write with and without a declared baseline, and each again holding locks. Expect: the
+    /// first two byte for byte what they were, `BASELINE_DELTA` before a declaration and a plain
+    /// page list without one; a lock's as that after its own prefix and the transaction, taken back
+    /// off by the decoder; and an unlocked entry never read as a lock's.
+    #[test]
+    fn t_t1_9_r30_a_lock_only_puts_a_prefix_before_an_entry() {
+        #[derive(Serialize)]
+        struct Plain {
+            base_index: u64,
+            base_term: u64,
+            pages: Vec<(u32, Vec<u8>)>,
+        }
+        let txn = crate::xgroup::TxnId {
+            coordinator: 7,
+            epoch: 300,
+            seq: 2,
+        };
+        let pages = vec![(3u32, vec![9; PAGE_BYTES])];
+        let plain = postcard::to_allocvec(&Plain {
+            base_index: 7,
+            base_term: 3,
+            pages: pages.clone(),
+        })
+        .unwrap();
+        for baseline in [None, Some(widest_declaration())] {
+            let before: Vec<u8> = match &baseline {
+                None => plain.clone(),
+                Some(declared) => {
+                    let declared = postcard::to_allocvec(declared).unwrap();
+                    [BASELINE_DELTA, declared.as_slice(), plain.as_slice()].concat()
+                }
+            };
+            let mut prepared = Prepared {
+                base_index: 7,
+                base_term: 3,
+                pages: pages.clone(),
+                baseline,
+                lock: None,
+                reads: None,
+            };
+            assert_eq!(prepared.encode().unwrap(), before);
+            assert_eq!(Prepared::decode(&before).unwrap().lock, None);
+            assert_eq!(open_lock_delta(&before).unwrap(), (None, before.as_slice()));
+            prepared.lock = Some(txn);
+            let bytes = prepared.encode().unwrap();
+            assert_eq!(
+                bytes,
+                [
+                    LOCK_DELTA,
+                    [7u8, 0xac, 0x02, 2].as_slice(),
+                    before.as_slice()
+                ]
+                .concat()
+            );
+            let read = Prepared::decode(&bytes).unwrap();
+            assert_eq!((read.lock, read.pages), (Some(txn), pages.clone()));
+            assert_eq!(
+                verdict(&bytes, Point { index: 7, term: 3 }).unwrap(),
+                Ok(())
+            );
+            assert!(matches!(
+                verdict(&bytes, Point { index: 8, term: 3 }).unwrap(),
+                Err(Refusal::Serialization { .. })
+            ));
+            // A member from before this prefix finds no valid page list in the entry.
+            let old = postcard::from_bytes::<Prepared>(&bytes);
+            assert!(!old.is_ok_and(|old| validate_pages(&old.pages, COMMAND_BYTES).is_ok()));
+        }
+    }
+
     /// T-EN.1.2: the widest image of a lowered budget, and of the full one's arithmetic — passes when
     /// it encodes within its bound, short only by the list length's unused varint bytes.
     #[test]
@@ -1531,6 +1804,49 @@ mod envelope_tests {
 mod image_room_tests {
     use super::*;
     use crate::memory::tests::{Fed, budget};
+
+    /// CT.1: do reopen a machine over a database of a few pages, then of past 128 (page ids of one
+    /// and two varint bytes). Expect: the bytes it states for the image it opened with,
+    /// counted without reading a page, are the bytes `image` writes, so a member that opens on a
+    /// compacted log weighs it as one that made the image would.
+    #[test]
+    fn ct1_the_image_a_machine_opened_with_is_counted_as_image_writes_it() {
+        let fed = Fed::new(Some(1 << 30), Some(1 << 20));
+        let (_budget, _unset) = budget(&fed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        for rows in [0usize, 200] {
+            {
+                let machine = Machine::open(&path, ConfState::default()).unwrap();
+                machine.db.exec("CREATE TABLE IF NOT EXISTS t(b)").unwrap();
+                machine.db.exec("BEGIN").unwrap();
+                for _ in 0..rows {
+                    machine
+                        .db
+                        .exec("INSERT INTO t VALUES(randomblob(4000))")
+                        .unwrap();
+                }
+                machine.db.exec("COMMIT").unwrap();
+            }
+            let mut machine = Machine::open(&path, ConfState::default()).unwrap();
+            let mut image = Vec::new();
+            machine.image(&mut image).unwrap();
+            assert_eq!(
+                machine.image_bytes(),
+                Some(image.len() as u64),
+                "{rows} rows"
+            );
+        }
+    }
+
+    /// CT.1: postcard's bytes for the ids `1..=count` are each id's varint, summed.
+    #[test]
+    fn ct1_page_ids_are_counted_as_postcard_writes_them() {
+        for count in [0, 1, 127, 128, 16_383, 16_384, 20_000] {
+            let each: usize = (1..=count).map(varint_bytes).sum();
+            assert_eq!(ids_bytes(count), each, "{count} ids");
+        }
+    }
 
     /// SB.1: do open a machine over a database of a 128 KiB row, its process budget fed: room to
     /// spare, then 64 KiB of room, then a limit that can't be read, then room to spare under a

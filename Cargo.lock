@@ -90,6 +90,9 @@ dependencies = [
  "amphora-api",
  "amphora-engine",
  "amphora-engine-parser",
+ "amphora-pg-analysis",
+ "amphora-pg-catalog",
+ "amphora-pg-parser",
  "anyhow",
  "fs4",
  "getrandom 0.4.3",
@@ -98,10 +101,10 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-rt",
  "hyper-timing",
  "hyper-tls",
  "memory-stats",
- "num-traits",
  "postcard",
  "private-fs",
  "rcgen",
@@ -149,6 +152,8 @@ dependencies = [
  "amphora-engine-ext",
  "amphora-engine-macros",
  "amphora-engine-parser",
+ "amphora-pg-analysis",
+ "amphora-pg-catalog",
  "antithesis_sdk",
  "arc-swap",
  "aristo",
@@ -255,6 +260,33 @@ dependencies = [
  "strum",
  "strum_macros",
  "thiserror",
+]
+
+[[package]]
+name = "amphora-pg-analysis"
+version = "0.1.0"
+dependencies = [
+ "amphora-pg-catalog",
+ "amphora-pg-parser",
+]
+
+[[package]]
+name = "amphora-pg-catalog"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "amphora-pg-oracle"
+version = "0.1.0"
+
+[[package]]
+name = "amphora-pg-parser"
+version = "0.1.0"
+dependencies = [
+ "amphora-pg-oracle",
+ "sha2",
 ]
 
 [[package]]

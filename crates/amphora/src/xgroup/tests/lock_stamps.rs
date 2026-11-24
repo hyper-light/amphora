@@ -177,7 +177,7 @@ fn t_t1_9_r30_a_replicated_lock_keeps_its_lifted_time_on_every_member() {
 #[test]
 fn t_t1_9_r30_real_owners_recover_the_answer_from_their_locks_alone() {
     use crate::backup::{Archive, CheckPolicy, ChunkGrowth, FolderBlobs};
-    use crate::database::Database;
+    use crate::database::{AnswerMax, Database};
     use std::cell::Cell;
     use std::time::Instant;
 
@@ -280,7 +280,7 @@ fn t_t1_9_r30_real_owners_recover_the_answer_from_their_locks_alone() {
         let key = keys[g].clone();
         let vote = votes[&GroupId::try_from(g).unwrap()];
         group
-            .call_internal(until(), move |db| {
+            .call_internal(until(), AnswerMax::fixed(), move |db| {
                 let mut tablet = SqlTablet::new(db);
                 assert_eq!(tablet.locks_of(id)?.len(), 1);
                 assert_eq!(tablet.value(&key)?, None);
@@ -299,7 +299,7 @@ fn t_t1_9_r30_real_owners_recover_the_answer_from_their_locks_alone() {
     assert_eq!(second.counts().recovered_committed, 1);
     for (group, key) in groups.iter().zip(keys) {
         group
-            .call_internal(until(), move |db| {
+            .call_internal(until(), AnswerMax::fixed(), move |db| {
                 let mut tablet = SqlTablet::new(db);
                 assert!(tablet.locks_of(id)?.is_empty());
                 assert_eq!(tablet.value(&key)?, Some(b"v".to_vec()));

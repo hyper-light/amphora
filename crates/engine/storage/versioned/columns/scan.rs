@@ -37,7 +37,7 @@ use crate::storage::versioned::version::Ts;
 use crate::sync::{Arc, Mutex};
 use crate::types::{ImmutableRecordRef, ValueRef};
 use crate::vdbe::morsel::{
-    self, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
+    self, ExactSum, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
 };
 use crate::Result;
 use std::cmp::Ordering;
@@ -645,98 +645,17 @@ pub enum Agg {
     Sum(usize),
     Min(usize),
     Max(usize),
+    /// AVG(col) over its numbers (lane R11): their sum, as SUM's, over how many there are, a
+    /// real; NULL when it has none. Text and blobs are not summed.
+    Avg(usize),
 }
 
 impl Agg {
     fn col(self) -> Option<usize> {
         match self {
             Agg::Count => None,
-            Agg::CountOf(c) | Agg::Sum(c) | Agg::Min(c) | Agg::Max(c) => Some(c),
+            Agg::CountOf(c) | Agg::Sum(c) | Agg::Min(c) | Agg::Max(c) | Agg::Avg(c) => Some(c),
         }
-    }
-}
-
-/// A real sum kept exactly, as non-overlapping parts (Shewchuk 1997, "Adaptive Precision
-/// Floating-Point Arithmetic"): the same however its values are split and merged. Its parts are
-/// bounded by binary64's exponent range over its precision, a format value.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct ExactSum {
-    parts: Vec<f64>,
-    /// The plain sum of what isn't finite, or of parts that overflowed: what it then is.
-    special: Option<f64>,
-}
-
-impl ExactSum {
-    fn add(&mut self, mut x: f64) {
-        if !x.is_finite() {
-            self.special = Some(self.special.unwrap_or(0.0) + x);
-            return;
-        }
-        let mut kept = Vec::with_capacity(self.parts.len().saturating_add(1));
-        for mut y in self.parts.drain(..) {
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
-            }
-            let hi = x + y;
-            if !hi.is_finite() {
-                self.special = Some(self.special.unwrap_or(0.0) + hi);
-                x = 0.0;
-                continue;
-            }
-            let lo = y - (hi - x);
-            if lo != 0.0 {
-                kept.push(lo);
-            }
-            x = hi;
-        }
-        kept.push(x);
-        self.parts = kept;
-    }
-
-    fn merge(&mut self, other: &ExactSum) {
-        for p in &other.parts {
-            self.add(*p);
-        }
-        if let Some(s) = other.special {
-            self.special = Some(self.special.unwrap_or(0.0) + s);
-        }
-    }
-
-    /// The sum, rounded once (Python's `math.fsum`'s last step).
-    fn value(&self) -> f64 {
-        if let Some(s) = self.special {
-            return s;
-        }
-        let p = &self.parts;
-        let mut n = p.len();
-        let mut hi = 0.0f64;
-        let mut lo = 0.0f64;
-        if n > 0 {
-            n = n.saturating_sub(1);
-            hi = p.get(n).copied().unwrap_or(0.0);
-            while n > 0 {
-                let x = hi;
-                n = n.saturating_sub(1);
-                let y = p.get(n).copied().unwrap_or(0.0);
-                hi = x + y;
-                let yr = hi - x;
-                lo = y - yr;
-                if lo != 0.0 {
-                    break;
-                }
-            }
-            if n > 0 {
-                let next = p.get(n.saturating_sub(1)).copied().unwrap_or(0.0);
-                if (lo < 0.0 && next < 0.0) || (lo > 0.0 && next > 0.0) {
-                    let y = lo * 2.0;
-                    let x = hi + y;
-                    if y == x - hi {
-                        hi = x;
-                    }
-                }
-            }
-        }
-        hi
     }
 }
 
@@ -754,10 +673,23 @@ enum Acc {
     /// partials merge in.
     Min(Option<(Cell, u64)>),
     Max(Option<(Cell, u64)>),
+    /// AVG: the numbers' sum as [`Acc::Sum`] keeps it, and the sum of the integers' magnitudes,
+    /// the bound of every partial sum of them in any order (lane R11).
+    Avg {
+        sum: Box<Acc>,
+        magnitude: u128,
+    },
 }
 
 fn overflow() -> LimboError {
     LimboError::IntegerOverflow
+}
+
+fn exact(e: MorselError) -> LimboError {
+    match e {
+        MorselError::Alloc => LimboError::OutOfMemory,
+        e => LimboError::InternalError(format!("column scan's exact sum: {e}")),
+    }
 }
 
 impl Acc {
@@ -772,7 +704,18 @@ impl Acc {
             },
             Agg::Min(_) => Acc::Min(None),
             Agg::Max(_) => Acc::Max(None),
+            Agg::Avg(c) => Acc::Avg {
+                sum: Box::new(Acc::new(Agg::Sum(c))),
+                magnitude: 0,
+            },
         }
+    }
+
+    /// Whether an AVG's integers reach a double's exact integers (2^53, IEEE 754 binary64's
+    /// 53-bit significand): past it the serial loop's compensated double sum rounds its own way,
+    /// so it answers (as the morsels' AVG, lane qs6-17).
+    fn past_exact(&self) -> bool {
+        matches!(self, Acc::Avg { magnitude, .. } if *magnitude >= crate::vdbe::morsel::DOUBLE_EXACT)
     }
 
     /// Folds one value, of the row at position `pos` (for COUNT(*), any non-null cell).
@@ -793,7 +736,7 @@ impl Acc {
                     *numbers = numbers.checked_add(1).ok_or_else(overflow)?;
                 }
                 Cell::Real(x) => {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     *any_real = true;
                     *numbers = numbers.checked_add(1).ok_or_else(overflow)?;
                 }
@@ -812,6 +755,14 @@ impl Acc {
                 {
                     *m = Some((c.clone(), pos));
                 }
+            }
+            Acc::Avg { sum, magnitude } => {
+                if let Cell::Int(x) = c {
+                    *magnitude = magnitude
+                        .checked_add(u128::from(x.unsigned_abs()))
+                        .ok_or_else(overflow)?;
+                }
+                sum.fold(c, pos)?;
             }
         }
         Ok(())
@@ -837,7 +788,7 @@ impl Acc {
                 },
             ) => {
                 *ints = ints.checked_add(*i2).ok_or_else(overflow)?;
-                reals.merge(r2);
+                reals.merge(r2).map_err(exact)?;
                 *any_real |= *a2;
                 *numbers = numbers.checked_add(*n2).ok_or_else(overflow)?;
             }
@@ -850,6 +801,16 @@ impl Acc {
                 if let Some((c, pos)) = later {
                     me.fold(c, *pos)?;
                 }
+            }
+            (
+                Acc::Avg { sum, magnitude },
+                Acc::Avg {
+                    sum: s2,
+                    magnitude: m2,
+                },
+            ) => {
+                sum.merge(s2)?;
+                *magnitude = magnitude.checked_add(*m2).ok_or_else(overflow)?;
             }
             _ => {
                 return Err(LimboError::InternalError(
@@ -880,7 +841,7 @@ impl Acc {
                         let part = magnitude
                             .checked_shr(k.saturating_mul(32))
                             .map_or(0, |v| u32::try_from(v & 0xffff_ffff).unwrap_or(0));
-                        all.add(f64::from(part) * scale);
+                        all.add(f64::from(part) * scale).map_err(exact)?;
                         // 2^32: a format value, exact as a double.
                         scale *= 4_294_967_296.0;
                     }
@@ -890,6 +851,17 @@ impl Acc {
                 }
             }
             Acc::Min(m) | Acc::Max(m) => m.as_ref().map_or(Cell::Null, |(c, _)| c.clone()),
+            // SQLite's avgFinalize: the sum as a double over the count as one (func.c); below
+            // 2^53 in magnitude the integers' sum is exact as SQLite's 64-bit one is.
+            Acc::Avg { sum, .. } => match (sum.finish()?, &**sum) {
+                (Cell::Int(total), Acc::Sum { numbers, .. }) => {
+                    Cell::Real(total as f64 / *numbers as f64)
+                }
+                (Cell::Real(total), Acc::Sum { numbers, .. }) => {
+                    Cell::Real(total / *numbers as f64)
+                }
+                _ => Cell::Null,
+            },
         })
     }
 }
@@ -1175,6 +1147,14 @@ impl Plan<'_> {
         budget: &MemoryBudget,
     ) -> std::result::Result<(Vec<Vec<Cell>>, Counts, RunStats), MorselError> {
         let (p, stats) = morsel::execute(self, mode, costs, budget)?;
+        if p.groups
+            .values()
+            .any(|(_, accs)| accs.iter().any(Acc::past_exact))
+        {
+            return Err(MorselError::Unsupported {
+                kind: "an average past a double's exact integers",
+            });
+        }
         let counts = p.counts;
         let rows = self.finish(p).map_err(morsel_error)?;
         Ok((rows, counts, stats))
@@ -1443,7 +1423,7 @@ fn fold_slots(
                     Some(x),
                 ) = (slot(accs, s, j), xs.get(i))
                 {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     *any_real = true;
                     count(numbers)?;
                 }
@@ -1542,7 +1522,7 @@ fn fold_vector(
             let mut k = 0u64;
             for (i, (x, s)) in xs.iter().zip(sel).enumerate() {
                 if *s && valid(i) {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     k = k.saturating_add(1);
                 }
             }
@@ -2452,9 +2432,39 @@ mod tests {
         assert_eq!(int_real(0, -0.0), Ordering::Equal);
         let mut s = ExactSum::default();
         for v in [1e100, 1.0, -1e100, 0.25] {
-            s.add(v);
+            s.add(v).unwrap();
         }
         assert_eq!(s.value(), 1.25);
+    }
+
+    /// Lane R5 (one `ExactSum`): the copy's SUM is `morsel::ExactSum`. Do: fold R1's bigpairs, a
+    /// sum that overflows and comes back, and an infinity beside finite values that overflow the
+    /// other way, cut in two at every place and merged. Expect +inf, 1.5 and +inf, never NaN.
+    #[test]
+    fn r5_the_copys_sum_stays_exact_past_the_range() {
+        let cases: [(&[f64], f64); 3] = [
+            (&[1e308, 1e308, -1e308, -1e308, 1e308, 1e308], f64::INFINITY),
+            (&[1e308, 1e308, -1e308, -1e308, 1.5], 1.5),
+            (&[f64::INFINITY, -1e308, -1e308], f64::INFINITY),
+        ];
+        for (terms, want) in cases {
+            for cut in 0..=terms.len() {
+                let mut parts = [Acc::new(Agg::Sum(0)), Acc::new(Agg::Sum(0))];
+                for (pos, x) in terms.iter().enumerate() {
+                    let part = usize::from(pos >= cut);
+                    parts[part]
+                        .fold(&Cell::Real(*x), u64::try_from(pos).unwrap())
+                        .unwrap();
+                }
+                let [mut a, b] = parts;
+                a.merge(&b).unwrap();
+                assert_eq!(
+                    a.finish().unwrap(),
+                    Cell::Real(want),
+                    "{terms:?} cut at {cut}"
+                );
+            }
+        }
     }
 
     /// Do: group rows whose keys mix integers with equal reals, nulls and text, under every

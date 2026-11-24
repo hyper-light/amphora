@@ -33,7 +33,17 @@ pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent
 /// [`EVENT_UPSERT`] for `rows` events in one statement (row `r`'s columns are `?13r+1` to `?13r+13`):
 /// a store applying a commit's rows runs one statement for many, its cursors opened once.
 pub fn event_upsert_rows(rows: usize) -> String {
-    let values: Vec<String> = (0..rows).map(|r| format!("({})", (1..=13).map(|c| format!("?{}", r * 13 + c)).collect::<Vec<_>>().join(", "))).collect();
+    let values: Vec<String> = (0..rows)
+        .map(|r| {
+            format!(
+                "({})",
+                (1..=13)
+                    .map(|c| format!("?{}", r * 13 + c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect();
     format!(
         "INSERT INTO events (session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev) VALUES {}
     ON CONFLICT (session, id) DO UPDATE SET
@@ -51,4 +61,5 @@ pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, le
 pub const EVENT_COLUMNS: usize = 12;
 
 /// Events whose text holds a word, newest first.
-pub const SEARCH: &str = "SELECT session, id FROM events WHERE text LIKE ?1 ORDER BY at DESC LIMIT ?2";
+pub const SEARCH: &str =
+    "SELECT session, id FROM events WHERE text LIKE ?1 ORDER BY at DESC LIMIT ?2";

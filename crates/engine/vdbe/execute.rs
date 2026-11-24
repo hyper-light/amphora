@@ -1124,7 +1124,11 @@ macro_rules! comparison_opcode {
                 *collation,
                 $op,
             )?;
-            state.pc = if jumps { target_pc } else { state.pc + 1 };
+            state.pc = if jumps {
+                target_pc
+            } else {
+                state.pc.checked_add(1).or_overflow()?
+            };
             Ok(InsnFunctionStepResult::Step)
         }
     };
@@ -1226,8 +1230,8 @@ fn comparison_slow(
 
     // If all else failed, do an affinity-aware comparison
     let (new_lhs, new_rhs) = (
-        affinity.convert_for_compare(lhs_value),
-        affinity.convert_for_compare(rhs_value),
+        affinity.convert_for_compare(lhs_value, program.connection.fp_digits()),
+        affinity.convert_for_compare(rhs_value, program.connection.fp_digits()),
     );
 
     let lhs_for_compare = new_lhs
@@ -1918,7 +1922,7 @@ pub fn op_rewind(
             .take(*cursor_id)
             .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
         {
-            let on_row = state.pc + 1;
+            let on_row = state.pc.checked_add(1).or_overflow()?;
             return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
         }
     }
@@ -1947,7 +1951,7 @@ pub fn op_rewind(
     } else {
         if !program.skip_hints.is_empty() {
             if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
-                let on_row = state.pc + 1;
+                let on_row = state.pc.checked_add(1).or_overflow()?;
                 return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
             }
         }
@@ -2154,15 +2158,13 @@ fn record_fused_rows(state: &mut ProgramState, rows: usize, fullscan: bool, is_i
         let skipped = skipped as u64;
         state.record_rows_read(skipped);
         state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(skipped as i64);
-        state.metrics.fullscan_steps = state
-            .metrics
-            .fullscan_steps
-            .wrapping_add(fullscan as u64 * skipped);
-        state.metrics.index_steps = state
-            .metrics
-            .index_steps
-            .wrapping_add(is_index as u64 * skipped);
+        state.metrics.search_count = state.metrics.search_count.wrapping_add_unsigned(skipped);
+        if fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(skipped);
+        }
+        if is_index {
+            state.metrics.index_steps = state.metrics.index_steps.wrapping_add(skipped);
+        }
     }
 }
 
@@ -2901,7 +2903,7 @@ pub fn op_column_has_field(
 }
 
 pub fn op_type_check(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -2942,7 +2944,8 @@ pub fn op_type_check(
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity());
+                let _applied =
+                    apply_affinity_char(reg, col.affinity(), program.connection.fp_digits());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
                     bail_constraint_error!(
@@ -2994,7 +2997,7 @@ pub fn op_is_type(
 /// against the declared element type using STRICT type-checking logic, then
 /// serialize to a native record-format BLOB for storage.
 pub fn op_array_encode(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3073,7 +3076,11 @@ pub fn op_array_encode(
 
         // Apply affinity coercion — same as STRICT's TypeCheck
         let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity);
+        apply_affinity_char(
+            &mut reg_tmp,
+            *element_affinity,
+            program.connection.fp_digits(),
+        );
         let coerced = reg_tmp.get_value().clone();
 
         // Check value type matches the declared element type — same as STRICT's TypeCheck
@@ -3636,7 +3643,7 @@ pub fn op_array_slice(
 }
 
 pub fn op_make_record(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3667,7 +3674,11 @@ pub fn op_make_record(
         }
         let registers = &mut state.registers[start_reg..start_reg + count];
         for (register, &affinity_code) in registers.iter_mut().zip(affinity_str.as_bytes()) {
-            apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+            apply_affinity_char(
+                register,
+                Affinity::from_char_code(affinity_code),
+                program.connection.fp_digits(),
+            );
         }
     }
 
@@ -3919,7 +3930,7 @@ pub fn op_next(
                 }
             }
             let next_pc = state.pc;
-            let on_end = next_pc + 1;
+            let on_end = next_pc.checked_add(1).or_overflow()?;
             let stepped = skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int())?;
             if state.pc == pc_if_next.as_offset_int() {
                 let fused = program
@@ -4614,6 +4625,8 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
+    seek_trace_write(program, state);
+    star_trace_write(program, state);
     halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
@@ -4665,28 +4678,6 @@ impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
             TransactionYieldPoint::BeforeMvccBegin => 1,
         }
     }
-}
-
-/// Save the writer-lock generation before attempting the upgrade. Releasing the
-/// contender's own read mark afterwards cannot wake a wait on the writer lock.
-fn begin_statement_write(
-    state: &mut ProgramState,
-    pager: &Pager,
-    actions: WalAutoActions,
-) -> IOResultOr<()> {
-    let release = pager
-        .wal
-        .as_ref()
-        .and_then(|wal| wal.writer_release())
-        .map(|event| {
-            let seen = event.generation();
-            (event, seen)
-        });
-    let result = pager.begin_write_tx(actions);
-    if matches!(&result, Err(err) if matches!(**err, LimboError::Busy)) {
-        state.busy_writer = Some(crate::busy::WriteLockWait(release));
-    }
-    result
 }
 
 pub fn op_transaction(
@@ -5390,8 +5381,7 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res =
-                            begin_statement_write(state, &pager, conn.wal_auto_actions());
+                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
                         if matches!(
                             &begin_w_tx_res,
                             Err(err) if matches!(**err, LimboError::Busy | LimboError::BusySnapshot)
@@ -5453,7 +5443,7 @@ pub fn op_transaction_inner(
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
                 let conn = program.connection.clone();
-                let res = begin_statement_write(state, &pager, conn.wal_auto_actions())?;
+                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(state.suspend_on_io(io));
                 }
@@ -6708,7 +6698,11 @@ pub fn op_idx_row_id(
 fn seek_rowid_key(key: &Value) -> Option<i64> {
     let mut numeric = Register::Value(key.clone());
     if matches!(key, Value::Text(_)) {
-        apply_affinity_char(&mut numeric, Affinity::Numeric);
+        apply_affinity_char(
+            &mut numeric,
+            Affinity::Numeric,
+            crate::numeric::fp::FpDigits::DEFAULT,
+        );
     }
     match numeric.get_value() {
         Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
@@ -6730,6 +6724,18 @@ fn seek_rowid_key(key: &Value) -> Option<i64> {
 }
 
 pub fn op_seek_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    let traced = seek_trace_start(insn);
+    let result = seek_rowid_run(program, state, insn, pager);
+    seek_trace_end(state, traced, &result);
+    result
+}
+
+fn seek_rowid_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -6918,11 +6924,115 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    timed_run(
+    let traced = seek_trace_start(insn);
+    let result = timed_run(
         program,
         crate::translate::optimizer::learned_costs::Work::Seek,
         || seek_run(program, state, insn, pager),
-    )
+    );
+    seek_trace_end(state, traced, &result);
+    result
+}
+
+/// Lane T18 (PL.13): a seek's cursor and its start when `amphora::seek_time` is on at DEBUG. Every
+/// seek is timed and none is learned from: the profile of a plan's seeks by how their keys arrive,
+/// written at the statement's halt (`seek_trace_write`).
+fn seek_trace_start(insn: &Insn) -> Option<(usize, std::time::Instant)> {
+    if !tracing::enabled!(target: "amphora::seek_time", tracing::Level::DEBUG) {
+        return None;
+    }
+    let cursor_id = match insn {
+        Insn::SeekGE { cursor_id, .. }
+        | Insn::SeekLE { cursor_id, .. }
+        | Insn::SeekGT { cursor_id, .. }
+        | Insn::SeekLT { cursor_id, .. }
+        | Insn::SeekRowid { cursor_id, .. } => *cursor_id,
+        _ => return None,
+    };
+    Some((cursor_id, std::time::Instant::now()))
+}
+
+/// Lane T18 (PL.13): adds a seek's time to its cursor's (`seek_trace_start`); a seek that waits
+/// on IO counts once, when it ends, and its runs before the wait add their time.
+fn seek_trace_end(
+    state: &mut ProgramState,
+    traced: Option<(usize, std::time::Instant)>,
+    result: &InsnResult,
+) {
+    let Some((cursor_id, started)) = traced else {
+        return;
+    };
+    let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if state.seek_times.len() <= cursor_id {
+        state.seek_times.resize(cursor_id.saturating_add(1), (0, 0));
+    }
+    if let Some((seeks, total)) = state.seek_times.get_mut(cursor_id) {
+        if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+            *seeks = seeks.saturating_add(1);
+        }
+        *total = total.saturating_add(nanos);
+    }
+}
+
+/// Lane T18 (PL.13): each cursor's seeks this run (`seek_trace_end`), with the row visit's learned
+/// time to weigh them against.
+fn seek_trace_write(program: &Program, state: &mut ProgramState) {
+    if state.seek_times.is_empty() {
+        return;
+    }
+    let row_nanos = program
+        .connection
+        .db
+        .learned_costs
+        .nanos_per(crate::translate::optimizer::learned_costs::Work::Row);
+    for (cursor_id, (seeks, nanos)) in std::mem::take(&mut state.seek_times)
+        .into_iter()
+        .enumerate()
+    {
+        if seeks == 0 && nanos == 0 {
+            continue;
+        }
+        let name = match program.cursor_ref.get(cursor_id).map(|(_, kind)| kind) {
+            Some(CursorType::BTreeTable(table)) => table.name.as_str(),
+            Some(CursorType::BTreeIndex(index)) => index.name.as_str(),
+            _ => "",
+        };
+        tracing::debug!(target: "amphora::seek_time", cursor_id, name, seeks, nanos, row_nanos = ?row_nanos, "T18: a cursor's seeks this run");
+    }
+}
+
+/// Lane T19: with `amphora::seek_time` on at DEBUG, the fact rows the star filters checked this
+/// run (`probes`) and dropped (`rejects`), beside the tables read into the run's Bloom filters.
+fn star_trace_write(program: &Program, state: &mut ProgramState) {
+    if !tracing::enabled!(target: "amphora::seek_time", tracing::Level::DEBUG) {
+        return;
+    }
+    let now = (
+        state.metrics.star_filter_probes,
+        state.metrics.star_filter_rejects,
+    );
+    let before = if now.0 >= state.star_trace_base.0 {
+        state.star_trace_base
+    } else {
+        (0, 0)
+    };
+    state.star_trace_base = now;
+    let probes = now.0.saturating_sub(before.0);
+    let rejects = now.1.saturating_sub(before.1);
+    if probes == 0 {
+        return;
+    }
+    let filters: Vec<&str> = program
+        .cursor_ref
+        .iter()
+        .enumerate()
+        .filter(|(cursor_id, _)| state.bloom_filters.contains_key(cursor_id))
+        .filter_map(|(_, (_, kind))| match kind {
+            CursorType::BTreeTable(table) => Some(table.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    tracing::debug!(target: "amphora::seek_time", probes, rejects, passed = probes.saturating_sub(rejects), filters = ?filters, "T19: the star filters' rows this run");
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
@@ -7737,6 +7847,279 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     }
 }
 
+/// Lane G8 (`RealSums::Exact`, arm b of the SUM-over-REAL A/B): SUM, TOTAL and AVG that sum
+/// exactly ([`crate::vdbe::morsel::ExactSum`]) and round once, as the morsel workers do, so either
+/// path answers alike at any worker count. Their payload is the usual one and one slot more; once
+/// the sum is no exact INTEGER its first slot holds the exact sum's bytes, which the fast paths
+/// (they take only numbers there) leave to the slow path.
+const EXACT_SUM_SLOTS: usize = 5;
+const EXACT_AVG_SLOTS: usize = 3;
+
+fn exact_error(error: crate::vdbe::morsel::MorselError) -> LimboError {
+    LimboError::InternalError(format!("exact sum: {error}"))
+}
+
+/// Makes a SUM, TOTAL or AVG payload `init_agg_payload` made an exact one.
+fn exact_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    match func {
+        AggFunc::Sum => {}
+        AggFunc::Total | AggFunc::Avg => {
+            let first = payload.first_mut().ok_or_else(|| {
+                LimboError::InternalError("an exact sum's payload is empty".into())
+            })?;
+            *first = exact_sum_value(&ExactSum::default())?;
+        }
+        _ => return Ok(()),
+    }
+    payload.try_reserve_exact(1)?;
+    payload.push(Value::from_i64(1));
+    Ok(())
+}
+
+/// The exact sum as its payload slot holds it: both infinities met are SQLite's NULL.
+fn exact_sum_value(sum: &crate::vdbe::morsel::ExactSum) -> Result<Value> {
+    if sum.is_nan() {
+        return Ok(Value::Null);
+    }
+    let mut bytes = crate::alloc::Vec::new();
+    sum.write_to(&mut bytes).map_err(exact_error)?;
+    Ok(Value::Blob(bytes))
+}
+
+fn exact_sum_of(acc: &Value) -> Result<crate::vdbe::morsel::ExactSum> {
+    match acc {
+        Value::Blob(bytes) => crate::vdbe::morsel::ExactSum::read_from(bytes).map_err(exact_error),
+        _ => Err(LimboError::InternalError(
+            "an exact sum's slot does not hold its bytes".into(),
+        )),
+    }
+}
+
+/// Adds an integer exactly, in the two parts `kbn_init_from_int` splits a large one into, each
+/// a double holds exactly.
+fn exact_add_int(sum: &mut crate::vdbe::morsel::ExactSum, i: i64) -> Result<()> {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
+        let low = i.checked_rem(16384).or_overflow()?;
+        let high = i.checked_sub(low).or_overflow()?;
+        sum.add(high as f64).map_err(exact_error)?;
+        sum.add(low as f64).map_err(exact_error)
+    } else {
+        sum.add(i as f64).map_err(exact_error)
+    }
+}
+
+/// The exact sum rounded once. `+0.0` joins it first, as the serial loop's compensated sum starts
+/// from it: an all-zero sum is `+0.0`, as SQLite's is.
+fn exact_rounded(acc: &Value) -> Result<f64> {
+    let mut sum = exact_sum_of(acc)?;
+    sum.add(0.0).map_err(exact_error)?;
+    Ok(sum.value())
+}
+
+/// A SUM or TOTAL step under `RealSums::Exact`: SQLite's sumStep with the exact sum in place of
+/// the compensated one. An exact INTEGER total while every value is an integer; from the first
+/// value that is none, or the first integer that overflows it, the exact sum.
+fn exact_sum_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    let [acc, _, approx_val, ovrfl_val, count_val, ..] = payload else {
+        return Err(LimboError::InternalError(
+            "Sum/Total: payload too short".to_string(),
+        ));
+    };
+    let Value::Numeric(Numeric::Integer(count)) = count_val else {
+        return Err(LimboError::InternalError(
+            "Sum/Total: payload[4] is not an integer".to_string(),
+        ));
+    };
+    let arg = classify_numeric_arg(arg);
+    if matches!(arg, NumericArg::Null) {
+        return Ok(());
+    }
+    *count = count.checked_add(1).or_overflow()?;
+    let approx = matches!(approx_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
+    // Both infinities met: NULL, which stays.
+    if matches!(acc, Value::Null) && approx {
+        return Ok(());
+    }
+    let total = match acc {
+        Value::Null => Some(None),
+        Value::Numeric(Numeric::Integer(total)) => Some(Some(*total)),
+        _ => None,
+    };
+    let sum = match (arg, total) {
+        (NumericArg::Integer(i), Some(None)) => {
+            *acc = Value::from_i64(i);
+            return Ok(());
+        }
+        (NumericArg::Integer(i), Some(Some(total))) => match total.checked_add(i) {
+            Some(total) => {
+                *acc = Value::from_i64(total);
+                return Ok(());
+            }
+            // sum() reports the overflow at the end unless a value that is no integer clears
+            // it; total() never reports it.
+            None => {
+                *approx_val = Value::from_i64(1);
+                *ovrfl_val = Value::from_i64(1);
+                let mut sum = ExactSum::default();
+                exact_add_int(&mut sum, total)?;
+                exact_add_int(&mut sum, i)?;
+                sum
+            }
+        },
+        (NumericArg::Integer(i), None) => {
+            let mut sum = exact_sum_of(acc)?;
+            exact_add_int(&mut sum, i)?;
+            sum
+        }
+        (NumericArg::Float(r), total) => {
+            let mut sum = match total {
+                Some(None) => ExactSum::default(),
+                Some(Some(total)) => {
+                    let mut sum = ExactSum::default();
+                    exact_add_int(&mut sum, total)?;
+                    sum
+                }
+                None => exact_sum_of(acc)?,
+            };
+            *approx_val = Value::from_i64(1);
+            *ovrfl_val = Value::from_i64(0);
+            sum.add(r).map_err(exact_error)?;
+            sum
+        }
+        (NumericArg::Null, _) => return Ok(()),
+    };
+    *acc = exact_sum_value(&sum)?;
+    Ok(())
+}
+
+/// An AVG step under `RealSums::Exact`.
+fn exact_avg_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
+    let [acc, _, count_val, ..] = payload else {
+        return Err(LimboError::InternalError(
+            "Avg: payload too short".to_string(),
+        ));
+    };
+    // Both infinities met: NULL, which stays.
+    if matches!(acc, Value::Null) {
+        return Ok(());
+    }
+    let Value::Numeric(Numeric::Integer(count)) = count_val else {
+        return Err(LimboError::InternalError(
+            "Avg: payload[2] is not an integer".to_string(),
+        ));
+    };
+    let mut sum = exact_sum_of(acc)?;
+    match classify_numeric_arg(arg) {
+        NumericArg::Null => return Ok(()),
+        NumericArg::Integer(i) => exact_add_int(&mut sum, i)?,
+        NumericArg::Float(f) => sum.add(f).map_err(exact_error)?,
+    }
+    *acc = exact_sum_value(&sum)?;
+    *count = count.checked_add(1).or_overflow()?;
+    Ok(())
+}
+
+/// A window frame's row leaving an exact SUM, TOTAL or AVG (its count in slot `count_at`): the
+/// value subtracted exactly; sumInverse's exact INTEGER subtract while the sum is one.
+fn exact_inverse(arg: NumericArg, payload: &mut [Value], count_at: usize) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    let Some(Value::Numeric(Numeric::Integer(count))) = payload.get_mut(count_at) else {
+        return Err(LimboError::InternalError(
+            "an exact sum's count slot is not an integer".to_string(),
+        ));
+    };
+    *count = count.checked_sub(1).or_overflow()?;
+    let integer_sum =
+        count_at == 4 && matches!(payload.get(2), Some(Value::Numeric(Numeric::Integer(0))));
+    let Some(acc) = payload.first_mut() else {
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
+    };
+    if let (true, Value::Numeric(Numeric::Integer(total)), NumericArg::Integer(sub)) =
+        (integer_sum, &mut *acc, &arg)
+    {
+        if let Some(rest) = total.checked_sub(*sub) {
+            *total = rest;
+            return Ok(());
+        }
+    }
+    let was_integer = matches!(acc, Value::Numeric(Numeric::Integer(_)));
+    let mut sum = match &*acc {
+        // Both infinities met: NULL, which stays.
+        Value::Null => return Ok(()),
+        Value::Numeric(Numeric::Integer(total)) => {
+            let mut sum = ExactSum::default();
+            exact_add_int(&mut sum, *total)?;
+            sum
+        }
+        acc => exact_sum_of(acc)?,
+    };
+    match arg {
+        NumericArg::Null => return Ok(()),
+        NumericArg::Integer(i) => match i.checked_neg() {
+            Some(negated) => exact_add_int(&mut sum, negated)?,
+            // -i64::MIN is 2^63, a double exactly.
+            None => sum.add(9_223_372_036_854_775_808.0).map_err(exact_error)?,
+        },
+        NumericArg::Float(f) => sum.add(-f).map_err(exact_error)?,
+    }
+    *acc = exact_sum_value(&sum)?;
+    if integer_sum && was_integer {
+        // The INTEGER subtract overflowed: sum() reports it at the end, as the step does.
+        if let Some(slot) = payload.get_mut(2) {
+            *slot = Value::from_i64(1);
+        }
+        if let Some(slot) = payload.get_mut(3) {
+            *slot = Value::from_i64(1);
+        }
+    }
+    Ok(())
+}
+
+fn exact_avg_final(payload: &[Value]) -> Result<Value> {
+    let count = payload.get(2).and_then(Value::as_int).unwrap_or(0);
+    match payload.first() {
+        Some(acc @ Value::Blob(_)) if count > 0 => {
+            Ok(Value::from_f64(exact_rounded(acc)? / count as f64))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+fn exact_sum_final(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    let flag = |at: usize| payload.get(at).and_then(Value::as_int).unwrap_or(0) != 0;
+    let (approx, ovrfl) = (flag(2), flag(3));
+    let Some(acc) = payload.first() else {
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
+    };
+    if matches!(func, AggFunc::Total) {
+        return Ok(match acc {
+            Value::Null if approx => Value::Null,
+            Value::Null => Value::from_f64(0.0),
+            Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64),
+            acc => Value::from_f64(exact_rounded(acc)?),
+        });
+    }
+    if payload.get(4).and_then(Value::as_int).unwrap_or(0) == 0 {
+        return Ok(Value::Null);
+    }
+    // As sumFinalize: an overflow no value that is no integer cleared is reported at the end.
+    if approx && ovrfl {
+        mark_unlikely();
+        return Err(LimboError::IntegerOverflow);
+    }
+    Ok(match acc {
+        Value::Null => Value::Null,
+        Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
+        acc => Value::from_f64(exact_rounded(acc)?),
+    })
+}
+
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
@@ -7751,7 +8134,10 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 ///   Blob(varying inter-string separator lengths)]
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+pub(crate) fn init_agg_payload(
+    func: &AggFunc,
+    payload: &mut crate::alloc::Vec<Value>,
+) -> Result<()> {
     // This initializes `payload` at exactly the right size.
     match func {
         AggFunc::Count | AggFunc::Count0 => {
@@ -7861,7 +8247,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
 #[amphora_engine_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::AggAccumulate)]
-fn update_agg_payload(
+pub(crate) fn update_agg_payload(
     func: &AggFunc,
     arg: &Value,                // first argument
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
@@ -7898,6 +8284,9 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
+            if payload.len() > EXACT_AVG_SLOTS {
+                return exact_avg_step(arg, payload);
+            }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
                 mark_unlikely();
@@ -7928,6 +8317,9 @@ fn update_agg_payload(
             *count = count.checked_add(1).or_overflow()?;
         }
         AggFunc::Sum | AggFunc::Total => {
+            if payload.len() > EXACT_SUM_SLOTS {
+                return exact_sum_step(arg, payload);
+            }
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
             // payload[1] is Float (r_err), payload[2] is Integer (approx),
             // payload[3] is Integer (ovrfl), payload[4] is Integer (count)
@@ -8224,7 +8616,14 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
-fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+pub(crate) fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    match func {
+        AggFunc::Avg if payload.len() > EXACT_AVG_SLOTS => return exact_avg_final(payload),
+        AggFunc::Sum | AggFunc::Total if payload.len() > EXACT_SUM_SLOTS => {
+            return exact_sum_final(func, payload)
+        }
+        _ => {}
+    }
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
@@ -8342,7 +8741,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::External(_) => {
             mark_unlikely();
-            // External aggregates are finalized via AggContext::compute_external()
+            // External aggregates are finalized by ExtFunc::finalize_aggregate.
             return Err(LimboError::InternalError(
                 "finalize_agg_payload called for External aggregate".to_string(),
             ));
@@ -9054,6 +9453,11 @@ pub fn op_agg_inverse(
         return op_window_inverse(state, *acc_reg, *col, win_func);
     }
     let func = func.expect_agg();
+    if let AggFunc::External(ext_func) = func {
+        ext_func.inverse_aggregate(&mut state.registers, *acc_reg, *col)?;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     // Run xInverse to undo a prior xStep when a row leaves the frame
     // from the left. min/max are handled separately using SQLite's
@@ -9156,6 +9560,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
             }
+            if payload.len() > EXACT_SUM_SLOTS {
+                return exact_inverse(parsed, payload, 4);
+            }
             let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload else {
                 unreachable!(
                     "Sum/Total payload has acc/r_err/approx/ovrfl/count per init_agg_payload"
@@ -9219,6 +9626,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let parsed = classify_numeric_arg(&arg);
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
+            }
+            if payload.len() > EXACT_AVG_SLOTS {
+                return exact_inverse(parsed, payload, 2);
             }
             let [sum_val, r_err_val, count_val, ..] = payload else {
                 unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
@@ -9324,7 +9734,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             unreachable!("planner should reject moving-start frame over non-invertible {func}");
         }
         AggFunc::External(_) => {
-            unreachable!("planner rejects moving-start frames over external aggregates");
+            unreachable!("extension aggregates take rows back in op_agg_inverse");
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject
@@ -9562,6 +9972,9 @@ pub(crate) fn op_agg_step_slow(
             .pop()
             .unwrap_or_else(|| crate::alloc::vec![]);
         init_agg_payload(func, &mut payload)?;
+        if program.connection.real_sums() == crate::RealSums::Exact {
+            exact_agg_payload(func, &mut payload)?;
+        }
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
@@ -9667,10 +10080,14 @@ pub fn op_agg_final(
     let func = func.expect_agg();
 
     if let AggFunc::External(ext_func) = func {
-        let value = return_if_io!(
-            state,
-            ext_func.finalize_aggregate(&mut state.registers[acc_reg])
-        );
+        let value = if matches!(insn, Insn::AggValue { .. }) {
+            ext_func.value_aggregate(&mut state.registers[acc_reg])?
+        } else {
+            return_if_io!(
+                state,
+                ext_func.finalize_aggregate(&mut state.registers[acc_reg])
+            )
+        };
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -10542,7 +10959,7 @@ pub fn op_function(
                     };
                     state.registers[*start_reg]
                         .get_value()
-                        .exec_cast(cast_type.as_str())?
+                        .exec_cast(cast_type.as_str(), program.connection.fp_digits())?
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -10560,13 +10977,18 @@ pub fn op_function(
             ScalarFunc::Coalesce => {}
             ScalarFunc::Concat => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result =
-                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
+                let result = Value::exec_concat_strings(
+                    reg_values.iter().map(|reg| reg.get_value()),
+                    program.connection.fp_digits(),
+                );
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::ConcatWs => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
+                let result = Value::exec_concat_ws(
+                    reg_values.iter().map(|reg| reg.get_value()),
+                    program.connection.fp_digits(),
+                );
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Glob => {
@@ -10608,7 +11030,7 @@ pub fn op_function(
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10616,7 +11038,7 @@ pub fn op_function(
 
                     let match_cow = match match_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10680,7 +11102,9 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT")? {
+                                    v => match v
+                                        .exec_cast("TEXT", program.connection.fp_digits())?
+                                    {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -10707,7 +11131,12 @@ pub fn op_function(
                             (Value::Text(pattern), Value::Text(text)) => {
                                 Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
                             }
-                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
+                            _ => exec_like_converted(
+                                pattern_value,
+                                match_value,
+                                escape_char,
+                                program.connection.fp_digits(),
+                            )?,
                         };
                         state.registers[*dest].set_int(matches as i64);
                     }
@@ -11130,7 +11559,10 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
-                let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
+                let result = exec_printf(
+                    &state.registers[*start_reg..*start_reg + arg_count],
+                    program.connection.fp_digits(),
+                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
@@ -12270,7 +12702,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -12291,7 +12723,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 }
                             }
@@ -12653,7 +13085,7 @@ pub fn op_function(
                                     program
                                         .connection
                                         .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                        .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -12759,17 +13191,18 @@ fn exec_like_converted(
     pattern_value: &Value,
     match_value: &Value,
     escape_char: Option<char>,
+    digits: crate::numeric::fp::FpDigits,
 ) -> Result<bool> {
     let pattern_cow = match pattern_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast("TEXT", digits)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
     };
     let match_cow = match match_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast("TEXT", digits)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
@@ -16555,6 +16988,7 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
+                Cookie::PgNextOid => header.pg_next_oid.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -16600,6 +17034,7 @@ pub fn op_set_cookie(
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::PgNextOid => header.pg_next_oid = value.cast_unsigned().into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
             Cookie::DatabaseTextEncoding => {
                 header.text_encoding = match *value {
@@ -16839,15 +17274,16 @@ pub fn op_is_true(
 }
 
 pub fn op_concat(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
-    let value = state.registers[*lhs]
-        .get_value()
-        .exec_concat(state.registers[*rhs].get_value())?;
+    let value = state.registers[*lhs].get_value().exec_concat(
+        state.registers[*rhs].get_value(),
+        program.connection.fp_digits(),
+    )?;
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17346,7 +17782,7 @@ pub fn op_found(
 }
 
 pub fn op_affinity(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -17369,7 +17805,11 @@ pub fn op_affinity(
 
     let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
     for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
-        apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+        apply_affinity_char(
+            register,
+            Affinity::from_char_code(affinity_code),
+            program.connection.fp_digits(),
+        );
     }
 
     state.pc += 1;
@@ -17712,7 +18152,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -17720,12 +18160,13 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    let digits = program.connection.fp_digits();
     let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
-        Affinity::Numeric => value.exec_cast("NUMERIC"),
-        Affinity::Integer => value.exec_cast("INTEGER"),
-        Affinity::Real => value.exec_cast("REAL"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB", digits),
+        Affinity::Text => value.exec_cast("TEXT", digits),
+        Affinity::Numeric => value.exec_cast("NUMERIC", digits),
+        Affinity::Integer => value.exec_cast("INTEGER", digits),
+        Affinity::Real => value.exec_cast("REAL", digits),
     }?;
 
     state.registers[*reg].set_value(result);
@@ -18824,9 +19265,10 @@ pub fn op_hash_distinct(
             track_matched: false,
             partition_count: None,
         };
-        state
-            .hash_tables
-            .insert(data.hash_table_id, HashTable::new(config, pager.io.clone())?);
+        state.hash_tables.insert(
+            data.hash_table_id,
+            HashTable::new(config, pager.io.clone())?,
+        );
     }
     let hash_table = state
         .hash_tables
@@ -19134,40 +19576,34 @@ fn hash_probe_run(
     let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
     let num_payload = *num_payload as usize;
     let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
-    let (probe_keys, partition_idx, probe_buffered) =
-        if let Some(op_state) = state.active_op_state.hash_probe().take() {
-            if op_state.hash_table_id == hash_table_id {
-                (
-                    op_state.probe_keys,
-                    Some(op_state.partition_idx),
-                    op_state.probe_buffered,
-                )
-            } else {
-                // Different hash table, read fresh keys
-                let keys = (0..num_keys)
-                    .map(|i| {
-                        let reg = &state.registers[key_start_reg + i];
-                        reg.get_value().clone()
-                    })
-                    .try_collect()?;
-                (keys, None, false)
-            }
-        } else {
-            // First entry, read probe keys from registers
-            let keys = (0..num_keys)
-                .map(|i| {
-                    let reg = &state.registers[key_start_reg + i];
-                    reg.get_value().clone()
-                })
-                .try_collect()?;
-            (keys, None, false)
-        };
+    let resumed = state
+        .active_op_state
+        .hash_probe()
+        .take()
+        .filter(|op_state| op_state.hash_table_id == hash_table_id);
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         // Empty build side: treat as no match and jump to target.
         state.active_op_state.clear();
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let (probe_keys, partition_idx, probe_buffered) = match resumed {
+        Some(op_state) => (
+            op_state.probe_keys,
+            Some(op_state.partition_idx),
+            op_state.probe_buffered,
+        ),
+        None => {
+            let keys_end = key_start_reg.checked_add(num_keys).or_overflow()?;
+            let keys = hash_table.probe_keys_from(
+                state.registers[key_start_reg..keys_end]
+                    .iter()
+                    .map(|reg| reg.get_value()),
+            )?;
+            (keys, None, false)
+        }
     };
 
     // For spilled hash tables, either buffer main-loop probe rows for grace
@@ -19370,12 +19806,12 @@ pub fn op_join_switch_step(
         None => Ok(JoinStep::NestedLoop),
     };
     state.pc = match step {
-        Ok(JoinStep::NestedLoop) => state.pc + 1,
+        Ok(JoinStep::NestedLoop) => state.pc.checked_add(1).or_overflow()?,
         Ok(JoinStep::SwitchNow) => data.build_pc.as_offset_int(),
         Ok(JoinStep::Hash) => data.probe_pc.as_offset_int(),
         Err(refused) => {
             tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
-            state.pc + 1
+            state.pc.checked_add(1).or_overflow()?
         }
     };
     Ok(InsnFunctionStepResult::Step)
@@ -19458,6 +19894,18 @@ pub fn op_join_switch_built(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// `rows` as an `as i64` cast reads it (toward zero, held at i64's ends, NaN as 0), without the
+/// lossy cast: exact for ANALYZE's whole, in-range row counts (PL.13).
+fn analyzed_rows_i64(rows: f64) -> i64 {
+    use num_traits::ToPrimitive;
+    match rows.to_i64() {
+        Some(whole) => whole,
+        None if rows > 0.0 => i64::MAX,
+        None if rows < 0.0 => i64::MIN,
+        None => 0,
+    }
+}
+
 /// Amphora (PL.13, the re-plan): the rows an adaptive join's hash table holds, the whole inner
 /// table, set against the rows the plan counted it at (ANALYZE's with the changes since, PL.9).
 /// Within the estimate's own error the plan stands. Past it the table's row counter is set to the
@@ -19490,7 +19938,7 @@ fn replan_on_built_rows(
         Ok(Replan::Again { rows }) => {
             let changes = i64::try_from(rows)
                 .unwrap_or(i64::MAX)
-                .saturating_sub(analyzed_rows as i64);
+                .saturating_sub(analyzed_rows_i64(analyzed_rows));
             // A count the planner floors to the estimate it already has would plan the same.
             if crate::row_changes::live_rows(analyzed_rows, changes) != estimate {
                 counter.store(changes, crate::sync::atomic::Ordering::Release);
@@ -20082,7 +20530,11 @@ pub fn op_hash_grace_advance_partition(
 }
 
 #[inline(always)]
-fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+fn apply_affinity_char(
+    target: &mut Register,
+    affinity: Affinity,
+    digits: crate::numeric::fp::FpDigits,
+) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
         let settled = match affinity {
@@ -20102,11 +20554,15 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
             return true;
         }
     }
-    apply_affinity_char_slow(target, affinity)
+    apply_affinity_char_slow(target, affinity, digits)
 }
 
 #[inline(never)]
-fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
+fn apply_affinity_char_slow(
+    target: &mut Register,
+    affinity: Affinity,
+    digits: crate::numeric::fp::FpDigits,
+) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
             return true;
@@ -20119,7 +20575,7 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                 if matches!(value, Value::Text(_) | Value::Null) {
                     return true;
                 }
-                let text = value.to_string();
+                let text = value.to_text_at(digits);
                 *value = Value::Text(text.into());
                 return true;
             }
@@ -20734,7 +21190,7 @@ fn op_journal_mode_inner(
                 // Return result
                 let ret: &'static str = new_mode.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
 
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -20768,7 +21224,7 @@ fn op_journal_mode_inner(
 
                 let ret: &'static str = journal_mode::JournalMode::Mvcc.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
 
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -20797,7 +21253,7 @@ pub fn op_filter(
     }
     let Some(filter) = state.get_bloom_filter(*cursor_id) else {
         // always safe to fall though, no filter present
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
         return Ok(InsnFunctionStepResult::Step);
     };
     let contains = filter_contains(filter, &state.registers, *key_reg, *num_keys);
@@ -20805,7 +21261,7 @@ pub fn op_filter(
     if !contains {
         state.pc = target_pc.as_offset_int();
     } else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20897,11 +21353,11 @@ pub fn op_star_probes(
         let most = u64::try_from(most).unwrap_or(u64::MAX);
         state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
     }
-    state
-        .star_orders
-        .get_or_insert_with(pc, || super::star_order::StarOrder::new(data.probes.len(), data.order));
+    state.star_orders.get_or_insert_with(pc, || {
+        super::star_order::StarOrder::new(data.probes.len(), data.order)
+    });
     let Some(order) = state.star_orders.get_mut(&pc) else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
         return Ok(InsnFunctionStepResult::Step);
     };
     let mut rejected = false;
@@ -20933,7 +21389,7 @@ pub fn op_star_probes(
     if rejected {
         state.pc = data.target_pc.as_offset_int();
     } else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20969,7 +21425,7 @@ pub fn op_filter_add(
         filter.insert_values(&value_refs);
     }
 
-    state.pc += 1;
+    state.pc = state.pc.checked_add(1).or_overflow()?;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -21122,7 +21578,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
         if source_db_id == TEMP_DB_ID {
-            state.pc += 1;
+            state.pc = state.pc.checked_add(1).or_overflow()?;
             return Ok(InsnFunctionStepResult::Step);
         }
 
@@ -21324,7 +21780,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 program.connection.execute("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
 
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -21355,7 +21811,7 @@ pub fn op_vacuum(
     match vacuum_state.step(&program.connection) {
         Ok(IOResult::Done(())) => {
             state.op_vacuum_state = VacuumOpState::None;
-            state.pc += 1;
+            state.pc = state.pc.checked_add(1).or_overflow()?;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
@@ -21506,11 +21962,12 @@ pub fn op_morsel_aggregate(
     use crate::vdbe::insn::MorselOuter;
     use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{
-        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
+        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, Predicate,
+        ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
-        TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
+        no_real_outputs, JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows,
+        TableBuild, TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21519,20 +21976,65 @@ pub fn op_morsel_aggregate(
         )))
     };
     let connection = &program.connection;
+    // A term against a bound parameter takes the parameter's value now, for the column copy and
+    // the morsels alike (lane R9); and a scan's terms on its rowid's alias, a search by a rowid
+    // range among them, narrow the rowids it reads to those they admit (lane R11).
+    let on_rowid = |p: &Predicate| match (p, data.rowid_alias) {
+        (Predicate::Compare { column, .. } | Predicate::Parameter { column, .. }, Some(alias)) => {
+            *column == alias && data.joins.is_empty()
+        }
+        _ => false,
+    };
+    let bound;
+    let data: &crate::vdbe::insn::MorselAggregateData = if data
+        .filter
+        .iter()
+        .any(|p| matches!(p, Predicate::Parameter { .. }) || on_rowid(p))
+    {
+        let mut filter = Vec::new();
+        filter
+            .try_reserve_exact(data.filter.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        for p in &data.filter {
+            filter.push(
+                p.bind(&state.parameters, connection.fp_digits())
+                    .map_err(refused)?,
+            );
+        }
+        let rowid_range = match data.rowid_alias {
+            Some(alias) if data.joins.is_empty() => {
+                crate::vdbe::morsel::rowid_range(&filter, alias, data.rowid_range)
+            }
+            _ => data.rowid_range,
+        };
+        bound = crate::vdbe::insn::MorselAggregateData {
+            filter,
+            rowid_range,
+            ..(**data).clone()
+        };
+        &bound
+    } else {
+        data
+    };
     // G11 step 5 (CS.5): on the versioned storage the pager holds no table's rows; the table's
     // column copy answers when the planner chooses it, else the serial loop reads the rows.
     if let Some(switch) = connection.versioned.as_ref() {
-        let copied = crate::storage::versioned::columns_sql::aggregate(
+        use crate::storage::versioned::columns_sql::{Handed, RowsTiming};
+        let handed = crate::storage::versioned::columns_sql::aggregate(
             switch,
             data,
             connection,
             pager.statement_memory_budget(),
         )?;
-        let Some(rows) = copied else {
-            state.pc = data.target_pc_serial.as_offset_int();
-            return Ok(InsnFunctionStepResult::Step);
+        let timed = match handed {
+            Handed::Copy(rows) => return morsel_rows(state, data, rows),
+            Handed::Rows(timed) => timed,
         };
-        return morsel_rows(state, data, rows);
+        // The serial loop the copies handed the statement to is timed to its end for its table's
+        // row path (lane R6), as the copy's scans are timed for the copy's.
+        state.rows_timed = timed.map(|t| RowsTiming::start(t, state.metrics.rows_read));
+        state.pc = data.target_pc_serial.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
     }
     // A scan's rows under a LIMIT with no ORDER BY run on morsels only behind their switch; off,
     // the control, the serial loop answers (lane qs6-8).
@@ -21593,7 +22095,9 @@ pub fn op_morsel_aggregate(
                     filter: &[],
                     group_by: &body.group_by,
                     aggregates: &body.aggregates,
+                    sums: connection.real_sums(),
                 };
+                let no_real = no_real_outputs(body, connection.real_sums())?;
                 let pipeline = TableBodyAggregate {
                     table: &table,
                     body,
@@ -21604,6 +22108,7 @@ pub fn op_morsel_aggregate(
                     shape: &shape,
                     ran: &connection.morsel_body_rows,
                     direct: None,
+                    no_real: &no_real,
                 };
                 // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
                 if body.rows {
@@ -21627,11 +22132,13 @@ pub fn op_morsel_aggregate(
                     .run_mode(connection.parallel_mode(), &mut costs, &budget)
                     .map(|(rows, _)| (rows, false));
             }
+            table.read_reals(&data.reals)?;
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,
                 group_by: &data.group_by,
                 aggregates: &data.aggregates,
+                sums: connection.real_sums(),
             };
             let pipeline = TableAggregate {
                 table: &table,
@@ -21741,6 +22248,7 @@ pub fn op_morsel_aggregate(
             filter: &[],
             group_by: &body.group_by,
             aggregates: &body.aggregates,
+            sums: connection.real_sums(),
         };
         // A join's body of nothing but reads is copied without running it when the switch says so
         // (lane qs6-13, T-QT.6.21); its rows are counted apart.
@@ -21749,6 +22257,7 @@ pub fn op_morsel_aggregate(
         } else {
             None
         };
+        let no_real = no_real_outputs(body, connection.real_sums())?;
         let looped = TableBodyAggregate {
             table: &table,
             body,
@@ -21763,6 +22272,7 @@ pub fn op_morsel_aggregate(
                 &connection.morsel_body_rows
             },
             direct,
+            no_real: &no_real,
         };
         // A RIGHT or FULL JOIN among three or more tables, or more than one outer join (lane
         // qs6-14): the chain walks in phases, its links' bitmaps merged between them.
@@ -21920,9 +22430,17 @@ fn morsel_rows(
         )))
     };
     // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
-    // them (the pipeline's own key order puts kinds apart).
-    let keys = data.group_by.len();
-    rows.sort_by(|a, b| a.iter().take(keys).cmp(b.iter().take(keys)));
+    // them (the pipeline's own key order puts kinds apart), each in its direction.
+    rows.sort_by(|a, b| {
+        a.iter()
+            .zip(b)
+            .zip(&data.group_order)
+            .map(|((a, b), key)| {
+                crate::types::cmp_in_column(&a.as_value_ref(), &b.as_value_ref(), key)
+            })
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut out = Vec::new();
     out.try_reserve_exact(rows.len())
         .map_err(|_| Box::new(LimboError::OutOfMemory))?;
@@ -22530,7 +23048,11 @@ mod tests {
 
         for (input, expected_int) in ascii_whitespace_cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
 
             match register {
                 Register::Value(Value::Numeric(Numeric::Integer(i))) => {
@@ -22558,7 +23080,11 @@ mod tests {
 
         for (input, _expected_type, expected_len) in test_strings {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
 
             match register {
                 Register::Value(Value::Text(t)) => {
@@ -22582,7 +23108,11 @@ mod tests {
 
         for input in cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
@@ -22593,7 +23123,11 @@ mod tests {
             }
 
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Numeric);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Numeric,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");

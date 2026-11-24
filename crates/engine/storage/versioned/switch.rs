@@ -131,10 +131,7 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
         orders: Mutex::new(recovered.into_inner()),
         // The copies' queues, decoded blocks and blocks take from the same source as they grow,
         // as the pages and row versions do: no share is set aside for them.
-        copies: super::columns_sql::Copies::new(
-            crate::translate::optimizer::column_path::asked(),
-            source,
-        ),
+        copies: super::columns_sql::Copies::new(source),
         #[cfg(test)]
         build_pause: Mutex::new(None),
         #[cfg(test)]
@@ -154,13 +151,6 @@ impl Storage {
     /// The last SQL table's column copy let go for its memory, and why (G11 step 5).
     pub fn copy_dropped(&self) -> Option<super::columns_sql::Dropped> {
         self.copies.last_dropped()
-    }
-
-    /// Turns the SQL tables' column copies on or off, as `AMPHORA_COLUMN_PATH=on` does at open,
-    /// for a driver outside the crate: the bench's comparison against DuckDB (lane colcopy-5,
-    /// AC-CB.4.2).
-    pub fn set_copies_on(&self, on: bool) {
-        self.copies.set_on(on);
     }
 
     /// Sets how a copy the memory source refused is bought again, as `AMPHORA_COLUMN_REBUY` does
@@ -1007,7 +997,8 @@ mod tests {
         let conn = db
             .connect(ConnectOpts::new().with_versioned_storage())
             .unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         let switch = conn.versioned.as_ref().unwrap().clone();
         let before = switch.db.log_counters();
@@ -1022,7 +1013,11 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
         let wrote = switch.db.log_counters();
         assert_eq!(wrote.records, read.records + 1, "the write's record");
-        assert_eq!(wrote.flushes, read.flushes + 1, "the write flushed before it returned");
+        assert_eq!(
+            wrote.flushes,
+            read.flushes + 1,
+            "the write flushed before it returned"
+        );
         let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 1);

@@ -29,7 +29,9 @@ pub(super) const GREETING_FRAME_MAX: usize = 256;
 /// RecoverAt and PreventAt and Reply what they answer, the one commit stamp across groups
 /// (CP-T1.9, T-T1.9.R27, R28, R30; sent only at 9 or later, `Request::since`); Request gained Blob and
 /// Answer Blob, a request to a peer's object store and its answer (CP-T1.12; backup.md, "The peer store").
-pub(super) const VERSION: u32 = 9;
+/// 10: Refusal gained Serialization, a write refused because what it read changed, to be asked
+/// again (local-owner-transport.md, "Version 10").
+pub(super) const VERSION: u32 = 10;
 /// The oldest protocol this side still speaks: 8, the version before negotiation, whose owners
 /// take only a greeting of exactly 8 (local-owner-transport.md, "Negotiated versions"). A format
 /// value: every message of version 8 keeps its shape here, and nothing newer is sent at 8.
@@ -37,6 +39,13 @@ pub(super) const VERSION_MIN: u32 = 8;
 /// The first version whose peers take [`Answer::SteppedClosed`]; an owner answers a step at an
 /// older agreed version with [`Answer::Stepped`].
 pub(super) const VERSION_STEPPED_CLOSED: u32 = 9;
+/// The first version whose peers take the steps that finish a transaction across groups at its one
+/// commit stamp ([`Step`](crate::xgroup::Step)'s ResolveAt, DecideAt, RecoverAt and PreventAt;
+/// T-T1.9.R28, R30): no lock is taken where they can't follow.
+pub(super) const VERSION_FINISHES: u32 = 9;
+/// The first version whose peers take [`Refusal::Serialization`]; an owner answers it at an older
+/// agreed version as the `Invalid` it was.
+pub(super) const VERSION_SERIALIZATION: u32 = 10;
 
 /// A client's greeting. Since version 9 `version` is the oldest version the client speaks, and
 /// [`Speaks`] follows it in the same frame; a version-8 client sends 8 and nothing after it.
@@ -158,11 +167,13 @@ impl Request {
             Request::Step { envelope, .. } => match envelope.step {
                 crate::xgroup::Step::Begin
                 | crate::xgroup::Step::Scan { .. }
-                | crate::xgroup::Step::Lock { .. }
                 | crate::xgroup::Step::Decide { .. }
                 | crate::xgroup::Step::Recover { .. }
                 | crate::xgroup::Step::Prevent { .. }
                 | crate::xgroup::Step::Resolve { .. } => 8,
+                // Version 8 has it, but what it locks is finished by the steps below: it goes only
+                // where they can follow (xgroup.md, "Over the transport").
+                crate::xgroup::Step::Lock { .. } => VERSION_FINISHES,
                 // Steps of version 9: a version-8 owner can't decode them, so a coordinator's
                 // step to one is refused before it goes out (nothing was done).
                 crate::xgroup::Step::LockIf { .. }

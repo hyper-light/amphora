@@ -1,12 +1,16 @@
 use crate::{turso_assert, turso_assert_greater_than};
-use amphora_engine_parser::ast::{Expr, Operator, TableInternalId, UnaryOperator};
+use amphora_engine_parser::ast::{
+    Expr, LikeOperator, Literal, Operator, TableInternalId, UnaryOperator,
+};
 
 use crate::{
     translate::{
-        expr::{unwrap_parens, unwrap_parens_owned},
-        plan::WhereTerm,
+        emitter::Resolver,
+        expr::{unwrap_parens, unwrap_parens_owned, walk_expr, WalkControl},
+        plan::{TableReferences, WhereTerm, WhereTermOrigin},
     },
     util::exprs_are_equivalent,
+    vdbe::value::MAX_LIKE_PATTERN_LENGTH,
     Result,
 };
 
@@ -20,6 +24,7 @@ use super::AvailableIndexes;
 pub(crate) fn rewrite_or_terms(
     where_clause: &mut Vec<WhereTerm>,
     available_indexes: &AvailableIndexes,
+    column_can_raise: &dyn Fn(TableInternalId, usize) -> bool,
 ) -> Result<()> {
     let mut term_index = 0;
     while term_index < where_clause.len() {
@@ -71,6 +76,35 @@ pub(crate) fn rewrite_or_terms(
                     .iter()
                     .any(|expr| exprs_are_equivalent(common_expr, expr))
             });
+        }
+
+        if term_origin == WhereTermOrigin::Where {
+            let remaining_terms: Vec<Vec<Expr>> = branch_terms
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .filter(|expr| {
+                            !common_terms
+                                .iter()
+                                .any(|common_expr| exprs_are_equivalent(common_expr, expr))
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            for expr in table_shares_of_or_branches(&remaining_terms, column_can_raise)? {
+                if !where_clause
+                    .iter()
+                    .any(|term| exprs_are_equivalent(&term.expr, &expr))
+                {
+                    where_clause.push(WhereTerm {
+                        expr,
+                        origin: term_origin,
+                        consumed: false,
+                    });
+                }
+            }
         }
 
         if common_terms.is_empty() {
@@ -206,6 +240,180 @@ fn in_filters_implied_by_or_branches(
         .collect()
 }
 
+/// Amphora (lane T8, TPC-H q19): each table's share of an `OR` term of the WHERE clause, as a
+/// filter on that table alone.
+///
+/// `(p.x = 1 AND l.y < 5) OR (p.x = 2 AND l.y > 9)` implies `p.x = 1 OR p.x = 2` on `p` and
+/// `l.y < 5 OR l.y > 9` on `l`: a row the term keeps passes some branch, so it passes that
+/// branch's terms on each table. A share filters its table's rows before any join and gives that
+/// table's estimate the rows it keeps, while the original term still decides each joined row.
+/// A table has a share only where every branch has a term on it alone, and a term on one table
+/// that holds a function or a subquery is not copied: it might give another value, or an error, on
+/// a row the original never reads. PostgreSQL derives the same filters
+/// (`extract_restriction_or_clauses`, src/backend/optimizer/util/orclauses.c). A share of one
+/// `column = value` a branch is the `IN` filter [in_filters_implied_by_or_branches] decides on.
+fn table_shares_of_or_branches(
+    or_branches: &[Vec<Expr>],
+    column_can_raise: &dyn Fn(TableInternalId, usize) -> bool,
+) -> Result<Vec<Expr>> {
+    let mut branch_tables = Vec::with_capacity(or_branches.len());
+    let mut tables: Vec<TableInternalId> = Vec::new();
+    for branch in or_branches {
+        let mut term_tables = Vec::with_capacity(branch.len());
+        for term in branch {
+            let table = sole_table(term, column_can_raise)?;
+            if let Some(table) = table {
+                if !tables.contains(&table) {
+                    tables.push(table);
+                }
+            }
+            term_tables.push(table);
+        }
+        branch_tables.push(term_tables);
+    }
+    let mut shares = Vec::new();
+    for table in tables {
+        let mut share = Vec::with_capacity(or_branches.len());
+        let mut reads_other_tables = false;
+        for (branch, term_tables) in or_branches.iter().zip(&branch_tables) {
+            let mut on_table = Vec::new();
+            for (term, term_table) in branch.iter().zip(term_tables) {
+                if *term_table == Some(table) {
+                    on_table.push(term.clone());
+                } else {
+                    reads_other_tables = true;
+                }
+            }
+            if on_table.is_empty() {
+                share.clear();
+                break;
+            }
+            share.push(on_table);
+        }
+        if share.is_empty() || !reads_other_tables {
+            continue;
+        }
+        let first_column = share
+            .first()
+            .and_then(|terms| terms.first())
+            .and_then(column_literal_equality)
+            .map(|(column, _)| column);
+        let is_in_filter = first_column.is_some_and(|first_column| {
+            share.iter().all(|terms| match terms.as_slice() {
+                [term] => column_literal_equality(term)
+                    .is_some_and(|(column, _)| exprs_are_equivalent(column, first_column)),
+                _ => false,
+            })
+        });
+        if is_in_filter {
+            continue;
+        }
+        shares.push(rebuild_or_expr_from_list(
+            share.into_iter().map(rebuild_and_expr_from_list).collect(),
+        ));
+    }
+    Ok(shares)
+}
+
+/// The one table `expr` reads, where evaluating it on any of that table's rows cannot raise an
+/// error. A share runs on rows the original OR may never evaluate (rows no other table joins, or
+/// terms an earlier false term skips), so a term that could raise there is left out of it:
+/// functions, subqueries, casts, `||` (its allocation can fail), JSON and array operators, MATCH,
+/// REGEXP, a LIKE or GLOB with an ESCAPE or a pattern that is not a short enough text literal, and
+/// a column whose read runs a custom type's or a generated column's code.
+fn sole_table(
+    expr: &Expr,
+    column_can_raise: &dyn Fn(TableInternalId, usize) -> bool,
+) -> Result<Option<TableInternalId>> {
+    let mut table: Option<TableInternalId> = None;
+    let mut sole = true;
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        match e {
+            Expr::Column {
+                table: read,
+                column,
+                ..
+            } => {
+                sole &= *table.get_or_insert(*read) == *read && !column_can_raise(*read, *column);
+            }
+            Expr::RowId { table: read, .. } => {
+                sole &= *table.get_or_insert(*read) == *read;
+            }
+            Expr::Binary(
+                _,
+                Operator::Add
+                | Operator::And
+                | Operator::BitwiseAnd
+                | Operator::BitwiseOr
+                | Operator::Equals
+                | Operator::Divide
+                | Operator::Greater
+                | Operator::GreaterEquals
+                | Operator::Is
+                | Operator::IsNot
+                | Operator::LeftShift
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Modulus
+                | Operator::Multiply
+                | Operator::NotEquals
+                | Operator::Or
+                | Operator::RightShift
+                | Operator::Subtract,
+                _,
+            )
+            | Expr::Literal(_)
+            | Expr::Variable(_)
+            | Expr::Parenthesized(_)
+            | Expr::Unary(..)
+            | Expr::Between { .. }
+            | Expr::InList { .. }
+            | Expr::IsNull(_)
+            | Expr::NotNull(_)
+            | Expr::Collate(..) => {}
+            Expr::Like {
+                op: LikeOperator::Like | LikeOperator::Glob,
+                rhs,
+                escape: None,
+                ..
+            } => {
+                sole &= matches!(
+                    unwrap_parens(rhs)?,
+                    Expr::Literal(Literal::String(pattern)) if pattern.len() <= MAX_LIKE_PATTERN_LENGTH
+                );
+            }
+            _ => sole = false,
+        }
+        Ok(if sole {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    })?;
+    Ok(table.filter(|_| sole))
+}
+
+/// Whether reading `column` of `table` can raise an error: a custom type's decoding and
+/// operators, and a virtual generated column's expression, run code that can.
+pub(crate) fn column_read_can_raise(
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    table: TableInternalId,
+    column: usize,
+) -> bool {
+    let Some((_, table)) = table_references.find_table_by_internal_id(table) else {
+        return true;
+    };
+    let Some(column) = table.get_column_at(column) else {
+        return true;
+    };
+    column.is_virtual_generated()
+        || resolver
+            .schema()
+            .get_type_def(&column.ty_str, table.is_strict())
+            .is_some()
+}
+
 fn sole_indexed_column(
     table: TableInternalId,
     columns: &[usize],
@@ -273,9 +481,7 @@ fn literal_expr_can_be_copied(expr: &Expr) -> bool {
 /// Selects the literal types that the rewrite copies into a new `IN` filter.
 ///
 /// `NULL` cannot satisfy `=`. The rewrite leaves all other literal types in the original expression.
-fn literal_can_be_copied(literal: &amphora_engine_parser::ast::Literal) -> bool {
-    use amphora_engine_parser::ast::Literal;
-
+fn literal_can_be_copied(literal: &Literal) -> bool {
     matches!(
         literal,
         Literal::Numeric(_)
@@ -422,7 +628,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should now have 3 terms:
         // 1. (x = 1) OR (y = 1)
@@ -524,7 +732,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should now have 2 terms:
         // 1. (x = 1) OR (y = 1) OR (z = 1)
@@ -591,7 +801,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
@@ -657,7 +869,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -708,7 +922,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should remain unchanged
         let nonconsumed_terms = where_clause
@@ -757,7 +973,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -786,7 +1004,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 1);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -812,7 +1032,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 3);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -847,7 +1069,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert!(!where_clause
@@ -872,7 +1096,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -892,7 +1118,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -922,7 +1150,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 1);
         Ok(())

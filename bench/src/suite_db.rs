@@ -54,6 +54,16 @@ pub trait Session: Send {
     /// `stmts` with `params` (a list each): a read's rows taken whole, how many came; a write's
     /// statements in one transaction, returned once durable.
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize>;
+    /// A read's rows with every value as [`Cell::text`] writes it, untimed: the answer check
+    /// (`bench/suite_answers.py`) holds each database's to another's.
+    fn answer(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let _ = (stmts, params);
+        anyhow::bail!("no answer check here")
+    }
     /// The plan the database makes for `sql` with `params` (its EXPLAIN), a line a step.
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let _ = (sql, params);
@@ -61,22 +71,82 @@ pub trait Session: Send {
     }
 }
 
+/// A value of a read's answer, whatever the database returned it as.
+pub enum Cell<'a> {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl Cell<'_> {
+    /// The value as the answer check compares it: an integer in decimal; a real as Rust writes an
+    /// f64 (the shortest text that reads back as the same f64), `.0` added to a whole one so it
+    /// stays apart from an integer; text as it is; a blob as `x'..'` in hex; NULL as none.
+    pub fn text(&self) -> Option<String> {
+        Some(match self {
+            Cell::Null => return None,
+            Cell::Int(i) => i.to_string(),
+            Cell::Real(f) => {
+                let s = f.to_string();
+                if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                    format!("{s}.0")
+                } else {
+                    s
+                }
+            }
+            Cell::Text(t) => (*t).to_owned(),
+            Cell::Blob(b) => format!(
+                "x'{}'",
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ),
+        })
+    }
+}
+
 /// `reuse`: the file databases (Amphora, Turso, SQLite) open the database a run left in `dir`
 /// instead of a new one (`--reuse`); the servers keep their data where they keep it.
-pub fn open(target: &str, dir: &str, dsn: Option<&str>, clients: usize, reuse: bool) -> anyhow::Result<Arc<dyn Target>> {
+pub fn open(
+    target: &str,
+    dir: &str,
+    dsn: Option<&str>,
+    clients: usize,
+    reuse: bool,
+) -> anyhow::Result<Arc<dyn Target>> {
     let dsn = |local: &str| dsn.unwrap_or(local).to_owned();
-    anyhow::ensure!(!reuse || matches!(target, "amphora" | "turso" | "sqlite"), "--reuse opens a file database a run left behind: amphora, turso or sqlite, not {target}");
+    anyhow::ensure!(
+        !reuse || matches!(target, "amphora" | "turso" | "sqlite"),
+        "--reuse opens a file database a run left behind: amphora, turso or sqlite, not {target}"
+    );
     Ok(match target {
         "amphora" => Arc::new(Amphora::open(dir, clients, reuse)?),
         "turso" => Arc::new(Turso::open(dir, reuse)?),
         "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir)?),
         "sqlite" => Arc::new(Sqlite::open(dir, reuse)?),
-        "postgres" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55432/postgres"), PgKind::Postgres)?),
-        "orioledb" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55433/postgres"), PgKind::Orioledb)?),
-        "cedardb" => Arc::new(Pg::open(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), PgKind::Cedardb)?),
-        "mysql" => Arc::new(MySql::open(&dsn("mysql://root@127.0.0.1:33306/convo"), clients + 4)?),
-        "clickhouse" => Arc::new(ClickHouse::open(&dsn("http://127.0.0.1:58123"), clients + 4)?),
-        t => anyhow::bail!("the suite has no target {t} (amphora, mvcc, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"),
+        "postgres" => Arc::new(Pg::open(
+            &dsn("postgres://postgres@127.0.0.1:55432/postgres"),
+            PgKind::Postgres,
+        )?),
+        "orioledb" => Arc::new(Pg::open(
+            &dsn("postgres://postgres@127.0.0.1:55433/postgres"),
+            PgKind::Orioledb,
+        )?),
+        "cedardb" => Arc::new(Pg::open(
+            &dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"),
+            PgKind::Cedardb,
+        )?),
+        "mysql" => Arc::new(MySql::open(
+            &dsn("mysql://root@127.0.0.1:33306/convo"),
+            clients + 4,
+        )?),
+        "clickhouse" => Arc::new(ClickHouse::open(
+            &dsn("http://127.0.0.1:58123"),
+            clients + 4,
+        )?),
+        t => anyhow::bail!(
+            "the suite has no target {t} (amphora, mvcc, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"
+        ),
     })
 }
 
@@ -97,6 +167,8 @@ fn suite_db(dir: &str, reuse: bool) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// How long a statement waits for another writer before it fails: each engine's deadline and the
+/// busy timeout of SQLite and Turso, whose own busy handlers do the waiting.
 const WAIT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------------------------
@@ -133,6 +205,61 @@ mod amphora_target {
         }
     }
 
+    fn cell(v: &Value) -> Option<String> {
+        match v {
+            Value::Null => Cell::Null,
+            Value::Numeric(amphora_engine::Numeric::Integer(i)) => Cell::Int(*i),
+            Value::Numeric(amphora_engine::Numeric::Float(f)) => Cell::Real(f64::from(*f)),
+            Value::Text(t) => Cell::Text(t.as_str()),
+            Value::Blob(b) => Cell::Blob(b),
+        }
+        .text()
+    }
+
+    /// Every row of each statement, every value as the answer check writes it.
+    fn answer_all(
+        db: &mut Db,
+        stmts: &[&'static str],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut rows = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            db.query(sql, ps.iter().map(value), |r| {
+                rows.push(r.get_values().map(cell).collect());
+                Ok(true)
+            })?;
+        }
+        Ok(rows)
+    }
+
+    /// The holding a bench engine's group keeps with its rows, as Amphora's own engine keeps it
+    /// (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks every engine
+    /// for it, and a run stops at open without it.
+    pub fn holding(db: &mut Db) -> anyhow::Result<Option<Vec<u8>>> {
+        db.exec(HOLDING_TABLE)?;
+        let mut kept = None;
+        db.query(
+            "SELECT holding FROM __suite_holding WHERE one = 0",
+            [],
+            |r| {
+                kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
+                Ok(false)
+            },
+        )?;
+        Ok(kept)
+    }
+
+    /// Keeps `holding` in place of the one kept before, durable before it returns.
+    pub fn keep_holding(db: &mut Db, holding: &[u8]) -> anyhow::Result<()> {
+        let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
+        db.transaction(|db| {
+            db.exec(HOLDING_TABLE)?;
+            db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
+        })?;
+        (db.flusher())()?;
+        Ok(())
+    }
+
     /// Every row of each statement, every column taken: how many rows.
     fn read_all(db: &mut Db, stmts: &[&'static str], params: &[Vec<P>]) -> anyhow::Result<usize> {
         let mut n = 0;
@@ -156,6 +283,27 @@ mod amphora_target {
             ""
         }
 
+        /// Its parameters: its statements are shared by every row of its kind.
+        fn row_bytes(row: &SqlRow) -> usize {
+            let list = std::mem::size_of::<SqlRow>().saturating_add(
+                row.params
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<P>>()),
+            );
+            row.params.iter().fold(list, |n, ps| {
+                ps.iter().fold(
+                    n.saturating_add(ps.capacity().saturating_mul(std::mem::size_of::<P>())),
+                    |n, p| {
+                        n.saturating_add(match p {
+                            P::T(s) => s.capacity(),
+                            P::B(b) => b.capacity(),
+                            P::I(_) | P::F(_) | P::Z(_) | P::N => 0,
+                        })
+                    },
+                )
+            })
+        }
+
         fn apply(&mut self, rows: &[SqlRow]) -> anyhow::Result<usize> {
             self.db.transaction(|db| {
                 for row in rows {
@@ -166,7 +314,11 @@ mod amphora_target {
         }
 
         // As many statements to a commit as the writer's cache holds the pages of (store.md, decision 23).
-        fn apply_batches(&mut self, rows: &[SqlRow], ends: &[usize]) -> anyhow::Result<(usize, usize)> {
+        fn apply_batches(
+            &mut self,
+            rows: &[SqlRow],
+            ends: &[usize],
+        ) -> anyhow::Result<(usize, usize)> {
             let mut start = 0;
             let batches = ends.iter().map(|&end| {
                 let batch = rows.get(start..end).unwrap_or_default();
@@ -188,26 +340,12 @@ mod amphora_target {
             Some(self.db.flusher())
         }
 
-        // The suite's one group keeps its holding with its rows, durable, as Amphora's own engine
-        // does (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks for it.
         fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-            self.db.exec(HOLDING_TABLE)?;
-            let mut kept = None;
-            self.db.query("SELECT holding FROM __suite_holding WHERE one = 0", [], |r| {
-                kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
-                Ok(false)
-            })?;
-            Ok(kept)
+            holding(&mut self.db)
         }
 
         fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
-            let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.db.transaction(|db| {
-                db.exec(HOLDING_TABLE)?;
-                db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
-            })?;
-            (self.db.flusher())()?;
-            Ok(())
+            keep_holding(&mut self.db, holding)
         }
 
         fn opener(&self) -> Option<Opener<Db>> {
@@ -223,6 +361,13 @@ mod amphora_target {
 
         fn checkpoint(reader: &mut Db) -> anyhow::Result<Checkpointed> {
             reader.checkpoint()
+        }
+
+        // As Amphora's own engine reports it (database.rs): the checkpointer then leaves a log
+        // within its bound uncopied (docs/design/store.md, decision 35). Without it the store can't
+        // tell and copies the log into the file every period, with a flush of the file each time.
+        fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+            Ok(Some(reader.uncopied()))
         }
 
         fn restart_log(&mut self) -> anyhow::Result<bool> {
@@ -271,13 +416,29 @@ mod amphora_target {
             if std::env::var("AMPHORA_PAGE_LOG").ok().as_deref() == Some("1") {
                 db.log_format(amphora::db::LogFormat::Pages)?;
             }
-            if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES").ok().and_then(|v| v.parse().ok()) {
+            if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 db.keep_pages(pages)?;
             }
-            let reader_pages = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok());
-            let commit_rows = std::env::var("AMPHORA_COMMIT_ROWS").ok().and_then(|v| v.parse().ok());
+            let reader_pages = std::env::var("AMPHORA_READER_PAGES")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let commit_rows = std::env::var("AMPHORA_COMMIT_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok());
             let retired = path.with_file_name("suite.retired");
-            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows, retired, pool })
+            Ok(Self {
+                loader: Mutex::new(Some(db)),
+                groups: OnceLock::new(),
+                sql: Arc::new(Mutex::new(HashMap::new())),
+                readers: clients.max(1),
+                reader_pages,
+                commit_rows,
+                retired,
+                pool,
+            })
         }
     }
 
@@ -287,9 +448,17 @@ mod amphora_target {
         }
 
         fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
-            let mut loader = self.loader.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            let db = loader.as_mut().ok_or_else(|| anyhow::anyhow!("the store has started"))?;
-            let leaked: Vec<&'static str> = stmts.iter().map(|(s, _)| leak(&self.sql, s)).collect::<anyhow::Result<_>>()?;
+            let mut loader = self
+                .loader
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let db = loader
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("the store has started"))?;
+            let leaked: Vec<&'static str> = stmts
+                .iter()
+                .map(|(s, _)| leak(&self.sql, s))
+                .collect::<anyhow::Result<_>>()?;
             db.transaction(|db| {
                 for (sql, (_, ps)) in leaked.iter().zip(stmts) {
                     db.query(sql, ps.iter().map(value), |_| Ok(true))?;
@@ -301,8 +470,13 @@ mod amphora_target {
         }
 
         fn settle(&self) -> anyhow::Result<()> {
-            let loader = self.loader.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            let db = loader.as_ref().ok_or_else(|| anyhow::anyhow!("the store has started"))?;
+            let loader = self
+                .loader
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let db = loader
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("the store has started"))?;
             // No reader exists yet, so nothing holds the log: the checkpoint copies all of it and
             // cuts the file, as SQLite's and Turso's settles do. A restart alone kept the load's 7.5
             // GB of log, whose pages then crowded the database out of the unit's OS cache.
@@ -310,19 +484,43 @@ mod amphora_target {
         }
 
         fn ready(&self) -> anyhow::Result<()> {
-            let db = self.loader.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.take().ok_or_else(|| anyhow::anyhow!("started twice"))?;
-            let mut slot = Some(SqlEngine { db, reader_pages: self.reader_pages });
+            let db = self
+                .loader
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("started twice"))?;
+            let mut slot = Some(SqlEngine {
+                db,
+                reader_pages: self.reader_pages,
+            });
             // As many readers as clients: a read never waits for another's reader.
             let defaults = Config::default();
-            let config = Config { readers: self.readers, commit_rows: self.commit_rows.unwrap_or(defaults.commit_rows), ..defaults };
-            let groups = Groups::start(1, config, &self.retired, |_| slot.take().ok_or_else(|| anyhow::anyhow!("one group")))?;
-            self.groups.set(Arc::new(groups)).map_err(|_| anyhow::anyhow!("started twice"))?;
+            let config = Config {
+                readers: self.readers,
+                commit_rows: self.commit_rows.unwrap_or(defaults.commit_rows),
+                ..defaults
+            };
+            let groups = Groups::start(1, config, &self.retired, |_| {
+                slot.take().ok_or_else(|| anyhow::anyhow!("one group"))
+            })?;
+            self.groups
+                .set(Arc::new(groups))
+                .map_err(|_| anyhow::anyhow!("started twice"))?;
             Ok(())
         }
 
         fn session(&self) -> anyhow::Result<Box<dyn Session>> {
-            let groups = self.groups.get().ok_or_else(|| anyhow::anyhow!("not started"))?.clone();
-            Ok(Box::new(AmphoraSession { groups, sql: self.sql.clone(), known: HashMap::new() }))
+            let groups = self
+                .groups
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("not started"))?
+                .clone();
+            Ok(Box::new(AmphoraSession {
+                groups,
+                sql: self.sql.clone(),
+                known: HashMap::new(),
+            }))
         }
 
         fn stats(&self) -> serde_json::Value {
@@ -351,12 +549,22 @@ mod amphora_target {
     }
 
     impl Session for AmphoraSession {
-        fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
+        fn run(
+            &mut self,
+            kind: Kind,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<usize> {
             let at = stmts.as_ptr() as usize;
             let leaked = match self.known.get(&at) {
                 Some(l) if l.len() == stmts.len() => l.clone(),
                 _ => {
-                    let l = Arc::new(stmts.iter().map(|s| leak(&self.sql, s)).collect::<anyhow::Result<Vec<_>>>()?);
+                    let l = Arc::new(
+                        stmts
+                            .iter()
+                            .map(|s| leak(&self.sql, s))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                    );
                     self.known.insert(at, l.clone());
                     l
                 }
@@ -366,36 +574,84 @@ mod amphora_target {
                 Kind::Read => {
                     let (s1, p1) = (leaked.clone(), params.to_vec());
                     let (s2, p2) = (leaked, params.to_vec());
-                    self.groups.read_committed("", until, move |db| read_all(db, &s1, &p1), move |e: &mut SqlEngine| read_all(&mut e.db, &s2, &p2))
+                    self.groups.read_committed(
+                        "",
+                        until,
+                        move |db| read_all(db, &s1, &p1),
+                        move |e: &mut SqlEngine| read_all(&mut e.db, &s2, &p2),
+                    )
                 }
                 Kind::Write => {
-                    let ticket = self.groups.put_wait(vec![SqlRow { stmts: leaked, params: params.to_vec() }], until)?;
+                    let ticket = self.groups.put_wait(
+                        vec![SqlRow {
+                            stmts: leaked,
+                            params: params.to_vec(),
+                        }],
+                        until,
+                    )?;
                     self.groups.durable(&ticket, until)?;
                     Ok(0)
                 }
             }
         }
 
+        fn answer(
+            &mut self,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            let leaked = Arc::new(
+                stmts
+                    .iter()
+                    .map(|s| leak(&self.sql, s))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+            let (s1, p1) = (leaked.clone(), params.to_vec());
+            let (s2, p2) = (leaked, params.to_vec());
+            self.groups.read_committed(
+                "",
+                Instant::now() + WAIT,
+                move |db| answer_all(db, &s1, &p1),
+                move |e: &mut SqlEngine| answer_all(&mut e.db, &s2, &p2),
+            )
+        }
+
         fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
             // AMPHORA_EQP_JSON=1: the plan with the optimizer's estimates (EXPLAIN QUERY PLAN FORMAT=JSON).
-            let format = if std::env::var("AMPHORA_EQP_JSON").ok().as_deref() == Some("1") { "FORMAT=JSON " } else { "" };
+            let format = if std::env::var("AMPHORA_EQP_JSON").ok().as_deref() == Some("1") {
+                "FORMAT=JSON "
+            } else {
+                ""
+            };
             let plan = leak(&self.sql, &format!("EXPLAIN QUERY PLAN {format}{sql}"))?;
             let p = params.to_vec();
             let lines = move |db: &mut Db| -> anyhow::Result<Vec<String>> {
                 let mut out = Vec::new();
                 db.query(plan, p.iter().map(value), |r| {
-                    out.push(r.get_values().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                    out.push(
+                        r.get_values()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    );
                     Ok(true)
                 })?;
                 Ok(out)
             };
             let on_writer = lines.clone();
-            self.groups.read_committed("", Instant::now() + WAIT, lines, move |e: &mut SqlEngine| on_writer(&mut e.db))
+            self.groups.read_committed(
+                "",
+                Instant::now() + WAIT,
+                lines,
+                move |e: &mut SqlEngine| on_writer(&mut e.db),
+            )
         }
     }
 }
 
-pub use amphora_target::value as amphora_value;
+pub use amphora_target::{
+    holding as amphora_holding, keep_holding as amphora_keep_holding, value as amphora_value,
+};
 
 /// How the bench's Amphora databases share the pages their connections read (docs/design/store.md,
 /// decisions 20 and 26): `AMPHORA_SHARED_PAGES` unset or 0, none, as Amphora ships; `process`, the
@@ -406,14 +662,20 @@ pub fn amphora_sharing() -> anyhow::Result<amphora::db::Sharing> {
     if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
         return Ok(Sharing::Off);
     }
-    Ok(match std::env::var("AMPHORA_SHARED_PAGES").ok().as_deref() {
-        None | Some("0") => Sharing::Off,
-        Some("process") => Sharing::Process,
-        Some(pages) => {
-            let pages = pages.parse::<usize>().map_err(|e| anyhow::anyhow!("AMPHORA_SHARED_PAGES={pages}: {e} (a number of pages, 0 or process)"))?;
-            Sharing::Pool(Arc::new(SharedPages::new(pages)))
-        }
-    })
+    Ok(
+        match std::env::var("AMPHORA_SHARED_PAGES").ok().as_deref() {
+            None | Some("0") => Sharing::Off,
+            Some("process") => Sharing::Process,
+            Some(pages) => {
+                let pages = pages.parse::<usize>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "AMPHORA_SHARED_PAGES={pages}: {e} (a number of pages, 0 or process)"
+                    )
+                })?;
+                Sharing::Pool(Arc::new(SharedPages::new(pages)))
+            }
+        },
+    )
 }
 use amphora_target::Amphora;
 
@@ -424,49 +686,92 @@ use amphora_target::Amphora;
 
 mod mvcc_target {
     use super::*;
-    use amphora_engine::{ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenOptions, PlatformIO, SqliteDialect, Statement, StepResult, Value};
+    use amphora_engine::{
+        ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenOptions, PlatformIO,
+        SqliteDialect, Statement, StepResult, Value,
+    };
 
     pub struct Mvcc {
         io: Arc<dyn IO>,
         db: Arc<Database>,
+        /// The checkpointing thread's stop (AMPHORA_MVCC_CHECKPOINT_MS), set when the target goes.
+        checkpointer: Option<Arc<crate::Stop>>,
+    }
+
+    impl Drop for Mvcc {
+        fn drop(&mut self) {
+            if let Some(stop) = &self.checkpointer {
+                stop.stop();
+            }
+        }
     }
 
     impl Mvcc {
         pub fn open(dir: &str) -> anyhow::Result<Self> {
             let path = fresh(dir)?;
-            let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
+            let name = path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
             let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-            let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let db = Database::open(
+                io.clone(),
+                name,
+                OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             // AMPHORA_MVCC_CHECKPOINT_MS: commits never checkpoint; a thread of its own does, this
             // often (unset: each commit past the log's threshold checkpoints, as the engine ships).
-            let background = std::env::var("AMPHORA_MVCC_CHECKPOINT_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis);
-            let m = Self { io, db };
+            let background = std::env::var("AMPHORA_MVCC_CHECKPOINT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_millis);
+            let mut m = Self {
+                io,
+                db,
+                checkpointer: None,
+            };
             let mut s = m.connect()?;
             let mut rows = 0;
             if let Err(Retry) = s.step("PRAGMA journal_mode = 'mvcc'", &[], &mut rows)? {
                 anyhow::bail!("couldn't turn MVCC on");
             }
             if let Some(every) = background {
-                if let Err(Retry) = s.step("PRAGMA mvcc_checkpoint_threshold = -1", &[], &mut rows)? {
+                if let Err(Retry) =
+                    s.step("PRAGMA mvcc_checkpoint_threshold = -1", &[], &mut rows)?
+                {
                     anyhow::bail!("couldn't turn inline checkpoints off");
                 }
                 let mut c = m.connect()?;
-                std::thread::Builder::new().name("mvcc-checkpoint".into()).spawn(move || {
-                    loop {
-                        std::thread::sleep(every);
-                        let mut rows = 0;
-                        if let Err(e) = c.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows) {
-                            eprintln!("mvcc checkpoint: {e:#}");
+                let stop = Arc::new(crate::Stop::default());
+                m.checkpointer = Some(stop.clone());
+                // Every `every`, until the target goes: the period is the setting's, a timed wait on
+                // the stop.
+                std::thread::Builder::new()
+                    .name("mvcc-checkpoint".into())
+                    .spawn(move || {
+                        while !stop.wait_until(Instant::now() + every) {
+                            let mut rows = 0;
+                            if let Err(e) =
+                                c.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)
+                            {
+                                eprintln!("mvcc checkpoint: {e:#}");
+                            }
                         }
-                    }
-                })?;
+                    })?;
             }
             Ok(m)
         }
 
         fn connect(&self) -> anyhow::Result<MvccSession> {
-            let conn = self.db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut s = MvccSession { io: self.io.clone(), conn, stmts: HashMap::new() };
+            let conn = self
+                .db
+                .connect(ConnectOpts::new())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut s = MvccSession {
+                io: self.io.clone(),
+                conn,
+                stmts: HashMap::new(),
+            };
             let mut rows = 0;
             if let Err(Retry) = s.step("PRAGMA synchronous = FULL", &[], &mut rows)? {
                 anyhow::bail!("couldn't set synchronous");
@@ -502,19 +807,32 @@ mod mvcc_target {
     struct Retry;
 
     impl MvccSession {
-        fn step(&mut self, sql: &str, params: &[P], rows: &mut usize) -> anyhow::Result<Result<(), Retry>> {
+        fn step(
+            &mut self,
+            sql: &str,
+            params: &[P],
+            rows: &mut usize,
+        ) -> anyhow::Result<Result<(), Retry>> {
             if !self.stmts.contains_key(sql) {
                 let stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
                 self.stmts.insert(sql.to_owned(), stmt);
             }
             let io = self.io.clone();
-            let stmt = self.stmts.get_mut(sql).ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
+            let stmt = self
+                .stmts
+                .get_mut(sql)
+                .ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
             stmt.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
             for (i, p) in params.iter().enumerate() {
-                stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+                stmt.bind_at(
+                    NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                    value(p),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            let waker = crate::unpark_waker();
             loop {
-                match stmt.step() {
+                match stmt.step_with_waker(&waker) {
                     Ok(StepResult::Row) => {
                         if let Some(r) = stmt.row() {
                             for v in r.get_values() {
@@ -524,13 +842,25 @@ mod mvcc_target {
                         *rows += 1;
                     }
                     Ok(StepResult::Done) => return Ok(Ok(())),
-                    Ok(StepResult::IO | StepResult::Yield) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                    Ok(StepResult::IO | StepResult::Yield) => {
+                        io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                    }
                     Ok(StepResult::Sleep { duration }) => {
-                        std::thread::sleep(duration);
+                        // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
+                        // no reason only steps again.
+                        std::thread::park_timeout(duration);
                         io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     Ok(StepResult::Busy) => return Ok(Err(Retry)),
-                    Err(e) if matches!(e, LimboError::Busy | LimboError::BusySnapshot | LimboError::WriteWriteConflict | LimboError::CommitDependencyAborted | LimboError::TxTerminated) => return Ok(Err(Retry)),
+                    Err(
+                        LimboError::Busy
+                        | LimboError::BusySnapshot
+                        | LimboError::WriteWriteConflict
+                        | LimboError::CommitDependencyAborted
+                        | LimboError::TxTerminated,
+                    ) => {
+                        return Ok(Err(Retry));
+                    }
                     Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
                     Err(e) => return Err(anyhow::anyhow!("{e}")),
                 }
@@ -538,7 +868,12 @@ mod mvcc_target {
         }
 
         /// `stmts` in one transaction begun by `begin`, tried again while it meets another writer.
-        fn transaction(&mut self, begin: &str, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<()> {
+        fn transaction(
+            &mut self,
+            begin: &str,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<()> {
             let began = Instant::now();
             loop {
                 let mut rows = 0;
@@ -586,7 +921,12 @@ mod mvcc_target {
     }
 
     impl Session for MvccSession {
-        fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
+        fn run(
+            &mut self,
+            kind: Kind,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<usize> {
             match kind {
                 Kind::Write => {
                     self.transaction("BEGIN CONCURRENT", stmts, params)?;
@@ -623,15 +963,32 @@ struct Turso {
 impl Turso {
     fn open(dir: &str, reuse: bool) -> anyhow::Result<Self> {
         let path = suite_db(dir, reuse)?;
-        let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-        let db = turso_core::Database::open(io.clone(), name, turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect)).db_opts(turso_core::DatabaseOpts::new())).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
+        let io: Arc<dyn turso_core::IO> =
+            Arc::new(turso_core::PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+        let db = turso_core::Database::open(
+            io.clone(),
+            name,
+            turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::new()),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self { io, db })
     }
 
     fn connect(&self) -> anyhow::Result<TursoSession> {
-        let conn = self.db.connect(turso_core::ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(TursoSession { io: self.io.clone(), conn, stmts: HashMap::new() })
+        let conn = self
+            .db
+            .connect(turso_core::ConnectOpts::new())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.set_busy_timeout(WAIT);
+        Ok(TursoSession {
+            io: self.io.clone(),
+            conn,
+            stmts: HashMap::new(),
+        })
     }
 }
 
@@ -650,10 +1007,7 @@ impl Target for Turso {
     fn settle(&self) -> anyhow::Result<()> {
         let mut s = self.connect()?;
         let mut rows = 0;
-        if let Err(Busy) = s.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)? {
-            anyhow::bail!("the checkpoint found the database busy");
-        }
-        Ok(())
+        s.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)
     }
 
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
@@ -667,9 +1021,6 @@ struct TursoSession {
     stmts: HashMap<String, turso_core::Statement>,
 }
 
-/// A statement found the database locked by another writer.
-struct Busy;
-
 fn turso_value(p: &P) -> turso_core::Value {
     match p {
         P::I(i) => turso_core::Value::from_i64(*i),
@@ -682,16 +1033,23 @@ fn turso_value(p: &P) -> turso_core::Value {
 }
 
 impl TursoSession {
-    fn step(&mut self, sql: &str, params: &[P], rows: &mut usize) -> anyhow::Result<Result<(), Busy>> {
+    fn step(&mut self, sql: &str, params: &[P], rows: &mut usize) -> anyhow::Result<()> {
         if !self.stmts.contains_key(sql) {
             let stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
             self.stmts.insert(sql.to_owned(), stmt);
         }
         let io = self.io.clone();
-        let stmt = self.stmts.get_mut(sql).ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
+        let stmt = self
+            .stmts
+            .get_mut(sql)
+            .ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
         stmt.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
-            stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, turso_value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            stmt.bind_at(
+                NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                turso_value(p),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         loop {
             match stmt.step() {
@@ -703,69 +1061,112 @@ impl TursoSession {
                     }
                     *rows += 1;
                 }
-                Ok(turso_core::StepResult::Done) => return Ok(Ok(())),
-                Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
-                Ok(turso_core::StepResult::Sleep { duration }) => {
-                    std::thread::sleep(duration);
-                    io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-                Ok(turso_core::StepResult::Busy) | Err(turso_core::LimboError::Busy) => return Ok(Err(Busy)),
+                Ok(turso_core::StepResult::Done) => return Ok(()),
+                // Sleep is the busy handler's backoff: Turso's own SDK steps again through it
+                // (sdk-kit's `step_inner`), so its handler does the waiting.
+                Ok(
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. },
+                ) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                Ok(turso_core::StepResult::Busy) => anyhow::bail!("busy past the busy timeout"),
                 Ok(turso_core::StepResult::Interrupt) => anyhow::bail!("interrupted"),
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             }
         }
     }
 
-    /// `stmts` in one transaction, tried again while another writer holds the database.
+    /// `stmts` in one transaction.
     fn transaction(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<()> {
-        let began = Instant::now();
-        loop {
-            let mut rows = 0;
-            let attempt = (|| -> anyhow::Result<Result<(), Busy>> {
-                if let Err(b) = self.step("BEGIN IMMEDIATE", &[], &mut rows)? {
-                    return Ok(Err(b));
-                }
-                for (s, p) in stmts.iter().zip(params) {
-                    if let Err(b) = self.step(s, p, &mut rows)? {
-                        return Ok(Err(b));
-                    }
-                }
-                self.step("COMMIT", &[], &mut rows)
-            })();
-            match attempt {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(Busy)) => {
-                    let _ = self.step("ROLLBACK", &[], &mut rows);
-                    if began.elapsed() > WAIT {
-                        anyhow::bail!("the database stayed busy");
-                    }
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                Err(e) => {
-                    let _ = self.step("ROLLBACK", &[], &mut rows);
-                    return Err(e);
-                }
+        let mut rows = 0;
+        let done = (|| -> anyhow::Result<()> {
+            self.step("BEGIN IMMEDIATE", &[], &mut rows)?;
+            for (s, p) in stmts.iter().zip(params) {
+                self.step(s, p, &mut rows)?;
             }
+            self.step("COMMIT", &[], &mut rows)
+        })();
+        if done.is_err() {
+            let _ = self.step("ROLLBACK", &[], &mut rows);
         }
+        done
     }
 }
 
+fn turso_cell(v: &turso_core::Value) -> Option<String> {
+    match v {
+        turso_core::Value::Null => Cell::Null,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => Cell::Int(*i),
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => Cell::Real(f64::from(*f)),
+        turso_core::Value::Text(t) => Cell::Text(t.as_str()),
+        turso_core::Value::Blob(b) => Cell::Blob(b),
+    }
+    .text()
+}
+
 impl Session for TursoSession {
+    fn answer(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let mut stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+            for (i, p) in ps.iter().enumerate() {
+                stmt.bind_at(
+                    NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                    turso_value(p),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            loop {
+                match stmt.step().map_err(|e| anyhow::anyhow!("{e}"))? {
+                    turso_core::StepResult::Row => {
+                        if let Some(r) = stmt.row() {
+                            out.push(r.get_values().map(turso_cell).collect());
+                        }
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                    }
+                    other => anyhow::bail!("the answer stopped: {other:?}"),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(format!("EXPLAIN QUERY PLAN {sql}")).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = self
+            .conn
+            .prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
-            stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, turso_value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            stmt.bind_at(
+                NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                turso_value(p),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         let mut out = Vec::new();
         loop {
             match stmt.step().map_err(|e| anyhow::anyhow!("{e}"))? {
                 turso_core::StepResult::Row => {
                     if let Some(r) = stmt.row() {
-                        out.push(r.get_values().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                        out.push(
+                            r.get_values()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" | "),
+                        );
                     }
                 }
                 turso_core::StepResult::Done => return Ok(out),
-                turso_core::StepResult::IO | turso_core::StepResult::Yield => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                }
                 other => anyhow::bail!("EXPLAIN stopped: {other:?}"),
             }
         }
@@ -775,24 +1176,11 @@ impl Session for TursoSession {
         match (kind, stmts) {
             (Kind::Write, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
             _ => {
-                let began = Instant::now();
-                loop {
-                    let mut rows = 0;
-                    let mut busy = false;
-                    for (s, p) in stmts.iter().zip(params) {
-                        if self.step(s, p, &mut rows)?.is_err() {
-                            busy = true;
-                            break;
-                        }
-                    }
-                    if !busy {
-                        return Ok(rows);
-                    }
-                    if began.elapsed() > WAIT {
-                        anyhow::bail!("the database stayed busy");
-                    }
-                    std::thread::sleep(Duration::from_micros(200));
+                let mut rows = 0;
+                for (s, p) in stmts.iter().zip(params) {
+                    self.step(s, p, &mut rows)?;
                 }
+                Ok(rows)
             }
         }
     }
@@ -807,12 +1195,15 @@ struct Sqlite {
 
 impl Sqlite {
     fn open(dir: &str, reuse: bool) -> anyhow::Result<Self> {
-        Ok(Self { path: suite_db(dir, reuse)? })
+        Ok(Self {
+            path: suite_db(dir, reuse)?,
+        })
     }
 
     fn connect(&self) -> anyhow::Result<rusqlite::Connection> {
         let c = rusqlite::Connection::open(&self.path)?;
-        c.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 120000;")?;
+        c.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+        c.busy_timeout(WAIT)?;
         Ok(c)
     }
 }
@@ -875,6 +1266,37 @@ struct SqliteSession {
 }
 
 impl Session for SqliteSession {
+    fn answer(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        use rusqlite::types::ValueRef;
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let mut stmt = self.c.prepare_cached(sql)?;
+            let columns = stmt.column_count();
+            let mut rows = stmt.query(rusqlite::params_from_iter(ps.iter().map(sqlite_value)))?;
+            while let Some(r) = rows.next()? {
+                let mut row = Vec::with_capacity(columns);
+                for col in 0..columns {
+                    row.push(
+                        match r.get_ref(col)? {
+                            ValueRef::Null => Cell::Null,
+                            ValueRef::Integer(i) => Cell::Int(i),
+                            ValueRef::Real(f) => Cell::Real(f),
+                            ValueRef::Text(t) => Cell::Text(std::str::from_utf8(t)?),
+                            ValueRef::Blob(b) => Cell::Blob(b),
+                        }
+                        .text(),
+                    );
+                }
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_value)))?;
@@ -887,7 +1309,9 @@ impl Session for SqliteSession {
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if kind == Kind::Write && stmts.len() > 1 {
-            let tx = self.c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = self
+                .c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for (s, p) in stmts.iter().zip(params) {
                 sqlite_rows(&tx, s, p)?;
             }
@@ -921,13 +1345,121 @@ struct Pg {
 struct Raw(usize);
 
 impl<'a> postgres::types::FromSql<'a> for Raw {
-    fn from_sql(_: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        _: &postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(Raw(raw.len()))
     }
 
     fn accepts(_: &postgres::types::Type) -> bool {
         true
     }
+}
+
+/// A column's value decoded by its type for the answer check: a boolean as SQLite keeps one (1 or
+/// 0), NUMERIC in decimal, JSONB as its text.
+struct PgCell(Option<String>);
+
+impl<'a> postgres::types::FromSql<'a> for PgCell {
+    fn from_sql(
+        ty: &postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        use postgres::types::Type;
+        let cell = match *ty {
+            Type::BOOL => Cell::Int(i64::from(<bool as postgres::types::FromSql>::from_sql(
+                ty, raw,
+            )?)),
+            Type::INT2 => Cell::Int(i64::from(<i16 as postgres::types::FromSql>::from_sql(
+                ty, raw,
+            )?)),
+            Type::INT4 => Cell::Int(i64::from(<i32 as postgres::types::FromSql>::from_sql(
+                ty, raw,
+            )?)),
+            Type::INT8 => Cell::Int(<i64 as postgres::types::FromSql>::from_sql(ty, raw)?),
+            Type::FLOAT4 => Cell::Real(f64::from(<f32 as postgres::types::FromSql>::from_sql(
+                ty, raw,
+            )?)),
+            Type::FLOAT8 => Cell::Real(<f64 as postgres::types::FromSql>::from_sql(ty, raw)?),
+            Type::NUMERIC => {
+                return Ok(PgCell(Some(
+                    numeric_text(raw).ok_or("a NUMERIC cut short")?,
+                )));
+            }
+            Type::BYTEA => Cell::Blob(raw),
+            // JSONB's binary form is a version byte, then the document's text.
+            Type::JSONB => Cell::Text(std::str::from_utf8(raw.get(1..).unwrap_or_default())?),
+            _ => Cell::Text(std::str::from_utf8(raw)?),
+        };
+        Ok(PgCell(cell.text()))
+    }
+
+    fn from_sql_null(
+        _: &postgres::types::Type,
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(PgCell(None))
+    }
+
+    fn accepts(_: &postgres::types::Type) -> bool {
+        true
+    }
+}
+
+/// NUMERIC's binary form (PostgreSQL's numeric.c, `numeric_send`) in decimal: digit count, weight
+/// of the first base-10000 digit, sign, display scale, then the digits.
+fn numeric_text(raw: &[u8]) -> Option<String> {
+    let u = |i: usize| {
+        raw.get(i..i + 2)
+            .map(|b| b.iter().fold(0u16, |n, &x| (n << 8) | u16::from(x)))
+    };
+    let (n, weight, sign, scale) = (
+        usize::from(u(0)?),
+        u(2)?.cast_signed(),
+        u(4)?,
+        usize::from(u(6)?),
+    );
+    match sign {
+        0xC000 => return Some("NaN".into()),
+        0xD000 => return Some("Infinity".into()),
+        0xF000 => return Some("-Infinity".into()),
+        _ => {}
+    }
+    let digits: Vec<u16> = (0..n).map(|i| u(8 + 2 * i)).collect::<Option<_>>()?;
+    // The digit at exponent `e` (base 10000) sits at index weight - e.
+    let at = |e: i16| {
+        usize::try_from(weight.checked_sub(e)?)
+            .ok()
+            .and_then(|i| digits.get(i).copied())
+            .or(Some(0))
+    };
+    let mut s = String::new();
+    if sign == 0x4000 {
+        s.push('-');
+    }
+    if weight < 0 {
+        s.push('0');
+    }
+    for e in (0..=weight).rev() {
+        let d = at(e)?;
+        if e == weight {
+            s.push_str(&d.to_string());
+        } else {
+            s.push_str(&format!("{d:04}"));
+        }
+    }
+    if scale > 0 {
+        let mut frac = String::new();
+        let mut e: i16 = -1;
+        while frac.len() < scale {
+            frac.push_str(&format!("{:04}", at(e)?));
+            e = e.checked_sub(1)?;
+        }
+        frac.truncate(scale);
+        s.push('.');
+        s.push_str(&frac);
+    }
+    Some(s)
 }
 
 fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
@@ -948,12 +1480,17 @@ fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
 
 impl Pg {
     fn open(dsn: &str, kind: PgKind) -> anyhow::Result<Self> {
-        let pg = Self { dsn: dsn.to_owned(), kind };
+        let pg = Self {
+            dsn: dsn.to_owned(),
+            kind,
+        };
         let mut c = pg.client()?;
         if kind == PgKind::Orioledb {
             c.batch_execute("CREATE EXTENSION IF NOT EXISTS orioledb")?;
         }
-        c.batch_execute("DROP TABLE IF EXISTS items; DROP TABLE IF EXISTS owners; DROP TABLE IF EXISTS regions")?;
+        c.batch_execute(
+            "DROP TABLE IF EXISTS items; DROP TABLE IF EXISTS owners; DROP TABLE IF EXISTS regions",
+        )?;
         Ok(pg)
     }
 
@@ -974,19 +1511,27 @@ impl Target for Pg {
     fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
         let mut c = self.client()?;
         // VACUUM runs outside a transaction.
-        if let [(s, p)] = stmts {
-            if p.is_empty() && s.starts_with("VACUUM") {
-                c.batch_execute(s)?;
-                return Ok(());
-            }
+        if let [(s, p)] = stmts
+            && p.is_empty()
+            && s.starts_with("VACUUM")
+        {
+            c.batch_execute(s)?;
+            return Ok(());
         }
         let mut tx = c.transaction()?;
         for (s, p) in stmts {
-            let s = if self.kind == PgKind::Orioledb && s.starts_with("CREATE TABLE") { format!("{s} USING orioledb") } else { s.clone() };
+            let s = if self.kind == PgKind::Orioledb && s.starts_with("CREATE TABLE") {
+                format!("{s} USING orioledb")
+            } else {
+                s.clone()
+            };
             let s = crate::suite::placeholders(Dialect::Postgres, &s);
             let owned = pg_params(p);
-            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
-            tx.execute(s.as_str(), &refs).map_err(|e| anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>()))?;
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                owned.iter().map(|b| b.as_ref()).collect();
+            tx.execute(s.as_str(), &refs).map_err(|e| {
+                anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>())
+            })?;
         }
         tx.commit()?;
         Ok(())
@@ -998,7 +1543,10 @@ impl Target for Pg {
     }
 
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
-        Ok(Box::new(PgSession { c: self.client()?, stmts: HashMap::new() }))
+        Ok(Box::new(PgSession {
+            c: self.client()?,
+            stmts: HashMap::new(),
+        }))
     }
 }
 
@@ -1029,20 +1577,49 @@ fn pg_rows(rows: &[postgres::Row]) -> anyhow::Result<usize> {
 }
 
 impl Session for PgSession {
+    fn answer(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let s = self.statement(sql)?;
+            let owned = pg_params(ps);
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                owned.iter().map(|b| b.as_ref()).collect();
+            for r in self.c.query(&s, &refs)? {
+                out.push(
+                    (0..r.len())
+                        .map(|i| r.try_get::<_, PgCell>(i).map(|c| c.0))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let owned = pg_params(params);
-        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            owned.iter().map(|b| b.as_ref()).collect();
         let rows = self.c.query(format!("EXPLAIN {sql}").as_str(), &refs)?;
-        rows.iter().map(|r| r.try_get::<_, String>(0).map_err(Into::into)).collect()
+        rows.iter()
+            .map(|r| r.try_get::<_, String>(0).map_err(Into::into))
+            .collect()
     }
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
-        let prepared: Vec<postgres::Statement> = stmts.iter().map(|s| self.statement(s)).collect::<anyhow::Result<_>>()?;
+        let prepared: Vec<postgres::Statement> = stmts
+            .iter()
+            .map(|s| self.statement(s))
+            .collect::<anyhow::Result<_>>()?;
         if kind == Kind::Write && stmts.len() > 1 {
             let mut tx = self.c.transaction()?;
             for (s, p) in prepared.iter().zip(params) {
                 let owned = pg_params(p);
-                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
+                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    owned.iter().map(|b| b.as_ref()).collect();
                 pg_rows(&tx.query(s, &refs)?)?;
             }
             tx.commit()?;
@@ -1051,7 +1628,8 @@ impl Session for PgSession {
         let mut n = 0;
         for (s, p) in prepared.iter().zip(params) {
             let owned = pg_params(p);
-            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                owned.iter().map(|b| b.as_ref()).collect();
             n += pg_rows(&self.c.query(s, &refs)?)?;
         }
         Ok(n)
@@ -1085,7 +1663,11 @@ fn mysql_params(params: &[P]) -> mysql::Params {
 }
 
 /// Every row of `sql` on `q`, every column taken: how many.
-fn mysql_rows(q: &mut impl mysql::prelude::Queryable, sql: &str, params: &[P]) -> anyhow::Result<usize> {
+fn mysql_rows(
+    q: &mut impl mysql::prelude::Queryable,
+    sql: &str,
+    params: &[P],
+) -> anyhow::Result<usize> {
     let mut n = 0;
     let result = q.exec_iter(sql, mysql_params(params))?;
     for row in result {
@@ -1101,8 +1683,10 @@ fn mysql_rows(q: &mut impl mysql::prelude::Queryable, sql: &str, params: &[P]) -
 impl MySql {
     fn open(dsn: &str, connections: usize) -> anyhow::Result<Self> {
         use mysql::prelude::Queryable;
-        let constraints = mysql::PoolConstraints::new(1, connections.max(2)).ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
-        let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(dsn)?).pool_opts(mysql::PoolOpts::default().with_constraints(constraints));
+        let constraints = mysql::PoolConstraints::new(1, connections.max(2))
+            .ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
+        let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(dsn)?)
+            .pool_opts(mysql::PoolOpts::default().with_constraints(constraints));
         let pool = mysql::Pool::new(opts)?;
         let mut c = pool.get_conn()?;
         for t in ["items", "owners", "regions"] {
@@ -1121,14 +1705,18 @@ impl Target for MySql {
         let mut c = self.pool.get_conn()?;
         let mut tx = c.start_transaction(mysql::TxOpts::default())?;
         for (s, p) in stmts {
-            mysql_rows(&mut tx, s, p).map_err(|e| anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>()))?;
+            mysql_rows(&mut tx, s, p).map_err(|e| {
+                anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>())
+            })?;
         }
         tx.commit()?;
         Ok(())
     }
 
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
-        Ok(Box::new(MySqlSession { c: self.pool.get_conn()? }))
+        Ok(Box::new(MySqlSession {
+            c: self.pool.get_conn()?,
+        }))
     }
 }
 
@@ -1139,8 +1727,13 @@ struct MySqlSession {
 impl Session for MySqlSession {
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         use mysql::prelude::Queryable;
-        let rows: Vec<String> = self.c.exec(format!("EXPLAIN FORMAT=TREE {sql}"), mysql_params(params))?;
-        Ok(rows.iter().flat_map(|r| r.lines().map(str::to_owned).collect::<Vec<_>>()).collect())
+        let rows: Vec<String> = self
+            .c
+            .exec(format!("EXPLAIN FORMAT=TREE {sql}"), mysql_params(params))?;
+        Ok(rows
+            .iter()
+            .flat_map(|r| r.lines().map(str::to_owned).collect::<Vec<_>>())
+            .collect())
     }
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
@@ -1217,7 +1810,10 @@ impl ClickHouse {
             .http_status_as_error(false)
             .build()
             .into();
-        let ch = Self { agent, url: format!("{}/", url.trim_end_matches('/')) };
+        let ch = Self {
+            agent,
+            url: format!("{}/", url.trim_end_matches('/')),
+        };
         for t in ["items", "owners", "regions"] {
             ch.post(&format!("DROP TABLE IF EXISTS {t} SYNC"))?;
         }
@@ -1234,7 +1830,10 @@ fn post(agent: &ureq::Agent, url: &str, sql: &str) -> anyhow::Result<String> {
     let status = response.status();
     let text = response.body_mut().read_to_string()?;
     if !status.is_success() {
-        anyhow::bail!("ClickHouse said {status}: {}", text.trim().chars().take(300).collect::<String>());
+        anyhow::bail!(
+            "ClickHouse said {status}: {}",
+            text.trim().chars().take(300).collect::<String>()
+        );
     }
     Ok(text)
 }
@@ -1252,7 +1851,10 @@ impl Target for ClickHouse {
     }
 
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
-        Ok(Box::new(ClickHouseSession { agent: self.agent.clone(), url: self.url.clone() }))
+        Ok(Box::new(ClickHouseSession {
+            agent: self.agent.clone(),
+            url: self.url.clone(),
+        }))
     }
 }
 
@@ -1263,7 +1865,11 @@ struct ClickHouseSession {
 
 impl Session for ClickHouseSession {
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
-        let out = post(&self.agent, &self.url, &format!("EXPLAIN indexes = 1 {} FORMAT TSV", inline(sql, params)))?;
+        let out = post(
+            &self.agent,
+            &self.url,
+            &format!("EXPLAIN indexes = 1 {} FORMAT TSV", inline(sql, params)),
+        )?;
         Ok(out.lines().map(str::to_owned).collect())
     }
 
@@ -1282,5 +1888,38 @@ impl Session for ClickHouseSession {
             }
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cell, numeric_text};
+
+    #[test]
+    fn answer_values_keep_reals_apart_from_integers() {
+        assert_eq!(Cell::Real(50.0).text().as_deref(), Some("50.0"));
+        assert_eq!(Cell::Real(-3.0).text().as_deref(), Some("-3.0"));
+        assert_eq!(Cell::Real(49.5).text().as_deref(), Some("49.5"));
+        assert_eq!(Cell::Int(50).text().as_deref(), Some("50"));
+        assert_eq!(Cell::Text("a b").text().as_deref(), Some("a b"));
+        assert_eq!(Cell::Blob(&[0, 255]).text().as_deref(), Some("x'00ff'"));
+        assert_eq!(Cell::Null.text(), None);
+    }
+
+    #[test]
+    fn numeric_binary_reads_as_its_decimal() {
+        // 12345.6780: 3 digits, weight 1, positive, scale 4; digits 1, 2345, 6780.
+        let raw = [0, 3, 0, 1, 0, 0, 0, 4, 0, 1, 0x09, 0x29, 0x1a, 0x7c];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("12345.6780"));
+        // -0.00001234: 1 digit, weight -2, negative, scale 8; digit 1234.
+        let raw = [0, 1, 0xff, 0xfe, 0x40, 0, 0, 8, 0x04, 0xd2];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("-0.00001234"));
+        // 10000: 1 digit, weight 1, scale 0: the trailing zero digit isn't sent.
+        let raw = [0, 1, 0, 1, 0, 0, 0, 0, 0, 1];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("10000"));
+        // 0 at scale 2: no digits.
+        let raw = [0, 0, 0, 0, 0, 0, 0, 2];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("0.00"));
+        assert_eq!(numeric_text(&[0, 1, 0, 0]), None);
     }
 }
