@@ -2642,8 +2642,9 @@ it does now:
   queue's whole (`Control::admitted`); a call either has no room for waits for bytes given back. The calls' bytes, holding
   none, take one call larger than their bound (`within`), as a window that holds nothing sends one entry (hyper-raft's
   `Inflights::full`): a call the budget has room for never waits for room that nothing can make. Such a call leaves the
-  queue a record without entries and its envelope (`alone`), so a vote or a heartbeat enters beside it and finds a leader,
-  and an image waits for it; a call past that is refused `TooLarge` at once, as one past the budget's whole limit is.
+  queue a record that carries a command whole and its envelope (`Bounds::alone`; lane perf-A27, below), so its group's
+  records enter beside it and an image waits for it; a call past that is refused `TooLarge` at once, as one past the
+  budget's whole limit is.
 - The count of calls the owner holds behind its prepared write or for a leader (`Actor::waiting`, held to the inputs'
   count) bounded nothing the bytes don't: each of those calls holds its bytes of the calls' room and of the budget, none
   of them stands before a wire record, and the line finds the soonest deadline in O(log N). It is gone; a write taken
@@ -2660,6 +2661,27 @@ of members, a hand-off and a catch-up take a place that is free without a turn, 
 own changes. A write with its place charges the budget without waiting (`Budget::take`), and where that room went
 meanwhile it gives the place back and waits for the budget again. Tested by the `a26_` tests (T-QB.1.18) and by
 `unknown_leader_application_pressure_keeps_wire_admission_available` (A11's, whose refusal at once this replaces).
+
+**Amendment (lane perf-A27, 2026-11-24): the line proved, and two rules of it put right.** The line and the queue's room
+are `crates/amphora/src/database/replicated/line.rs`, which takes what it shares between threads from `super::sync`:
+`crates/line-loom` compiles that file over loom's and runs every interleaving of a call's arrival, a place or bytes given
+back, a wire record's arrival, the bounds learned again, a deadline, the owner's end and the budget's room going after a
+place was granted (T-QB.1.19; every interleaving where that is at most some two million, at most two or three
+preemptions where it is not). No wake is lost, no place is held twice, the first come goes first, a deadline always ends
+a wait with `Full`, the owner's end wakes every call in line, nothing is left charged, and a wire record is admitted at
+once whatever the calls do. Nine broken copies of the file each turn it red. Two of A26's rules were wrong:
+- *First come, first served held to the line, not to the owner.* A call left the line as its place was granted, before it
+  sent what the place was for, so the call behind it could send first: A26's own order test failed one round in three on
+  main at load 50 (`left: [1, 2, 4, 3]`). A call now keeps its turn until it has sent (`Room::place_by`).
+- *The largest call left room for a record without entries* (120 bytes), which a vote or a bare heartbeat is, but not
+  what a group with a read under way sends: the leader's heartbeats and their answers carry the read's round (145 bytes),
+  the read's answer an entry, and its commit a whole command's entries. A call that large starved its own group: at a
+  leader it was never answered, its read's round refused; at a follower, its read's answer. It now leaves a record that
+  carries a command whole (`MESSAGE_BYTES`), the largest of a group's records but an image. A heartbeat or a vote is
+  processed in the step that takes it, as with no call held.
+A call whose budget room went after its place was granted gives the place back, then its turn, so the call behind finds
+it, and waits for the budget again (T-QB.1.21). A stress of the line from every thread runs under ThreadSanitizer
+(T-QB.1.22).
 
 **A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
 budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
