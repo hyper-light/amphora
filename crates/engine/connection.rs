@@ -3503,9 +3503,12 @@ impl Connection {
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager
-                .load()
-                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
+            // Amphora: rows on the versioned storage are not in the file, which stays marked.
+            self.pager.load().checkpoint_shutdown(
+                self.wal_auto_actions(),
+                self.get_sync_mode(),
+                self.versioned.is_none(),
+            )?;
         };
         Ok(())
     }

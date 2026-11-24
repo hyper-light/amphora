@@ -410,6 +410,27 @@ fn d45_a_database_sqlite3_left_is_marked_before_its_second_segment_is_written() 
     }
 }
 
+/// Do: close cleanly a database whose B-trees are on the versioned storage; read it with sqlite3.
+/// Expect: refused: none of its rows is in its file, where sqlite3 would find no table (lane B30).
+#[test]
+fn d45_sqlite3_is_refused_a_closed_database_whose_rows_are_not_in_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let path = beside(dir.path(), "");
+    let options = OpenOptions::new(Arc::new(SqliteDialect));
+    let db = Database::open(io, path.to_str().unwrap(), options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    insert(&conn, 1, 3);
+    assert_eq!(rows(&conn, "SELECT count(*) FROM t"), ["3"]);
+    conn.close().unwrap();
+    drop((conn, db));
+    Files::of(dir.path(), &[]).refuses("rows on the versioned storage");
+}
+
 /// Do: set a log's format and commit past two switches. Expect: every generation is in that format, the
 /// second segment's as the first's (lane B30, item 2).
 #[test]

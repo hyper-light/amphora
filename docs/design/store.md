@@ -2592,6 +2592,7 @@ SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a
   cuts the power at each change). Not closed cleanly, so refused too: a store whose flush failed (decision 9: the log's
   frames may not be what the disk holds) or whose engine's upkeep did, and a database backed up, whose log starts again
   only once shipped (`Db::back_up`).
+  A connection whose rows are on the versioned storage closes its file without the reset, as none of them is in it.
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other

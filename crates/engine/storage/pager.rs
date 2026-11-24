@@ -6547,10 +6547,14 @@ impl Pager {
     /// connection being closed is the last open connection to the database),
     /// then SQLite performs a checkpoint before closing the connection and
     /// deletes the WAL file.
+    ///
+    /// Amphora: `whole` says the file holds the whole database once its log is folded, so that it is
+    /// left to SQLite ([`Self::leave_to_sqlite`]).
     pub fn checkpoint_shutdown(
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
+        whole: bool,
     ) -> Result<()> {
         let mut attempts = 0;
         {
@@ -6580,7 +6584,9 @@ impl Pager {
                 }
                 attempts += 1;
             }
-            self.leave_to_sqlite(sync_mode)?;
+            if whole {
+                self.leave_to_sqlite(sync_mode)?;
+            }
         }
         // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
         // no other connections have opened since.
