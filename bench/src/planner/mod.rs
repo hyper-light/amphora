@@ -203,7 +203,8 @@ fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights>
     weights_json(&text).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))
 }
 
-/// `--pin-weights`' file: a JSON object of `LearnedWeights`' eight fields, each a number;
+/// `--pin-weights`' file: a JSON object of `LearnedWeights`' eight fields, each a number, and
+/// `scan_row` where the set has it;
 /// `row_in_pages` and `page_miss` may be null, as a process that has read no page from its file
 /// has them. The trace's "the weights this plan is made on" prints the same fields.
 fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {

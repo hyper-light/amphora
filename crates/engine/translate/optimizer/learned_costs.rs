@@ -38,8 +38,8 @@ pub(crate) enum Work {
     WhereStep,
     /// Lane T22: a row a scan visits, as the statement loop that runs it does: the cursor steps to
     /// the row, its column is decoded and a condition tests it once. [Work::Row] is that visit over
-    /// a page of plain keys, without the engine's work around it, and the scans' prices were 7 to 10
-    /// times under their times (the record's lane T22: lineitem at SF1 99 ns a row against 4.2).
+    /// a page of plain keys, without the engine's work around it: priced from it, TPC-H's scans of
+    /// lineitem and orders were 7 and 10 times under their times (bench/records, lane T22).
     ScanRow,
     /// One page read from the database's file, as the pager times it from the read's submission
     /// to its completion, less what the reading thread waited for a CPU meanwhile
@@ -2538,6 +2538,7 @@ mod tests {
         let mut scan = CalibrationScan::open(&keys).expect("the engine opens a database in memory");
         let answer = scan.statement.run_collect_rows().unwrap();
         assert_eq!(answer, vec![vec![crate::Value::from_i64(0)]]);
+        // The first row is the Rewind's, the rest the Next's.
         assert!(scan.statement.metrics().rows_read >= keys.len() as u64);
         scan.statement.reset().unwrap();
         let mut ticks = 0.0;
