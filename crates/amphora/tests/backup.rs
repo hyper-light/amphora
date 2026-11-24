@@ -1878,13 +1878,6 @@ fn base_before_b22(s: &Source, start_gen: u64) -> u64 {
     id
 }
 
-/// What a restore to `second` answers: its rows, or why it was refused.
-fn answer(s: &Source, second: u64) -> Result<usize, String> {
-    s.restored(second)
-        .map(|rows| rows.len())
-        .map_err(|e| format!("{e:#}"))
-}
-
 /// AC-T1.12.4 (lane B26): a base made by a shipper before lane B22's fix is refused, as nothing says what its
 /// file held, and a whole new one restores. Do: as in
 /// `d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit`, a read keeping 20 of 41

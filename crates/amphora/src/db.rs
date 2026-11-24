@@ -362,10 +362,11 @@ impl Db {
 
     /// [`Db::open_sharing`] in a directory that exists: it makes none.
     pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
+        ensure_restored(path)?;
         in_place(path);
         let [first, _] = log_paths(path);
         in_place(&first);
-        Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
+        Self::open_any(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
     }
 
     /// [`Db::open`] on `io`: the system's files, or a simulator's disk.

@@ -49,12 +49,32 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   a crash's tail. So a restore compares the frames the engine recovered of each generation with those the
   archive's keys gave it, up to the cut, before it folds them: fewer is refused, typed
   (`Unrestorable::Short`, naming the generation and the frames), never answered with the shorter
-  database. The files it made are removed then, as they would open as a whole database. Nothing new is
-  written for it, so an archive made before proves itself the same: whole, it restores as it did; one that
+  database. Nothing new is written for it, so an archive made before proves its log the same: one that
   holds another generation's frames under a key (a shipper before lane B24 sent some so, its log started
-  again under a send) restores every second before them and refuses every second after. What no frame
-  says is what a base's file held: a base begun by a shipper before lane B22's fix, its file short of the
-  closing segment's frames, can't be told from a whole one.
+  again under a send) restores every second before them and refuses every second after.
+- **A base says what its file holds** (lane B26, AC-T1.12.4). No frame says it: a restore replays the log
+  from the first frame of the generation its base began in, and the file must hold every frame before
+  that one. So a base's manifest (format 3) records, as its copy begins, the generation it began in (its
+  header's sequence and salts) and the closing segment (decision 45): its file (`-wal`, `-wal2`), its
+  generation, the frames committed in it, and how many of them the file held. A restore compares that
+  with the log it replays, before it makes a file where it can: the closing segment all in the file; its last
+  frame the one the archive says the generation before ended at (a switch is the one way a generation
+  begins whole on another, so the segment is then known); and the generation the archive holds as the
+  base's own the one it began in. A mismatch, or a manifest of an earlier format, which says none of it,
+  is refused, typed (`Unrestorable::Unproven`, naming the base and what is missing). A shipper refuses to
+  begin a base a restore would refuse so, and one opened on an archive whose latest base is of an earlier
+  format needs a base, and begins a whole one: bases made before this restore nothing until it ends
+  (Amphora is unreleased; the lead's decision, 2026-11-24).
+- **A failed restore leaves no database** (lane B26, AC-T1.12.4). A restore makes the database under a name
+  no open takes (`<database>.restoring`, its log beside it: `db::Unrestored`), and puts it at its path
+  once it is whole, its log folded, emptied and removed, its file flushed: linked there, as a link
+  refuses a name that exists ("The folder store", below), or renamed where the file system has no links.
+  So nothing stands at the path until the restore ends, whatever ends it: a refusal, an error, a full
+  disk, or a kill between two writes. Its files are removed where it fails; a kill leaves them, refused by
+  every open under their own name, and the path is refused too while they are there (a new database made
+  at it would be in the restore's way). A restore to the path is refused then, naming them: they may be
+  another's under way. A check removes those a check killed before it left. A cut across groups puts no
+  group's database at its path before every group's is made.
 - **A segment with no header yet** (decision 45, lane B22). The store switches the log's segments once
   a batch is committed, and a segment's header is written by its first commit. Until then, which is
   as long as the writer is idle, the current segment's file is empty (a switch made it, or cut it),
@@ -64,6 +84,17 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   a small sealed object (`p/through/...`) saying the archive is whole through now, once that is in
   a later second than it was: a database that stops committing, or closes, restores up to the
   second it stopped in. A later mark or segment lets the earlier mark go.
+- **A check that finds the archive short begins a base** (lane B26). A check whose restore is refused for
+  what the archive lacks (`Unrestorable::lacks`: frames of a generation, or a base's proof) asks the
+  shipping thread for a base and wakes it: its next round begins one, with no commit to wait for, where
+  the latest base began no later than the generation that is short, or is the one not proven
+  (`Shipper::mend`). The base is whole: nothing in the archive vouches for a chunk kept. A base begun in the
+  short generation itself would restore nothing, as a restore replays it from its first frame, so where
+  that is the generation shipped now the log, which holds its frames still, is shipped again from its
+  first frame as a generation of the archive's own, begun on a gap: its commits so far are stamped
+  by the time the archive was whole through, so a mark at that time says which a second since holds. The
+  same log gives the same archive: one that is found short again gets another base once a commit moves
+  the log's end, so a check can't keep a base copying for nothing.
 - **A restore makes a new database** (lane B24). It is refused where the file or either of its log's
   segments is there already: the engine recovers a segment left at the path (`-wal2`) as the
   restored log's own, commits after the asked second with it.
@@ -374,8 +405,7 @@ copies only the rest, so bases can come often and a restore replays a short log 
 usual failure: GitLab 2017, GitHub 2018, Atlassian 2022; research/backup-single-node.md §0.2), as
 PostgreSQL 17's incremental `pg_basebackup` copies only blocks its WAL summaries say changed
 (postgresql.org/docs/17/release-17.html) and pgBackRest's block incremental does (research §1.2,
-§1.3). A base's manifest names, in runs, the base each chunk is stored under (manifest format 2;
-format 1 manifests still read, every chunk their own).
+§1.3). A base's manifest names, in runs, the base each chunk is stored under.
 
 - **Which chunks changed.** A restore replays the log from the first frame of the generation its
   base began in, and a base begins only once the file holds every frame of the generations before
