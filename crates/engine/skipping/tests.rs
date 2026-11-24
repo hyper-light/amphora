@@ -2720,6 +2720,42 @@ mod builds {
         assert_eq!(registry.claim_build(ROOT), None);
     }
 
+    /// T-SKU.10, AC-NS.2.1: pin after an unrelated commit while a told writer is
+    /// open, then after a write between the snapshot sample and the pin.
+    #[test]
+    fn t_sku_10_versioned_build_pins_respect_writes() {
+        use crate::skipping::SkipRefusal;
+        let insert = RowWrite::Insert {
+            rowid: 3,
+            value: Some(1),
+        };
+        for mode in [BuildMode::Replay, BuildMode::VoidOnWrite] {
+            let registry = registry_over(&[], mode);
+            registry.on_write_told(ROOT, 9, AT, insert, &mut || 0);
+            let claim = registry.claim_build(ROOT).unwrap();
+            let other_commit = (0, 2);
+            assert!(
+                !registry.pin_build(&claim, 1, other_commit, other_commit),
+                "another commit cannot end this writer"
+            );
+            registry.abandon_build(claim);
+            registry.rolled_back(9);
+            assert_eq!(
+                registry.candidates(ROOT, 1, other_commit, other_commit, 1, 1),
+                Err(SkipRefusal::Stale)
+            );
+
+            let registry = registry_over(&[], mode);
+            let claim = registry.claim_build(ROOT).unwrap();
+            registry.on_write_told(ROOT, 9, AT, insert, &mut || 0);
+            registry.committed(9);
+            assert!(
+                !registry.pin_build(&claim, 1, AT, AT),
+                "the sampled snapshot predates the write"
+            );
+        }
+    }
+
     /// Do: a real table whose summary's cracker is due a build, and eight connections that find
     /// it due at once start the build. Expect: one build starts, on its own thread and
     /// connection, and installs a cracker holding every row of the table; none is due after.
@@ -2752,7 +2788,7 @@ mod builds {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    start_build(&asker, root, 0, 2)
+                    start_build(&asker, root, 2)
                 })
             })
             .collect();
@@ -3057,7 +3093,7 @@ mod builds {
         let root = fill_table(&conn, rows);
         for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
             set_due(&conn, root, rows, mode);
-            let build = start_build(&conn, root, 0, 2).expect("the cracker's build is due");
+            let build = start_build(&conn, root, 2).expect("the cracker's build is due");
             assert_eq!(build.join().unwrap(), BuildEnd::Installed, "{mode:?}");
             let held = cracker_rows(&db.skipping, root).map(|rows| rows.len());
             assert_eq!(held, Some(300), "{mode:?}");
@@ -3242,6 +3278,51 @@ mod versioned {
             })
             .collect();
         (rows, stmt.metrics().rows_read)
+    }
+
+    #[test]
+    fn t_ns_2_1_a_filter_uses_the_column_and_snapshot_checked_at_the_probe() {
+        use super::super::{Candidates, CrackerColumn};
+        let registry = SkipRegistry::default();
+        let root = 5;
+        let install = |column, value| {
+            registry.set(
+                root,
+                column,
+                Skipping::Cracking(CrackerColumn::new(vec![(1, Some(value))])),
+            )
+        };
+        install(0, 7);
+        let column = registry.column_of(root).unwrap();
+        // The scan has computed bounds for column 0; an install on column 1 wins the race.
+        install(1, 9);
+        let snap = (0, 3);
+        let candidates = registry.probe(root, 1, Some(column), &[(7, 7)], || Some((snap, snap)));
+        assert_eq!(
+            candidates,
+            Err(SkipRefusal::Off),
+            "column {column} still has row 1"
+        );
+        install(0, 7);
+        registry.on_write_told(
+            root,
+            2,
+            snap,
+            RowWrite::Update {
+                rowid: 1,
+                old: Some(7),
+                new: Some(9),
+            },
+            &mut || 0,
+        );
+        registry.committed(2);
+        let newest = (0, 4);
+        let candidates = registry.probe(root, 1, Some(column), &[(7, 7)], || Some((snap, newest)));
+        assert_eq!(candidates, Err(SkipRefusal::OlderSnapshot));
+        assert_eq!(
+            registry.candidates(root, 1, newest, newest, 9, 9),
+            Ok(Candidates::Rowids(vec![1]))
+        );
     }
 
     /// Do: a told writer's write, another writer's commit beside it, then its own commit told.
@@ -3641,6 +3722,41 @@ mod versioned {
                 "{kind:?}: a stale summary's scan read {read} rows"
             );
         }
+    }
+
+    #[test]
+    fn a_waiting_build_stops_rebuilding_when_commits_cross_its_deadline() {
+        let (db, writer, root) = waiting_table();
+        let switch = writer.versioned_for(crate::MAIN_DB_ID).unwrap();
+        let (paused, go_on) = switch.pause_next_build(root);
+        let build = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let conn = db
+                    .connect(ConnectOpts::new().with_versioned_storage())
+                    .unwrap();
+                let deadline = conn.get_pager().io.current_time_monotonic();
+                let result =
+                    set_skipping_until(&conn, "t", "a", Some(SkipKind::Cracking), Some(deadline));
+                conn.versioned_for(crate::MAIN_DB_ID)
+                    .unwrap()
+                    .clear_build_pause();
+                result
+            })
+        };
+        paused.recv().unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (110, 'slipped in')")
+            .unwrap();
+        go_on.send(()).unwrap();
+        build.join().unwrap().unwrap();
+        assert_eq!(
+            db.skipping.wait_counts(),
+            (0, 0),
+            "retried past the deadline"
+        );
+        assert_eq!(db.skipping.wait_refusals(), (0, 1));
+        assert_eq!(rowids(&writer, FILTER).0, with_the_new_row());
     }
 
     /// Do (lane g7s2-17, `AC-NS.2.1`): under `BuildPolicy::Wait`, a build on a thread of its own

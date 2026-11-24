@@ -2007,12 +2007,13 @@ fn skip_walk_for(
     };
     let span = [(bounds.lo, bounds.hi)];
     let spans: &[(i64, i64)] = values.as_deref().unwrap_or(&span);
-    let (reader_pos, committed) = conn.skipping_positions()?;
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end (lane
     // skip-11: every probe of an IN list's values included).
     let mut started = std::time::Instant::now();
     let (candidates, method) = registry
-        .candidates_spans(root, conn.skipping_id(), reader_pos, committed, spans)
+        .probe(root, conn.skipping_id(), Some(column), spans, || {
+            conn.skipping_positions()
+        })
         .ok()?;
     // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
     // off this scan's path, one build per summary at a time; this scan goes on with the leader.
@@ -2025,14 +2026,14 @@ fn skip_walk_for(
         match registry.build_mode(root) {
             Some(crate::skipping::BuildMode::Inline) => {
                 let building = std::time::Instant::now();
-                if crate::skipping::build_inline(conn, root, column, columns).is_some() {
+                if crate::skipping::build_inline(conn, root, columns).is_some() {
                     started = started
                         .checked_add(building.elapsed())
                         .unwrap_or_else(std::time::Instant::now);
                 }
             }
             Some(_) => {
-                let _detached = crate::skipping::start_build(conn, root, column, columns);
+                let _detached = crate::skipping::start_build(conn, root, columns);
             }
             None => {}
         }

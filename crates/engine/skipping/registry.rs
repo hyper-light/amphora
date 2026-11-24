@@ -201,6 +201,7 @@ struct Entry {
 pub struct BuildClaim {
     pub root_page: i64,
     pub method: SkipMethod,
+    pub(crate) column: usize,
     ticket: u64,
 }
 
@@ -610,11 +611,30 @@ impl SkipRegistry {
         committed: WalPos,
         spans: &[(i64, i64)],
     ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
+        self.probe(root_page, reader, None, spans, || {
+            Some((reader_pos, committed))
+        })
+    }
+
+    /// The bounds were computed for `column`. Validate it and sample the commit position
+    /// while holding the entry, so a replacement or a writer's commit cannot split the check.
+    pub(crate) fn probe(
+        &self,
+        root_page: i64,
+        reader: usize,
+        column: Option<usize>,
+        spans: &[(i64, i64)],
+        positions: impl FnOnce() -> Option<(WalPos, WalPos)>,
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
             .find(|entry| entry.root_page == root_page)
             .ok_or(SkipRefusal::Off)?;
+        if column.is_some_and(|expected| expected != entry.column) {
+            return Err(SkipRefusal::Off);
+        }
+        let (reader_pos, committed) = positions().ok_or(SkipRefusal::Off)?;
         if entry.stale {
             entry.counts.refused_stale = entry.counts.refused_stale.saturating_add(1);
             return Err(SkipRefusal::Stale);
@@ -709,6 +729,7 @@ impl SkipRegistry {
         });
         Some(BuildClaim {
             root_page,
+            column: entry.column,
             method,
             ticket,
         })
@@ -736,14 +757,14 @@ impl SkipRegistry {
             || !entry
                 .building
                 .as_ref()
-                .is_some_and(|building| building.ticket == claim.ticket)
+                .is_some_and(|building| building.ticket == claim.ticket && !building.invalidated)
         {
             return false;
         }
         match &entry.pending {
             Some(p) if p.writer == builder => {}
-            // The writer committed since its writes: the newest commit holds them.
-            Some(p) if p.base != committed => entry.pending = None,
+            // Only the single-writer WAL can infer a commit from the position.
+            Some(p) if !p.told && p.base != committed => entry.pending = None,
             Some(_) => return false,
             None => {}
         }
@@ -753,7 +774,6 @@ impl SkipRegistry {
         let replay = entry.build_mode == BuildMode::Replay;
         let bound = held_rows(&entry.skipping);
         if let Some(building) = entry.building.as_mut() {
-            building.invalidated = false;
             building.record = replay.then(Vec::new);
             building.bound = bound;
         }

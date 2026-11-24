@@ -213,6 +213,17 @@ pub(crate) fn held(db: &Db, key: &[u8]) -> anyhow::Result<bool> {
     Ok(held)
 }
 
+/// Exclusive end of a Records range in the lock table. Every binary row key begins
+/// below the successor of the family prefix, including keys starting with 0xff.
+fn lock_range_end(namespace: &str, family: &str, upper: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    let key = |row: &[u8]| record_key(namespace, family, row).map_err(|e| anyhow::anyhow!("{e}"));
+    match upper {
+        Some(upper) => key(upper),
+        None => crate::database::successor(&key(&[])?)
+            .ok_or_else(|| anyhow::anyhow!("a family's cross-group keys have no end")),
+    }
+}
+
 /// The cross-group key of the first Records row of `family` in a scan's range a transaction
 /// across groups holds a write lock on (as [`locked`]), if one is (T-T1.10.W10): rows from `lower` (past it when
 /// `continued`) below `upper` (none: the family's end), and no further than `last` when the
@@ -228,13 +239,8 @@ pub(crate) fn locked_in(
     last: Option<&[u8]>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let at = |key: &[u8]| record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"));
-    let base = at(&[])?;
     let from = at(lower)?;
-    let to = match upper {
-        Some(upper) => at(upper)?,
-        None => crate::database::successor(&base)
-            .ok_or_else(|| anyhow::anyhow!("a family's cross-group keys have no end"))?,
-    };
+    let to = lock_range_end(namespace, family, upper)?;
     let last = last.map(at).transpose()?;
     let mut held = None;
     db.query(
@@ -272,16 +278,7 @@ pub(crate) fn held_at(
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let refused = |e: Refusal| anyhow::anyhow!("{e}");
     let from = record_key(namespace, family, lower).map_err(refused)?;
-    // Past every row of the family: its prefix with the next byte past the last (the four-byte
-    // lengths keep one family's prefix from being another's).
-    let to = match upper {
-        Some(upper) => record_key(namespace, family, upper).map_err(refused)?,
-        None => {
-            let mut end = record_key(namespace, family, &[]).map_err(refused)?;
-            end.push(u8::MAX);
-            end
-        }
-    };
+    let to = lock_range_end(namespace, family, upper)?;
     let mut held = None;
     db.query(
         "SELECT l.key FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 ORDER BY l.key LIMIT 1",
@@ -731,8 +728,8 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 /// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
 /// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
 /// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
-/// the step answered, the clock is at or past the step's own commit, as a token taken after a
-/// write's answer is ([`Database::session_token`]).
+/// the step answered, the clock covers the step's own commit: an internal call waits
+/// for its write's index to apply here before answering.
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,

@@ -25,7 +25,8 @@
 //! [`SkipRegistry::claim_build`]: super::SkipRegistry::claim_build
 //! [`SkipRegistry::pin_build`]: super::SkipRegistry::pin_build
 
-use super::{cracker_of_table, nanos_since, BuildClaim, BuildEnd, SkipMethod};
+use super::leaves::LeafCursor;
+use super::{nanos_since, BuildClaim, BuildEnd, SkipMethod};
 use crate::sync::Arc;
 use crate::thread;
 use crate::{ConnectOpts, Connection, Database, EncryptionKey, PageCodec};
@@ -88,7 +89,7 @@ impl Drop for ReadTx {
     }
 }
 
-/// Starts the build of the table at `root`'s dropped method (column `column` of a table `columns`
+/// Starts the build of the table at `root`'s dropped method (the claimed column of a table `columns`
 /// wide) when its trial is due and no other build of it is under way. `None`: nothing started
 /// (none due, one under way, or no thread could start; the claim is handed back). The handle
 /// tells a test how the build ended; a scan lets it go. `conn` is the scan's connection: the
@@ -97,7 +98,6 @@ impl Drop for ReadTx {
 pub(crate) fn start_build(
     conn: &Arc<Connection>,
     root: i64,
-    column: usize,
     columns: usize,
 ) -> Option<thread::JoinHandle<BuildEnd>> {
     let claim = conn.db.skipping.claim_build(root)?;
@@ -108,7 +108,7 @@ pub(crate) fn start_build(
     };
     let spawned = thread::Builder::new()
         .name("amphora-skip-build".to_owned())
-        .spawn(move || build(&mut held, Reader::Own(keys), column, columns));
+        .spawn(move || build(&mut held, Reader::Own(keys), columns));
     match spawned {
         Ok(handle) => Some(handle),
         Err(error) => {
@@ -121,21 +121,16 @@ pub(crate) fn start_build(
 /// Lane skip-9 (T-SKU.11): [`super::BuildMode::Inline`], skip-7's build: the scan on `conn`,
 /// inside its read, that finds the trial due builds it now, on its own path. `None`: none due, or
 /// another builder holds the claim.
-pub(crate) fn build_inline(
-    conn: &Arc<Connection>,
-    root: i64,
-    column: usize,
-    columns: usize,
-) -> Option<BuildEnd> {
+pub(crate) fn build_inline(conn: &Arc<Connection>, root: i64, columns: usize) -> Option<BuildEnd> {
     let claim = conn.db.skipping.claim_build(root)?;
     let mut held = Held {
         db: Arc::clone(&conn.db),
         claim: Some(claim),
     };
-    Some(build(&mut held, Reader::Scan(conn), column, columns))
+    Some(build(&mut held, Reader::Scan(conn), columns))
 }
 
-fn build(held: &mut Held, reader: Reader<'_>, column: usize, columns: usize) -> BuildEnd {
+fn build(held: &mut Held, reader: Reader<'_>, columns: usize) -> BuildEnd {
     let Some(method) = held.claim.as_ref().map(|claim| claim.method) else {
         return BuildEnd::Superseded;
     };
@@ -148,7 +143,7 @@ fn build(held: &mut Held, reader: Reader<'_>, column: usize, columns: usize) -> 
                 .rebuild_zones(claim, &mut || nanos_since(origin)),
             None => BuildEnd::Superseded,
         },
-        SkipMethod::Cracking => build_cracker(held, reader, column, columns, origin),
+        SkipMethod::Cracking => build_cracker(held, reader, columns, origin),
     };
     tracing::debug!(target: "amphora.skipping", method = ?method, end = ?end, "skipping build ended");
     end
@@ -159,7 +154,6 @@ fn build(held: &mut Held, reader: Reader<'_>, column: usize, columns: usize) -> 
 fn build_cracker(
     held: &mut Held,
     reader: Reader<'_>,
-    column: usize,
     columns: usize,
     origin: std::time::Instant,
 ) -> BuildEnd {
@@ -182,13 +176,22 @@ fn build_cracker(
             (conn, Some(ReadTx(pager)))
         }
     };
-    let Some((builder_pos, committed)) = conn.skipping_positions() else {
-        return BuildEnd::Failed;
-    };
     let Some(claim) = held.claim.as_ref() else {
         return BuildEnd::Superseded;
     };
     let root = claim.root_page;
+    // Opening the versioned cursor begins its transaction. Pin that snapshot before
+    // recording writes to replay, so the same write cannot also be in the base copy.
+    let mut cursor = match LeafCursor::open(&conn, root, columns) {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not open its table");
+            return BuildEnd::Failed;
+        }
+    };
+    let Some((builder_pos, committed)) = conn.skipping_positions() else {
+        return BuildEnd::Failed;
+    };
     if !held
         .db
         .skipping
@@ -196,7 +199,7 @@ fn build_cracker(
     {
         return BuildEnd::OlderSnapshot;
     }
-    let cracker = match cracker_of_table(&conn, root, column, columns) {
+    let cracker = match cursor.cracker(claim.column) {
         Ok(cracker) => cracker,
         Err(error) => {
             tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again");

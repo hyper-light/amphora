@@ -22,6 +22,40 @@ pub const QUERIES: [&str; 7] = [
     "SELECT min(id), max(id), sum(id) FROM t WHERE v < 100",
 ];
 
+/// Handoffs for the measured SELECTs. Setup and maintenance SQL use the same
+/// database counters, so add only the changes during each timed query.
+#[derive(Default)]
+pub struct Handoffs {
+    pub handed: u64,
+    pub skipped: BTreeMap<&'static str, u64>,
+}
+
+impl Handoffs {
+    pub fn record(
+        &mut self,
+        before: &super::columns_sql::CopyCounts,
+        after: &super::columns_sql::CopyCounts,
+    ) {
+        self.handed = self
+            .handed
+            .saturating_add(after.handed.saturating_sub(before.handed));
+        for (reason, start, end) in [
+            ("rows", before.skipped_rows, after.skipped_rows),
+            ("body", before.skipped_body, after.skipped_body),
+            ("join", before.skipped_join, after.skipped_join),
+            (
+                "transaction",
+                before.skipped_transaction,
+                after.skipped_transaction,
+            ),
+            ("defaults", before.skipped_defaults, after.skipped_defaults),
+        ] {
+            let total = self.skipped.entry(reason).or_default();
+            *total = total.saturating_add(end.saturating_sub(start));
+        }
+    }
+}
+
 /// Table `t{i}`.
 pub fn schema(i: usize) -> String {
     format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)")
