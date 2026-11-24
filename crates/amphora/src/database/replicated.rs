@@ -19334,8 +19334,9 @@ mod tests {
             }
             pump.losing = None;
             drop(calls);
+            driven.drain(&mut pump);
+            pump.finish();
             driven.real = false;
-            drop(pump);
             drop(clients);
         }
     }
