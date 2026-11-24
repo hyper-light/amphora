@@ -402,6 +402,7 @@ impl PragmaVirtualTableCursor {
             .as_mut()
             .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
         let result = stmt.step()?;
+        eprintln!("C25TRACE pragma {} step {:?}", self.pragma_name, result);
         match result {
             StepResult::Done => Ok(false),
             _ => {
