@@ -286,6 +286,7 @@ pub fn emit_program_for_update(
             rowid_referenced: false,
             outer_join_may_null_extend: false,
             scope_depth: 0,
+            recursive_table_of_from: false,
         });
         // CTEs are also visible during the write phase, so add them here.
         for outer_ref in plan.from_tables.outer_query_refs() {

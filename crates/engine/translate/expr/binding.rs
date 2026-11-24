@@ -257,29 +257,6 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // --- Error reporting. ---
                     if matches!(qualified_match, QualifiedNameMatch::NoTable) {
-                        // No scope contains a table with this identifier. Normally we
-                        // report "no such table", but there is one case where SQLite
-                        // reports "no such column" instead: when the identifier names a
-                        // CTE that was preplanned for subquery FROM visibility and kept
-                        // as a definition-only outer ref. The CTE *name* is valid in
-                        // principle; it's the column access through it that isn't,
-                        // because the CTE hasn't been brought into this scope's FROM.
-                        // The `cte_id`/`cte_scope` check restricts this to real CTE
-                        // definition refs so any other future use of `cte_definition_only`
-                        // still falls through to "no such table".
-                        let is_definition_only_cte = referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
-                            .is_some_and(|outer_ref| {
-                                outer_ref.cte_definition_only
-                                    && (outer_ref.cte_id.is_some() || outer_ref.cte_scope.is_some())
-                            });
-                        if is_definition_only_cte {
-                            crate::bail_parse_error!(
-                                "no such column: {}.{}",
-                                tbl.as_str(),
-                                id.as_str()
-                            );
-                        }
                         // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
                         //
                         // For `a.b`, resolution order is:
@@ -310,7 +287,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        // SQLite looks the qualifier and the column up together (`lookupName`).
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {

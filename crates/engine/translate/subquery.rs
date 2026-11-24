@@ -375,38 +375,7 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query, and read its CTEs.
-    let get_outer_query_refs = |tables: &TableReferences| {
-        let mut outer_query_refs = outer_query_refs_for_correlated_subquery(tables)?;
-        outer_query_refs.retain(|entry| entry.cte_scope.is_some());
-        Ok(outer_query_refs)
-    };
-    {
-        let mut subquery_parser = get_subquery_parser(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            connection,
-            get_outer_query_refs,
-            SubqueryPosition::LimitOffset,
-            SubqueryOrigin::SelectLimitOffset,
-            false,
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        );
-        // Limit
-        if let Some(limit) = &mut plan.limit {
-            crate::stack::trace_stack!("select_limit");
-            walk_expr_mut(limit, &mut subquery_parser)?;
-        }
-        // Offset
-        if let Some(offset) = &mut plan.offset {
-            crate::stack::trace_stack!("select_offset");
-            walk_expr_mut(offset, &mut subquery_parser)?;
-        }
-    }
+    plan_subqueries_from_limit(program, plan, resolver, connection)?;
 
     {
         let mut dropped = Vec::new();
@@ -458,6 +427,64 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.non_from_clause_subqueries,
     )?;
     Ok(())
+}
+
+/// Plans the subqueries of LIMIT and OFFSET, which read the CTEs of the queries around them and none of
+/// their columns.
+pub(crate) fn plan_subqueries_from_limit(
+    program: &mut ProgramBuilder,
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let get_outer_query_refs = |tables: &TableReferences| {
+        let mut outer_query_refs = outer_query_refs_for_correlated_subquery(tables)?;
+        outer_query_refs.retain(|entry| entry.cte_scope.is_some());
+        Ok(outer_query_refs)
+    };
+    let mut cse_map = Vec::new();
+    let mut same_query_map = Vec::new();
+    let mut subquery_parser = get_subquery_parser(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        resolver,
+        connection,
+        get_outer_query_refs,
+        SubqueryPosition::LimitOffset,
+        SubqueryOrigin::SelectLimitOffset,
+        false,
+        &mut cse_map,
+        &mut same_query_map,
+        &[],
+    );
+    if let Some(limit) = &mut plan.limit {
+        crate::stack::trace_stack!("select_limit");
+        walk_expr_mut(limit, &mut subquery_parser)?;
+    }
+    if let Some(offset) = &mut plan.offset {
+        crate::stack::trace_stack!("select_offset");
+        walk_expr_mut(offset, &mut subquery_parser)?;
+    }
+    Ok(())
+}
+
+/// Emits the subqueries of a compound's LIMIT and OFFSET, which its last arm's plan holds, before any
+/// arm runs: the LIMIT is read there.
+pub(crate) fn emit_limit_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    last_arm: &mut SelectPlan,
+) -> Result<()> {
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        &mut last_arm.non_from_clause_subqueries,
+        &last_arm.join_order,
+        Some(&last_arm.table_references),
+        EvalAt::BeforeLoop,
+        |subquery| subquery.origin == SubqueryOrigin::SelectLimitOffset,
+    )
 }
 
 /// Compute query plans for subqueries in a DML statement's WHERE clause.
@@ -719,6 +746,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 outer_join_may_null_extend: referenced_tables
                     .outer_join_may_null_extend(t.internal_id),
                 scope_depth: 0,
+                recursive_table_of_from: false,
             };
             Ok::<_, crate::LimboError>(outer_ref)
         })
@@ -735,6 +763,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 rowid_referenced: false,
                 outer_join_may_null_extend: t.outer_join_may_null_extend,
                 scope_depth: t.scope_depth + 1,
+                recursive_table_of_from: false,
             })
         }))
         .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -2077,7 +2106,7 @@ pub fn emit_from_clause_subquery(
                     limit_ctx: None,
                     reg_offset: None,
                     reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork(),
+                    resolver: t_ctx.resolver.fork_with_expr_cache(),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
@@ -2096,7 +2125,7 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork();
+                let resolver = t_ctx.resolver.fork_with_expr_cache();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
                 emit_program_for_compound_select(program, &resolver, plan)?
@@ -2180,7 +2209,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -2199,7 +2228,7 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
@@ -2326,7 +2355,7 @@ fn emit_materialized_subquery_table(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -2345,7 +2374,7 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
@@ -2528,7 +2557,11 @@ pub fn emit_non_from_clause_subquery(
                     }
                 }
                 mut compound @ Plan::CompoundSelect { .. } => {
-                    emit_program_for_compound_select(program, resolver, &mut compound)?;
+                    if preserve_outer_expr_cache {
+                        emit_program_for_compound_select(program, resolver, &mut compound)?;
+                    } else {
+                        emit_program_for_compound_select(program, &resolver.fork(), &mut compound)?;
+                    }
                     Ok(())
                 }
                 _ => unreachable!("DML plans cannot be subqueries"),

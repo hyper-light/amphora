@@ -20,11 +20,14 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
-    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_limit,
+    collect_subquery_table_refs_in_window_clause, parse_from, parse_limit, parse_where,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_subqueries_from_limit, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -247,6 +250,9 @@ pub(crate) fn prepare_select_plan_from_arms(
     }
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
+        if limit.is_some() && matches!(first_arm, ast::OneSelect::Values(_)) {
+            crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+        }
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
             first_arm,
             resolver,
@@ -275,17 +281,23 @@ pub(crate) fn prepare_select_plan_from_arms(
     )?;
 
     let mut left = Vec::with_capacity(compound_arms.size_hint().0);
-    for CompoundSelect {
+    while let Some(CompoundSelect {
         select: compound_select,
         operator,
-    } in compound_arms
+    }) = compound_arms.next()
     {
         left.push((last, operator));
+        // The LIMIT is the last arm's, as SQLite's parser has it: its subqueries read that arm's WITH
+        // clause, and that arm's plan holds them.
+        let limit_of_arm = match compound_arms.peek() {
+            Some(_) => None,
+            None => limit.take(),
+        };
         last = prepare_one_select_plan(
             compound_select,
             resolver,
             program,
-            None,
+            limit_of_arm,
             vec![],
             with.clone(),
             outer_query_refs,
@@ -303,7 +315,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let (limit, offset) = (last.limit.take(), last.offset.take());
 
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
@@ -894,9 +906,6 @@ fn prepare_one_select_plan(
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }
-            if limit.is_some() {
-                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
-            }
             let len = values[0].len();
             if len > crate::types::MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
@@ -919,6 +928,7 @@ fn prepare_one_select_plan(
             for expr in values.iter().flatten() {
                 collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
             }
+            collect_subquery_table_refs_in_limit(limit.as_ref(), &mut subquery_table_refs);
             plan_ctes_as_outer_refs(
                 with,
                 &subquery_table_refs,
@@ -953,7 +963,9 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
-            let plan = SelectPlan {
+            let (limit, offset) =
+                limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+            let mut plan = SelectPlan {
                 join_order: vec![],
                 table_references,
                 result_columns,
@@ -961,8 +973,8 @@ fn prepare_one_select_plan(
                 group_by: None,
                 order_by: vec![],
                 aggregates: vec![],
-                limit: None,
-                offset: None,
+                limit,
+                offset,
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
@@ -980,6 +992,7 @@ fn prepare_one_select_plan(
                 phantom_params: vec![],
                 loop_order: vec![],
             };
+            plan_subqueries_from_limit(program, &mut plan, resolver, connection)?;
 
             validate_expr_correct_column_counts(&plan)?;
 
@@ -1616,12 +1629,7 @@ fn collect_table_refs_outside_from(
     for sorted in order_by {
         collect_subquery_table_refs_in_expr(&sorted.expr, &mut table_refs);
     }
-    if let Some(limit) = limit {
-        collect_subquery_table_refs_in_expr(&limit.expr, &mut table_refs);
-        if let Some(offset) = &limit.offset {
-            collect_subquery_table_refs_in_expr(offset, &mut table_refs);
-        }
-    }
+    collect_subquery_table_refs_in_limit(limit, &mut table_refs);
     table_refs
 }
 

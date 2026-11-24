@@ -87,9 +87,10 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
         let mut referenced_table_names = Vec::new();
         collect_from_clause_table_refs(&cte.select, &mut referenced_table_names);
-        let references_itself = RecursiveRefCounter { cte_name: &name }
-            .count_select(&cte.select, &mut RecursiveRefScope::new())
-            > 0;
+        let counter = RecursiveRefCounter { cte_name: &name };
+        let references_itself = counter.count_select(&cte.select, &mut RecursiveRefScope::new())
+            > 0
+            || !matches!(counter.first_recursive_arm(&cte.select.body), Ok(None));
         referenced_table_names_by_cte.push(referenced_table_names);
         definitions.push(CteDefinition {
             cte_id: program.alloc_cte_id(),
@@ -367,55 +368,77 @@ impl RecursiveRefCounter<'_> {
         count
     }
 
-    /// Returns `(top_level_from_count, total_count)` for one arm of a
-    /// recursive CTE body: direct references to the recursive table in the
-    /// arm's FROM clause, and all references reachable from the arm.
-    fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
-        fn count_direct_in_from_table(
-            counter: &RecursiveRefCounter,
-            table: &ast::SelectTable,
-            scope: &RecursiveRefScope,
-        ) -> usize {
-            match table {
-                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                    if name.db_name.is_some() {
-                        return 0;
-                    }
-                    let name = normalize_ident(name.name.as_str());
-                    // A direct reference only counts when nothing shadows the
-                    // recursive table's name.
-                    usize::from(
-                        name == counter.cte_name
-                            && !scope.iter().any(|(scope_name, _)| *scope_name == name),
-                    )
-                }
-                ast::SelectTable::Select { .. } => 0,
-                ast::SelectTable::Sub(from, _) => {
-                    count_direct_in_from_table(counter, &from.select, scope)
-                        + from
-                            .joins
-                            .iter()
-                            .map(|join| count_direct_in_from_table(counter, &join.table, scope))
-                            .sum::<usize>()
+    /// The first of the body's recursive arms, as SQLite finds them (`resolveFromTermToCte`): from the
+    /// last arm back, those that the body's last operator joins, UNION or UNION ALL, and whose own FROM
+    /// clause names the CTE. The name is the recursive table there, whatever a WITH clause of the body
+    /// defines by it.
+    fn first_recursive_arm(&self, body: &ast::SelectBody) -> Result<Option<usize>> {
+        let Some(last_operator) = body.compounds.last().map(|arm| arm.operator) else {
+            return Ok(None);
+        };
+        if !matches!(
+            last_operator,
+            ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll
+        ) {
+            return Ok(None);
+        }
+        let mut first = None;
+        for (index, arm) in body.compounds.iter().enumerate().rev() {
+            if arm.operator != last_operator {
+                break;
+            }
+            match self.count_in_own_from(&arm.select) {
+                0 => break,
+                1 => first = index.checked_add(1),
+                _ => crate::bail_parse_error!(
+                    "multiple references to recursive table: {}",
+                    self.cte_name
+                ),
+            }
+        }
+        Ok(first)
+    }
+
+    /// How often the FROM clause of one arm names the CTE itself, in no query inside it: a
+    /// parenthesized join is a query of its own, but where it stands alone or first, unnamed.
+    fn count_in_own_from(&self, one: &ast::OneSelect) -> usize {
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = one
+        else {
+            return 0;
+        };
+        let mut first = from.as_ref();
+        let mut tables: Vec<&ast::SelectTable> = Vec::new();
+        loop {
+            tables.extend(first.joins.iter().map(|join| join.table.as_ref()));
+            match first.select.as_ref() {
+                ast::SelectTable::Sub(inner, None) => first = inner,
+                table => {
+                    tables.push(table);
+                    break;
                 }
             }
         }
-
-        let top_level_from_count = if let ast::OneSelect::Select {
-            from: Some(from), ..
-        } = one
-        {
-            count_direct_in_from_table(self, &from.select, scope)
-                + from
-                    .joins
-                    .iter()
-                    .map(|join| count_direct_in_from_table(self, &join.table, scope))
-                    .sum::<usize>()
-        } else {
-            0
-        };
-        let total_count = self.count_one_select(one, scope);
-        (top_level_from_count, total_count)
+        tables
+            .into_iter()
+            .filter(|table| {
+                let mut table = *table;
+                while let ast::SelectTable::Sub(inner, _) = table {
+                    if !inner.joins.is_empty() {
+                        return false;
+                    }
+                    table = inner.select.as_ref();
+                }
+                match table {
+                    ast::SelectTable::Table(name, ..) | ast::SelectTable::TableCall(name, ..) => {
+                        name.db_name.is_none()
+                            && normalize_ident(name.name.as_str()) == self.cte_name
+                    }
+                    ast::SelectTable::Select { .. } | ast::SelectTable::Sub(..) => false,
+                }
+            })
+            .count()
     }
 }
 
@@ -462,12 +485,7 @@ fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<St
         collect_subquery_table_refs_in_expr(&sorted.expr, out);
     }
 
-    if let Some(limit) = &select.limit {
-        collect_subquery_table_refs_in_expr(&limit.expr, out);
-        if let Some(offset) = &limit.offset {
-            collect_subquery_table_refs_in_expr(offset, out);
-        }
-    }
+    collect_subquery_table_refs_in_limit(select.limit.as_ref(), out);
 }
 
 fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
@@ -554,6 +572,16 @@ pub fn collect_subquery_table_refs_in_window_clause(
         for sorted in &window_def.window.order_by {
             collect_subquery_table_refs_in_expr(&sorted.expr, out);
         }
+    }
+}
+
+pub fn collect_subquery_table_refs_in_limit(limit: Option<&Limit>, out: &mut Vec<String>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    collect_subquery_table_refs_in_expr(&limit.expr, out);
+    if let Some(offset) = &limit.offset {
+        collect_subquery_table_refs_in_expr(offset, out);
     }
 }
 
@@ -1408,6 +1436,7 @@ fn cte_name_entry(
         rowid_referenced: false,
         outer_join_may_null_extend: false,
         scope_depth: 0,
+        recursive_table_of_from: false,
     })
 }
 
@@ -1420,71 +1449,71 @@ fn prepare_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter { cte_name };
+    let Some(first_recursive_query_index) = ref_counter.first_recursive_arm(&select.body)? else {
+        crate::bail_parse_error!("circular reference: {}", cte_name);
+    };
     // Nested CTEs defined at the body level are visible in every arm; bring
     // them into scope so shadowing and use-through-nested-CTE references are
     // counted the way name resolution will see them.
     let mut ref_scope = RecursiveRefScope::new();
     ref_counter.push_nested_ctes(select.with.as_ref(), &mut ref_scope);
-    for (query_index, query) in std::iter::once(&select.body.select)
-        .chain(
-            select
-                .body
-                .compounds
-                .iter()
-                .map(|compound| &compound.select),
-        )
-        .enumerate()
-    {
-        let (top_level_from_count, total_count) = ref_counter.count_arm(query, &mut ref_scope);
-        if first_recursive_query_index.is_none() && total_count == 0 {
-            continue;
-        }
-        if query_index == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_name);
-        }
-        first_recursive_query_index.get_or_insert(query_index);
-        if top_level_from_count == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_name);
-        }
-        if top_level_from_count > 1 {
-            crate::bail_parse_error!("multiple references to recursive table: {}", cte_name);
-        }
-        if total_count > top_level_from_count {
-            crate::bail_parse_error!("multiple recursive references: {}", cte_name);
+    let arms = std::iter::once(&select.body.select).chain(
+        select
+            .body
+            .compounds
+            .iter()
+            .map(|compound| &compound.select),
+    );
+    let (mut in_initial_arms, mut in_recursive_arms, mut recursive_arms) =
+        (0_usize, 0_usize, 0_usize);
+    for (query_index, query) in arms.enumerate() {
+        let count = ref_counter.count_one_select(query, &mut ref_scope);
+        if query_index < first_recursive_query_index {
+            in_initial_arms = in_initial_arms.saturating_add(count);
+        } else {
+            in_recursive_arms = in_recursive_arms.saturating_add(count);
+            recursive_arms = recursive_arms.saturating_add(1);
         }
     }
-    let Some(first_recursive_query_index) = first_recursive_query_index else {
+    if in_initial_arms > 0 {
+        crate::bail_parse_error!("circular reference: {}", cte_name);
+    }
+    for sorted in &select.order_by {
+        in_recursive_arms =
+            in_recursive_arms.saturating_add(ref_counter.count_expr(&sorted.expr, &mut ref_scope));
+    }
+    if let Some(limit) = &select.limit {
+        for expr in std::iter::once(&limit.expr).chain(&limit.offset) {
+            in_recursive_arms =
+                in_recursive_arms.saturating_add(ref_counter.count_expr(expr, &mut ref_scope));
+        }
+    }
+    // Each recursive arm's own FROM clause reads the recursive table once, under a name that counts for
+    // nothing where the body defines it.
+    let in_own_from = recursive_arms.saturating_mul(ref_counter.name_weight(cte_name, &ref_scope));
+    if in_recursive_arms > in_own_from {
+        crate::bail_parse_error!("multiple recursive references: {}", cte_name);
+    }
+
+    let Some(recursive_compound_operator) = first_recursive_query_index
+        .checked_sub(1)
+        .and_then(|index| select.body.compounds.get(index))
+        .map(|compound| compound.operator)
+    else {
         return Err(crate::LimboError::InternalError(format!(
             "recursive CTE {cte_name} has no recursive query"
         )));
     };
-
-    let recursive_compound_operator =
-        select.body.compounds[first_recursive_query_index - 1].operator;
-    let union_all = match recursive_compound_operator {
-        ast::CompoundOperator::UnionAll => true,
-        ast::CompoundOperator::Union => false,
-        ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
-            crate::bail_parse_error!("circular reference: {}", cte_name);
-        }
-    };
-    for compound in select
-        .body
-        .compounds
-        .iter()
-        .skip(first_recursive_query_index)
-    {
-        if compound.operator != recursive_compound_operator {
-            crate::bail_parse_error!("recursive CTE queries must use the same UNION operator");
-        }
-    }
+    let union_all = matches!(recursive_compound_operator, ast::CompoundOperator::UnionAll);
 
     let initial_query = prepare_select_plan_from_arms(
         select.body.select.clone(),
-        select.body.compounds[..first_recursive_query_index - 1]
+        select
+            .body
+            .compounds
             .iter()
+            .take(first_recursive_query_index.saturating_sub(1))
             .cloned(),
         select.with.clone(),
         vec![],
@@ -1549,7 +1578,7 @@ fn prepare_recursive_cte_plan(
             .iter()
             .zip(&columns)
             .any(|(initial, column)| initial.affinity() != column.affinity());
-    let recursive_query = if !mistyped {
+    let mut recursive_query = if !mistyped {
         recursive_query
     } else if program.is_typing_recursive_arms() {
         program.mark_recursive_arms_mistyped();
@@ -1565,10 +1594,11 @@ fn prepare_recursive_cte_plan(
         &recursive_query,
         resolver,
     )?;
-    let (limit, offset) = select
-        .limit
-        .clone()
-        .map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let (limit, offset) = match &mut recursive_query {
+        Plan::Select(plan) => (plan.limit.take(), plan.offset.take()),
+        Plan::CompoundSelect { limit, offset, .. } => (limit.take(), offset.take()),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => (None, None),
+    };
 
     Ok(Plan::RecursiveCte(Box::new(
         super::plan::RecursiveCtePlan {
@@ -1638,13 +1668,14 @@ impl RecursiveArms<'_> {
             rowid_referenced: false,
             outer_join_may_null_extend: false,
             scope_depth: 0,
+            recursive_table_of_from: true,
         });
         prepare_select_plan_from_arms(
             first_arm.select,
             arms,
             self.select.with.clone(),
             vec![],
-            None,
+            self.select.limit.clone(),
             resolver,
             program,
             &recursive_query_outer_refs,
@@ -1749,7 +1780,11 @@ fn parse_from_clause_table(
                     .into_iter()
                     .collect()
             } else {
-                table_references.outer_query_refs().to_vec()
+                let mut outer_query_refs = table_references.outer_query_refs().to_vec();
+                for entry in &mut outer_query_refs {
+                    entry.recursive_table_of_from = false;
+                }
+                outer_query_refs
             };
             // Make the parent's CTEs visible while planning this inline subquery.
             let with = cte_with(table_references.outer_query_refs(), cte_definitions);
@@ -2115,11 +2150,19 @@ fn parse_table(
     let table_name = &qualified_name.name;
 
     if qualified_name.db_name.is_none() {
+        // A recursive arm's own FROM clause reads the recursive table by its name, before any CTE that the
+        // body defines by it.
+        let recursive_table = table_references.outer_query_refs().iter().find(|entry| {
+            entry.recursive_table_of_from && entry.identifier == normalized_qualified_name
+        });
         // Each CTE use gets its own table and cursor IDs unless it shares materialized rows.
-        if let Some(cte_definition_index) = cte_definitions
-            .iter()
-            .position(|definition| definition.name == normalized_qualified_name)
-        {
+        let cte_definition_index = match recursive_table {
+            Some(_) => None,
+            None => cte_definitions
+                .iter()
+                .position(|definition| definition.name == normalized_qualified_name),
+        };
+        if let Some(cte_definition_index) = cte_definition_index {
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
@@ -2143,8 +2186,9 @@ fn parse_table(
             return Ok(());
         }
 
-        let outer_ref =
-            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name);
+        let outer_ref = recursive_table.or_else(|| {
+            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
+        });
         // A non-recursive CTE cannot read its own name, even when a table or view
         // with that name exists. A CTE of its name that its body defines hides it.
         if program.is_cte_being_defined(&normalized_qualified_name)
@@ -2513,6 +2557,7 @@ fn cte_with(
             if let Some(scope) = &mut entry.cte_scope {
                 scope.plan_taken = None;
             }
+            entry.recursive_table_of_from = false;
             entry
         })
         .collect();

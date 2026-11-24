@@ -1023,6 +1023,7 @@ pub fn translate_alter_table(
                             rowid_referenced: false,
                             outer_join_may_null_extend: false,
                             scope_depth: 0,
+                            recursive_table_of_from: false,
                         }],
                     );
                     let where_copy = index

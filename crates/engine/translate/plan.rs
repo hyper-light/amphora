@@ -1880,6 +1880,10 @@ pub struct OuterQueryReference {
     /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
     /// errors when the same column name exists at different nesting depths.
     pub scope_depth: usize,
+    /// Whether this is the recursive table of the CTE whose arm this query is: the arm's own FROM
+    /// clause reads it by its name, whatever a WITH clause of the CTE's body defines by that name. A
+    /// query inside the arm reads what the name means where it stands.
+    pub recursive_table_of_from: bool,
 }
 
 impl OuterQueryReference {

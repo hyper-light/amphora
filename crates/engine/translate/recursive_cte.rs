@@ -13,6 +13,7 @@ use crate::translate::emitter::{
 use crate::translate::eqp::EqpDetail;
 use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey};
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
+use crate::translate::subquery::emit_limit_subqueries;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
 use crate::{emit_explain, LimboError, Result};
@@ -155,8 +156,17 @@ pub(crate) fn emit_recursive_cte(
     let recursive_cte_end = program.allocate_label();
     let dequeue_next_row = program.allocate_label();
     let run_recursive_query = program.allocate_label();
-    let mut output_limit_context = TranslateCtx::new(program, resolver.fork(), 0, false);
+    let mut output_limit_context =
+        TranslateCtx::new(program, resolver.fork_with_expr_cache(), 0, false);
     output_limit_context.label_main_loop_end = Some(recursive_cte_end);
+    match recursive_cte.recursive_query.as_mut() {
+        Plan::Select(last_arm)
+        | Plan::CompoundSelect {
+            right_most: last_arm,
+            ..
+        } => emit_limit_subqueries(program, &output_limit_context.resolver, last_arm)?,
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+    }
     init_limit(
         program,
         &mut output_limit_context,
@@ -308,7 +318,7 @@ fn emit_recursive_cte_query(
         Plan::Select(select_plan) => {
             let mut context = TranslateCtx::new(
                 program,
-                resolver.fork(),
+                resolver.fork_with_expr_cache(),
                 select_plan.joined_tables().len(),
                 false,
             );
