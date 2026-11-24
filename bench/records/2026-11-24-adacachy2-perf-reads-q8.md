@@ -181,8 +181,8 @@ was not measured.
   and Q6's among them; `packed_log` 16, `log_read_index` 1, `spilled_log` 2 passed (1 ignored).
   clippy's log shows `Compiling amphora-engine` (not `Checking`: my script counted 0 of the latter
   and ended 3; RULES 6 counts either).
-- The merged trees, with main's later commits (main moved in crates/engine twice in this hour, PG14/PG15
-  and F6's ratchet; also in crates/amphora, crates/api, CLAUDE.md, vendored hyper-raft and scripts):
+- The merged trees, with main's later commits (main moved in crates/engine three times in this hour, PG14/PG15,
+  F6's ratchet and T21's optimizer; also in crates/amphora, crates/api, CLAUDE.md, vendored hyper-raft and scripts):
   - 87d37672 (main 1f4a8e88): Mac, r424 (`STEPS='clippy wal'`): clippy on amphora-engine exit 0, its log `Checking
     amphora-engine`; `storage::wal::test::` 111 passed, 0 failed, 1 ignored. `cargo fmt --all --check` clean
     before each commit. adacachy2, Linux: r425, `scripts/check-production.sh`, exit 0, `engine-ratchet: 10903
@@ -191,9 +191,12 @@ was not measured.
     `Checking amphora-engine` in its log; `storage::wal::test::` 111 passed, 0 failed, 1 ignored. adacachy2, Linux: r454, check-production
     exit 0, `engine-ratchet: 10617 left ... as the ratchet holds`, its log `Checking amphora-engine` (line 31).
   - 4b9108d4 (main 3a58a13f), check-production on adacachy2 (r391): exit 0, 10903 left.
-  Since d1718017, main moved only in crates/amphora (V18, 731240ed), which amphora-engine does not depend on
-  (`cargo tree -p amphora-engine --edges normal,build,dev` names only its own crates and
-  amphora-pg-catalog), so the push of the merge with it re-ran nothing (RULES 6).
+  - a3f712c8 (main ac2c429a: V18's replicated.rs in crates/amphora, T21's optimizer/lip.rs in crates/engine, 10 lines), re-run
+    because main moved in crates/engine: Mac, r464 (`STEPS='clippy wal'` with CARGO_BUILD_JOBS 8, needs cpus=6): clippy on amphora-engine exit
+    0, its log `Checking amphora-engine`, `storage::wal::test::` 111 passed, 0 failed, 1 ignored (the same 111 on
+    87d37672 and d1718017); adacachy2 (r465): check-production exit 0, 10617 left, its log `Compiling
+    amphora-engine` (RULES 6 counts Compiling too). The commit that main takes is that tree with its
+    message amended (`git diff a3f712c8 HEAD` empty).
 
 ## Commands
 
