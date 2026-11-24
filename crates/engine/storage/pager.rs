@@ -4344,6 +4344,15 @@ impl Pager {
         }
     }
 
+    /// Amphora: whether the log's owner ended this connection's read under way (decision 45): its
+    /// snapshot's segment was taken back, so no page it reads from here on is its snapshot's.
+    pub fn read_ended(&self) -> bool {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.read_hold())
+            .is_some_and(|hold| hold.is_ended())
+    }
+
     /// `read_page_no_cache` for a cache miss: on the plain path a page the log doesn't hold is
     /// read in line, with no completion (decision 42).
     fn read_page_uncached(

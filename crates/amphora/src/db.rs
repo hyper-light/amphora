@@ -132,6 +132,13 @@ pub(crate) fn too_old(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether `error` says the engine interrupted the statement it was running.
+pub(crate) fn interrupted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref(), Some(LimboError::Interrupt)))
+}
+
 /// Wakes the thread that made it: what a statement stepped on this thread waits on while it is busy
 /// (the release of the lock it found held, [`step`]).
 struct Unpark(std::thread::Thread);
@@ -309,9 +316,19 @@ impl Db {
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Deadline {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
-        // execute at most 1024 further instructions between deadline checks.
-        self.conn
-            .set_progress_handler(1024, Some(Box::new(move || clock() >= until)));
+        // execute at most 1024 further instructions between deadline checks. A read the log's owner
+        // ended ([`Db::end_closing_reads`]) ends at the same step, whatever it is reading: one that
+        // works in memory alone looks no page up, and would hold nothing back otherwise.
+        let ended = Arc::downgrade(&self.conn);
+        self.conn.set_progress_handler(
+            1024,
+            Some(Box::new(move || {
+                clock() >= until
+                    || ended
+                        .upgrade()
+                        .is_some_and(|conn| conn.get_pager().read_ended())
+            })),
+        );
         Deadline {
             connection: Arc::clone(&self.conn),
         }
@@ -802,6 +819,11 @@ impl Db {
     /// past its room would refuse every submit after the restart that brought it back within.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
         Ok(self.db.wal_backfill().0)
+    }
+
+    /// Whether the log's owner ended this connection's last read ([`Db::end_closing_reads`]).
+    pub(crate) fn read_ended(&self) -> bool {
+        self.conn.get_pager().read_ended()
     }
 
     /// Ends the reads under way that count on the log's closing segment, and says how many: what
