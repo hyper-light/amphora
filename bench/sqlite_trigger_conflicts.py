@@ -16,7 +16,9 @@ leaves what its statement wrote before it, under ROLLBACK ends the transaction, 
 the user wrote.
 
 Not drawn, each a difference of another cause (lane C17's and C22's records): NOCASE columns; the order a
-statement of several rows visits them in where an index may be chosen.
+statement of several rows visits them in where an index may be chosen. Not held: which constraint refused a
+statement beside foreign keys (a trigger's program refuses a violation where it ends, SQLite where the statement
+does).
 
 Each line is `db <name>`, `sql <statement>` (the database's tables, rows and triggers) or `q <statement>
 <answer>`: the answer's rows sorted, each row's values joined by commas, a NULL written NULL, the rows joined by
@@ -260,20 +262,18 @@ def text(value):
     return str(value)
 
 
-def answer(db, sql):
+def answer(db, sql, words):
     try:
         rows = sorted(",".join(text(value) for value in row) for row in db.execute(sql).fetchall())
     except sqlite3.IntegrityError as error:
-        return f"ERROR {error}"
+        return f"ERROR {error}" if words else "ERROR"
     except sqlite3.Error:
         return "ERROR"
     return f"{len(rows)}:{';'.join(rows)}"
 
 
-def ask(db, sql, out):
-    got = answer(db, sql)
-    out.append(f"q\t{sql}\t{got}")
-    return got
+def ask(db, sql, out, words=True):
+    out.append(f"q\t{sql}\t{answer(db, sql, words)}")
 
 
 def main():
@@ -321,7 +321,7 @@ def main():
         for _ in range(rng.choice([4, 5, 6])):
             if scope == "SAVEPOINT":
                 ask(db, "SAVEPOINT s", out)
-            ask(db, draw.statement(), out)
+            ask(db, draw.statement(), out, not draw.linked)
             ask(db, LOOK, out)
             if scope == "SAVEPOINT":
                 if rng.random() < 0.5:
