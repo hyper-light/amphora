@@ -30,6 +30,19 @@ pub(crate) mod members;
 pub(crate) mod readsets;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
+/// A lock delta adds the transaction whose vote must be stamped at apply (T-T1.9.R30).
+/// Like BASELINE_DELTA its prefix cannot begin a valid postcard page list.
+const LOCK_DELTA: &[u8] = b"amphora.lock.v1\0";
+
+fn open_lock_delta(data: &[u8]) -> Result<(Option<crate::xgroup::TxnId>, &[u8]), Refusal> {
+    match data.strip_prefix(LOCK_DELTA) {
+        Some(rest) => {
+            let (txn, body) = postcard::take_from_bytes(rest).map_err(unavailable)?;
+            Ok((Some(txn), body))
+        }
+        None => Ok((None, data)),
+    }
+}
 const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
 #[derive(Serialize, Deserialize)]
 struct BaselineSnapshot {
@@ -81,11 +94,14 @@ const fn pages_envelope(budget: usize) -> usize {
     U64_MOST.saturating_add(pages.saturating_mul(page))
 }
 /// What a prepared transaction's encoding adds to its pages, at the most: the baseline's prefix and
-/// declaration, its base's index and term, and its pages' envelope. A read set rides in what an
+/// declaration, the lock prefix and three transaction-id varints, its base's index and term,
+/// and its pages' envelope. A read set rides in what an
 /// entry leaves of it and of the pages' budget, or goes without one (`Prepared::encode`).
 pub(crate) const COMMAND_ENVELOPE: usize = BASELINE_DELTA
     .len()
     .saturating_add(BOOTSTRAP_MOST)
+    .saturating_add(LOCK_DELTA.len())
+    .saturating_add(U64_MOST.saturating_mul(3))
     .saturating_add(U64_MOST.saturating_mul(2))
     .saturating_add(pages_envelope(COMMAND_BYTES));
 /// What an image's encoding adds to its `budget` bytes of pages, at the most: the baseline's prefix
@@ -108,6 +124,8 @@ pub struct Prepared {
     pages: Vec<(u32, Vec<u8>)>,
     #[serde(skip)]
     baseline: Option<api::replication::Bootstrap>,
+    #[serde(skip)]
+    lock: Option<crate::xgroup::TxnId>,
     /// What its session read, carried after its encoding (`readsets`): `None` for a session that
     /// read more than its entry could carry, and for what isn't a caller's write.
     #[serde(skip)]
@@ -126,6 +144,7 @@ impl Prepared {
             base_term: base.term,
             pages,
             baseline: None,
+            lock: None,
             reads,
         }
     }
@@ -135,13 +154,21 @@ impl Prepared {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Refusal> {
-        let mut bytes = if let Some(declaration) = &self.baseline {
-            let mut bytes = BASELINE_DELTA.to_vec();
-            bytes.extend(postcard::to_allocvec(&(declaration, self)).map_err(unavailable)?);
-            bytes
+        let mut prefix = Vec::new();
+        if let Some(txn) = self.lock {
+            prefix.extend_from_slice(LOCK_DELTA);
+            prefix = postcard::to_extend(&txn, prefix).map_err(unavailable)?;
+        }
+        if let Some(declaration) = &self.baseline {
+            prefix.extend_from_slice(BASELINE_DELTA);
+            prefix = postcard::to_extend(declaration, prefix).map_err(unavailable)?;
+        }
+        let mut bytes = if prefix.is_empty() {
+            postcard::to_allocvec(self)
         } else {
-            postcard::to_allocvec(self).map_err(unavailable)?
-        };
+            postcard::to_extend(self, prefix)
+        }
+        .map_err(unavailable)?;
         let bound = COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE);
         api::bound("replicated command", bytes.len(), bound)?;
         // The read set rides after the encoding while the entry keeps its bound; past it, the
@@ -161,7 +188,8 @@ impl Prepared {
             bytes.len(),
             COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE),
         )?;
-        let prepared: Self = if let Some(payload) = bytes.strip_prefix(BASELINE_DELTA) {
+        let (lock, bytes) = open_lock_delta(bytes)?;
+        let mut prepared: Self = if let Some(payload) = bytes.strip_prefix(BASELINE_DELTA) {
             let (declaration, mut prepared): (api::replication::Bootstrap, Self) =
                 postcard::from_bytes(payload).map_err(unavailable)?;
             prepared.baseline = Some(declaration);
@@ -169,6 +197,7 @@ impl Prepared {
         } else {
             postcard::from_bytes(bytes).map_err(unavailable)?
         };
+        prepared.lock = lock;
         validate_pages(&prepared.pages, COMMAND_BYTES)?;
         Ok(prepared)
     }
@@ -205,6 +234,7 @@ pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>,
         data.len(),
         COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE),
     )?;
+    let (_, data) = open_lock_delta(data)?;
     let base: Base = if let Some(payload) = data.strip_prefix(BASELINE_DELTA) {
         let (_, base): (api::replication::Bootstrap, Base) =
             postcard::from_bytes(payload).map_err(unavailable)?;
@@ -846,12 +876,13 @@ impl Machine {
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
+                lock: traced.lock,
                 // Only on a base whose state has the closed time's table: an apply that makes it
                 // (the group's first stamped entry) changes the schema beyond any entry's pages,
                 // so a write prepared before it must not move past it (`readsets`).
                 reads: traced
                     .reads
-                    .filter(|_| self.time.is_some())
+                    .filter(|_| self.time.is_some() && traced.lock.is_none())
                     .map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
@@ -883,6 +914,7 @@ impl Machine {
             base_term: self.point.term,
             pages: image,
             baseline: self.baseline.declaration().cloned(),
+            lock: None,
             reads: None,
         };
         // The hard page fence proves the worst-case bound; retain the exact serialization check
@@ -1229,6 +1261,7 @@ impl StateMachine for Machine {
         }
         let mut result = Ok(());
         let mut pages = Vec::new();
+        let mut lock = None;
         if !data.is_empty() {
             self.require_baseline().map_err(failed)?;
             let prepared = Prepared::decode(data).map_err(failed)?;
@@ -1238,6 +1271,7 @@ impl StateMachine for Machine {
             result = on_base(prepared.base_index, prepared.base_term, self.point);
             if result.is_ok() {
                 pages = prepared.pages;
+                lock = prepared.lock;
             }
         }
         // Its flush is the owner's flushing thread's, in every class (replication.md, "A
@@ -1245,7 +1279,14 @@ impl StateMachine for Machine {
         // transaction changes nothing but still takes its time: the time counts entries, and every
         // member refuses it alike.
         self.advance_with(at, &pages, &self.configuration.clone(), false, |db| {
-            closed::record(db, before, next.time)
+            closed::record(db, before, next.time)?;
+            if let Some(txn) = lock {
+                let time = next.time.ok_or_else(|| {
+                    anyhow::anyhow!("a replicated lock delta requires a closed time")
+                })?;
+                crate::xgroup::sql::keep_lock_stamp(db, txn, time)?;
+            }
+            Ok(())
         })?;
         self.timed(next);
         if !data.is_empty() {
@@ -1423,6 +1464,11 @@ mod envelope_tests {
             base_term: u64::MAX,
             pages,
             baseline: Some(widest_declaration()),
+            lock: Some(crate::xgroup::TxnId {
+                coordinator: u64::MAX,
+                epoch: u64::MAX,
+                seq: u64::MAX,
+            }),
             reads: None,
         };
         let bytes = prepared.encode().unwrap();

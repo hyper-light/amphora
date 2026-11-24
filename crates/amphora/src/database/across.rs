@@ -29,15 +29,16 @@ use crate::xgroup::sql::Member;
 
 /// Writes the commit stamp of revision `at` of namespace `ns`, in the commit that makes it, on a
 /// writer that stamps its commits; a revision already stamped (a cross-group step's rows share one)
-/// keeps its stamp. An unbacked writer stamps nothing: it has no place in the order across groups.
+/// keeps its stamp. A replicated-only writer keeps the pinned stamp when it applies a resolution.
 ///
 /// The stamp is the cross-group clock's, in microseconds (lane split-merge-21, T-T1.9.R28): the
 /// writer's own fresh one, or `pinned`, the commit stamp a transaction across groups chose for all
 /// its rows in every group, which the writer's clock then takes in so its later commits are later.
 pub(super) fn stamp(db: &Db, ns: &str, at: Rev, pinned: Option<u64>) -> anyhow::Result<()> {
-    let Some(hooks) = db.stamps() else {
+    let hooks = db.stamps();
+    if pinned.is_none() && hooks.is_none() {
         return Ok(());
-    };
+    }
     let mut stamped = false;
     db.query(
         "SELECT 1 FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev = ?2",
@@ -50,12 +51,14 @@ pub(super) fn stamp(db: &Db, ns: &str, at: Rev, pinned: Option<u64>) -> anyhow::
     if stamped {
         return Ok(());
     }
-    let stamp = match pinned {
-        Some(pinned) => {
-            hooks.marks.observe_micros(pinned)?;
-            pinned
+    let stamp = match (pinned, hooks) {
+        (Some(at), Some(hooks)) => {
+            hooks.marks.observe_micros(at)?;
+            at
         }
-        None => hooks.marks.next_micros()?,
+        (Some(at), None) => at,
+        (None, Some(hooks)) => hooks.marks.next_micros()?,
+        (None, None) => return Ok(()),
     };
     db.query(
         "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES (?1, ?2, ?3)",

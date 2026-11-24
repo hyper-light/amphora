@@ -294,7 +294,7 @@ pub trait Tablet {
     fn done(&mut self, txn: TxnId) -> anyhow::Result<Option<Outcome>>;
     fn set_done(&mut self, txn: TxnId, outcome: Outcome) -> anyhow::Result<()>;
     /// The transaction's lock stamp here (lane split-merge-21's `__amphora_xg_lock_at`): this
-    /// group's clock as it took the transaction's first lock, while it holds them; none in a
+    /// group's clock at publication of the lock step, while it holds the locks; none in a
     /// group that stamps nothing.
     fn lock_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>>;
     /// The transaction's commit stamp as kept here (lane split-merge-22, T-T1.9.R30): by its
@@ -611,6 +611,26 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Apply a step in the simulator and publish it at the supplied group clock. The lock and
+    /// its vote survive together even when the coordinator never receives the reply (T-T1.9.R30).
+    pub fn apply_committed(
+        &mut self,
+        here: GroupId,
+        envelope: &Envelope,
+        published: Option<u64>,
+    ) -> anyhow::Result<(Reply, Option<u64>)> {
+        let reply = apply(here, self, envelope)?;
+        if matches!(reply, Reply::Locked { .. })
+            && let (Some(txn), Some(at)) = (envelope.step.txn(), published)
+            && let Some(stamp) = self.lock_at.get_mut(&txn)
+        {
+            self.clock = self.clock.max(at);
+            *stamp = self.clock;
+            return Ok((reply, Some(*stamp)));
+        }
+        Ok((reply, None))
+    }
+
     /// The committed values.
     #[must_use]
     pub fn data(&self) -> &BTreeMap<Vec<u8>, Vec<u8>> {

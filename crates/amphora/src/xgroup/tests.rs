@@ -2,6 +2,8 @@
 //! a coordinator crash at every step (T-T1.10.1), and seeded simulations under lost and late steps
 //! and crashes, checked Elle-style (AC-T1.10.5).
 
+mod lock_stamps;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -257,9 +259,9 @@ fn t_t1_10_c_the_group_rules_hold_in_memory() {
 #[test]
 fn t_t1_10_c_the_group_rules_hold_in_a_groups_database() {
     let io = Arc::new(amphora_engine::MemoryIO::new());
-    let db = Db::open_with(Path::new(":memory:xgroup"), io).unwrap();
+    let mut db = Db::open_with(Path::new(":memory:xgroup"), io).unwrap();
     db.exec(SCHEMA).unwrap();
-    conformance(&mut SqlTablet::new(&db));
+    conformance(&mut SqlTablet::new(&mut db));
 }
 
 fn lock_if(id: TxnId, writes: &[(&[u8], &[u8])], conds: &[(&[u8], Option<u64>)]) -> Step {
@@ -1374,10 +1376,34 @@ fn drive(
     groups: &mut [Memory],
     coordinator: &mut Coordinator,
     first: Vec<Event>,
-    mut begin: Option<Txn>,
+    begin: Option<Txn>,
     clocks: &[u64],
-    mut fate: impl FnMut(&Step) -> Fate,
+    fate: impl FnMut(&Step) -> Fate,
 ) -> Option<Answer> {
+    drive_on(
+        coordinator,
+        first,
+        begin,
+        |group, envelope| {
+            let at = usize::try_from(group).unwrap();
+            groups[at]
+                .apply_committed(group, envelope, clocks.get(at).copied())
+                .unwrap()
+        },
+        fate,
+    )
+    .map(|(answer, _)| answer)
+}
+
+/// The same coordinator crash boundary for the memory model and the SQL owners. The last byte
+/// of each test key is its group. A crash drops the coordinator's queue and any pending reply.
+fn drive_on(
+    coordinator: &mut Coordinator,
+    first: Vec<Event>,
+    mut begin: Option<Txn>,
+    mut land: impl FnMut(GroupId, &Envelope) -> (Reply, Option<u64>),
+    mut fate: impl FnMut(&Step) -> Fate,
+) -> Option<(Answer, u32)> {
     let mut queue: std::collections::VecDeque<Event> = first.into();
     let mut answer = None;
     while let Some(event) = queue.pop_front() {
@@ -1389,25 +1415,24 @@ fn drive(
                     Fate::Lose => continue,
                     Fate::Land | Fate::LandThenCrash => {}
                 }
-                let at = usize::try_from(send.group).unwrap();
-                let reply = apply(send.group, &mut groups[at], &send.envelope).unwrap();
+                let (reply, clock) = land(send.group, &send.envelope);
                 if fated == Fate::LandThenCrash {
                     return answer;
                 }
-                let clock = match send.envelope.step {
-                    Step::Lock { .. } | Step::LockIf { .. } => clocks.get(at).copied(),
-                    _ => None,
-                };
                 queue.extend(coordinator.reply(send.id, Ok(reply), clock).unwrap());
             }
             Event::Ready => {
                 if let Some(txn) = begin.take() {
-                    let route = |key: &[u8]| key.first().map_or(0, |g| GroupId::from(*g));
+                    let route = |key: &[u8]| key.last().map_or(0, |g| GroupId::from(*g));
                     let (_, events) = coordinator.begin(txn, route).unwrap();
                     queue.extend(events);
                 }
             }
-            Event::Answer { answer: heard, .. } => answer = Some(heard),
+            Event::Answer {
+                answer: heard,
+                rounds,
+                ..
+            } => answer = Some((heard, rounds)),
             _ => {}
         }
     }
@@ -1421,8 +1446,7 @@ fn drive(
 /// Commits its explicit commit lost before), and a new incarnation recovers it. Then, under
 /// Parallel Commits, a crash with every lock in place and nothing decided or resolved, and a
 /// recovery. Expect: the client heard committed at 50, and after the recovery every group's key
-/// is stamped 50, the stamp the first group resolved at; in the second, every key carries one
-/// stamp, the latest of the groups' lock stamps (21), at or before the 50 the client heard.
+/// is stamped exactly as the client heard, including when the locks alone survive.
 #[test]
 fn t_t1_9_r30_a_recovered_transaction_resolves_at_its_one_stamp() {
     let lock_clocks = [30u64, 50, 40];
@@ -1501,16 +1525,21 @@ fn t_t1_9_r30_a_recovered_transaction_resolves_at_its_one_stamp() {
         Some(txn),
         &lock_clocks,
         |step| match step {
-            Step::Decide { .. } | Step::DecideAt { .. } => Fate::Crash,
+            Step::Decide { .. }
+            | Step::DecideAt { .. }
+            | Step::Resolve { .. }
+            | Step::ResolveAt { .. } => Fate::Crash,
             _ => Fate::Land,
         },
     );
-    assert!(
-        matches!(heard, Some(Answer::Committed { at: Some(50), .. })),
-        "{heard:?}"
-    );
+    let Some(Answer::Committed { at, .. }) = heard else {
+        panic!("the client must hear the implicit commit before the crash: {heard:?}");
+    };
+    assert_eq!(at, Some(50));
+    assert!(groups.iter().all(|g| !g.held().is_empty()));
+    assert_eq!(stamps(&mut groups), vec![None; 3]);
     let (mut second, events) = Coordinator::start(config).unwrap();
     drive(&mut groups, &mut second, events, None, &[], |_| Fate::Land);
-    assert_eq!(stamps(groups.as_mut_slice()), vec![Some(21); 3]);
+    assert_eq!(stamps(&mut groups), vec![at; 3]);
     assert!(groups.iter().all(|g| g.held().is_empty()));
 }
