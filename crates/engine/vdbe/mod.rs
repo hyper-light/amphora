@@ -912,6 +912,9 @@ pub struct ProgramState {
     pub(crate) index_methods_finalized: bool,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Owned TEXT/BLOB buffers reclaimed across `ProgramState::reset()` for the same prepared
+    /// statement so repeated queries reuse their heap capacity without per-row malloc/free churn.
+    pub(crate) register_spares: RegisterSpares,
     /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
@@ -1081,6 +1084,56 @@ pub struct ProgramState {
     mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
 }
 
+/// Owned TEXT/BLOB backing buffers reclaimed across `ProgramState::reset()` when re-running the
+/// same prepared statement. Bounded by the program's register count and a single database page
+/// (`BufferPool::DEFAULT_PAGE_SIZE`) per buffer.
+#[derive(Default)]
+pub(crate) struct RegisterSpares {
+    texts: Vec<String>,
+    blobs: Vec<crate::types::ValueBlob>,
+}
+
+impl RegisterSpares {
+    #[inline(always)]
+    pub(crate) fn pop_text(&mut self) -> Option<String> {
+        self.texts.pop()
+    }
+
+    #[inline(always)]
+    pub(crate) fn pop_blob(&mut self) -> Option<crate::types::ValueBlob> {
+        self.blobs.pop()
+    }
+
+    #[inline(always)]
+    pub(crate) fn push_text(&mut self, mut text: String, max_count: usize) {
+        let cap = text.capacity();
+        if cap > 0
+            && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
+            && self.texts.len() < max_count
+        {
+            text.clear();
+            self.texts.push(text);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn push_blob(&mut self, mut blob: crate::types::ValueBlob, max_count: usize) {
+        let cap = blob.capacity();
+        if cap > 0
+            && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
+            && self.blobs.len() < max_count
+        {
+            blob.clear();
+            self.blobs.push(blob);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.texts.clear();
+        self.blobs.clear();
+    }
+}
+
 /// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
 pub(crate) struct MvStoreHandle(Arc<crate::Database>);
 
@@ -1130,6 +1183,7 @@ impl ProgramState {
             index_methods_finalized: false,
             cursor_seqs,
             registers,
+            register_spares: RegisterSpares::default(),
             pre_op_registers: None,
             result_row: None,
             last_compare: None,
@@ -1320,9 +1374,35 @@ impl ProgramState {
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
         self.index_methods_finalized = false;
+        let keep_register_spares = max_registers.is_none();
+        if !keep_register_spares {
+            self.register_spares.clear();
+        }
+        let max_spares = self.registers.len();
         for r in self.registers.iter_mut() {
             match r {
-                Register::Value(v) => *v = Value::Null,
+                Register::Value(v) => {
+                    if keep_register_spares {
+                        match v {
+                            Value::Text(_) => {
+                                if let Value::Text(text) = std::mem::replace(v, Value::Null) {
+                                    if let std::borrow::Cow::Owned(s) = text.value {
+                                        self.register_spares.push_text(s, max_spares);
+                                    }
+                                }
+                                continue;
+                            }
+                            Value::Blob(_) => {
+                                if let Value::Blob(blob) = std::mem::replace(v, Value::Null) {
+                                    self.register_spares.push_blob(blob, max_spares);
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    *v = Value::Null;
+                }
                 _ => r.set_null(),
             }
         }
@@ -4255,25 +4335,7 @@ pub trait ValueIteratorExt {
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
-        let mut header = self.header_section_ref();
-        let mut data = self.data_section_ref();
-
-        if let Err(e) = skip_serial_types(&mut header, &mut data, n) {
-            return Some(Err(e));
-        }
-        if header.is_empty() {
-            return None;
-        }
-
-        let serial_type = match read_serial_type(&mut header) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-        // Update iterator state
-        self.set_header_section(header);
-        let result = decode_serial_type_into_register(serial_type, &mut data, dest);
-        self.set_data_section(data);
-        Some(result)
+        nth_into_register_with_spares(self, n, dest, None)
     }
 
     /// The header and data positions live in locals for the whole range and
@@ -4285,22 +4347,64 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         skip: usize,
         dests: &mut [Register],
     ) -> Result<usize> {
-        let mut header = self.header_section_ref();
-        let mut data = self.data_section_ref();
-        skip_serial_types(&mut header, &mut data, skip)?;
-        let mut decoded = 0;
-        for dest in dests.iter_mut() {
-            if header.is_empty() {
-                break;
-            }
-            let serial_type = read_serial_type(&mut header)?;
-            decode_serial_type_into_register(serial_type, &mut data, dest)?;
-            decoded += 1;
-        }
-        self.set_header_section(header);
-        self.set_data_section(data);
-        Ok(decoded)
+        decode_into_registers_after_with_spares(self, skip, dests, None)
     }
+}
+
+#[inline(always)]
+pub(crate) fn nth_into_register_with_spares(
+    iter: &mut crate::types::ValueIterator<'_>,
+    n: usize,
+    dest: &mut Register,
+    spares: Option<&mut RegisterSpares>,
+) -> Option<Result<()>> {
+    let mut header = iter.header_section_ref();
+    let mut data = iter.data_section_ref();
+
+    if let Err(e) = skip_serial_types(&mut header, &mut data, n) {
+        return Some(Err(e));
+    }
+    if header.is_empty() {
+        return None;
+    }
+
+    let serial_type = match read_serial_type(&mut header) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    iter.set_header_section(header);
+    let result = decode_serial_type_into_register_with_spares(serial_type, &mut data, dest, spares);
+    iter.set_data_section(data);
+    Some(result)
+}
+
+#[inline(always)]
+pub(crate) fn decode_into_registers_after_with_spares(
+    iter: &mut crate::types::ValueIterator<'_>,
+    skip: usize,
+    dests: &mut [Register],
+    mut spares: Option<&mut RegisterSpares>,
+) -> Result<usize> {
+    let mut header = iter.header_section_ref();
+    let mut data = iter.data_section_ref();
+    skip_serial_types(&mut header, &mut data, skip)?;
+    let mut decoded = 0;
+    for dest in dests.iter_mut() {
+        if header.is_empty() {
+            break;
+        }
+        let serial_type = read_serial_type(&mut header)?;
+        decode_serial_type_into_register_with_spares(
+            serial_type,
+            &mut data,
+            dest,
+            spares.as_deref_mut(),
+        )?;
+        decoded += 1;
+    }
+    iter.set_header_section(header);
+    iter.set_data_section(data);
+    Ok(decoded)
 }
 
 /// Advance `header` and `data` past `n` serial types, stopping early if the header is shorter than
@@ -4361,13 +4465,46 @@ fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
     })
 }
 
+/// Puts a TEXT value in a register that does not hold text yet, reusing a reclaimed `String`
+/// buffer from `spares` when available.
+#[inline(always)]
+fn start_text_register_with_spares(
+    dest: &mut Register,
+    text_data: &[u8],
+    spares: Option<&mut RegisterSpares>,
+) -> Result<()> {
+    if let Some(spare) = spares.and_then(RegisterSpares::pop_text) {
+        let mut text = crate::types::Text::new(spare);
+        text.replace_with_bytes(text_data)?;
+        return dest.set_text(text);
+    }
+    start_text_register(dest, text_data)
+}
+
+/// Puts a BLOB value in a register that does not hold a blob yet, reusing a reclaimed `ValueBlob`
+/// buffer from `spares` when available.
+#[inline(always)]
+fn start_blob_register_with_spares(
+    dest: &mut Register,
+    blob_data: &[u8],
+    spares: Option<&mut RegisterSpares>,
+) -> Result<()> {
+    if let Some(mut spare) = spares.and_then(RegisterSpares::pop_blob) {
+        use crate::types::Extendable;
+        spare.do_extend(&blob_data)?;
+        return dest.set_blob(spare);
+    }
+    start_blob_register(dest, blob_data)
+}
+
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
 /// and moves `data` past it.
 #[inline(always)]
-fn decode_serial_type_into_register(
+fn decode_serial_type_into_register_with_spares(
     serial_type: u64,
     data: &mut &[u8],
     dest: &mut Register,
+    spares: Option<&mut RegisterSpares>,
 ) -> Result<()> {
     use crate::types::Extendable;
     match serial_type {
@@ -4477,7 +4614,7 @@ fn decode_serial_type_into_register(
                 Register::Value(Value::Blob(existing_blob)) => {
                     existing_blob.do_extend(&blob_data)?;
                 }
-                _ => start_blob_register(dest, blob_data)?,
+                _ => start_blob_register_with_spares(dest, blob_data, spares)?,
             }
             *data = &data[content_size..];
         }),
@@ -4492,7 +4629,7 @@ fn decode_serial_type_into_register(
                 Register::Value(Value::Text(existing_text)) => {
                     existing_text.replace_with_bytes(text_data)?;
                 }
-                _ => start_text_register(dest, text_data)?,
+                _ => start_text_register_with_spares(dest, text_data, spares)?,
             }
             *data = &data[content_size..];
         }

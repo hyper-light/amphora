@@ -2456,7 +2456,12 @@ fn op_column_fetch(
         dest_reg.set_null();
         return Ok(InsnFunctionStepResult::Step);
     };
-    if !header.column_into_register(payload, column, dest_reg)? {
+    if !header.column_into_register_with_spares(
+        payload,
+        column,
+        dest_reg,
+        Some(&mut state.register_spares),
+    )? {
         branches::mark_unlikely();
         // The record has fewer columns than expected.
         apply_column_default(default, dest_reg)?;
@@ -2494,7 +2499,12 @@ fn op_column_fetch_pseudo(
             // Decode straight into the register; going through an owned
             // Value would allocate for every TEXT/BLOB column on every row.
             let mut payload_iterator = record.iter()?;
-            match payload_iterator.nth_into_register(column, dest_reg) {
+            match super::nth_into_register_with_spares(
+                &mut payload_iterator,
+                column,
+                dest_reg,
+                Some(&mut state.register_spares),
+            ) {
                 Some(result) => result?,
                 // A pseudo cursor is opened with num_fields matching the
                 // record built for it, so every emitted Column index is in
@@ -2592,18 +2602,28 @@ fn op_column_fetch_other(
             apply_column_default(default, &mut state.registers[dest])?;
         }
         CursorType::Sorter => {
-            let record = {
-                let cursor = state.get_cursor(cursor_id);
-                let cursor = cursor.as_sorter_mut();
-                cursor.record().cloned()
-            };
-            if let Some(record) = record {
-                state.registers[dest].set_value(match record.get_value_opt(column) {
-                    Some(val) => val.to_owned()?,
-                    None => default.clone().unwrap_or(Value::Null),
-                });
+            let cursor = state
+                .cursors
+                .get_mut(cursor_id)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| cursor_out_of_range("Column", cursor_id))?;
+            let dest_reg = state
+                .registers
+                .get_mut(dest)
+                .ok_or_else(|| register_out_of_range("Column", dest))?;
+            if let Some(record) = cursor.as_sorter_mut().record() {
+                let mut payload_iterator = record.iter()?;
+                match super::nth_into_register_with_spares(
+                    &mut payload_iterator,
+                    column,
+                    dest_reg,
+                    Some(&mut state.register_spares),
+                ) {
+                    Some(result) => result?,
+                    None => apply_column_default(default, dest_reg)?,
+                }
             } else {
-                state.registers[dest].set_null();
+                dest_reg.set_null();
             }
         }
         CursorType::Pseudo(_) => {
@@ -2707,7 +2727,12 @@ fn op_column_range_fetch(
         dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);
     };
-    let filled = header.columns_into_registers(payload, start_column, dest_regs)?;
+    let filled = header.columns_into_registers_with_spares(
+        payload,
+        start_column,
+        dest_regs,
+        Some(&mut state.register_spares),
+    )?;
     if let Some(missing) = dest_regs.get_mut(filled..) {
         if !missing.is_empty() {
             branches::mark_unlikely();
@@ -2793,22 +2818,30 @@ fn op_column_range_fetch_other(
             }
         }
         CursorType::Sorter => {
-            if let Some(record) = get_cursor!(state, cursor_id).as_sorter_mut().record() {
+            let cursor = state
+                .cursors
+                .get_mut(cursor_id)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| cursor_out_of_range("ColumnRange", cursor_id))?;
+            let dest_regs = dest
+                .checked_add(count)
+                .and_then(|end| state.registers.get_mut(dest..end))
+                .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+            if let Some(record) = cursor.as_sorter_mut().record() {
                 let mut payload_iterator = record.iter()?;
-                let filled = payload_iterator.decode_into_registers_after(
+                let filled = super::decode_into_registers_after_with_spares(
+                    &mut payload_iterator,
                     start_column,
-                    &mut state.registers[dest..dest + count],
+                    dest_regs,
+                    Some(&mut state.register_spares),
                 )?;
-                for (default, reg) in defaults[filled..]
-                    .iter()
-                    .zip(&mut state.registers[dest + filled..dest + count])
-                {
-                    apply_column_default(default, reg)?;
+                if let Some(missing) = dest_regs.get_mut(filled..) {
+                    for (default, reg) in defaults.iter().skip(filled).zip(missing) {
+                        apply_column_default(default, reg)?;
+                    }
                 }
             } else {
-                for reg in &mut state.registers[dest..dest + count] {
-                    reg.set_null();
-                }
+                dest_regs.iter_mut().for_each(Register::set_null);
             }
         }
         CursorType::Pseudo(_) => {
@@ -2828,9 +2861,13 @@ fn op_column_range_fetch_other(
             };
             match content {
                 Register::Record(record) => {
-                    let filled = record
-                        .iter()?
-                        .decode_into_registers_after(start_column, dest_regs)?;
+                    let mut iter = record.iter()?;
+                    let filled = super::decode_into_registers_after_with_spares(
+                        &mut iter,
+                        start_column,
+                        dest_regs,
+                        Some(&mut state.register_spares),
+                    )?;
                     if filled < count {
                         crate::bail_parse_error!("pseudo-cursor column out of range for record");
                     }

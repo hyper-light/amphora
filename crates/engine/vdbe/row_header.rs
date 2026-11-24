@@ -4,7 +4,9 @@
 //! header further only past the last column parsed, instead of walking every serial type before
 //! its column on every call (docs/design/executor.md, decision 7; QT.3).
 
-use super::{decode_serial_type_into_register, read_serial_type, Register};
+use super::{
+    decode_serial_type_into_register_with_spares, read_serial_type, Register, RegisterSpares,
+};
 use crate::error::LimboError;
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::types::get_serial_type_size;
@@ -28,11 +30,13 @@ const SERIAL_SIZE_1BYTE: [u8; 128] = [
 ];
 
 /// One column's place in the record: its serial type and where its value starts in the data
-/// section.
+/// section. Packed into 8 bytes (`u32`, `u32`) so one 128-byte cache line holds 16 columns
+/// inline without heap allocation; columns whose serial type or offset exceed `u32::MAX` bypass
+/// the cache and decode directly from `u64`/`usize`.
 #[derive(Clone, Copy)]
 struct ParsedColumn {
-    serial_type: u64,
-    offset: usize,
+    serial_type: u32,
+    offset: u32,
 }
 
 impl ParsedColumn {
@@ -47,7 +51,10 @@ const INLINE_COLUMNS: usize = 128 / std::mem::size_of::<ParsedColumn>();
 
 /// Where a column's serial type is, once the header is parsed that far.
 enum Located {
-    Column(ParsedColumn),
+    Column {
+        serial_type: u64,
+        offset: usize,
+    },
     /// The record holds fewer columns than the one asked for: an `ALTER TABLE ... ADD COLUMN`
     /// added it after the row was written, and its default applies.
     PastEnd,
@@ -115,16 +122,6 @@ impl RowHeader {
         self.get_kept(last)
     }
 
-    #[inline(always)]
-    fn push_kept(&mut self, parsed: ParsedColumn) -> Result<()> {
-        if let Some(slot) = self.inline.get_mut(self.len) {
-            *slot = parsed;
-            self.len = self.len.wrapping_add(1);
-            return Ok(());
-        }
-        self.push_overflow(parsed)
-    }
-
     #[cold]
     #[inline(never)]
     fn push_overflow(&mut self, parsed: ParsedColumn) -> Result<()> {
@@ -148,10 +145,26 @@ impl RowHeader {
         column: usize,
         dest: &mut Register,
     ) -> Result<bool> {
+        self.column_into_register_with_spares(payload, column, dest, None)
+    }
+
+    /// Like [`Self::column_into_register`], recycling owned TEXT/BLOB buffers from `spares` when
+    /// `dest` does not already hold a buffer of that type.
+    #[inline(always)]
+    pub(crate) fn column_into_register_with_spares(
+        &mut self,
+        payload: &[u8],
+        column: usize,
+        dest: &mut Register,
+        spares: Option<&mut RegisterSpares>,
+    ) -> Result<bool> {
         match self.locate(payload, column)? {
-            Located::Column(parsed) => {
-                let mut data = self.data_at(payload, parsed.offset)?;
-                decode_serial_type_into_register(parsed.serial_type, &mut data, dest)?;
+            Located::Column {
+                serial_type,
+                offset,
+            } => {
+                let mut data = self.data_at(payload, offset)?;
+                decode_serial_type_into_register_with_spares(serial_type, &mut data, dest, spares)?;
                 Ok(true)
             }
             Located::PastEnd => Ok(false),
@@ -167,13 +180,26 @@ impl RowHeader {
         start: usize,
         dests: &mut [Register],
     ) -> Result<usize> {
+        self.columns_into_registers_with_spares(payload, start, dests, None)
+    }
+
+    /// Like [`Self::columns_into_registers`], recycling owned TEXT/BLOB buffers from `spares`.
+    #[inline(always)]
+    pub(crate) fn columns_into_registers_with_spares(
+        &mut self,
+        payload: &[u8],
+        start: usize,
+        dests: &mut [Register],
+        mut spares: Option<&mut RegisterSpares>,
+    ) -> Result<usize> {
         if dests.is_empty() {
             return Ok(0);
         }
         if !self.started {
             self.start(payload)?;
         }
-        let data_section = payload.get(self.header_end..).ok_or_else(too_small)?;
+        let header_end = self.header_end;
+        let data_section = payload.get(header_end..).ok_or_else(too_small)?;
         let data_len = data_section.len();
         let mut filled = 0usize;
 
@@ -188,8 +214,14 @@ impl RowHeader {
             let Some(dest) = dests.get_mut(filled) else {
                 break;
             };
-            let mut data = data_section.get(parsed.offset..).ok_or_else(too_small)?;
-            decode_serial_type_into_register(parsed.serial_type, &mut data, dest)?;
+            let offset = usize::try_from(parsed.offset).map_err(|_| too_small())?;
+            let mut data = data_section.get(offset..).ok_or_else(too_small)?;
+            decode_serial_type_into_register_with_spares(
+                u64::from(parsed.serial_type),
+                &mut data,
+                dest,
+                spares.as_deref_mut(),
+            )?;
             filled = filled.wrapping_add(1);
         }
 
@@ -197,28 +229,37 @@ impl RowHeader {
             return Ok(filled);
         }
 
-        // Fast path: walk forward through the remaining header bytes in one pass.
-        let mut index = self.len;
-        let mut type_at = self.next_type_at;
+        // Fast path: walk forward through the remaining header bytes in one pass, keeping
+        // `kept_len` and `next_type_at` in locals and writing them back once on exit.
+        let bound = self.bound;
+        let mut kept_len = self.len;
+        let mut next_type_at = self.next_type_at;
+        let mut index = kept_len;
         let mut offset = match self.last_kept() {
             None => 0usize,
-            Some(prev) => prev
-                .offset
-                .checked_add(serial_type_size_fast(prev.serial_type)?)
-                .ok_or_else(too_small)?,
+            Some(prev) => {
+                let prev_offset = usize::try_from(prev.offset).map_err(|_| too_small())?;
+                prev_offset
+                    .checked_add(serial_type_size_fast(u64::from(prev.serial_type))?)
+                    .ok_or_else(too_small)?
+            }
         };
         let mut header = payload
-            .get(type_at..self.header_end)
+            .get(next_type_at..header_end)
             .ok_or_else(too_small)?;
 
         while filled < dests.len() {
-            let target = start
-                .checked_add(filled)
-                .ok_or_else(|| LimboError::InternalError("column index overflows".into()))?;
+            let Some(target) = start.checked_add(filled) else {
+                self.len = kept_len;
+                self.next_type_at = next_type_at;
+                return Err(LimboError::InternalError("column index overflows".into()));
+            };
 
             // Advance `index` up to `target`.
             loop {
                 let Some((&first, rest)) = header.split_first() else {
+                    self.len = kept_len;
+                    self.next_type_at = next_type_at;
                     if offset > data_len {
                         return Err(too_small());
                     }
@@ -228,44 +269,112 @@ impl RowHeader {
                     header = rest;
                     u64::from(first)
                 } else {
-                    read_serial_type(&mut header)?
+                    match read_serial_type(&mut header) {
+                        Ok(st) => st,
+                        Err(e) => {
+                            self.len = kept_len;
+                            self.next_type_at = next_type_at;
+                            return Err(e);
+                        }
+                    }
                 };
-                type_at = self
-                    .header_end
-                    .checked_sub(header.len())
-                    .ok_or_else(header_too_small)?;
-                let parsed = ParsedColumn {
-                    serial_type,
-                    offset,
-                };
-                if index == self.len && self.len < self.bound {
-                    self.push_kept(parsed)?;
-                    self.next_type_at = type_at;
+                let type_at = header_end.wrapping_sub(header.len());
+                if index == kept_len && kept_len < bound {
+                    if let (Ok(st32), Ok(off32)) =
+                        (u32::try_from(serial_type), u32::try_from(offset))
+                    {
+                        let parsed = ParsedColumn {
+                            serial_type: st32,
+                            offset: off32,
+                        };
+                        if let Some(slot) = self.inline.get_mut(kept_len) {
+                            *slot = parsed;
+                            kept_len = kept_len.wrapping_add(1);
+                            next_type_at = type_at;
+                        } else {
+                            self.len = kept_len;
+                            self.next_type_at = next_type_at;
+                            self.push_overflow(parsed)?;
+                            kept_len = self.len;
+                            next_type_at = type_at;
+                        }
+                    }
                 }
                 if index == target {
                     if offset > data_len {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
                         return Err(too_small());
                     }
                     if let Some(dest) = dests.get_mut(filled) {
-                        let mut data = data_section.get(offset..).ok_or_else(too_small)?;
-                        decode_serial_type_into_register(serial_type, &mut data, dest)?;
+                        let Some(mut data) = data_section.get(offset..) else {
+                            self.len = kept_len;
+                            self.next_type_at = next_type_at;
+                            return Err(too_small());
+                        };
+                        if let Err(e) = decode_serial_type_into_register_with_spares(
+                            serial_type,
+                            &mut data,
+                            dest,
+                            spares.as_deref_mut(),
+                        ) {
+                            self.len = kept_len;
+                            self.next_type_at = next_type_at;
+                            return Err(e);
+                        }
                     }
                     filled = filled.wrapping_add(1);
                     if filled == dests.len() {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
                         return Ok(filled);
                     }
-                    offset = offset
-                        .checked_add(serial_type_size_fast(serial_type)?)
-                        .ok_or_else(too_small)?;
-                    index = index.checked_add(1).ok_or_else(header_too_small)?;
+                    let size = match serial_type_size_inline(first, serial_type) {
+                        Ok(sz) => sz,
+                        Err(e) => {
+                            self.len = kept_len;
+                            self.next_type_at = next_type_at;
+                            return Err(e);
+                        }
+                    };
+                    let Some(next_offset) = offset.checked_add(size) else {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
+                        return Err(too_small());
+                    };
+                    offset = next_offset;
+                    let Some(next_index) = index.checked_add(1) else {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
+                        return Err(header_too_small());
+                    };
+                    index = next_index;
                     break;
                 }
-                offset = offset
-                    .checked_add(serial_type_size_fast(serial_type)?)
-                    .ok_or_else(too_small)?;
-                index = index.checked_add(1).ok_or_else(header_too_small)?;
+                let size = match serial_type_size_inline(first, serial_type) {
+                    Ok(sz) => sz,
+                    Err(e) => {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
+                        return Err(e);
+                    }
+                };
+                let Some(next_offset) = offset.checked_add(size) else {
+                    self.len = kept_len;
+                    self.next_type_at = next_type_at;
+                    return Err(too_small());
+                };
+                offset = next_offset;
+                let Some(next_index) = index.checked_add(1) else {
+                    self.len = kept_len;
+                    self.next_type_at = next_type_at;
+                    return Err(header_too_small());
+                };
+                index = next_index;
             }
         }
+        self.len = kept_len;
+        self.next_type_at = next_type_at;
         Ok(filled)
     }
 
@@ -282,7 +391,11 @@ impl RowHeader {
     #[inline(always)]
     fn locate(&mut self, payload: &[u8], column: usize) -> Result<Located> {
         if let Some(parsed) = self.get_kept(column) {
-            return Ok(Located::Column(parsed));
+            let offset = usize::try_from(parsed.offset).map_err(|_| too_small())?;
+            return Ok(Located::Column {
+                serial_type: u64::from(parsed.serial_type),
+                offset,
+            });
         }
         self.locate_past_kept(payload, column)
     }
@@ -292,22 +405,29 @@ impl RowHeader {
         if !self.started {
             self.start(payload)?;
         }
+        let header_end = self.header_end;
+        let bound = self.bound;
         let data_len = self.data_len(payload);
-        let mut index = self.len;
-        let mut type_at = self.next_type_at;
+        let mut kept_len = self.len;
+        let mut next_type_at = self.next_type_at;
+        let mut index = kept_len;
         let mut offset = match self.last_kept() {
             None => 0usize,
-            Some(previous) => previous
-                .offset
-                .checked_add(serial_type_size_fast(previous.serial_type)?)
-                .ok_or_else(too_small)?,
+            Some(previous) => {
+                let prev_offset = usize::try_from(previous.offset).map_err(|_| too_small())?;
+                prev_offset
+                    .checked_add(serial_type_size_fast(u64::from(previous.serial_type))?)
+                    .ok_or_else(too_small)?
+            }
         };
         let mut header = payload
-            .get(type_at..self.header_end)
+            .get(next_type_at..header_end)
             .ok_or_else(too_small)?;
         // Ends at the header's end: each serial type takes at least one of its bytes.
         loop {
             let Some((&first, rest)) = header.split_first() else {
+                self.len = kept_len;
+                self.next_type_at = next_type_at;
                 // The walk this replaces checked the data the skipped columns take even when
                 // the record ended before the column asked for.
                 if offset > data_len {
@@ -319,30 +439,66 @@ impl RowHeader {
                 header = rest;
                 u64::from(first)
             } else {
-                read_serial_type(&mut header)?
+                match read_serial_type(&mut header) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
+                        return Err(e);
+                    }
+                }
             };
-            type_at = self
-                .header_end
-                .checked_sub(header.len())
-                .ok_or_else(header_too_small)?;
-            let parsed = ParsedColumn {
-                serial_type,
-                offset,
-            };
-            if index == self.len && self.len < self.bound {
-                self.push_kept(parsed)?;
-                self.next_type_at = type_at;
+            let type_at = header_end.wrapping_sub(header.len());
+            if index == kept_len && kept_len < bound {
+                if let (Ok(st32), Ok(off32)) = (u32::try_from(serial_type), u32::try_from(offset)) {
+                    let parsed = ParsedColumn {
+                        serial_type: st32,
+                        offset: off32,
+                    };
+                    if let Some(slot) = self.inline.get_mut(kept_len) {
+                        *slot = parsed;
+                        kept_len = kept_len.wrapping_add(1);
+                        next_type_at = type_at;
+                    } else {
+                        self.len = kept_len;
+                        self.next_type_at = next_type_at;
+                        self.push_overflow(parsed)?;
+                        kept_len = self.len;
+                        next_type_at = type_at;
+                    }
+                }
             }
             if index == column {
+                self.len = kept_len;
+                self.next_type_at = next_type_at;
                 if offset > data_len {
                     return Err(too_small());
                 }
-                return Ok(Located::Column(parsed));
+                return Ok(Located::Column {
+                    serial_type,
+                    offset,
+                });
             }
-            offset = offset
-                .checked_add(serial_type_size_fast(serial_type)?)
-                .ok_or_else(too_small)?;
-            index = index.checked_add(1).ok_or_else(header_too_small)?;
+            let size = match serial_type_size_inline(first, serial_type) {
+                Ok(sz) => sz,
+                Err(e) => {
+                    self.len = kept_len;
+                    self.next_type_at = next_type_at;
+                    return Err(e);
+                }
+            };
+            let Some(next_offset) = offset.checked_add(size) else {
+                self.len = kept_len;
+                self.next_type_at = next_type_at;
+                return Err(too_small());
+            };
+            offset = next_offset;
+            let Some(next_index) = index.checked_add(1) else {
+                self.len = kept_len;
+                self.next_type_at = next_type_at;
+                return Err(header_too_small());
+            };
+            index = next_index;
         }
     }
 
@@ -381,6 +537,16 @@ impl RowHeader {
     fn data_len(&self, payload: &[u8]) -> usize {
         payload.len().saturating_sub(self.header_end)
     }
+}
+
+#[inline(always)]
+fn serial_type_size_inline(first: u8, serial_type: u64) -> Result<usize> {
+    if let Some(&size) = SERIAL_SIZE_1BYTE.get(usize::from(first)) {
+        if size != INVALID_SERIAL_SIZE {
+            return Ok(usize::from(size));
+        }
+    }
+    get_serial_type_size(serial_type)
 }
 
 #[inline(always)]
