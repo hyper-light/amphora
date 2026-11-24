@@ -575,6 +575,7 @@ fn select_plan(
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
+        loop_order: vec![],
     }
 }
 

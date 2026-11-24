@@ -37,7 +37,7 @@ use crate::translate::plan::{
     Distinctness, HashJoinType, IterationDirection, JoinType, JoinedTable, Operation,
     QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, WhereTermOrigin,
 };
-use crate::types::{SeekOp, Value};
+use crate::types::{KeyInfo, SeekOp, Value};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{
@@ -59,7 +59,7 @@ pub(crate) fn emit_morsel_hook(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> crate::Result<Option<MorselHook>> {
-    let Some(window) = window(plan) else {
+    let (Some(window), Some(group_order)) = (window(plan), group_order(plan)) else {
         return Ok(None);
     };
     // A one-table scan runs a copy of its loop body in the workers (lane qs6-7), and so does a
@@ -82,6 +82,7 @@ pub(crate) fn emit_morsel_hook(
                 rowid_range: looped.rowid_range,
                 filter: Vec::new(),
                 group_by: looped.group_by.clone(),
+                group_order: Vec::new(),
                 aggregates: looped.aggregates.clone(),
                 result_map: looped.result_map.clone(),
                 joins: Vec::new(),
@@ -198,6 +199,7 @@ pub(crate) fn emit_morsel_hook(
         data: Box::new(MorselAggregateData {
             target_pc_serial: serial,
             body: body.clone().map(Box::new),
+            group_order,
             ..data
         }),
     });
@@ -735,6 +737,23 @@ fn rowid_bounds(seek_def: &SeekDef, alias: usize) -> Option<Vec<Predicate>> {
     Some(terms)
 }
 
+/// How a GROUP BY's groups come out (`MorselAggregateData::group_order`); none when the planner
+/// states no order for a key, the serial loop's.
+fn group_order(plan: &SelectPlan) -> Option<Vec<KeyInfo>> {
+    let Some(group) = &plan.group_by else {
+        return Some(Vec::new());
+    };
+    (0..group.exprs.len())
+        .map(|key| {
+            Some(KeyInfo {
+                sort_order: *group.sort_order.get(key)?,
+                collation: CollationSeq::Binary,
+                nulls_order: *group.nulls_order.get(key)?,
+            })
+        })
+        .collect()
+}
+
 /// A GROUP BY's HAVING terms as the hook's row loop tests them (lane qs6-17): each aggregate in
 /// them rewritten to the register its value is loaded into, `first + i` for the plan's aggregate
 /// `i`. Only terms over the aggregates and
@@ -1109,6 +1128,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         rowid_range: (None, None),
         filter,
         group_by,
+        group_order: Vec::new(),
         aggregates,
         result_map,
         joins: Vec::new(),
@@ -1731,6 +1751,7 @@ fn shape_join(
         rowid_range: *ranges.get(probe_at)?,
         filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by: group_by.clone(),
+        group_order: Vec::new(),
         aggregates: aggregates.clone(),
         result_map: result_map.clone(),
         joins,
@@ -1781,6 +1802,12 @@ fn join_outputs<'p>(
     if !rows_mode {
         return Some((outputs, no_real, None));
     }
+    // The workers don't run the planner's loops, so an ORDER BY those give is the hook's to sort by.
+    let order_by = if plan.order_by.is_empty() {
+        &plan.loop_order
+    } else {
+        &plan.order_by
+    };
     // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
     // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
     // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10), a padded row's NULL keys
@@ -1791,7 +1818,7 @@ fn join_outputs<'p>(
                 .get(at)
                 .and_then(|table| rowid_alias(table))
                 .is_some_and(|alias| {
-                    plan.order_by
+                    order_by
                         .iter()
                         .any(|(expr, _, _)| side(expr) == Some((at, alias)))
                 })
@@ -1805,7 +1832,7 @@ fn join_outputs<'p>(
     // least, is the values' own order), so the workers' sort is the serial sorter's.
     let width = outputs.outs.len();
     let mut order = Vec::new();
-    for (expr, sort, nulls) in &plan.order_by {
+    for (expr, sort, nulls) in order_by {
         if nulls.is_some() {
             return None;
         }
@@ -2111,6 +2138,7 @@ fn shape_chain(
         rowid_range: *ranges.first()?,
         filter: std::mem::take(filters.first_mut()?),
         group_by: group_by.clone(),
+        group_order: Vec::new(),
         aggregates: aggregates.clone(),
         result_map: result_map.clone(),
         joins,
