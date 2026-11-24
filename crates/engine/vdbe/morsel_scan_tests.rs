@@ -3472,6 +3472,12 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-35");
     let mut rng = ChaCha8Rng::seed_from_u64(635);
     fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    // Morsels take an inner join only with at least one hash join in it (executor.md, lane
+    // qs6-10), and the planner promises none: hash joins are asked for, and ANALYZE counts the
+    // rows a range keeps. Without it a table counts as 1,000,000 rows, and a build read by a range
+    // as more than a hash join may materialize (`MAX_MATERIALIZED_BUILD_ROWS`).
+    conn.execute("ANALYZE").unwrap();
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let queries: [(&str, bool); 9] = [
         ("SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000", false),
         ("SELECT d.c, count(*), min(f.b) FROM f JOIN d ON f.c = d.c WHERE f.id BETWEEN 500 AND 1500 AND d.id < 300 GROUP BY d.c", false),
