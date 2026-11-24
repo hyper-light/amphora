@@ -93,8 +93,13 @@ fn upsert_update_aborts_without_changing_outer_fail_policy() {
     );
 }
 
+/// Do: INSERT OR REPLACE on a WITHOUT ROWID table with a DELETE trigger, and on one with a generated
+/// column. Expect: the first row replaced and no trigger fired (lang_conflict.html: \"When the REPLACE
+/// conflict resolution strategy deletes rows in order to satisfy a constraint, delete triggers fire if
+/// and only if recursive triggers are enabled\"; docs/design/without-rowid.md, Triggers); the second
+/// refused before anything is written.
 #[test]
-fn replace_refuses_unsupported_delete_trigger_and_generated_image_before_writing() {
+fn replace_fires_no_delete_trigger_and_refuses_a_generated_image_before_writing() {
     let io = Arc::new(MemoryIO::new());
     let database = Database::open(
         io.clone(),
@@ -116,31 +121,36 @@ fn replace_refuses_unsupported_delete_trigger_and_generated_image_before_writing
     ] {
         sql(&io, &connection, statement).unwrap();
     }
-    for table in ["triggered", "generated"] {
-        let error = sql(
-            &io,
-            &connection,
-            &format!("INSERT OR REPLACE INTO {table}(k,v) VALUES('a',2)"),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("WITHOUT ROWID"), "{error:?}");
-        assert_eq!(
-            sql(&io, &connection, &format!("SELECT k,v FROM {table}")).unwrap(),
-            if table == "triggered" {
-                vec![vec!["a", "1"]]
-            } else {
-                Vec::<Vec<&str>>::new()
-            }
-        );
-    }
+    sql(
+        &io,
+        &connection,
+        "INSERT OR REPLACE INTO triggered(k,v) VALUES('a',2)",
+    )
+    .unwrap();
+    assert_eq!(
+        sql(&io, &connection, "SELECT k,v FROM triggered").unwrap(),
+        vec![vec!["a", "2"]]
+    );
     assert!(sql(&io, &connection, "SELECT * FROM audit")
+        .unwrap()
+        .is_empty());
+    sql(&io, &connection, "DELETE FROM triggered").unwrap();
+    assert_eq!(
+        sql(&io, &connection, "SELECT value FROM audit").unwrap(),
+        vec![vec!["1"]]
+    );
+    let error = sql(
+        &io,
+        &connection,
+        "INSERT OR REPLACE INTO generated(k,v) VALUES('a',2)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("WITHOUT ROWID"), "{error:?}");
+    assert!(sql(&io, &connection, "SELECT k,v FROM generated")
         .unwrap()
         .is_empty());
 }
 
-// AC-T1.1.1: work ledger lookups must seek their existing primary root,
-// independently of the number of unrelated weak keys. Counters, not timing,
-// distinguish bounded access from a scan of this 20,000-row fixture.
 #[test]
 fn native_primary_root_bounds_work_ledger_point_and_prefix_reads() {
     use amphora_engine::{StatementStatusCounter as Counter, Value};
