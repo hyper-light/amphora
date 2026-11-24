@@ -150,11 +150,12 @@ fn answers_as_sqlite(fixture: &'static str) {
                 match step {
                     Step::Fill(sql) => {
                         let got = outcome(&io, &conn, sql);
-                        assert!(
-                            !got.starts_with("ERROR") && !got.starts_with("PANIC"),
-                            "{} {settings:?}: {sql}: {got}",
-                            case.name
-                        );
+                        if got.starts_with("ERROR") || got.starts_with("PANIC") {
+                            wrong.push(format!(
+                                "{} {settings:?}: {sql}\n    SQLite takes it\n    Amphora {got}",
+                                case.name
+                            ));
+                        }
                     }
                     Step::Ask(sql, want) => {
                         if settings.statistics && !analyzed {
@@ -198,4 +199,11 @@ fn answers_as_sqlite(fixture: &'static str) {
 #[test]
 fn windows_over_windows_answer_as_sqlite() {
     answers_as_sqlite(include_str!("fixtures/windows.tsv"));
+}
+
+/// Finding CP: triggers of every event and time on rowid and WITHOUT ROWID tables, fired by every
+/// statement under every conflict clause.
+#[test]
+fn triggers_fire_as_sqlite_fires_them() {
+    answers_as_sqlite(include_str!("fixtures/triggers.tsv"));
 }
