@@ -15,8 +15,8 @@ use amphora_engine::io::FileSyncType;
 use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
-    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
-    Statement, StepResult, Value,
+    DatabaseOpts, IO, IOExt, LimboError, LogBefore, OpenFlags, OpenOptions, PlatformIO, Row,
+    SqliteDialect, Statement, StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
@@ -160,6 +160,40 @@ pub(crate) fn log_paths(path: &Path) -> [PathBuf; 2] {
     })
 }
 
+/// The file a restore makes of the database at `path` until it ends (docs/design/backup.md, "A failed
+/// restore leaves no database"): a name no open takes ([`Unrestored`]).
+pub(crate) fn restoring_path(path: &Path) -> PathBuf {
+    let mut file = path.as_os_str().to_owned();
+    file.push(RESTORING);
+    PathBuf::from(file)
+}
+
+const RESTORING: &str = ".restoring";
+
+/// A file of a restore that hasn't ended, or ended midway: no database.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{} is what a restore that hasn't ended has made, no database: one ended midway (killed, or its machine stopped) is restored again once that file and its log's are removed",
+    .0.display()
+)]
+pub struct Unrestored(pub PathBuf);
+
+/// Refuses the file of a restore that hasn't ended, and the path it restores to while nothing is
+/// there: a database made new at it would be in the restore's way.
+fn ensure_restored(path: &Path) -> anyhow::Result<()> {
+    let restoring = path
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(RESTORING.as_bytes()));
+    if restoring {
+        return Err(Unrestored(path.to_path_buf()).into());
+    }
+    let making = restoring_path(path);
+    if making.exists() && !path.exists() {
+        return Err(Unrestored(making).into());
+    }
+    Ok(())
+}
+
 /// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
 /// `-wal2`.
 fn segment_path(path: &Path, segment: SegmentId) -> String {
@@ -256,6 +290,7 @@ impl Db {
     /// Read-only source inspection. This opens no directories, creates no database, and executes
     /// no writable connection PRAGMAs. The caller owns the product's external lease.
     pub(crate) fn open_readonly(path: &Path) -> anyhow::Result<Self> {
+        ensure_restored(path)?;
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the database path is not UTF-8"))?;
@@ -338,6 +373,12 @@ impl Db {
         Self::open_with_sharing(path, io, &Sharing::Off)
     }
 
+    /// The file a restore makes ([`restoring_path`]), opened by that restore to replay its log.
+    pub(crate) fn open_restoring(path: &Path) -> anyhow::Result<Self> {
+        let io = Arc::new(PlatformIO::new().map_err(fail)?);
+        Self::open_any(path, io, &Sharing::Off)
+    }
+
     /// [`Db::open_with`], its connections reading through `sharing`'s pages. A pool the caller
     /// names that the database refuses is an error; the process's pool, refused (a storage that
     /// can't share), leaves each connection its own cache, and says so.
@@ -346,6 +387,11 @@ impl Db {
         io: Arc<dyn IO>,
         sharing: &Sharing,
     ) -> anyhow::Result<Self> {
+        ensure_restored(path)?;
+        Self::open_any(path, io, sharing)
+    }
+
+    fn open_any(path: &Path, io: Arc<dyn IO>, sharing: &Sharing) -> anyhow::Result<Self> {
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the path isn't UTF-8: {}", path.display()))?;
@@ -689,8 +735,8 @@ impl Db {
     }
 
     /// How the log's generation before the current one ended, where the segment the last switch left
-    /// still holds it (decision 45): that segment, its generation and its last committed frame.
-    pub(crate) fn log_before(&self) -> Option<(SegmentId, u32, u64)> {
+    /// still holds it (decision 45), and how many of its frames the file holds.
+    pub(crate) fn log_before(&self) -> Option<LogBefore> {
         self.db.wal_before()
     }
 

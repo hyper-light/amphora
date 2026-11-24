@@ -15,21 +15,23 @@
 //! foreground's calls in flight ([`Pacer`], T-T1.12.C7, C8).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use amphora_api::blobs::Blobs;
 
 use super::check::step_bytes;
 use super::drill::{Foreground, Pace, Pacer, Unpaced};
+use super::plan::Lacks;
+use super::restore::remove;
 use super::ship::FRAME_BYTES;
 use super::{
-    BaseCopy, Budget, Check, CheckCounters, CheckPolicy, ChunkGrowth, Clock, DrillMeter, Drills,
-    Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
-    next_random, plan, restore_and_check_at,
+    BaseCopy, Budget, Check, CheckCounters, CheckFailure, CheckPolicy, ChunkGrowth, Clock,
+    DrillMeter, Drills, Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due,
+    digest_paced, newest_second, next_random, plan, restore_and_check_at,
 };
-use crate::db::{Db, PAGE_BYTES, log_paths};
+use crate::db::{Db, PAGE_BYTES, log_paths, restoring_path};
 use crate::store::Watcher;
 
 /// Where and how a database is backed up ([`crate::database::Database::open_backed_up`]).
@@ -163,6 +165,40 @@ pub(crate) struct Prepared {
     meter: Arc<DrillMeter>,
     /// Whether a base that was to begin waits for the log's closing segment to be copied.
     base_waits: bool,
+    mends: Arc<Mends>,
+}
+
+/// What the check thread asks of the shipping thread: a base for what a check's restore found the
+/// archive to lack (the latest ask; an earlier one untaken, the next check finds again), and that
+/// thread's wake, held weakly: the thread ends once the store's own is gone.
+#[derive(Default)]
+struct Mends {
+    asked: Mutex<(Option<Lacks>, Weak<SyncSender<()>>)>,
+}
+
+impl Mends {
+    /// Asks, and wakes the shipping thread: its next round begins the base, with no commit to wait for.
+    fn ask(&self, lacks: Lacks) {
+        let Ok(mut state) = self.asked.lock() else {
+            return;
+        };
+        let (asked, wake) = &mut *state;
+        *asked = Some(lacks);
+        // Full, a wake is pending already: the round that takes this.
+        if let Some(wake) = wake.upgrade() {
+            let _pending = wake.try_send(());
+        }
+    }
+
+    fn take(&self) -> Option<Lacks> {
+        self.asked.lock().ok()?.0.take()
+    }
+
+    fn wakes(&self, wake: Weak<SyncSender<()>>) {
+        if let Ok(mut state) = self.asked.lock() {
+            state.1 = wake;
+        }
+    }
 }
 
 /// What the shipping thread tells the check thread: rounds ended, the latest base, the log shipped
@@ -237,6 +273,7 @@ struct Checker {
     pacer: Option<Pacer>,
     /// What the pending check's digest cost.
     pending_cost: u64,
+    mends: Arc<Mends>,
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -296,6 +333,7 @@ impl Prepared {
         let foreground = Arc::new(Foreground::default());
         let counters: Arc<CheckCounters> = Arc::default();
         let meter: Arc<DrillMeter> = Arc::default();
+        let mends: Arc<Mends> = Arc::default();
         let checker = match scratch {
             Some(scratch) => {
                 let reader = db.reader()?;
@@ -324,6 +362,7 @@ impl Prepared {
                         Pacer::new(Arc::clone(&foreground), Arc::clone(&meter), policy)
                     }),
                     pending_cost: 0,
+                    mends: Arc::clone(&mends),
                 })
             }
             None => None,
@@ -346,6 +385,7 @@ impl Prepared {
             counters,
             meter,
             base_waits: false,
+            mends,
         })
     }
 
@@ -357,6 +397,8 @@ impl Prepared {
         // The first round runs at once: what the database committed as it opened is shipped, and
         // its first base begins, without waiting for a commit.
         wake.try_send(())?;
+        let wake = Arc::new(wake);
+        self.mends.wakes(Arc::downgrade(&wake));
         let foreground = Arc::clone(&self.foreground);
         on_commit(Box::new(move || {
             foreground.committed();
@@ -473,6 +515,12 @@ impl Prepared {
     /// Ships, then moves a base on by one chunk while one is due: what it shipped, and whether a
     /// base ended.
     fn round(&mut self, copy: &mut Option<BaseCopy>) -> anyhow::Result<(Shipped, bool)> {
+        if let Some(lacks) = self.mends.take()
+            && self.shipper.mend(&self.reader, lacks)?
+        {
+            tracing::warn!(target: "amphora.backup", event = "backup.base_begun_again", prefix = %self.archive.prefix, lacks = ?lacks, "a check found the archive short: a new base begins");
+            *copy = None;
+        }
         let generation = self.shipper.generation();
         let shipped = self.ship()?;
         let blobs = self.archive.blobs.as_ref();
@@ -706,6 +754,13 @@ impl Checker {
             pacer.end_check(check.is_ok());
         }
         let check = check?;
+        if let Check::Failed {
+            why: CheckFailure::Lacking { lacks, .. },
+            ..
+        } = &check
+        {
+            self.mends.ask(*lacks);
+        }
         let cost = self.pending_cost.saturating_add(elapsed_ns(began));
         self.meter.cost(cost);
         self.last_check = Some(match &check {
@@ -725,16 +780,12 @@ impl Checker {
     }
 }
 
-/// Removes a check's scratch database and its log, if there.
+/// Removes a check's scratch database and its log, and what a restore to it that ended midway (its
+/// process killed) left, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
-    let [first, second] = log_paths(scratch);
-    for file in [scratch, &first, &second, &suffixed(scratch, "-shm")] {
-        match std::fs::remove_file(file) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-    }
-    Ok(())
+    remove(scratch)?;
+    remove(&suffixed(scratch, "-shm"))?;
+    remove(&restoring_path(scratch))
 }
 
 #[cfg(test)]
@@ -1014,7 +1065,9 @@ mod tests {
         prepared.ship().unwrap();
         let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
         let (key, _) = listed.first().unwrap();
-        let first = object::manifest(key, &blobs.get(key, until()).unwrap()).unwrap();
+        let first = object::manifest(key, &blobs.get(key, until()).unwrap())
+            .unwrap()
+            .unwrap();
         let useless = object::Manifest {
             id: first.id + 1,
             end: (2, prepared.shipper.frames_in_generation()),
