@@ -178,7 +178,7 @@ s1: Q|select count(*) from pgbench_branches group by 1
 s1: Q|select bid from pgbench_branches order by bid asc limit count(*)
 s1: Q|select count(*) from generate_series(1, count(*)) as g
 s1: Q|select 1 from pgbench_branches as b cross join lateral (select count(b.bid)) as o(n)
-s1: Q|update pgbench_branches set bbalance = count(*)
+s1: Q|update pgbench_branches set bbalance = count(*) where bid = 1
 s1: Q|insert into pgbench_branches (bid) values (count(*))
 s1: Q|select count() from pgbench_branches
 s1: Q|select count(1, 2) from pgbench_branches
@@ -219,7 +219,7 @@ s1: Q|select o.n from pgbench_branches as b cross join lateral (select b.bid) as
 s1: Q|select 1 from pgbench_branches as b cross join lateral (select bid, nosuch) as o(n)
 s1: Q|select n from pgbench_branches as b cross join lateral (select b.bid) as b(n)
 s1: Q|select 1 from lateral (select 1) as o(n) where n = 'x'
-s1: Q|select o from lateral (select 1) as o(n) where o.m = 1
+s1: Q|select o.n from lateral (select 1) as o(n) where o.m = 1
 s1: Q|select int4 from pgbench_branches as b cross join lateral (select b.bid::int4, '1'::int4) as o
 s1: Q|select 1 from nosuch.pgbench_branches
 s1: Q|select nosuch.pgbench_branches.bid from pgbench_branches
