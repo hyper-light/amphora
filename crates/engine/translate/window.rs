@@ -246,6 +246,7 @@ fn prepare_window_subquery(
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
+        loop_order: vec![],
     };
 
     prepare_window_subquery(
