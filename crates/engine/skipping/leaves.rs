@@ -53,7 +53,11 @@ pub(crate) enum LeafCursor {
 }
 
 impl LeafCursor {
-    fn open(conn: &Arc<Connection>, root: i64, columns: usize) -> Result<Self, LeafBuildError> {
+    pub(super) fn open(
+        conn: &Arc<Connection>,
+        root: i64,
+        columns: usize,
+    ) -> Result<Self, LeafBuildError> {
         Ok(match conn.versioned_for(crate::MAIN_DB_ID) {
             Some(switch) => {
                 Self::Versioned(Box::new(switch.cursor(root, None, conn.get_pager())?))
@@ -200,17 +204,11 @@ pub(crate) fn nanos_since(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Lane skip-5 (T-SKU.5): a dropped cracker built again from the table's B-tree (rooted at
-/// `root`, `columns` wide) for its trial, at the caller's snapshot: on the versioned storage, in
-/// the connection's transaction (G7 step 2, `AC-NS.2.1`).
-pub(crate) fn cracker_of_table(
-    conn: &Arc<Connection>,
-    root: i64,
-    column: usize,
-    columns: usize,
-) -> Result<CrackerColumn, LeafBuildError> {
-    let mut cursor = LeafCursor::open(conn, root, columns)?;
-    rows_of(&mut cursor, column).map(CrackerColumn::new)
+impl LeafCursor {
+    /// Rebuilds a dropped cracker from the cursor whose snapshot the builder pinned.
+    pub(super) fn cracker(&mut self, column: usize) -> Result<CrackerColumn, LeafBuildError> {
+        rows_of(self, column).map(CrackerColumn::new)
+    }
 }
 
 /// Every row's rowid and its column `column`'s integer value, in rowid order.
@@ -399,6 +397,16 @@ pub fn set_skipping_with_until(
                 };
                 conn.execute("COMMIT")?;
                 if wait && missed.is_some() {
+                    if deadline
+                        .is_some_and(|end| conn.get_pager().io.current_time_monotonic() >= end)
+                    {
+                        // This checked install is already the stale fallback. A writer can
+                        // commit during every build without being open at the next wait.
+                        conn.db.skipping.count_refused(
+                            crate::storage::versioned::version::UnwrittenRefusal::Deadline,
+                        );
+                        return Ok(());
+                    }
                     again = true;
                     continue;
                 }
@@ -469,10 +477,12 @@ pub fn skipping_candidates(
         .flatten()
         .map(|btree| btree.root_page)
         .ok_or(SkipRefusal::Off)?;
-    let (reader_pos, committed) = conn.skipping_positions().ok_or(SkipRefusal::Off)?;
     conn.db
         .skipping
-        .candidates(root, conn.skipping_id(), reader_pos, committed, lo, hi)
+        .probe(root, conn.skipping_id(), None, &[(lo, hi)], || {
+            conn.skipping_positions()
+        })
+        .map(|(candidates, _)| candidates)
 }
 
 /// Lane skip-11 (T-SKU.14): how scans of `table` ask its summary for an IN list's rows (span or

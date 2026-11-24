@@ -1237,6 +1237,7 @@ fn find_select_plan_form(
                 access_cost: 0.0,
                 total_cost: 0.0,
                 position,
+                star_filter: None,
             });
         }
         plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
@@ -3294,6 +3295,7 @@ fn find_table_access_plan(
         allow_automatic_index: resolver.automatic_indexes()
             && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
+        star_filters: resolver.star_filters(),
         search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
@@ -3533,6 +3535,8 @@ fn plan_unmatched_right_rows(
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
                 join_methods: resolver.join_methods(),
+                // A RIGHT or FULL JOIN takes no star filter (`lip::choose`).
+                star_filters: crate::StarFilters::Off,
                 search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
@@ -5347,6 +5351,7 @@ fn apply_table_access_plan(
             access_cost: access_method.cost.0,
             total_cost,
             position,
+            star_filter: access_method.star_filter,
         });
         input_rows = output_rows;
     }
