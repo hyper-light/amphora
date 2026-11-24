@@ -1643,3 +1643,93 @@ in round 3), so no speed is claimed.
     # r1993: the merged tree 4656c99c, the same runner and needs
     cargo test -p amphora --lib --locked -- --test-threads=4 database::slot:: v14_a_slow v13_thirty_two v7_a_hundred_and_twenty_eight
     cargo clippy -p amphora --all-targets --locked -- -D warnings
+
+# Lane V15 (commits) on adacachy2: lane V14's two gaps, one red on main and one measured; neither closed (2026-11-24, 01:59Z to 02:58Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: lane V14's two robustness gaps closed and merged. Gap 1, a driven test in which a follower's
+write passes its deadline in its barrier phase and its close ends the leader's slot released, with no clock moved
+for it, red on main before lane V14. Gap 2, a real-time run that loses the holder's forward, with the wait of the
+leader's other writes timed per stage, bounded by an event the leader can see if it is the holder's whole deadline,
+and the rule in replication.md. Then the replicated suites three rounds and the ladder's zero refusals.
+
+## Losses first
+
+1. **The deliverable is not met.** Gap 1's test is red on main too: lane V14's close does not reach the leader when
+   the write's barrier answer was lost, so the slot holds until the leader's clock passes it, as before lane V14.
+   The test is not on main (branch `perf/commits-v15`, 4b473a4d). Gap 2's wait is measured, the holder's whole
+   10 s deadline, and no bound is built. The suites' three rounds and the ladder were not run for a change, since
+   nothing in `crates/` landed. What landed is docs only: replication.md's write-slot rule (lane V14's, which the
+   doc lacked), the open defect, the measured wait, and the two designs for a bound.
+2. **Where lane V14's close stops is not traced past the owner.** r19's instrumented run shows member 3's `expire`
+   taking the barrier-phase branch (deadline passed, term 1 and leader 1 unchanged, not leading) and `Actor::close`
+   past its checks (term 1/1, leader 1/1), and no error from its replica's `read`; yet the pump saw no read-marked
+   ReadIndex from member 3. hyper-raft's follower forwards a ReadIndex as it comes (`step_follower`, `forward`), so
+   the stop is between the replica's accepted read and the wire; not found in this hour.
+3. **Time lost to the platform.** The coordinator's kiln restarted twice and stopped this session (about 02:01Z and
+   02:18Z), kiln's server was unreachable for 5 of this lane's run requests, and adacachy2 refused cpus=8 once and
+   cpus=4 once (3 of 32 cores idle), so runs went at cpus=4 and cpus=2.
+4. **Two of this lane's runs shared its remote clone at once** (r3 and r16, about 02:34Z): r16 checked out the
+   merged tree while r3 built its red arm. r3's red result names its own tree's line (18865, against 19010 on the
+   green arm), so it built the red tree, but the overlap was a process error; r3 and r16 were then stopped.
+5. **The stages run measured the persisted class only.** It panicked in its teardown after that class (the
+   diagnostic skipped the harness's drain), before the replicated class.
+6. **The first two versions of the test were confounded** (r28, r65): member 3's floor keeper attests once it
+   applies the table, and its session (an owner's write, through a barrier) held member 3's slot as a write's would;
+   the test's write waited behind it in member 3's queue and timed out there, sending no close by design. The test
+   now waits for that session to end and loses only the write's barrier answers (r3).
+
+## Gap 1: a write its deadline ends at its barrier (red on main)
+
+`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot` (branch `perf/commits-v15`; CP-T1.8), in
+each class: owner 0 leads; member 3's floor session ends; the leader's answers to member 3's barriers are lost while
+member 3 writes with one tick of its pace left; its barrier begins its slot (`slot::holder`, a test's view, names
+member 3, and member 3's pending is that write's barrier); the leader's own write waits on the slot; member 3's
+clock passes the deadline. Expect member 3 refused `Timeout`, member 3's close sent and the slot free after it, the
+leader's write Ok, one slot ended `released` and none `expired`, `Driven::lapses` 0. The red arm is the same test on
+7d6cd7f0, main before lane V14 (`diag/commits-v15-red`).
+
+| run (adacachy2) | arm | result |
+|---|---|---|
+| r28, 02:10Z, cpus=8, load 70 to 80 | 6f37fccf red, d0094bd3 on main (first version) | both: slots ended (released, expired) (0, 1) |
+| r65, 02:14Z, cpus=4, load 58 | 6e495458 on main (holder named) | (released, expired, lapses) (0, 1, 1) |
+| r3, 02:33Z, cpus=4, load 19 to 44 | 6adfa5f8 on main (floor session first) | Timeout as expected; member 3 closed false, slot still member 3's |
+| r3 | ba2b2351 red | the same |
+| r19, 02:37Z, cpus=2, load 66 | 193ff5dc (6adfa5f8 with `eprintln` in `expire`, `close`, `prepare_barrier`) | `expire id=3 phase_barrier=true expired=true changed_term=false leader=1 is_leader=false`; `close id=3 term=1/1 leader=1/1 is_leader=false`; no close counted |
+
+The other slot tests ran beside it in r3: `database::slot::`, `v14_a_slow_live_holder_keeps_its_slot_past_the_election_timeout`
+and `a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length` passed on main's arm (17 passed, the
+new test failed).
+
+## Gap 2: a lost forward on real time (measured, not bounded)
+
+r65's stages run (`diag/commits-v15-stages` d64cff0b, 02:16:50Z, cpus=4, load (1 min) 41 on 32 cores, CPU "some"
+avg10 17%). The diagnostic opens three members in one process whose owners read the real clock, relayed by the
+test pump, whose `losing` hook lost member 3's first forward to the leader. Persisted class; tick 10 ms,
+election_tick 20, heartbeat_tick 2; member 3's write with the bench driver's 10 s deadline. Times are from member
+3's call, by the real clock (617,145 relay rounds).
+
+| ms | stage |
+|---|---|
+| 0.00 | member 3's write is called, 10 s deadline |
+| 0.74 | the leader's slot for member 3 begins at last 3, commit 3 |
+| 2.70 | member 3's forward is lost |
+| 2.75 | the leader's own write and member 2's are called |
+| 10,000.21 | member 3 answered `UnknownOutcome` |
+| 10,006.74 | the slot ends `expired` (forwarded, expired, released: 0 0 0 to 0 1 0); the leader's log grows past the slot's start |
+| 10,008.24 | the commit passes the slot's start |
+| 10,030.61 | the leader's write answered Ok (waited 10,027.9 ms) |
+| 10,064.82 | member 2's write answered Ok (waited 10,062.1 ms) |
+
+Each of the leader's other writes waited the holder's whole deadline: the slot ended `expired` 6.5 ms after member 3
+was answered at its own deadline. No event ended it sooner: the holder sends no barrier or forward after its forward, and the test's detector suspected no one. Two
+designs for a bound are in replication.md ("What bounds a lost forward"); neither is built or measured.
+
+## Commands
+
+    # every run: kiln run on 00aad8daff2fa3c9daa65d53c425d450, sync false, cwd ~/.cache/amphora-perf/commits-remote,
+    # CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS = the needs' cpus
+    cargo test -p amphora --lib --locked --no-run    # each arm in turn, the binary kept as ~/.cache/amphora-perf-bin/commits/v15-tests-<sha>
+    v15-tests-<sha> --test-threads=4 v15_a_write database::slot:: v14_a_slow a_slot_holder_whose_write_fails
+    v15-tests-d64cff0b --ignored --nocapture --test-threads=1 v15_stages    # r65, gap 2's stages
+    v15-tests-193ff5dc --test-threads=1 --nocapture v15_a_write             # r19, gap 1's trace
