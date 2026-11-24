@@ -15,9 +15,9 @@ Losses first.
 - **The sweep ends its process on main** ("has overflowed its stack", rc 134): one of its statements recurses without end in main's planner, so the
   sweep's red count on main is not known, nor which statement. The red of DH, DI and the uses is `oracle_findings`' and the reductions' (below).
 - `planner` is 13 of 14 in the last run (`a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages`, the cost of a GROUP BY that lanes C4, C9, C10
-  and C13 recorded of main); it was 14 of 14 on 88e955aa, the same engine but the last fix, at a 1-minute load of 30. Run alone on the
-  same binary it passed once and failed twice (loads of 35, 30 and 27): `planner.rs:182`, 800 pages; the statement holds no CTE.
-- The lib suites were not run on the landed tree (a run was stopped for room on 3cf88284): `cte`, `subquery`, `optimizer::` are not in this record.
+  and C13 recorded of main); it was 14 of 14 on 88e955aa. Run alone, it fails on
+  main's engine from before this landing (837071af) 3 times of 3, and passes on this one's 2 times of 6 (6692bdf5, 200e6d31): `planner.rs:182`, 800 pages; the statement holds no CTE. It is main's.
+- Of the lib suites, `cte` 56, `subquery` 9 and `translate::` 113 (without `optimizer`) passed on the landed tree (200e6d31, after the merge); `optimizer::` and C6's shards were not run on it.
 - A statement with an unknown column's qualifier says "no such table: d" for SQLite's "no such column: d.k" (main's, not touched): no draw holds it.
 - Each use of a sibling CTE beyond the first, in a body's nested query, is planned anew: the work of planning doubles for each level of a chain of
   CTEs that each read the one before in two nested queries. SQLite's does for every second read (and refuses the statement at 14 levels, "nested too deep"; 1 s at 12); not measured here.
@@ -77,6 +77,8 @@ statements of the first probe were DI's, 4 the shared plan's (one a panic) and 1
   amphora-engine", 58 s); oracle_findings 95, cte_scopes 1 (4,800 answers), outer_join_subqueries 3, cte_columns 11, on_terms 5, adaptive_joins 23, in_subquery 4, join_methods 4 (1
   ignored), hash_semi_join 1, unnesting 2 (simulator), top_n 3, hash_group_by 5, upsert_or_clause 2, planner 13 of 14 (above).
 - eb28e119 (6692bdf5 and the ratchet): check-production 0 (10,591, as the ratchet holds: expect_used 856 to 855, indexing_slicing 3,046 to 3,042).
+
+- 200e6d31 (main, after the merge): lib `cte` 56, lib `subquery` 9, lib `translate::` 113 without `optimizer`.
 
 ## Reproduce
 
