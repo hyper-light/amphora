@@ -1753,6 +1753,49 @@ mod tests {
         ));
     }
 
+    /// T-T1.3.1. Stop the writer between the redo write and its flush. A replacement process
+    /// reads the row and returns two durable successes. A power cut must preserve their prefix.
+    #[test]
+    fn a_durable_finish_after_process_restart_covers_the_replayed_redo() {
+        for seed in [3, 5, 7, 11, 13] {
+            let disk = Arc::new(Simulated::new(seed, 2).unwrap());
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            let mut d = Descender::new();
+            let mut writer = db.begin().unwrap();
+            db.put(&mut d, &mut writer, 0, b"a", b"replayed").unwrap();
+            disk.crash_after(1); // The redo write reaches the OS cache. Its sync is interrupted.
+            assert!(db.commit(writer, &mut d, db.lane(), true).is_err());
+            drop(db);
+            disk.restart_process();
+
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            let reader = db.begin().unwrap();
+            assert_eq!(
+                db.get(&mut d, &reader.snapshot(), 0, b"a")
+                    .unwrap()
+                    .as_deref(),
+                Some(b"replayed".as_slice())
+            );
+            assert!(db.end_unwritten(reader).unwrap().is_none());
+            let first_lane = db.lane();
+            let next_lane = db.lane();
+            assert_ne!(first_lane, next_lane);
+            let mut writer = db.begin().unwrap();
+            db.put(&mut d, &mut writer, 0, b"b", b"acknowledged")
+                .unwrap();
+            db.commit(writer, &mut d, next_lane, true).unwrap();
+            drop(db);
+
+            disk.power_cut().unwrap();
+            let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+            let expected = [
+                (b"a".to_vec(), b"replayed".to_vec()),
+                (b"b".to_vec(), b"acknowledged".to_vec()),
+            ];
+            assert_eq!(rows(&db), BTreeMap::from(expected), "seed {seed}");
+        }
+    }
+
     /// Do: a checkpoint on a disk that fails partway, then a commit, not asked to be durable.
     /// Expect: both refused and the commit rolled back, since the pages the checkpoint took as
     /// copied may not be on the disk; after a power cut, the rows committed before (T-T1.3.1).
