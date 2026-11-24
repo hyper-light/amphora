@@ -364,39 +364,76 @@ test reaches frames left from before a restart.
 **Falsified by.** An acknowledged batch lost to a power cut (`tests/crash.rs`); on ext4 or XFS, the
 log's `fdatasync` no faster than its `fsync`.
 
-## 14. A flush begins as soon as none is running
+## 14. A flush waits for the batches handed before it, never a clock
 
-**Decision.** The flusher begins a flush as soon as something is committed that no flush has begun
-for, and waits for nothing else. What is committed during a flush joins the next one. With one
-flusher a commit waits for the flush under way, if any, and the next.
+**Decision.** The flusher begins a flush on events alone. Once something is committed that no flush
+has begun for, it notes how many batches have been handed to the writer, and waits until that many
+are settled: committed, refused, or let go. Then it begins the flush, which covers everything
+committed by then. What is handed after the note joins the next flush.
 
-**Why.** Nothing in the store waits for a timer (decision 1). Until 2026-11-23 the flusher gathered
-instead: when the writer had run out of work during a flush, the flusher waited until the writer
-had been idle for a 32nd of a flush, or half a flush had gone by, before it began the next. That
-wait was a timer, and its two fractions were chosen, never measured. With one client nothing can
-join the flush its only sender waits for, so the wait timed out every time and added its whole
-length to every write.
+The events it waits on, and why each wait ends:
+
+1. **Something committed that no flush has begun for** (`Sends::wake`). With nothing committed
+   there is nothing to flush. Every batch settled wakes the flusher, and so do the store stopping
+   (`Sends::stop`) and a failed flush (`Sends::disk_failed`), each under the lock it waits with.
+2. **A batch handed before the note is settled.** Each such batch is a commit of the writer away:
+   committed, refused, or let go when its sender's wait for room ends. The store stopping or its
+   disk failing ends the wait. Batches handed after the note aren't waited for, so senders that keep
+   coming can't hold a flush.
+
+Nothing waits for a sender to send again, so a sender that stops sending holds no flush.
+
+**Why.** Writers that each wait for their own write send their next one as soon as they're told.
+A flush begun at the first commit after the last one ends covers only that commit, and the writers
+settle into two halves, each committing during the other's flush. Lane W4 measured it on Mac Studio
+2 (`bench/records/2026-11-23-macstudio2-perf-oltp.md`): rows a flush fell from 29.0 to 15.5 at 32
+clients and from 121 to 61 at 128, with a flush costing 4.6 to 4.9 ms either way, and writes a
+second fell 26 to 35%. Until 2026-11-23 a timer bridged that gap: the flusher waited until the
+writer had been idle a 32nd of a flush, or half a flush had gone by. Its fractions were picked, and
+at 1 client it added its whole length to every write (lane W2's trace, below). With the note, the
+flusher wakes at the first commit after a flush, while the writer commits the first batches the
+told writers send next, and the rest are handed during that commit: the note counts them, and one
+flush covers them all (rows a flush, below).
+
+**Designs weighed.** Lane W5, 2026-11-23, each a flush begun on events alone:
+
+- D1, this decision. Lane W5's clean runs on Mac Studio 2 (r1815, two rounds): rows a flush
+  31.0 to 32.0 at 32 clients and 123.5 to 128.0 at 128, against main's 14.0 to 15.6 and 59.1 to
+  64.3. The five-round A/B is not yet done (below).
+- D2: D1, and after a flush the flusher also waits for the senders it told to leave their wait in
+  `Store::durable`, counted by the commit each waits for. Each leaves on its own thread, so the
+  wait ends. Measured no better than D1 in the same runs, so not taken: its registry is code with
+  nothing measured to show for it.
+- Waiting for the told senders to send again, by count: refused on paper. A sender that stops never
+  sends, and nothing else ends the wait.
+- Waiting for the writer to find its queue empty: refused on paper. Senders that don't wait for
+  their writes, a bulk load among them, can keep the queue from emptying, and nothing then ends the
+  wait.
+- A timer: refused. Nothing in the store waits for a timer (decision 1).
 
 **Sources.** Helland et al. (HPTS 1987; decision 1): a timer adds latency without adding throughput
-once commits arrive faster than they complete.
+once commits arrive faster than they complete. DeWitt et al. (SIGMOD 1984): group commit.
 
-**Evidence.** adacachy2, 2026-11-23, insert_one at 1 client, traced with an `LD_PRELOAD` shim on the
-log's write, open, flush and close and on the threads' futex hand-offs (lane W2,
-`bench/records/2026-11-23-adacachy2-perf-oltp.md`). Between the log's write and its flush, the
-flusher sat in a `FUTEX_WAIT_BITSET` of 191.8 to 192.8 µs that returned timed out, in an insert of
-2.9 to 3.3 ms at p50. Outside the flush Amphora spent 292 µs an insert, SQLite 95 µs. The A/B
-against the gathering flusher at 1, 32 and 128 clients is in the same record (lane W3).
+**Evidence.** Not yet complete. Lane W5's A/B on Mac Studio 2 (r1815,
+`bench/records/2026-11-23-macstudio2-perf-oltp.md`) was disturbed from its second round by other
+work on the machine; its clean runs are recorded there, without p values. The five-round A/B
+against main and the timer (98bd0fa9) at 1, 32 and 128 clients is still to run.
 
-What gathering bought, and what this decision answers for: fedora, 2026-10-20, 32 writers, one
-group (`bench/records/2026-10-20-fedora-32-writers-flush-at-first-commit.jsonl`,
-`...-gathering.jsonl`). Flushing at the first commit: 5,134–5,608 writes a second, p50
-5.12–5.76 ms, p99 9.3–9.7 ms. Gathering: 7,390–7,605 writes a second, p50 4.06–4.16 ms, p99
-7.2–8.1 ms. Writers that each wait for their own write send their next when told. A flush begun at
-the first of those covers few of them, and the writers can settle into two halves that each commit
-during the other's flush.
+adacachy2, 2026-11-23, insert_one at 1 client, traced with an `LD_PRELOAD` shim on the log's write,
+open, flush and close and on the threads' futex hand-offs (lane W2,
+`bench/records/2026-11-23-adacachy2-perf-oltp.md`): with the timer, between the log's write and its
+flush, the flusher sat in a `FUTEX_WAIT_BITSET` of 191.8 to 192.8 µs that returned timed out, in an
+insert of 2.9 to 3.3 ms at p50.
 
-**Falsified by.** A flush begun on an event other than the last flush's end (never a timer) that
-gives more writes a second at 32 writers and more, with no longer a write's p50 at one.
+The store's tests: a batch committed during a flush and one the busy writer had not yet taken are
+made durable by one flush, the next (`a_batch_handed_before_a_flush_begins_is_made_durable_by_it`);
+a sender told durable that sends nothing more holds no flush
+(`a_sender_told_durable_that_sends_nothing_more_holds_no_flush`).
+
+**Falsified by.** Writers that settle into two groups under it (rows a flush near half the writers
+at 32 or more); a flush begun on another event, never a timer, that gives more writes a second at
+32 writers and more with no longer a write's p50 at one; or a flush held by a sender that stopped
+sending (the second test).
 
 ## 15. The checkpoint copies what the flusher made durable
 

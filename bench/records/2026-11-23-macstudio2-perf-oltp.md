@@ -110,3 +110,73 @@ The limiter in both arms is the flush: one F_FULLFSYNC of 4.6 to 4.9 ms at a tim
 flushing 55 to 96% of the window (the store's counters). The CPU of each run was not measured.
 Inferred, not measured here: doubling needs more rows a flush, or flushes that overlap on this disk
 (decision 6: on fedora they serialized).
+
+# Lane W5 (oltp), 2026-11-23 23:47Z to 00:47Z: a gather on events, never a clock
+
+Ada's goal: Amphora about 10x faster than every competitor, with no loss of durability. W4 found W3's
+flusher (a flush as soon as none runs) losing 26 to 35% at 32 and 128 clients, the writers split in
+two halves. The timer that kept them together is forbidden. Lane W5 looked for a gather that waits
+only on events.
+
+## Verdict, losses first
+
+- **Not merged: the A/B is incomplete.** r1815 (four arms, 5 rounds alternated, `ab-w5.sh`) was hit
+  from round 2 on by other work on Mac Studio 2: a rustc build and three `mantle-a148` processes
+  (`ps`, 00:22Z), load up to 47, other processes at 1,000 to 2,900% CPU. Flushes collapsed in every
+  arm in those runs: T's update_plain at 1 client made 7 writes a second, M's insert_one at 1 client 3.
+  Only round 1 (all arms) and round 2's D2, D1 and M runs before it are clean. The rerun into
+  `out-w5b` could not start: from 00:24Z kiln refused every run ("not connected to the kiln
+  server"). The checks run r1800 (`w5-checks.sh`: clippy, the store, crash and lib store tests, and
+  the first new test's red run on main) was still building on MacBook Pro 2 at the end.
+- **In the clean runs, D1 alone keeps the writers in one group, and beats the timer and main.**
+  Rows a flush 31.0 to 32.0 at 32 clients and 123.5 to 128.0 at 128, against main's 14.0 to 15.6
+  and 59.1 to 64.3. insert_one at 32 clients 5,856 and 5,792 writes a second, against main's 3,406
+  and 3,190 and the timer's 4,800. At 1 client no loss against main (216 and 220 against 213 and 175).
+  Two runs an arm and one of the timer: no p value, so no claim.
+- **My guess about D1 was wrong.** I predicted D1 would keep the two halves, since the told senders
+  haven't handed their next batches when a flush ends. In the one-group state nothing is committed
+  during a flush, so the flusher's note is taken at the first commit after it, and the rest of the
+  told senders hand theirs during that commit (rows a flush 32 of 32). Inferred from rows a flush and
+  the code; the per-stage timestamps were not taken (the stages shim is Linux-only).
+- **D2 measured no better than D1** in the clean runs, so it was reverted (0f3c6906): its waiter
+  registry is code with nothing measured to show for it.
+
+## Candidates, each a flush begun on events alone
+
+- **D1** (716ede4d): once something is committed that no flush has begun for, the flusher notes how
+  many batches have been handed to the writer and waits until that many are settled (committed,
+  refused, or let go). Bounded: each is a commit of the writer away; the store stopping or its disk
+  failing ends the wait; batches handed after the note aren't waited for.
+- **D2** (386ab899, reverted): D1, and after a flush the flusher waits for the senders it told to
+  leave their wait in `Store::durable`, counted by commit. Bounded: each leaves on its own thread.
+- **Refused on paper.** Waiting for the told senders to send again (a sender that stops never does,
+  and nothing else ends the wait). Waiting for the writer's queue to empty (senders that don't wait,
+  a bulk load among them, can keep it full).
+- **The flusher's wait for a commit** looked again every second; every batch settled, the store
+  stopping and a failed flush notify it under its lock, so 0e83fc98 makes it wait on those alone.
+  Not in the measured binaries, and not yet tested (r1800 tested the tree before it).
+
+## The clean runs (r1815, 00:12Z to 00:16Z, load 3.4 to 9.2 on 32 cores)
+
+T = 98bd0fa9 (the timer), M = f363d688 (main, the candidates' parent), D1 = 716ede4d, D2 = 386ab899.
+Each binary's sha256 printed first (all four differ). Writes a second (p50 ms; rows a flush), each run
+a fresh process on a fresh database, 0 errors and 0 retries.
+
+| statement | clients | T r1 | M r1, r2 | D1 r1, r2 | D2 r1, r2 |
+|---|---|---|---|---|---|
+| insert_one | 1 | 169 (5.25; 1.0) | 213 (4.22), 175 (5.18) | 216 (4.22), 220 (4.22) | 220 (4.22), 218 (4.22) |
+| insert_one | 32 | 4,800 (6.21; 31.9) | 3,406 (8.45; 14.8), 3,190 (8.58; 14.0) | 5,856 (5.18; 32.0), 5,792 (5.18; 31.7) | 5,824 (5.18; 32.0), 5,696 (5.25; 32.0) |
+| insert_one | 128 | 13,184 (9.34; 123.0) | 12,041 (9.60; 59.1), 12,027 (9.73; 60.1) | 15,488 (8.19; 127.3), 14,592 (8.32; 128.0) | 15,104 (8.32; 128.0), 15,360 (8.32; 128.0) |
+| update_plain | 1 | 159 (5.82; 1.0) | 206 (4.22), 226 (4.22) | 223 (4.22), 229 (4.22) | 224 (4.22), 223 (4.22) |
+| update_plain | 32 | 4,896 (6.21; 31.6) | 3,584 (8.45; 15.6), 3,566 (8.45; 15.6) | 6,641 (4.22; 31.0), 6,455 (4.22; 31.4) | 6,400 (5.12; 32.0), 6,496 (5.06; 32.0) |
+| update_plain | 128 | 18,688 (6.46; 127.4) | 12,923 (9.34; 63.5), 8,636 (14.46; 64.3) | 20,880 (6.14; 126.6), 16,238 (6.59; 123.5) | 20,736 (6.14; 127.8), 20,992 (6.14; 127.7) |
+
+Round 2's M and D1 update_plain at 128 may already carry the interference (p99 23.8 and 15.5 ms).
+The disturbed runs' JSON stays in `~/.cache/oltp-ab/out-w5` on Mac Studio 2.
+
+## For the next lane
+
+1. Rerun `ab-w5.sh` (arms built, `OUT=$HOME/.cache/oltp-ab/out-w5b`) on a quiet Mac Studio 2 and
+   read `ab_w5_stats.py`'s p values for M against D1 and T against D1 at 1, 32 and 128 clients.
+2. Run `w5-checks.sh` (`RED=f363d688`) on perf/oltp's tip.
+3. If D1 holds, fill decision 14's evidence (docs/design/store.md) and merge perf/oltp.

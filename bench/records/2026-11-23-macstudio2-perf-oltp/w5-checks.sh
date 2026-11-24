@@ -12,6 +12,7 @@ step cargo clippy -p amphora --all-targets --locked --offline -- -D warnings
 step cargo test -p amphora --locked --offline --test store -- --test-threads=8
 step cargo test -p amphora --locked --offline --test crash -- --test-threads=8
 step cargo test -p amphora --locked --offline --lib store -- --test-threads=8
+step cargo test -p amphora --locked --offline --test design_index -- --test-threads=8
 if [ -n "${RED:-}" ]; then
   git show "$RED:crates/amphora/src/store.rs" > crates/amphora/src/store.rs || exit 3
   for i in 1 2 3; do
