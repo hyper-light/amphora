@@ -995,6 +995,9 @@ pub struct ProgramState {
     group_tables: id_map::IdMap<group_table::GroupTable>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
     morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
+    /// Amphora (CS.5, lane R6): the serial loop a column copy handed its statement to, timed while
+    /// the statement steps and charged to its table's row path when it ends.
+    pub(crate) rows_timed: Option<crate::storage::versioned::columns_sql::RowsTiming>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1150,6 +1153,7 @@ impl ProgramState {
             handoff_asked: false,
             group_tables: id_map::IdMap::default(),
             morsel_rows: None,
+            rows_timed: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1352,6 +1356,7 @@ impl ProgramState {
             self.group_tables.clear();
         }
         self.morsel_rows = None;
+        self.rows_timed = None;
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
             self.ephemeral_temp_files
@@ -2464,11 +2469,15 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
+        let entered = state.rows_timed.is_some().then(std::time::Instant::now);
         let result = if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
+        if state.rows_timed.is_some() {
+            self.time_rows(state, entered, &result);
+        }
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
@@ -2633,6 +2642,35 @@ impl Program {
                     }
                 }
             }
+        }
+    }
+
+    /// Amphora (CS.5, lane R6): a step of a statement a column copy handed to its serial loop ran
+    /// from `entered` (None: from the hand-over within it); at the statement's end its time is
+    /// charged to its table's row path, and a statement that fails or is interrupted charges none.
+    #[inline(never)]
+    fn time_rows(
+        &self,
+        state: &mut ProgramState,
+        entered: Option<std::time::Instant>,
+        result: &ProgramStep,
+    ) {
+        if let Some(timing) = state.rows_timed.as_mut() {
+            timing.ran(entered);
+        }
+        match result {
+            ProgramStep::Done => {
+                if let (Some(timing), Some(switch)) =
+                    (state.rows_timed.take(), self.connection.versioned.as_ref())
+                {
+                    switch
+                        .storage()
+                        .copies
+                        .rows_measured(timing, state.metrics.rows_read);
+                }
+            }
+            ProgramStep::Error(_) | ProgramStep::Interrupt => state.rows_timed = None,
+            _ => {}
         }
     }
 
