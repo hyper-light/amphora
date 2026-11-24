@@ -217,6 +217,9 @@ pub struct Resolver<'a> {
     /// Amphora (QT.5): the cost weights the connection's database has learned
     /// (`optimizer::learned_costs`), set at prepare.
     learned_weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    /// Table-rowid (`INTEGER PRIMARY KEY`) seek weight in rows' visits, set when weights are not
+    /// pinned so `SeekRowid` lookups are priced separately from secondary-index record seeks.
+    learned_rowid_seek: Option<f64>,
     /// Amphora (PL.7): the weights fitted to the database's measured statement times
     /// (`optimizer::cost_fit`), set at prepare; None with the switch off.
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
@@ -386,6 +389,7 @@ impl<'a> Resolver<'a> {
             plan_values: None,
             statement_memory: 0,
             learned_weights: None,
+            learned_rowid_seek: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             bushy_left_join_probes: false,
@@ -477,6 +481,14 @@ impl<'a> Resolver<'a> {
         weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
     ) {
         self.learned_weights = weights;
+    }
+
+    pub(crate) fn learned_rowid_seek(&self) -> Option<f64> {
+        self.learned_rowid_seek
+    }
+
+    pub(crate) fn set_learned_rowid_seek(&mut self, weight: Option<f64>) {
+        self.learned_rowid_seek = weight;
     }
 
     pub(crate) fn fitted_weights(
@@ -646,6 +658,7 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            learned_rowid_seek: self.learned_rowid_seek,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             bushy_left_join_probes: self.bushy_left_join_probes,
@@ -694,6 +707,7 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            learned_rowid_seek: self.learned_rowid_seek,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             bushy_left_join_probes: self.bushy_left_join_probes,

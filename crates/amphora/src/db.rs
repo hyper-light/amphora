@@ -15,8 +15,8 @@ use amphora_engine::io::FileSyncType;
 use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
-    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
-    Statement, StepResult, Value,
+    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PagePath, PlatformIO, Row,
+    SqliteDialect, Statement, StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
@@ -90,8 +90,20 @@ fn connect_opts() -> ConnectOpts {
 /// ends, by its end or by its request's deadline ([`Db::deadline`]), which releases the lock (lane
 /// constants-22, goal "no picked constants": the 1 ms retried 10,000 times is gone). The busy
 /// timeout isn't set per request: the engine's setter makes every cached statement prepare again.
+fn default_page_path() -> PagePath {
+    static PATH: OnceLock<PagePath> = OnceLock::new();
+    *PATH.get_or_init(|| {
+        if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|v| v == "today") {
+            PagePath::Today
+        } else {
+            PagePath::Plain
+        }
+    })
+}
+
 fn connect(db: &Arc<Database>) -> Result<Arc<Connection>, LimboError> {
     let conn = db.connect(connect_opts())?;
+    conn.get_pager().set_page_path(default_page_path());
     conn.set_busy_timeout(Duration::MAX);
     Ok(conn)
 }

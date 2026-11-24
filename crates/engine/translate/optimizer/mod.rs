@@ -1176,6 +1176,7 @@ fn find_select_plan_form(
         .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
+        .with_rowid_seek(resolver.learned_rowid_seek())
         .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values())
         .with_is_value_estimate(resolver.is_value_estimate());
@@ -3082,6 +3083,7 @@ fn find_table_access_plan(
         .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
+        .with_rowid_seek(resolver.learned_rowid_seek())
         .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values())
         .with_is_value_estimate(resolver.is_value_estimate());

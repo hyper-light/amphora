@@ -1265,12 +1265,13 @@ fn join_lhs_and_rhs<'a>(
                                 );
                             }
                             if should_materialize {
-                                // Materialize build-side rowids so the hash build only includes
-                                // rows that already match prior join constraints.
+                                // Materialize build-side rows into an ephemeral B-tree so the hash
+                                // build only includes rows matching prior join constraints: each
+                                // row pays an ephemeral insert (`hash_insert_cost`) plus its scan
+                                // back (`cpu_cost_per_row`).
                                 *materialize_build_input = true;
-                                // A row's visit each, at the row's learned cost (QT.5).
-                                let materialize_cost =
-                                    effective_build_cardinality * params.cpu_cost_per_row;
+                                let materialize_cost = effective_build_cardinality
+                                    * (params.hash_insert_cost + params.cpu_cost_per_row);
                                 hash_join_method.cost =
                                     hash_join_method.cost + Cost(materialize_cost);
                                 // When two materialized hash-join plans have equal cost,
@@ -3290,12 +3291,14 @@ fn get_best_seek_score(
             Some(index) => IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
+                is_rowid: false,
                 column_count: index.columns.len(),
                 rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
                 covering: true,
+                is_rowid: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
             },

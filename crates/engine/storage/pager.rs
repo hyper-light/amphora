@@ -1129,14 +1129,15 @@ impl PagePath {
         }
     }
 
-    /// The process's switch, read once: defaults to `Plain`, with `AMPHORA_PAGE_PATH=today`
-    /// opting back into the legacy completion/copy path for A/B comparison.
+    /// The process's switch, read once: `AMPHORA_PAGE_PATH=plain`.
+    /// (`crates/amphora` opts its own connections into `Plain` by default unless
+    /// `AMPHORA_PAGE_PATH=today`.)
     pub fn switched() -> Self {
         static PATH: crate::sync::LazyLock<PagePath> = crate::sync::LazyLock::new(|| {
-            if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|value| value == "today") {
-                PagePath::Today
-            } else {
+            if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|value| value == "plain") {
                 PagePath::Plain
+            } else {
+                PagePath::Today
             }
         });
         *PATH
@@ -2065,6 +2066,9 @@ pub struct Pager {
     /// their recent share (`page_miss_ratio`).
     page_fetches: AtomicU64,
     page_file_reads: AtomicU64,
+    /// Amphora (QT.5): fetches that missed this connection's `PageCache` (served by `SharedPages`
+    /// or disk), so `timed_run` excludes shared-pool lookup/eviction overhead from pure CPU rates.
+    page_cache_misses: AtomicU64,
     page_miss_window: Mutex<PageMissWindow>,
 }
 
@@ -2365,6 +2369,7 @@ impl Pager {
             learned_costs: std::sync::OnceLock::new(),
             page_fetches: AtomicU64::new(0),
             page_file_reads: AtomicU64::new(0),
+            page_cache_misses: AtomicU64::new(0),
             page_miss_window: Mutex::new(PageMissWindow::default()),
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
@@ -4182,10 +4187,6 @@ impl Pager {
             Some(buffer) => buffer,
             None => Arc::new(self.buffer_pool.get_page()),
         };
-        let read_timer = self
-            .learned_costs
-            .get()
-            .and_then(|costs| costs.start_page_read());
         let read = {
             let io_ctx = self.io_ctx.read();
             self.db_file
@@ -4194,14 +4195,9 @@ impl Pager {
         let Some(read) = read else {
             return Ok(false);
         };
-        // Inline reads complete synchronously without a Completion; count them as file reads and
-        // feed their latency to LearnedCosts just like completion-driven reads so `page_miss_ratio`
-        // and `Work::PageRead` stay accurate on `PagePath::Plain` (and `timed_run` excludes them
-        // from CPU `Work::Seek`).
+        // Inline reads complete synchronously without a Completion; count them as file reads so
+        // `page_miss_ratio` stays accurate and `timed_run` excludes them from pure CPU rates.
         self.page_file_reads.fetch_add(1, Ordering::Relaxed);
-        if let (Some(costs), Some(timer)) = (self.learned_costs.get(), read_timer) {
-            costs.finish_page_read(timer);
-        }
         let expected = buffer.len();
         if (read == 0 && !allow_empty) || (read != 0 && read != expected) {
             return Err(LimboError::CompletionError(CompletionError::ShortRead {
@@ -4362,6 +4358,7 @@ impl Pager {
                 }
             }
 
+            self.page_cache_misses.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             // Amphora: a version another connection read in is shared, and one read now is
             // shared once read (decision 20).
@@ -4496,6 +4493,18 @@ impl Pager {
     /// cost model (`cost_fit`).
     pub(crate) fn page_file_reads(&self) -> u64 {
         self.page_file_reads.load(Ordering::Relaxed)
+    }
+
+    /// Amphora (QT.5): fetches that missed this connection's `PageCache`.
+    pub(crate) fn page_cache_misses(&self) -> u64 {
+        self.page_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Approximate count of concurrent WAL transactions active on this database.
+    /// Used only on sampled cost-learning runs to avoid skewing one operator's rate under
+    /// multi-core saturation while unobserved operators remain on uncontended calibration.
+    pub(crate) fn concurrent_readers(&self) -> u64 {
+        self.wal.as_ref().map_or(1, |wal| wal.concurrent_readers())
     }
 
     /// Lane T13: the standing share once an epoch has closed; before that, the share so far.
@@ -4923,10 +4932,10 @@ impl Pager {
                 if self.insert_yield.should_yield_for(page_idx) {
                     return Ok(Some(SharedRead::Yield(crate::Completion::new_yield())));
                 }
-                let inserted = self
-                    .page_cache
-                    .write()
-                    .insert_shared_plain(PageCacheKey::new(id), id, buffer);
+                let inserted =
+                    self.page_cache
+                        .write()
+                        .insert_shared_plain(PageCacheKey::new(id), id, buffer);
                 match inserted {
                     Ok(page) => return Ok(Some(SharedRead::Cached(page))),
                     Err((CacheError::Full, buffer)) => {

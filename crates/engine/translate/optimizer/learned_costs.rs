@@ -500,6 +500,10 @@ impl Rate {
 struct Rates {
     row: Rate,
     seek: Rate,
+    /// Table rowid (`INTEGER PRIMARY KEY`) seek rate (`SeekRowid` and table-cursor seeks),
+    /// tracked separately from secondary-index record seeks (`seek`) because integer rowid
+    /// comparisons avoid index record decoding and collation overhead.
+    rowid_seek: Rate,
     hash_build: Rate,
     hash_probe: Rate,
     sort: Rate,
@@ -523,6 +527,7 @@ impl Rates {
         let kind = [
             &self.row,
             &self.seek,
+            &self.rowid_seek,
             &self.hash_build,
             &self.hash_probe,
             &self.sort,
@@ -545,6 +550,7 @@ impl Rates {
         for rate in [
             &mut self.row,
             &mut self.seek,
+            &mut self.rowid_seek,
             &mut self.hash_build,
             &mut self.hash_probe,
             &mut self.sort,
@@ -613,6 +619,7 @@ pub struct LearnedWeights {
 #[derive(Debug, Default)]
 pub(crate) struct RunCounts {
     seek: RunCount,
+    rowid_seek: RunCount,
     hash_build: RunCount,
     hash_probe: RunCount,
 }
@@ -624,6 +631,7 @@ impl RunCounts {
         let base = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         Self {
             seek: RunCount(AtomicU64::new(base)),
+            rowid_seek: RunCount(AtomicU64::new(base.rotate_left(7))),
             hash_build: RunCount(AtomicU64::new(base.rotate_left(17))),
             hash_probe: RunCount(AtomicU64::new(base.rotate_left(37))),
         }
@@ -659,16 +667,23 @@ impl RunCount {
 #[derive(Debug, Clone, Copy)]
 struct WeightsSnapshot {
     weights: Option<LearnedWeights>,
+    rowid_seek_weight: Option<f64>,
     cost_margin: f64,
     row_nanos: Option<f64>,
 }
 
 impl WeightsSnapshot {
     fn from_rates(rates: &Rates) -> Self {
+        let row_nanos = rates.row.nanos_per_unit();
+        let rowid_seek_weight = match (row_nanos, rates.rowid_seek.nanos_per_unit()) {
+            (Some(row), Some(seek)) => Some(seek / row),
+            _ => None,
+        };
         Self {
             weights: rates.weights(None),
+            rowid_seek_weight,
             cost_margin: rates.cost_margin(),
-            row_nanos: rates.row.nanos_per_unit(),
+            row_nanos,
         }
     }
 }
@@ -681,8 +696,9 @@ pub(crate) struct LearnedCosts {
     snapshot: ArcSwap<WeightsSnapshot>,
     /// True when the active weight rule is `WeightRule::BatchMeans`.
     batch_means: AtomicBool,
-    /// Which runs of the seek, the hash build and the hash probe are timed (step 3a).
+    /// Which runs of the seek, rowid seek, hash build and hash probe are timed (step 3a).
     seek: Sampling,
+    rowid_seek: Sampling,
     hash_build: Sampling,
     hash_probe: Sampling,
     /// What timing one run costs: two clock reads, as calibration timed them.
@@ -716,6 +732,12 @@ struct Sampling {
     /// [WeightRule::BatchMeans]: at most an epoch's, the work calibration timed a sample of
     /// (`Rate::close_runs`).
     batch: Mutex<Vec<f64>>,
+    /// True while `batch` holds unclosed samples; lets `discard_batch` avoid touching `contended`
+    /// once a concurrent burst has already invalidated the batch.
+    batch_non_empty: AtomicBool,
+    /// Set when concurrent readers or lock contention overlap the batch under way, so the next
+    /// uncontended push clears stale contention-skewed samples instead of closing a polluted batch.
+    contended: AtomicBool,
 }
 
 /// Welford's running mean and sum of squared deviations (Welford, "Note on a method for
@@ -749,6 +771,16 @@ impl Sampling {
             epoch_len,
             spread: Mutex::new(Spread::default()),
             batch: Mutex::new(Vec::new()),
+            batch_non_empty: AtomicBool::new(false),
+            contended: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the in-progress batch as contended so samples taken during multi-reader saturation
+    /// are discarded rather than closing a batch skewed against unobserved operators.
+    fn discard_batch(&self) {
+        if self.batch_non_empty.load(Ordering::Relaxed) && !self.contended.load(Ordering::Relaxed) {
+            self.contended.store(true, Ordering::Relaxed);
         }
     }
 
@@ -761,9 +793,21 @@ impl Sampling {
     /// sample when another thread already holds the batch lock rather than spinning/parking query
     /// threads, and hands the closed batch back to compute median and Welford spread lock-free.
     fn try_push_batch(&self, nanos: f64) -> Option<Vec<f64>> {
-        let mut batch = self.batch.try_lock()?;
+        let Some(mut batch) = self.batch.try_lock() else {
+            self.discard_batch();
+            return None;
+        };
+        if self.contended.swap(false, Ordering::Relaxed) {
+            batch.clear();
+            self.batch_non_empty.store(false, Ordering::Relaxed);
+            return None;
+        }
+        if batch.is_empty() {
+            self.batch_non_empty.store(true, Ordering::Relaxed);
+        }
         batch.push(nanos);
         if batch.len() >= self.epoch_len {
+            self.batch_non_empty.store(false, Ordering::Relaxed);
             Some(std::mem::replace(
                 &mut *batch,
                 Vec::with_capacity(self.epoch_len),
@@ -837,6 +881,7 @@ impl LearnedCosts {
             snapshot: ArcSwap::from_pointee(WeightsSnapshot::from_rates(rates)),
             batch_means: AtomicBool::new(rates.seek.rule == WeightRule::BatchMeans),
             seek: Sampling::new(rates.seek.epoch),
+            rowid_seek: Sampling::new(rates.rowid_seek.epoch),
             hash_build: Sampling::new(rates.hash_build.epoch),
             hash_probe: Sampling::new(rates.hash_probe.epoch),
             timing_nanos: rates.timing_nanos,
@@ -961,6 +1006,57 @@ impl LearnedCosts {
         }
     }
 
+    /// Invalidates any unclosed batch for `work` when concurrent readers overlap the run.
+    pub(crate) fn discard_sampled_batch(&self, work: Work) {
+        if let Some(sampling) = self.sampling(work) {
+            sampling.discard_batch();
+        }
+    }
+
+    /// Whether to time this run of a table-rowid (`INTEGER PRIMARY KEY`) seek.
+    pub(crate) fn sampled_rowid_seek(&self, runs: &RunCounts) -> bool {
+        self.rowid_seek.sampled(runs.rowid_seek.next())
+    }
+
+    /// Invalidates any unclosed batch for table-rowid seeks when concurrent readers overlap.
+    pub(crate) fn discard_sampled_rowid_seek_batch(&self) {
+        self.rowid_seek.discard_batch();
+    }
+
+    /// Records a timed run of a table-rowid seek (`SeekRowid` or table `SeekGE`/`LE`/`GT`/`LT`).
+    pub(crate) fn observe_sampled_rowid_seek(&self, nanos: f64) {
+        if !(nanos.is_finite() && nanos >= 0.0) {
+            return;
+        }
+        if self.batch_means.load(Ordering::Relaxed) {
+            if let Some(mut closed) = self.rowid_seek.try_push_batch(nanos) {
+                self.rowid_seek
+                    .update_every_from_batch(&closed, self.timing_nanos);
+                if let Some(med) = median(&mut closed) {
+                    let mut rates = self.rates.lock();
+                    if rates.rowid_seek.rule == WeightRule::BatchMeans {
+                        rates.rowid_seek.close_runs(med);
+                        self.publish_snapshot(&rates);
+                    }
+                }
+            }
+            return;
+        }
+        let epoch = {
+            let mut rates = self.rates.lock();
+            rates.rowid_seek.observe(1.0, nanos);
+            let epoch = rates.rowid_seek.epoch;
+            self.publish_snapshot(&rates);
+            epoch
+        };
+        self.rowid_seek.add(nanos, epoch, self.timing_nanos);
+    }
+
+    /// Lock-free learned weight (in rows' visits) for table-rowid (`INTEGER PRIMARY KEY`) seeks.
+    pub(crate) fn rowid_seek_weight(&self) -> Option<f64> {
+        self.snapshot.load().rowid_seek_weight
+    }
+
     /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
     /// how often the runs are timed. Under [WeightRule::BatchMeans] a batch of runs closes at its
     /// median run (`Rate::close_runs`) outside `rates` lock; under [WeightRule::Blend], the
@@ -1056,8 +1152,16 @@ impl LearnedCosts {
         rates.switch(rule);
         self.batch_means
             .store(rule == WeightRule::BatchMeans, Ordering::Relaxed);
-        for sampling in [&self.seek, &self.hash_build, &self.hash_probe, &self.page] {
+        for sampling in [
+            &self.seek,
+            &self.rowid_seek,
+            &self.hash_build,
+            &self.hash_probe,
+            &self.page,
+        ] {
             sampling.batch.lock().clear();
+            sampling.batch_non_empty.store(false, Ordering::Relaxed);
+            sampling.contended.store(false, Ordering::Relaxed);
         }
         self.publish_snapshot(&rates);
     }
@@ -1140,11 +1244,15 @@ impl Calibration {
         for (kind, (units, nanos)) in CALIBRATED.iter().zip(self.kinds) {
             *rates.rate_mut(*kind) = Rate::measured(units, nanos);
         }
+        // Table-rowid seeks start at calibration's integer-key seek rate, then learn separately
+        // from secondary-index record seeks (`SeekRowid` vs `SeekGE` on secondary indexes).
+        rates.rowid_seek = rates.seek;
         // A page read can't be timed here: there's no file yet. Each database anchors it at open
         // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
-        // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
+        // (`LearnedCosts::observe`), its epoch one page of keys (`PAGE_KEYS`) so a handful of
+        // OS-cached inline reads do not replace the open's anchor.
         rates.page = Rate {
-            epoch: (rates.row.epoch / calibration_keys() as f64).max(1.0),
+            epoch: (calibration_keys() as f64).max(1.0),
             ..Rate::default()
         };
         rates
@@ -1431,27 +1539,117 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     let keys: Vec<u64> = (0..n as u64).map(mix).collect();
     let mut ordered = keys.clone();
     ordered.sort_unstable();
-    let table: FxHashMap<u64, u64> = keys.iter().map(|k| (*k, *k)).collect();
-    let rows = n as f64;
-
-    let mut row = || {
-        black_box(keys.iter().filter(|k| black_box(**k) & 1 == 0).count());
+    let values: Vec<crate::Value> = keys
+        .iter()
+        .map(|k| crate::Value::from_i64(i64::from_ne_bytes(k.to_ne_bytes())))
+        .collect();
+    let ordered_records: Vec<crate::types::ImmutableRecord> = ordered
+        .iter()
+        .filter_map(|k| {
+            let v = [crate::Value::from_i64(i64::from_ne_bytes(k.to_ne_bytes()))];
+            crate::types::ImmutableRecord::from_values(&v, 1).ok()
+        })
+        .collect();
+    let records: Vec<crate::types::ImmutableRecord> = values
+        .iter()
+        .filter_map(|v| crate::types::ImmutableRecord::from_values(std::slice::from_ref(v), 1).ok())
+        .collect();
+    let cal_io: crate::sync::Arc<dyn crate::io::IO> =
+        crate::sync::Arc::new(crate::io::MemoryIO::new());
+    let ht_config = crate::vdbe::hash_table::HashTableConfig {
+        initial_buckets: 1,
+        mem_budget: usize::MAX,
+        num_keys: 1,
+        collations: vec![crate::translate::collate::CollationSeq::Binary],
+        temp_store: crate::TempStore::Memory,
+        track_matched: false,
+        partition_count: None,
     };
+    let mut probe_table =
+        crate::vdbe::hash_table::HashTable::new(ht_config.clone(), cal_io.clone()).ok();
+    if let Some(ht) = probe_table.as_mut() {
+        for (idx, v) in values.iter().enumerate() {
+            let mut key_values = crate::vdbe::hash_table::HashKeyValues::new();
+            key_values.push(v.clone());
+            let mut payload_values = crate::vdbe::hash_table::HashPayloadValues::new();
+            payload_values.push(v.clone());
+            let _ = ht.insert_pending(
+                crate::vdbe::hash_table::PendingHashInsert {
+                    key_values,
+                    rowid: i64::try_from(idx).unwrap_or(0),
+                    payload_values,
+                },
+                None,
+            );
+        }
+        let _ = ht.finalize_build(None);
+    }
+    let rows = n as f64;
+    let pivot = crate::Value::from_i64(0);
+
+    // Calibrate on the engine's own record decoding, key comparison, and hash table build/probe so
+    // runtime operator observations (Work::Seek, Work::Row, Work::HashBuild, Work::HashProbe)
+    // share the same nanosecond scale as calibration rather than suffering a synthetic-vs-VDBE cliff.
+    let mut header = crate::vdbe::row_header::RowHeader::new(1);
+    let mut reg = crate::vdbe::Register::Value(crate::Value::Null);
+    let mut row = || {
+        let mut passed = 0usize;
+        for rec in &records {
+            header.forget();
+            if header
+                .column_into_register(rec.get_payload(), 0, &mut reg)
+                .is_ok()
+                && black_box(reg.get_value()) < &pivot
+            {
+                passed = passed.wrapping_add(1);
+            }
+        }
+        black_box(passed);
+    };
+    let mut seek_header = crate::vdbe::row_header::RowHeader::new(1);
+    let mut seek_reg = crate::vdbe::Register::Value(crate::Value::Null);
     let mut seek = || {
         for k in &keys {
-            let _ = black_box(ordered.binary_search(k));
+            // A B-tree seek binary-searches page keys (comparing integers directly, not decoding
+            // every record header at each bisection step) and decodes the landed row once.
+            if let Ok(pos) = ordered.binary_search(k) {
+                if let Some(rec) = ordered_records.get(pos) {
+                    seek_header.forget();
+                    let _ = seek_header.column_into_register(rec.get_payload(), 0, &mut seek_reg);
+                    black_box(seek_reg.get_value());
+                }
+            }
         }
     };
     let mut build = || {
-        let mut built = FxHashMap::default();
-        for k in &keys {
-            built.insert(*k, *k);
+        if let Ok(mut built) =
+            crate::vdbe::hash_table::HashTable::new(ht_config.clone(), cal_io.clone())
+        {
+            for (idx, v) in values.iter().enumerate() {
+                let mut key_values = crate::vdbe::hash_table::HashKeyValues::new();
+                key_values.push(v.clone());
+                let mut payload_values = crate::vdbe::hash_table::HashPayloadValues::new();
+                payload_values.push(v.clone());
+                let _ = built.insert_pending(
+                    crate::vdbe::hash_table::PendingHashInsert {
+                        key_values,
+                        rowid: i64::try_from(idx).unwrap_or(0),
+                        payload_values,
+                    },
+                    None,
+                );
+            }
+            let _ = built.finalize_build(None);
+            black_box(&built);
         }
-        black_box(&built);
     };
     let mut probe = || {
-        for k in &keys {
-            black_box(table.get(k));
+        if let Some(ht) = probe_table.as_mut() {
+            for v in &values {
+                if let Ok(probe_keys) = ht.probe_keys_from(std::iter::once(v)) {
+                    black_box(ht.probe(probe_keys, None).ok().flatten().map(|e| e.rowid));
+                }
+            }
         }
     };
     let mut sort = || {
@@ -1489,11 +1687,6 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
         }
     };
     // A condition's step: each key, as one of the engine's values, compared with another.
-    let values: Vec<crate::Value> = keys
-        .iter()
-        .map(|k| crate::Value::from_i64(i64::from_ne_bytes(k.to_ne_bytes())))
-        .collect();
-    let pivot = crate::Value::from_i64(0);
     let mut step = || {
         for v in &values {
             black_box(black_box(v) < &pivot);
@@ -1955,6 +2148,7 @@ mod tests {
         Rates {
             row: Rate::measured(100.0, 100.0 * row),
             seek: Rate::measured(100.0, 100.0 * seek),
+            rowid_seek: Rate::measured(100.0, 100.0 * seek),
             hash_build: Rate::measured(100.0, 100.0 * build),
             hash_probe: Rate::measured(100.0, 100.0 * probe),
             sort: Rate::measured(100.0, 100.0 * sort),

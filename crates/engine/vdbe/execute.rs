@@ -6728,7 +6728,9 @@ pub fn op_seek_rowid(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = seek_rowid_run(program, state, insn, pager);
+    let result = timed_run_rowid_seek(program, pager, || {
+        seek_rowid_run(program, state, insn, pager)
+    });
     seek_trace_end(state, traced, &result);
     result
 }
@@ -6923,12 +6925,23 @@ pub fn op_seek(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = timed_run(
-        program,
-        pager,
-        crate::translate::optimizer::learned_costs::Work::Seek,
-        || seek_run(program, state, insn, pager),
+    let is_index = matches!(
+        insn,
+        Insn::SeekGE { is_index: true, .. }
+            | Insn::SeekLE { is_index: true, .. }
+            | Insn::SeekGT { is_index: true, .. }
+            | Insn::SeekLT { is_index: true, .. }
     );
+    let result = if is_index {
+        timed_run(
+            program,
+            pager,
+            crate::translate::optimizer::learned_costs::Work::Seek,
+            || seek_run(program, state, insn, pager),
+        )
+    } else {
+        timed_run_rowid_seek(program, pager, || seek_run(program, state, insn, pager))
+    };
     seek_trace_end(state, traced, &result);
     result
 }
@@ -7049,12 +7062,56 @@ fn timed_run(
     if !costs.sampled(work, &program.connection.cost_runs) {
         return run();
     }
+    if pager.concurrent_readers() > 1 {
+        costs.discard_sampled_batch(work);
+        return run();
+    }
     let reads_before = pager.page_file_reads();
+    let misses_before = pager.page_cache_misses();
     let started = std::time::Instant::now();
     let result = run();
-    if matches!(result, Ok(InsnFunctionStepResult::Step)) && pager.page_file_reads() == reads_before
+    if matches!(result, Ok(InsnFunctionStepResult::Step))
+        && pager.page_file_reads() == reads_before
+        && pager.page_cache_misses() == misses_before
     {
-        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+        if pager.concurrent_readers() <= 1 {
+            costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+        } else {
+            costs.discard_sampled_batch(work);
+        }
+    }
+    result
+}
+
+/// Samples a table-rowid (`INTEGER PRIMARY KEY`) seek (`op_seek_rowid` or table `op_seek`)
+/// separately from secondary-index record seeks, excluding disk/cache misses and multi-reader
+/// contention just like `timed_run`.
+fn timed_run_rowid_seek(
+    program: &Program,
+    pager: &Pager,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    if !costs.sampled_rowid_seek(&program.connection.cost_runs) {
+        return run();
+    }
+    if pager.concurrent_readers() > 1 {
+        costs.discard_sampled_rowid_seek_batch();
+        return run();
+    }
+    let reads_before = pager.page_file_reads();
+    let misses_before = pager.page_cache_misses();
+    let started = std::time::Instant::now();
+    let result = run();
+    if matches!(result, Ok(InsnFunctionStepResult::Step))
+        && pager.page_file_reads() == reads_before
+        && pager.page_cache_misses() == misses_before
+    {
+        if pager.concurrent_readers() <= 1 {
+            costs.observe_sampled_rowid_seek(started.elapsed().as_nanos() as f64);
+        } else {
+            costs.discard_sampled_rowid_seek_batch();
+        }
     }
     result
 }
@@ -10121,7 +10178,15 @@ pub(crate) fn op_agg_step_slow(
     ) {
         // Inline fast checks for NULL inputs (and non-NULL text/blob COUNT or MinMax without heap).
         match (&state.registers[*col], func) {
-            (Register::Value(Value::Null), AggFunc::Count | AggFunc::Sum | AggFunc::Total | AggFunc::Avg | AggFunc::Min | AggFunc::Max) => {
+            (
+                Register::Value(Value::Null),
+                AggFunc::Count
+                | AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max,
+            ) => {
                 state.pc = state.pc.checked_add(1).or_overflow()?;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -20149,8 +20214,8 @@ fn replan_on_built_rows(
 /// (read-only, no row returned), and the implicit transaction it would end is its own (no other
 /// statement on the connection under way in it, `ProgramState::can_autocommit_now`'s siblings).
 fn hand_off_now(program: &Program, state: &mut ProgramState, replanned: bool) -> bool {
-    let txn_its_own = !program.connection.get_auto_commit()
-        || program.connection.active_root_statements() == 1;
+    let txn_its_own =
+        !program.connection.get_auto_commit() || program.connection.active_root_statements() == 1;
     if replanned && state.handoff_open && txn_its_own {
         state.handoff_asked = true;
         return true;

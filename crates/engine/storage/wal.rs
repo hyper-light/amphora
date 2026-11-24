@@ -13,9 +13,7 @@ use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
-use crate::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use crate::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
 use bitflags::bitflags;
 use std::fmt::{Debug, Formatter};
@@ -434,6 +432,14 @@ impl ShardedRwLock {
         self.shards
             .first()
             .is_some_and(|s| (s.load(Ordering::Acquire) & Self::EXCLUSIVE) != 0)
+    }
+
+    /// Approximate count of active shared holders across all per-core shards.
+    #[inline]
+    pub fn reader_count(&self) -> u64 {
+        self.shards.iter().fold(0u64, |acc, s| {
+            acc.saturating_add((s.load(Ordering::Relaxed) & Self::READER_MASK) >> 1)
+        })
     }
 
     /// Upgrade a held shared read lock to exclusive iff there is exactly one reader across all
@@ -1469,6 +1475,11 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool;
 
+    /// Approximate count of concurrent transactions active on this WAL.
+    fn concurrent_readers(&self) -> u64 {
+        1
+    }
+
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
 
@@ -2047,7 +2058,9 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn checkpoint_epoch(&self) -> u32 {
-        self.log.epoch(self.log.current_id()).load(Ordering::Acquire)
+        self.log
+            .epoch(self.log.current_id())
+            .load(Ordering::Acquire)
     }
 
     fn bump_checkpoint_epoch(&self) -> u32 {
@@ -2297,8 +2310,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
-        let shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> =
-            self.log.current().write();
+        let shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> = self.log.current().write();
         if shared.metadata.initialized.load(Ordering::Acquire) {
             return None;
         }
@@ -6231,9 +6243,7 @@ impl Wal for WalFile {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
             // A read guard is installed only with its span (`try_begin_read_tx`).
-            let raw_span = self
-                .read_span
-                .swap(ReadSpan::PACKED_NONE, Ordering::AcqRel);
+            let raw_span = self.read_span.swap(ReadSpan::PACKED_NONE, Ordering::AcqRel);
             if let Some(span) = ReadSpan::unpack_u32(raw_span) {
                 self.coordination
                     .end_read_tx(ReadGuardKind::from_lock_index(slot), span);
@@ -6365,6 +6375,10 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool {
         self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD
+    }
+
+    fn concurrent_readers(&self) -> u64 {
+        self.coordination.shared_log().vacuum_lock.reader_count()
     }
 
     /// Returns true if this WAL instance currently holds the write lock.
@@ -9224,7 +9238,13 @@ impl WalFileShared {
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
         let wal_header = WalHeader::new();
         let read_locks = new_read_locks();
-        let snap = Arc::new(SnapshotCell::new(0, 0, 0, (0, 0), wal_header.checkpoint_seq));
+        let snap = Arc::new(SnapshotCell::new(
+            0,
+            0,
+            0,
+            (0, 0),
+            wal_header.checkpoint_seq,
+        ));
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
@@ -9264,7 +9284,13 @@ impl WalFileShared {
     pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<SharedLog>> {
         let wal_header = WalHeader::new();
         let read_locks = new_read_locks();
-        let snap = Arc::new(SnapshotCell::new(0, 0, 0, (0, 0), wal_header.checkpoint_seq));
+        let snap = Arc::new(SnapshotCell::new(
+            0,
+            0,
+            0,
+            (0, 0),
+            wal_header.checkpoint_seq,
+        ));
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
@@ -9348,8 +9374,10 @@ impl WalFileShared {
             self.metadata.snap.update(|s| {
                 s.max_frame.store(0, Ordering::Relaxed);
                 s.nbackfills.store(0, Ordering::Relaxed);
-                s.last_checksum_packed
-                    .store(pack_checksum((hdr.checksum_1, hdr.checksum_2)), Ordering::Relaxed);
+                s.last_checksum_packed.store(
+                    pack_checksum((hdr.checksum_1, hdr.checksum_2)),
+                    Ordering::Relaxed,
+                );
                 s.checkpoint_seq
                     .store(hdr.checkpoint_seq, Ordering::Relaxed);
             });
@@ -10839,8 +10867,10 @@ pub mod test {
         guard.metadata.snap.update(|s| {
             s.max_frame.store(snapshot.max_frame, Ordering::Relaxed);
             s.nbackfills.store(snapshot.nbackfills, Ordering::Relaxed);
-            s.last_checksum_packed
-                .store(super::pack_checksum(snapshot.last_checksum), Ordering::Relaxed);
+            s.last_checksum_packed.store(
+                super::pack_checksum(snapshot.last_checksum),
+                Ordering::Relaxed,
+            );
             s.transaction_count
                 .store(snapshot.transaction_count, Ordering::Relaxed);
         });

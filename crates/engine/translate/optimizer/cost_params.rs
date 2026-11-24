@@ -80,6 +80,18 @@ pub struct CostModelParams {
     /// CPU cost per index seek (key comparisons).
     pub cpu_cost_per_seek: f64,
 
+    /// CPU cost per table-rowid (`INTEGER PRIMARY KEY`) seek (`SeekRowid` and table rowid range
+    /// seeks), learned separately from secondary-index record seeks because integer rowid searches
+    /// do not decode index key records or apply collations. Defaults to `cpu_cost_per_seek`.
+    pub cpu_cost_per_rowid_seek: f64,
+
+    /// CPU cost per in-memory (cached) B-tree page lookup, set to `cpu_cost_per_row` when learned
+    /// costs are active: touching a cached page does at least a row visit's worth of CPU work,
+    /// preventing plans that touch thousands of cached table pages from appearing equal to narrow
+    /// covering-index scans when `page_miss == 0`. Zero in `DEFAULT_PARAMS` until `with_learned`
+    /// populates it.
+    pub cached_page_cost: f64,
+
     /// Amphora: pages a read finds without reading the file (`docs/design/planner.md`, decision 5):
     /// the connection's page cache and its database's shared pages. The default is the engine's
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
@@ -169,6 +181,8 @@ impl CostModelParams {
             cpu_cost_per_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
+            cpu_cost_per_rowid_seek: 0.01,
+            cached_page_cost: 0.0,
             cache_pages: 2000.0,
             page_miss: 1.0,
             statement_memory: 0,
@@ -382,6 +396,8 @@ impl CostModelParams {
         Self {
             cpu_cost_per_row: row,
             cpu_cost_per_seek: row * learned.seek,
+            cpu_cost_per_rowid_seek: row * learned.seek,
+            cached_page_cost: row,
             hash_cpu_cost: 0.0,
             hash_insert_cost: row * learned.hash_build,
             hash_lookup_cost: row * learned.hash_probe,
@@ -389,6 +405,18 @@ impl CostModelParams {
             cpu_cost_per_where_step: row * learned.where_step,
             bloom_lookup_cost: row * learned.bloom_probe,
             page_miss: learned.page_miss.unwrap_or(1.0),
+            ..self.clone()
+        }
+    }
+
+    /// Sets the learned table-rowid (`INTEGER PRIMARY KEY`) seek cost, in rows' visits, when
+    /// unpinned runtime observations are available.
+    pub(crate) fn with_rowid_seek(&self, rowid_seek: Option<f64>) -> Self {
+        let Some(weight) = rowid_seek.filter(|w| w.is_finite() && *w > 0.0) else {
+            return self.clone();
+        };
+        Self {
+            cpu_cost_per_rowid_seek: self.cpu_cost_per_row * weight,
             ..self.clone()
         }
     }
@@ -521,6 +549,7 @@ impl CostModelParams {
             ("cpu_cost_per_row", self.cpu_cost_per_row),
             ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
+            ("cached_page_cost", self.cached_page_cost),
             ("sort_cpu_per_row", self.sort_cpu_per_row),
             ("hash_cpu_cost", self.hash_cpu_cost),
             ("hash_insert_cost", self.hash_insert_cost),
