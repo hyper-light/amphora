@@ -97,6 +97,10 @@ closing segment free), `q3_a_read_past_what_the_word_counts_is_refused`.
 Gate at 36ed445e (r1887, adacachy2): `cargo test -p amphora-engine --lib -- storage::log_segments
 storage::wal` 118 passed, 0 failed, 1 ignored; `cargo clippy -p amphora-engine --all-targets --locked
 -- -D warnings` exit 0; `scripts/check-production.sh` exit 0 (engine ratchet 10,908, as it holds).
+Re-checked on each merge with main: dc9d8575 (r1925: 118 passed, clippy 0, check-production 0) and
+ac1547d6, after lane B16's decision 45 unit 4 landed and its reads of the segments were moved onto the
+cell (121 passed, 0 failed, 1 ignored; clippy 0; check-production 0, ratchet 10,903). Landed on main as
+bfa2d3f2 (main had moved only in crates/amphora, which amphora-engine doesn't depend on).
 
 ## The A/B (r1903)
 
