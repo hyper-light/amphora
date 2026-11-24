@@ -655,11 +655,12 @@ after; reads under writes slower than when every commit cleared the cache.
 
 ## 19. The page cache evicts the oldest page not looked at again
 
-**Decision.** A page new to a connection's cache joins at the head of its queue, and the clock
-hand sweeps from the tail toward the head (`crates/engine/storage/page_cache.rs`), as SIEVE has
-it: the hand evicts the first page it finds unmarked, taking a mark off each marked page it
-passes, so a page new to the cache is examined after every older one. Turso's cache inserted a new
-page just after the hand, where the sweep looks next.
+**Decision.** A page new to a connection's cache joins its queue just behind the clock hand, where
+the sweep looks last (`crates/engine/storage/page_cache.rs`): the hand evicts the first page it
+finds unmarked, taking a mark off each marked page it passes, so a page new to the cache is
+examined after every page already in it. Turso's cache inserted a new page just after the hand,
+where the sweep looks next. Until lane Q2 it joined at the head (the queue's back), as SIEVE has
+it, which puts it after only the pages between the hand and the head.
 
 **Why.** Inserted there, a page read once was the next the sweep examined: with the cache full,
 each miss evicted the page the previous miss brought in, the pages cached before stayed, and a new
@@ -674,7 +675,20 @@ Turn-Key Eviction Algorithm for Web Caches" (NSDI 2024): new objects are inserte
 the hand moves from the tail toward the head, evicting the first object not visited since it last
 passed.
 
-**Evidence.** `page_cache.rs`, `a_new_working_set_settles_in_a_full_cache`: a cache of 100 pages
+**Lane Q2 (2026-11-23).** At the head, the hand reached a new page after only the pages between it
+and the head. S8's `table_count` after `point_secondary` (adacachy2, 200,000 items, a census of each
+reader's cache before and after each count, record
+`bench/records/2026-11-23-adacachy2-perf-analytics-q2.md`): on 32 of 128 readers, later counts kept
+reading the file (95 of 383 counts, 57,564 pages). On the worst, the hand stood 143 pages from the
+head, all unmarked, with 1,857 pages behind it (254, 254, 177 and 1,172 at marks 0 to 3). The count's
+607 index pages evicted those 143, then one another: every count read 603-607 pages from the file,
+and the 1,861 pages behind the hand were never examined again (their marks unchanged across three
+counts). Just behind the hand, no reader's later count read the file (0 of 383).
+
+**Evidence.** `page_cache.rs`, `q2_counts_after_point_lookups_read_no_page_from_the_file`: 20,000
+point lookups through one index of a table larger than a 200-page cache, then four counts through
+another index: the counts after the first read no page from the file.
+`a_new_working_set_settles_in_a_full_cache`: a cache of 100 pages
 full of pages read once, then a working set of 40 read round after round: every read after the
 first round a hit; with the insertion after the hand, 360 misses in the 9 rounds after the first,
 every read. Two of Turso's tests asserted the old order (the newest page evicted first) and now
