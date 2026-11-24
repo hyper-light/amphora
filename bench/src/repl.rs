@@ -34,7 +34,7 @@
 //!
 //! usage: amphora-bench --repl <commit|failover|catchup> --system <amphora|rqlite|dqlite|litefs|libsql>
 //!        --batch N --text-bytes N --deadline-s N [--record FILE]
-//!        commit:   --writers N --warmup-s N --seconds N
+//!        commit:   --writers N --warmup-s N --seconds N [--route spread|leader]
 //!        failover: --writers N --kills N --settle-s N
 //!        catchup:  --behind N --poll-us N
 //!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
@@ -198,6 +198,14 @@ fn platform() -> serde_json::Value {
 
 pub const NODES: usize = 3;
 
+/// Where `commit`'s writers send: `Spread` starts writer w at node w % NODES, `Leader` sends every
+/// writer to the node the cluster names its leader once the schema is in (lane V12's leader-only rows).
+#[derive(Clone, Copy)]
+enum Route {
+    Spread,
+    Leader,
+}
+
 struct Opts {
     measure: String,
     system: String,
@@ -217,6 +225,7 @@ struct Opts {
     spanning: Option<u32>,
     relay_records: Option<usize>,
     members: Option<Vec<String>>,
+    route: Route,
     scripts: PathBuf,
     shell: String,
 }
@@ -247,6 +256,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
         spanning: None,
         relay_records: None,
         members: None,
+        route: Route::Spread,
         scripts: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/servers/repl")),
         shell: "bash".into(),
     };
@@ -279,6 +289,13 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--spanning" => o.spanning = Some(v()?.parse()?),
             "--relay-records" => o.relay_records = Some(v()?.parse()?),
             "--members" => o.members = Some(v()?.split(',').map(str::to_owned).collect()),
+            "--route" => {
+                o.route = match v()?.as_str() {
+                    "spread" => Route::Spread,
+                    "leader" => Route::Leader,
+                    other => anyhow::bail!("unknown route {other} (spread, leader)"),
+                }
+            }
             "--scripts" => o.scripts = PathBuf::from(v()?),
             "--shell" => o.shell = v()?,
             other => anyhow::bail!("unknown argument {other}"),
@@ -508,6 +525,11 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
         need(o.seconds, "--seconds", "commit")?,
     );
     let down: [AtomicBool; NODES] = Default::default();
+    // Each ask is a round trip to a node, so the wait paces itself: no interval of its own.
+    let to_leader = match o.route {
+        Route::Spread => None,
+        Route::Leader => Some(leader_by(c, o.deadline, Duration::ZERO)?),
+    };
     let began = Instant::now();
     let (counting, ends) = (began + warmup, began + warmup + seconds);
     // Each write's latency by the node that acknowledged it, and the `Serialization` refusals
@@ -531,7 +553,7 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
                         // again unchanged (same ids), as `failover`'s writers do, and timed from its
                         // first send once acknowledged; one unacknowledged when the run ends is untimed.
                         let node = loop {
-                            match send_counting(c, down, w, &s, o.deadline, &mine) {
+                            match send_counting(c, down, to_leader.unwrap_or(w), &s, o.deadline, &mine) {
                                 Ok(node) => break Some(node),
                                 Err(_) if t >= counting => missed += 1,
                                 Err(_) => {}
@@ -581,7 +603,8 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
     let secs = seconds.as_secs_f64();
     Ok(serde_json::json!({
-        "writers": writers, "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
+        "writers": writers, "route": match o.route { Route::Spread => "spread", Route::Leader => "leader" },
+        "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
         "writes_per_s": writes as f64 / secs, "events_per_s": (writes as f64) * (o.batch as f64) / secs,
         "by_node": by_node, "leader": leader, "deadline_misses": missed, "writers_missed": writers_missed,
     }))

@@ -6,7 +6,7 @@
 pub const REFUSED_IN_ACTIONS: usize = 35;
 
 /// Regression statements whose every rule has a ported action and whose tree is 19's (FNV-1a 64 of
-/// the oracle's text, corpus.digest): 5169 measured on b01712ce (r1763) with pgbench's TPC-B, -I G
-/// and count(*) ported (1074 with TPC-B, 857 with its UPDATE, 738 with BEGIN and END only); raise it
-/// as actions are ported, never lower it.
-pub const TREES_EQUAL: usize = 5169;
+/// the oracle's text, corpus.digest): 5397 measured on 6bde4b44 (adacachy2, cpus=2) with each of
+/// pgbench's ported (5169 before its partition query, 1074 with TPC-B, 857 with its UPDATE, 738 with
+/// BEGIN and END only); raise it as actions are ported, never lower it.
+pub const TREES_EQUAL: usize = 5397;
