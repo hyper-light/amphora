@@ -58,6 +58,33 @@ fn until() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
 
+/// The log's two segments as their files stand (decision 45), for what a failure says: each file's
+/// bytes, its header's generation, and the frames of that generation it begins with.
+fn log_files(path: &std::path::Path) -> String {
+    ["-wal", "-wal2"]
+        .map(|suffix| {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) => return format!("{suffix}: {e}"),
+            };
+            let Some(header) = bytes.get(..32) else {
+                return format!("{suffix}: {} bytes, no header", bytes.len());
+            };
+            let generation = u32::from_be_bytes(header[12..16].try_into().unwrap());
+            let frames = bytes[32..]
+                .chunks_exact(4096 + 24)
+                .take_while(|frame| frame[8..16] == header[16..24])
+                .count();
+            format!(
+                "{suffix}: {} bytes, generation {generation}, {frames} frames of it",
+                bytes.len()
+            )
+        })
+        .join("; ")
+}
+
 /// The rows as of `second`: after the last commit stamped at or before it.
 fn at(history: &[(u64, Rows)], second: u64) -> Option<&Rows> {
     history
@@ -108,7 +135,7 @@ fn drill(seed: u64) {
     let mut breaks: Vec<(u64, u64)> = Vec::new();
     let mut bases: Vec<(u64, u64)> = Vec::new();
     let mut base_began = 0u64;
-    for _ in 0..600 {
+    for step in 0..600 {
         tick(&mut rng);
         match rng.below(20) {
             0..=10 => {
@@ -169,7 +196,18 @@ fn drill(seed: u64) {
                 Some(c) => {
                     if !shipper.copy_base(&db, &blobs, c, until()).unwrap() {
                         let c = copy.take().unwrap();
-                        shipper.end_base(&db, &blobs, c, until()).unwrap();
+                        let base = format!("{c:?}");
+                        shipper
+                            .end_base(&db, &blobs, c, until())
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "seed {seed:#x}, step {step}: {base} refused its end: {e:#}; \
+                                     shipped through frame {} of the archive's generation {}; {}",
+                                    shipper.frames_in_generation(),
+                                    shipper.generation(),
+                                    log_files(&path)
+                                )
+                            });
                         (dirty, shipped_at) = (false, now.load(Ordering::SeqCst));
                         first_base_end.get_or_insert(now.load(Ordering::SeqCst));
                         bases.push((base_began, now.load(Ordering::SeqCst)));
@@ -769,6 +807,234 @@ fn d45_a_backup_after_a_switch_holds_the_writes_made_after_it() {
     let restored = rows(&Db::open(&target).unwrap());
     assert_eq!(restored.len(), 40, "every row, the 20 after the switch too");
     assert_eq!(restored, model);
+}
+
+/// A database backed up in step with its test: `now` is its clock, and `history` the rows as of
+/// each second it wrote in ([`put`]).
+struct Source {
+    path: std::path::PathBuf,
+    now: Arc<AtomicU64>,
+    hooks: Arc<Hooks>,
+    db: Db,
+    blobs: backup::FolderBlobs,
+    shipper: Shipper,
+    model: Rows,
+    history: Vec<(u64, Rows)>,
+    dir: tempfile::TempDir,
+}
+
+impl Source {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+        let read = Arc::clone(&now);
+        let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+        let mut db = Db::open(&path).unwrap();
+        db.back_up(Arc::clone(&hooks));
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+            .unwrap();
+        let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+        let shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
+        Self {
+            path,
+            now,
+            hooks,
+            db,
+            blobs,
+            shipper,
+            model: Rows::new(),
+            history: Vec::new(),
+            dir,
+        }
+    }
+
+    fn put(&mut self, ids: impl Iterator<Item = i64>, tag: &str) {
+        put(
+            &mut self.db,
+            &self.now,
+            ids,
+            tag,
+            &mut self.model,
+            &mut self.history,
+        );
+    }
+
+    fn ship(&mut self) -> anyhow::Result<backup::Shipped> {
+        self.shipper.ship(&self.db, &self.blobs, until())
+    }
+
+    fn begin_base(&mut self) -> anyhow::Result<BaseCopy> {
+        self.shipper.begin_base(
+            &self.db,
+            &self.blobs,
+            &amphora::memory::process(),
+            32 * 1024,
+        )
+    }
+
+    fn copy_base(&mut self, base: &mut BaseCopy) {
+        while self
+            .shipper
+            .copy_base(&self.db, &self.blobs, base, until())
+            .unwrap()
+        {}
+    }
+
+    fn end_base(&mut self, base: BaseCopy) -> anyhow::Result<()> {
+        self.shipper.end_base(&self.db, &self.blobs, base, until())
+    }
+
+    /// The rows of a restore to `second`, into a folder of its own.
+    fn restored(&self, second: u64) -> anyhow::Result<Rows> {
+        let dir = tempfile::tempdir_in(self.dir.path())?;
+        let target = dir.path().join("restored.db");
+        backup::restore(&self.blobs, "db", second, &target, until())?;
+        Ok(rows(&Db::open(&target)?))
+    }
+
+    /// Every second from the first the archive restores to the last commit's, restored and
+    /// compared with the rows as of that second.
+    fn restores_every_second_from(&self, first: u64) {
+        let last = self.history.last().unwrap().0.div_ceil(SECOND_NS);
+        assert!(first <= last, "a second to restore");
+        for second in first..=last {
+            let restored = self
+                .restored(second)
+                .unwrap_or_else(|e| panic!("second {second} refused: {e:#}"));
+            let expected = at(&self.history, second).cloned().unwrap_or_default();
+            assert_eq!(restored, expected, "the rows of second {second}");
+        }
+    }
+
+    fn second(&self) -> u64 {
+        self.now.load(Ordering::SeqCst).div_ceil(SECOND_NS)
+    }
+}
+
+/// Decision 45 (lane B22): a base is ended, and the archive is whole through now, while the log's
+/// current segment holds no frame, as it does after a switch until the next commit (the store
+/// switches once a batch is committed, so an idle writer leaves it so). Do: write 20 rows and ship
+/// them, begin a base and copy it, write 5 rows more, start the log again (the writer switches to
+/// `-wal2`, which its first commit writes a header to) and end the base with nothing committed
+/// since; then restore the last commit's second and one 4 s later, when a round has run; then
+/// write 10 rows more, ship, and restore every second. Expect: the base ends, every second
+/// restores with every row committed by then, and the ones written after the switch are in theirs.
+#[test]
+fn d45_a_base_ended_while_the_current_segment_holds_no_frame_restores_every_commit() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.put(20..25, "b");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    let state = log_files(&s.path);
+    s.end_base(base)
+        .unwrap_or_else(|e| panic!("the base refused its end: {e:#}; {state}"));
+    let based = s.second();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    assert_eq!(s.restored(last).unwrap(), s.model, "{state}");
+    // Nothing committed since: a round 5 s later says the archive is whole through them.
+    s.now.fetch_add(5 * SECOND_NS, Ordering::SeqCst);
+    s.ship()
+        .unwrap_or_else(|e| panic!("a round: {e:#}; {state}"));
+    let idle = s.second() - 1;
+    assert_eq!(
+        s.restored(idle).unwrap(),
+        s.model,
+        "a second with no commit"
+    );
+    s.put(25..35, "c");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+}
+
+/// AC-T1.12.3 (lane B22): a restored database is backed up to its archive again. Do: write rows,
+/// ship them and end a base, write more and ship; restore the last second (the restore's replay
+/// empties the log, its file kept with no header), open the restored file backed up to the same
+/// archive, write on, end a base, write more, and restore every second from that base on. Expect:
+/// the shipper opens on the log with no header, and every second restores with its rows.
+#[test]
+fn a_restored_database_is_backed_up_to_its_archive_again() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(20..25, "b");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    let restored = s.dir.path().join("restored.db");
+    backup::restore(&s.blobs, "db", last, &restored, until()).unwrap();
+    let state = log_files(&restored);
+
+    let now = Arc::clone(&s.now);
+    s.hooks = Hooks::new(Arc::new(move || now.load(Ordering::SeqCst)), 1 << 16);
+    s.db = Db::open(&restored).unwrap();
+    s.db.back_up(Arc::clone(&s.hooks));
+    s.path = restored;
+    s.shipper = Shipper::open("db", Arc::clone(&s.hooks), &s.blobs, &s.db, until())
+        .unwrap_or_else(|e| panic!("the shipper refused to open: {e:#}; {state}"));
+    s.put(25..45, "c");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let based = s.second();
+    s.put(45..50, "d");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+}
+
+/// Decision 45 (lane B22): a base begun after a switch holds what the closing segment holds that no
+/// pass has copied into the file yet. Do: write 20 rows, open a read on them and leave it open,
+/// write 20 more, ship, and start the log again: the read keeps the pass from copying the later 20
+/// (the closing segment's frames past its mark). Write 1 row in the new segment, ship it, and copy
+/// a base; then end the read and restore the last second. Expect: the restore holds every row
+/// committed, those 20 too.
+#[test]
+fn d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let slow = s.db.reader().unwrap();
+    slow.exec("BEGIN").unwrap();
+    assert_eq!(rows(&slow).len(), 20);
+    s.put(20..40, "b");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    let state = log_files(&s.path);
+    s.put(40..41, "c");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    assert_eq!(rows(&slow).len(), 20, "the read keeps its snapshot");
+    slow.exec("COMMIT").unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    let restored = s.restored(last).unwrap();
+    let lost: Vec<i64> = s
+        .model
+        .iter()
+        .filter(|(id, v)| restored.get(id) != Some(v))
+        .map(|(id, _)| *id)
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{} rows committed before the base began are lost in its restore: {lost:?}; at the switch {state}",
+        lost.len()
+    );
+    assert_eq!(restored, s.model);
 }
 
 /// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
