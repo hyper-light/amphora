@@ -2325,7 +2325,19 @@ impl Database {
                 "an attached client can't run Amphora's own SQL; run it on the owner",
             ));
         }
-        database.call_db(until, answer, f)
+        let (value, write) =
+            database.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))?;
+        if let (Writer::Replicated { client, .. }, Some(write)) = (&database.shared.writer, write) {
+            // A follower can answer on the group's commit before its own apply. The step's
+            // subsequent clock read must cover the applied entry, including any HLC lift.
+            client
+                .wait_closed(write, None, until)
+                .map_err(|error| match error {
+                    Refusal::Timeout => Refusal::UnknownOutcome,
+                    other => other,
+                })?;
+        }
+        Ok(value)
     }
 
     /// [`Database::call_internal`] for a cross-group step, `f` answering its value and the
@@ -2661,7 +2673,7 @@ impl Database {
     }
 
     /// A replicated group's closed point as a token, for the tests across groups (lane
-    /// xgroup-sql): at or past every write this node has answered. None standalone and for an
+    /// xgroup-sql), at the last local application. None standalone and for an
     /// attached client.
     #[cfg(test)]
     pub(crate) fn closed_token(&self, until: Instant) -> Result<Option<Token>, Refusal> {

@@ -2139,7 +2139,13 @@ mod tests {
             floor: None,
             step,
         };
-        let key = |g: usize| vec![u8::try_from(g).unwrap(), b'a'];
+        let key = |g: usize| {
+            if g == 0 {
+                vec![0, b'a']
+            } else {
+                vec![0xff, b'a']
+            }
+        };
         let serve = |g: usize, carried: u64, step: Step| {
             crate::xgroup::sql::serve(
                 &dbs[g],
@@ -2197,6 +2203,19 @@ mod tests {
             read(1, before),
             Some(None),
             "a read before the lock's stamp isn't held"
+        );
+
+        let last = record_key("n", "f", &key(1)).unwrap();
+        let bound = std::mem::size_of::<Option<Vec<u8>>>().saturating_add(last.len());
+        let held = dbs[1]
+            .call_internal(until(), AnswerMax::bytes(bound), move |db| {
+                crate::xgroup::sql::held_at(db, "n", "f", &[], None, at)
+            })
+            .unwrap();
+        assert_eq!(
+            held,
+            Some(last),
+            "the full-family scan and feed must wait for the last prefix"
         );
 
         let scanning = std::thread::spawn(move || {
