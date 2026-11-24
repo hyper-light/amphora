@@ -1788,6 +1788,101 @@ fn t_qt_6_18_join_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
     assert!(bodied_rows > 0, "no row-returning join ran the body");
 }
 
+/// Lane C2, diagnosis only: writes T-QT.6.18's fixture and statements to `C2_DIR`.
+#[test]
+fn c2_dump_fixture() {
+    use std::io::Write;
+    let Ok(dir) = std::env::var("C2_DIR") else {
+        return;
+    };
+    let conn = open(":memory:c2-dump");
+    let mut rng = ChaCha8Rng::seed_from_u64(618);
+    fill(&conn, &mut rng, "t", 600);
+    fill(&conn, &mut rng, "u", 120);
+    fill(&conn, &mut rng, "v", 50);
+    fill(&conn, &mut rng, "w", 30);
+    let mut out = std::fs::File::create(format!("{dir}/fixture.sql")).unwrap();
+    for name in ["t", "u", "v", "w"] {
+        writeln!(out, "CREATE TABLE {name}(a INTEGER, b INTEGER, c TEXT, p TEXT);").unwrap();
+        for row in sql_rows(&conn, &format!("SELECT rowid, a, b, c, p FROM {name} ORDER BY rowid")) {
+            let values: Vec<String> = row.iter().map(literal).collect();
+            writeln!(out, "INSERT INTO {name}(rowid, a, b, c, p) VALUES ({});", values.join(", ")).unwrap();
+        }
+    }
+    let mut out = std::fs::File::create(format!("{dir}/queries.txt")).unwrap();
+    for query in 0..36usize {
+        let tables: &[&str] = match query % 3 {
+            0 => &["t", "u"],
+            1 => &["t", "u", "v"],
+            _ => &["t", "u", "v", "w"],
+        };
+        let (sql, rows) = random_body_chain(&mut rng, tables);
+        writeln!(out, "{query}|{rows}|{sql}").unwrap();
+    }
+}
+
+/// Lane C2, diagnosis only: T-QT.6.18's loop with each run logged as it starts and as it ends.
+#[test]
+fn c2_trace() {
+    if std::env::var("C2_TRACE").is_err() {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let conn = open(":memory:qt-6-18");
+    let mut rng = ChaCha8Rng::seed_from_u64(618);
+    fill(&conn, &mut rng, "t", 600);
+    fill(&conn, &mut rng, "u", 120);
+    fill(&conn, &mut rng, "v", 50);
+    fill(&conn, &mut rng, "w", 30);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    for query in 0..36usize {
+        let tables: &[&str] = match query % 3 {
+            0 => &["t", "u"],
+            1 => &["t", "u", "v"],
+            _ => &["t", "u", "v", "w"],
+        };
+        let (sql, rows) = random_body_chain(&mut rng, tables);
+        eprintln!("C2 {:8.3} query {query} rows={rows} {sql}", began.elapsed().as_secs_f64());
+        conn.set_parallel_mode(ParallelMode::Off);
+        for step in sql_rows(&conn, &format!("EXPLAIN QUERY PLAN {}", sql.split(" -- ").next().unwrap())) {
+            eprintln!("C2 {:8.3}   plan {:?}", began.elapsed().as_secs_f64(), step.last());
+        }
+        for cores in [0usize, 1, 2, 3, 4, 8] {
+            if cores == 0 {
+                conn.set_parallel_mode(ParallelMode::Off);
+            } else {
+                conn.set_parallel_mode(ParallelMode::On);
+                *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                    NonZeroUsize::new(cores).unwrap(),
+                    1.0,
+                    1.0,
+                ));
+            }
+            let links_before = conn.morsel_join_links.load(std::sync::atomic::Ordering::Relaxed);
+            let body_before = conn.morsel_body_rows.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("C2 {:8.3}   cores {cores} starts", began.elapsed().as_secs_f64());
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut count = 0u64;
+            let mut next = 1u64;
+            stmt.run_with_row_callback(|_| {
+                count += 1;
+                if count == next {
+                    eprintln!("C2 {:8.3}     {count} rows so far", began.elapsed().as_secs_f64());
+                    next *= 4;
+                }
+                Ok(())
+            })
+            .unwrap();
+            eprintln!(
+                "C2 {:8.3}   cores {cores} ends: {count} rows, links {}, body rows {}",
+                began.elapsed().as_secs_f64(),
+                conn.morsel_join_links.load(std::sync::atomic::Ordering::Relaxed) - links_before,
+                conn.morsel_body_rows.load(std::sync::atomic::Ordering::Relaxed) - body_before,
+            );
+        }
+    }
+}
+
 /// A random outer join of `t` and `u` (lane qs6-12), `kind` LEFT, RIGHT or FULL: ON `a`, or `a`
 /// and `c`, with more ON terms on either table or both (so rows on either side match nothing),
 /// WHERE terms that read the padded side's NULLs, and aggregates or rows, with an ORDER BY of
