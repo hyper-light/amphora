@@ -5,6 +5,8 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
 
