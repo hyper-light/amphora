@@ -216,6 +216,20 @@ mod amphora_target {
             ""
         }
 
+        /// Its parameters: its statements are shared by every row of its kind.
+        fn row_bytes(row: &SqlRow) -> usize {
+            let list = std::mem::size_of::<SqlRow>().saturating_add(row.params.capacity().saturating_mul(std::mem::size_of::<Vec<P>>()));
+            row.params.iter().fold(list, |n, ps| {
+                ps.iter().fold(n.saturating_add(ps.capacity().saturating_mul(std::mem::size_of::<P>())), |n, p| {
+                    n.saturating_add(match p {
+                        P::T(s) => s.capacity(),
+                        P::B(b) => b.capacity(),
+                        P::I(_) | P::F(_) | P::Z(_) | P::N => 0,
+                    })
+                })
+            })
+        }
+
         fn apply(&mut self, rows: &[SqlRow]) -> anyhow::Result<usize> {
             self.db.transaction(|db| {
                 for row in rows {

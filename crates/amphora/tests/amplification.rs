@@ -298,6 +298,14 @@ impl Engine for Postings {
         "postings"
     }
 
+    fn row_bytes(call: &Call) -> usize {
+        let grams = match call {
+            Call::Begin(_) => 0,
+            Call::Post { grams, .. } => grams.capacity().saturating_mul(std::mem::size_of::<i64>()),
+        };
+        std::mem::size_of::<Call>().saturating_add(grams)
+    }
+
     fn apply(&mut self, rows: &[Call]) -> anyhow::Result<usize> {
         self.db.transaction(|db| {
             for call in rows {

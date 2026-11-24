@@ -643,3 +643,103 @@ NOT on main. Main moved after r1582, so the merged tree was checked again (r1601
   on_writer)` when `readers.with` gives `None` (store.rs:1484, :1521), queuing a `Msg::Run` on the unbounded
   queue with no charge; `Database::query_reader`'s writer fallback is the place to charge it at admission (its
   `AnswerMax` plus the closure).
+
+## Unit 3's landing re-checked; unit 4 built, unchecked (perf-A16)
+
+**Unit 3.** r1629 (adacachy2, needs linux/amd64,cpus=4,mem=12g, `~/.cache/amphora-perf/cross-a16-scripts/check16.sh`: check15.sh held to 4 jobs and 4 test threads) at c79b2d53 (e0fcbc82 + main 98bd0fa9: pg-parser tests): clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench clippy 164 findings (main's own), 0 compile errors, none on A14's lines; load 42-49. Clippy's `Finished` took 8.67 s after replicated.rs changed: not explained. Main then moved inside `crates/` (engine sums and morsel scans, store.rs and bench suite_db.rs by lanes R4 and W3), so the landing merge b5738b12 (c79b2d53 + main 4b2a9793, branch perf/cross-a16-land) is checked again in r1680's first half. NOT on main.
+
+**Unit 4 (5e5ae655 on perf/cross-a13, unchecked).** r1680's second half: clippy, lib `store::`, `database::`, `xgroup::`, and `--test store`.
+- `Config::queue` and bench's `AMPHORA_QUEUE` deleted; the writer's channel counts nothing. A batch is charged `Engine::row_bytes` (new, required: each engine's inline size plus owned capacity) to the memory budget's room for queues until its commit ends, refused `Full` past it, counted.
+- The room's state (this store's charged bytes) is under `room.0`: a sender holds and checks under the lock and waits on the condvar only until its deadline; `Queued`'s drop gives a batch's bytes back under the lock, then notifies. `ROOM_LOOK` and the two lock-free `notify_all` at take-off are deleted.
+- A sender refused while nothing of its store holds a charge is refused at once: none of its commits could wake the wait, and the budget's other holders (other stores, admissions, caches, resident bytes) signal nothing.
+- `Local::row_bytes` is 0: a Database command is charged at admission until answered.
+- `query_reader`'s writer fallback is charged at admission before it is queued (`Store::on_reader` splits the reader attempt from `read_committed`): its job, its session and `query`'s declared answer. `query_local` and `query_closed` declare no answer, so their fallback charges only the job and session.
+- Test `store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back` (room for one row; deadline an hour off; `Counters::room_waits`, new, as its non-vacuity count) replaces tests/store.rs's counted-queue test.
+- Main 4b2a9793 conflicts with 5e5ae655 in crates/amphora/src/store.rs (W3's flusher change): the next lane merges it.
+
+## Unit 3 landed; unit 4 checked green, not on main (perf-A17)
+
+**Unit 3 on main (626b0a90).** While unit 3 waited, main's V11 (ad4c0922, CP-T1.8) changed `Database::query`: a replicated query runs past its group's barrier as `Operation::Query`, charged a flat `REQUEST_MAX`. The merge 96b83947 keeps both. The replicated arm submits `Operation::Query` charged `answer.get()`, and `within` checks the answer inside the call, as `call_nowait` does. The attached client's session takes `answer.get()` and `within`. Script `~/.cache/amphora-perf/cross-a17-scripts/check17.sh` (check16.sh with `JOBS`, `STORE` and `BENCH`; adacachy2):
+
+| run | commit | result |
+|---|---|---|
+| r1712 | 96b83947 (b5738b12 + main dd9c3ce7) | needs cpus=4: clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34, and V11's `a_follower_read_completes_while_another_member_holds_the_write_slot`, `a_replicated_query_that_writes_is_refused_and_writes_nothing`, `a_read_barrier_asks_for_no_slot_and_ends_its_members_own` 1/1 each; load 34-48 |
+| r1732, first half | 848a16c2 (96b83947 + main c75bb13f: engine types, vdbe, functions) | needs cpus=8: the same set, all green; load 28-33 |
+
+Pushed as 626b0a90: 848a16c2 + main 8c426f7b, which moved only crates/pg-parser and docs/requirements.toml. No crate in the workspace or bench depends on amphora-pg-parser, so no new run. A16's r1684 (macOS, b5738b12, never started) was stopped: r1712 had checked the newer merge.
+
+**Unit 4, NOT on main.** 5e5ae655 merged with unit 3's landing (b7910c4a, cf13e776). store.rs conflicted with W3's flusher change (81fc0dca, via 6a3e8ebb) at the writer's take-off of `Msg::Rows` and `Msg::Run`: W3 deleted `Sends::went_busy`, unit 4 the lock-free `room.1.notify_all`. Both deletions are kept. Unit 4 compiled as A16 wrote it.
+
+| run | commit | result |
+|---|---|---|
+| r1732, second half | cf13e776 | needs cpus=8: clippy -p amphora --all-targets clean; lib `store::` 5/5 (`mb1_` among them), `database::` 253/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; bench clippy 164 findings (main's own count), 0 compile errors, none on unit 4's `row_bytes` lines; load 33-48 |
+| foreground, no id | 848a16c2 and cf13e776 lib binaries | `database::`'s failure alone, `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: 10/10 pass on each binary; load 31-36 |
+| r1756 | the same binaries, `database::` at 8 threads | round 1: 848a16c2 (no unit 4) fails the same test (253/254), cf13e776 passes 254/254; load 23-51 |
+
+The failure is main's own: session_reads.rs:122 asserts `counters.waited == 1` once `behind` was read before the reading thread starts, so under the suite's load the follower can catch up before the read waits. It fails on the arm without unit 4.
+
+Main moved inside `crates/` twice more before the push, so each merge was checked again with the same set:
+
+| run | commit | result |
+|---|---|---|
+| r1762 | a36e1cce (22ccfa30 + main 41422da9: R5's engine sums and column scans) | needs cpus=8: clippy clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; bench clippy 164 findings, 0 compile errors, none on unit 4's lines; load 21-34 |
+| r1776 | 3c9425d3 (a36e1cce + main ef34f511: W4's store.rs, decision 9, and its crash test) | needs cpus=8: clippy clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; tests/crash.rs 10/10 (3 ignored); bench clippy 164 findings, 0 compile errors, none on unit 4's lines; load 19-37 |
+
+3c9425d3 conflicted in store.rs's `Sends`: W4 replaced `claimed: Mutex<u64>` with `claims: Mutex<Claims>`, unit 4 made `room` a `(Mutex<u64>, Condvar)`. Both kept.
+
+Seen on the way, not changed:
+- `Budget::hold` refuses `Unavailable` where the memory limit can't be read. `Store::charge` treats every refusal as no room, so on such a platform a batch with a nonzero `row_bytes` is refused `Full` at once, as `Admission::charge` already refuses a database's requests there.
+- r1740 (the first try of the 10/10 runs) ended and was collected before its output was read: the kiln server did not answer in time.
+- Unit 4's push of 99b67668 (3c9425d3 + records-only main) was rejected: main had moved inside `crates/` (B15's engine WAL, d0660c11). Its merge ff71d6f8 (on perf/cross-a13) is unchecked. adacachy2 refused its check at cpus=8 (r1781) and at cpus=4 (r1784): 0 of 32 cores idle, 23:54Z. Next lane: run check17.sh at ff71d6f8 (or a fresh merge) with `JOBS=4 STORE=1 BENCH=0` and `store:: database:: xgroup::`; if green and main moved only outside amphora's build, merge and push HEAD:main.
+
+## Unit 4 and a wait for room woken by any charge given back (perf-A18)
+
+**Where the checks ran.** macOS first: r1795 (unit 4's landing) and r1841 (the wait, then the red run) waited 26 and
+20 minutes for a Mac with 8 idle cores (no Mac answered the balancer's probes; at 00:26Z the kiln server could not be
+reached from adacachy) and were stopped before they started once r1892 ran the same checks. adacachy2 refused
+cpus=8 (4 of 32 cores idle) and cpus=4 (0 of 32 idle) at 00:16Z, then admitted cpus=4 at 00:27Z. Script
+`~/.cache/amphora-perf/cross-a18-scripts/check18.sh` (check17.sh with `CRASH=1` for tests/crash.rs and `CLIPPY=0`).
+
+| run | commit | result |
+|---|---|---|
+| r1892, first part | 14e6d081 (unit 4: ff71d6f8 + main a34b83b1, then main 2f29b288: engine page cache, on-disk format, learned costs) | needs cpus=4: clippy -p amphora --all-targets clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 33/34; tests/store.rs 14/14; load 54-113 |
+| r1892, second part | 72d62e76 (the wait on 14e6d081) | clippy clean; `store::` 6/6, `database::` 254/254 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 103-140 |
+| r1892, third part | dbeb960a (14e6d081's unit 4 + the new test alone) | red: the new test fails in 0.06 s at store.rs:1849 (`waiter.join().unwrap().unwrap()`: store B's `put_wait` refused `Full` at once) |
+
+r1892's one `xgroup::` failure on 14e6d081: `xgroup::lan::tests::t_t1_9_r18_the_lan_harness_runs_over_network_endpoints`
+panicked at lan.rs:720 (`measure(..).unwrap()`; its error was not captured). The `xgroup::` run took 17.95 s against
+the measurement's 120 s deadline (`transport::HANG`), so it was not the deadline. It passed on 72d62e76, which holds
+all of 14e6d081. Not run alone: adacachy2 refused cpus=2 at 00:34Z (0 of 32 idle). Whether unit 4's refusal at once
+refused one of the harness's writes, which the wait now makes wait, is not shown.
+
+**The wait (bdfb19ff, f4e87ed0).** A sender whose store held no charge was refused `Full` at once, since only its own
+store's commits woke the wait. Now the budget wakes its waiters:
+- `memory::Budget::take_until` looks for room and, finding none, waits until its holder's deadline, woken only by
+  charges given back anywhere in the budget (`Budget::give`: every `Charge`'s drop and the caches' give-back), never by a
+  timer. A refusal other than no room (`Unavailable`) returns at once.
+- A give with no holder waiting takes no lock. Holders waiting are counted. The waiter counts itself, then a SeqCst
+  fence, then looks. The giver's give-back and its read of the count are SeqCst. So the look sees the bytes given back
+  or the giver sees the waiter (C++ [atomics.order]'s single total order; Linux's `waitqueue_active`).
+- store.rs's `Queued` and `Sends::room` are gone: a batch's charge is a `memory::Charge`, and `Store::charge` asks the
+  budget to wait (`room_waits` counts each wait, under the budget's lock).
+- The rule is in docs/design/store.md, "Decision (lane perf-A18): a wait for room is woken by any charge given back".
+- Test: `store::tests::mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back` (store B, holding no charge,
+  waits with a deadline an hour off; store A's commit gives its charge back; B's row is taken, one wait counted).
+
+Seen on the way, not changed:
+- A batch past the whole limit waits out its deadline: no give can make room for it. Resident bytes that fall wake no one.
+- A give wakes every waiter, and each looks again.
+- `Budget::give`'s give-back and read are SeqCst where they were AcqRel and absent: the same instructions on x86-64
+  (a locked `cmpxchg`, a plain `mov`), an `ldar` for an `ldr` on aarch64. Not measured: the A/B runs after the merge (rule 5b).
+- Requests admitted to a database (`Admission`, serve.rs's frames) still refuse at once; only a store's `put_wait` and
+  `put_then` wait.
+
+Main moved inside `crates/engine` twice more before the push, so each merge was checked again with the same set:
+
+| run | commit | result |
+|---|---|---|
+| r1922 | ffe2fa35 (72d62e76 + main a48b29f2: R6's column copy choice) | needs cpus=4: clippy clean; `store::` 6/6, `database::` 254/254 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 65-105 |
+| r1940 | 473b207e (ffe2fa35 + this record + main 90c1ff8d: B16's checkpointer segment) | needs cpus=4: the same, all green; load 28-81 |
+| r1944 | c1c0e531 (473b207e + these rows + main b1a92917: V13's database/replicated.rs and slot.rs) | needs cpus=4: clippy clean; `store::` 6/6, `database::` 256/256 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 17-26 |
+
+Unit 4 (14e6d081) and the wait (bdfb19ff, f4e87ed0) land together. Unit 4 alone was not pushed first: its own check had `xgroup::` 33/34, and the tree with the wait was green on every check.
