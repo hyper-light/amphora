@@ -10,6 +10,7 @@ split of the runs.
 """
 import glob
 import itertools
+import math
 import json
 import os
 import re
@@ -47,6 +48,11 @@ def mann_whitney(a, b):
         return None, None
     u = u_of(a, b)
     pooled = a + b
+    if math.comb(len(pooled), len(a)) > 20000:
+        # Too many splits to count: the normal approximation (no tie correction), two-sided.
+        n1, n2 = len(a), len(b)
+        z = (u - n1 * n2 / 2) / math.sqrt(n1 * n2 * (n1 + n2 + 1) / 12)
+        return min(u, n1 * n2 - u), min(1.0, math.erfc(abs(z) / math.sqrt(2)))
     us = [u_of([pooled[i] for i in s], [pooled[i] for i in range(len(pooled)) if i not in s])
           for s in map(set, itertools.combinations(range(len(pooled)), len(a)))]
     lo = sum(1 for x in us if x <= u) / len(us)
