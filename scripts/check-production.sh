@@ -5,9 +5,9 @@
 #
 # The engine (crates/engine*) came from Turso with code that predates the rule: its crates are
 # counted instead, lint by lint, against scripts/engine-ratchet.toml, and a count may only fall.
-# They are counted as the binary Amphora ships builds them (`cargo build --release --locked -p
-# amphora`: docs/runbook.md, scripts/cluster.sh), with the engine features that build turns on;
-# what only tests, simulators, fuzzers or a build of the whole workspace turn on doesn't ship.
+# They are counted with the engine features the binary Amphora ships turns on (`cargo build --release
+# --locked -p amphora`: docs/runbook.md, scripts/cluster.sh), in the dev profile; what only tests,
+# simulators, fuzzers or a build of the whole workspace turn on doesn't ship.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 rule=(

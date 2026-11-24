@@ -7,7 +7,17 @@ kept, committed as found (f49bdd80) and measured by this lane.
 
 ## Losses first
 
-- Nothing rose. Every ceiling fell or held, each now the count of the shipping build.
+- No test runs any of the new error returns: the suites below exercise the paths where the invariant holds.
+  `commit_main_mvcc_tx_for_wal_session` has no caller in the repository (crates, vendor, bench), so nothing
+  runs that edit at all.
+- The gate counts the features that ship, not the profile that ships. It lints the dev profile, as it did
+  before this lane; the binary ships as `--release`, where `debug_assertions` is off. 54 `cfg(debug_assertions)`
+  and 3 `cfg(not(debug_assertions))` lines in the engine crates differ between the two. Measured at
+  15dd57d8 (r452): the dev profile counts 10617, `--release` 10499. No site is in the release build alone, so
+  nothing that ships goes uncounted; 118 counted sites are debug-only and don't ship (arithmetic_side_effects 21,
+  cast_possible_truncation 15, disallowed_macros 35, indexing_slicing 27, panic 2, unreachable 3, unwrap_used 15).
+  For Ada: should the gate count `--release` instead? The ceilings would fall by those 118.
+- No ceiling rose. Every one fell or held, each now the count of the shipping build's features.
 - README.md:47 says `cargo build --release` (no `-p`), and the workspace has no `default-members`, so
   it builds every workspace member, the engine with its own default features as well. The shipped build
   is the runbook's, `cargo build --release --locked -p amphora` (docs/runbook.md:12-13,
@@ -16,8 +26,8 @@ kept, committed as found (f49bdd80) and measured by this lane.
   `page.get().id() as u32`, cast_possible_truncation, compiled only with `autovacuum` off, as the shipped
   build has it. It is inside the new ceiling (519), not one of the 12, left as inherited code.
 - Behaviour on impossible input changed from a panic to an error value (listed under "Changed" below);
-  no caller relied on the panic (the one caller of `write_schema_version`, crates/amphora/src/db.rs:1258,
-  returns its errors).
+  no caller relied on the panic (the one caller of `write_schema_version`, crates/amphora/src/db.rs:1268
+  at 15dd57d8, returns its errors).
 
 ## What ships, and the engine features it turns on
 
@@ -90,8 +100,9 @@ build only, and 1 in the engine-alone pass only, net 12.
 | total | 10903 | 10617 | 10903 |
 
 "The old gate's count at this commit" is `-p amphora-engine ...` with the engine's default features (F4's way),
-re-measured on this tree. Main's shipping build at a64549cc: 10630 (the 13 sites, then counted by neither gate,
-and `pager.rs:3334`).
+re-measured on this tree. Main's shipping build at a64549cc: 10630 (the 10617
+left and the 13 this lane fixed). The old gate compiled none of those 13 (`conn_raw_api` off), nor `pager.rs:3334`
+(`autovacuum` on).
 
 ## Checks (adacachy2, Rust 1.99.1, CARGO_HOME/CARGO_TARGET_DIR per RULES rule 6)
 
@@ -118,8 +129,9 @@ and `pager.rs:3334`).
   added no counted site to the shipping build); workspace clippy `--all-targets -D warnings` exit 0 in 45 s;
   `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- mvcc::`: 558 passed, 0 failed, 12 ignored.
 - `cargo fmt --all --check`: exit 0 (this machine, 5237f16e and the merge).
-- macOS run r351 (portable checks) queued behind others and never started; nothing here relies on it. The
-  engine suites were run on Linux with `conn_raw_api` instead.
+@@LIB@@
+- macOS run r351 (portable checks, no `on`) queued and never started; stopped at 05:36Z, unneeded. Its last
+  candidate was runner 2768d0d5, which RULES rule 6 forbids: a macOS run without `on` can be placed there.
 
 ## Commands
 
