@@ -122,7 +122,11 @@ fn t_qb_1_19_the_first_in_line_is_the_first_admitted_and_no_place_is_taken_twice
             let (order, holding) = (Arc::clone(&order), Arc::clone(&holding));
             move |placed: Placed<'_>| {
                 let placed = placed.unwrap();
-                assert_eq!(holding.fetch_add(1, Ordering::SeqCst), 0, "two hold one place");
+                assert_eq!(
+                    holding.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "two hold one place"
+                );
                 order.lock().unwrap().push(id);
                 holding.fetch_sub(1, Ordering::SeqCst);
                 drop(placed);

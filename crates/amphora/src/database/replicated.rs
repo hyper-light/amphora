@@ -144,8 +144,8 @@ mod sync {
 }
 mod tokens;
 mod waiting;
-pub use tokens::{ReadMode, Served, SessionCounters, Token};
 use line::{Reservation, Room};
+pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
@@ -3578,7 +3578,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             outgoing.over = None;
         }
         drop(outgoing);
-        self.control.room.queued.store(bounds.queued, Ordering::SeqCst);
+        self.control
+            .room
+            .queued
+            .store(bounds.queued, Ordering::SeqCst);
         self.control
             .room
             .applications
@@ -6326,7 +6329,10 @@ mod tests {
         assert!(matches!(refused, Some(Refusal::Full { .. })), "{refused:?}");
         assert_eq!(budget.held(crate::memory::Use::Queues), written(48 << 20));
         assert_eq!(budget.waiting(), 0);
-        assert_eq!(handle.shared.room.admitted.load(Ordering::Acquire), admitted);
+        assert_eq!(
+            handle.shared.room.admitted.load(Ordering::Acquire),
+            admitted
+        );
     }
 
     /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write past the memory budget's whole limit
@@ -6904,7 +6910,10 @@ mod tests {
             } else {
                 handle.alone_bound()
             };
-            assert!(most > handle.application_bound(), "a call past the calls' room");
+            assert!(
+                most > handle.application_bound(),
+                "a call past the calls' room"
+            );
             let call = on_budget(&budget, || {
                 waiting_call(&handle, most - whole, until, &evaluated)
             });
@@ -7038,6 +7047,13 @@ mod tests {
         }
     }
 
+    /// The first member's owner takes the next input from its channel and steps with it, and no more.
+    fn take_one(driven: &mut Driven) {
+        let (owner, inputs) = driven.owners.first_mut().unwrap().as_mut().unwrap();
+        let input = inputs.try_recv().unwrap();
+        owner.run_step(Some(input)).unwrap();
+    }
+
     /// QB.1 (T-QB.1.21, lane perf-A27): a call granted a place whose budget room went meanwhile gives
     /// the place back, is never admitted without its charge, and waits for the budget again until that
     /// room comes back, or is `Full` at its deadline. Do: on a leaderless member whose queue holds one
@@ -7070,10 +7086,7 @@ mod tests {
             };
             let queued = call(0, until)();
             assert!(queued.is_ok(), "{:?}", queued.err());
-            let large = std::thread::spawn(call(
-                32 << 20,
-                if given_back { until } else { soon },
-            ));
+            let large = std::thread::spawn(call(32 << 20, if given_back { until } else { soon }));
             in_line(&handle, 1, || large.is_finished());
             let small = std::thread::spawn(call(0, until));
             in_line(&handle, 2, || small.is_finished());
@@ -7081,7 +7094,7 @@ mod tests {
             // Room for the queued call and the small one, none for the large.
             let room = (64 << 20) - 2 * written(0);
             let other = budget.take(Use::Images, room).unwrap();
-            driven.step();
+            take_one(&mut driven);
             let began = Instant::now();
             while budget.waiting() == 0 && !large.is_finished() {
                 assert!(began.elapsed() < crate::transport::HANG, "a hang");
@@ -7110,13 +7123,10 @@ mod tests {
             drop(other);
             in_line(&handle, 1, || large.is_finished());
             assert_eq!(budget.held(Use::Queues), 2 * written(0), "a charge in line");
-            driven.step();
+            take_one(&mut driven);
             let large = large.join().unwrap();
             assert!(large.is_ok(), "{:?}", large.err());
-            assert_eq!(
-                budget.held(Use::Queues),
-                2 * written(0) + written(32 << 20)
-            );
+            assert_eq!(budget.held(Use::Queues), 2 * written(0) + written(32 << 20));
             assert_eq!(
                 handle.shared.room.charged.load(Ordering::SeqCst),
                 usize::try_from(budget.held(Use::Queues)).unwrap()
@@ -7198,16 +7208,14 @@ mod tests {
                                 crate::transport::HANG
                             };
                         // Sizes from a few bytes to past the calls' room, taken alone.
-                        let bytes = [16, 1 << 10, 1 << 14, 1 << 17, 600 << 10]
-                            [(writer + call) % 5]
-                            + call;
-                        let placed =
-                            on_budget(&budget, || Room::submit_by(&room, bytes, until).map(
-                                |(place, turn)| {
-                                    sender.send(place).unwrap();
-                                    drop(turn);
-                                },
-                            ));
+                        let bytes =
+                            [16, 1 << 10, 1 << 14, 1 << 17, 600 << 10][(writer + call) % 5] + call;
+                        let placed = on_budget(&budget, || {
+                            Room::submit_by(&room, bytes, until).map(|(place, turn)| {
+                                sender.send(place).unwrap();
+                                drop(turn);
+                            })
+                        });
                         match placed {
                             Ok(()) => {}
                             Err(Refusal::Full { .. }) if near => full += 1,
@@ -7586,7 +7594,8 @@ mod tests {
                         .map_or(0, |client| client.handle().queue_bound());
                     let full = self.clients.iter().any(|client| {
                         let handle = client.handle();
-                        handle.shared.room.commands.load(Ordering::Acquire) >= handle.command_bound()
+                        handle.shared.room.commands.load(Ordering::Acquire)
+                            >= handle.command_bound()
                     });
                     if full || self.bytes + MESSAGE_BYTES > bound {
                         break;
