@@ -11,9 +11,11 @@ Verdict, losses first.
 - SUM over a REAL *column* still doesn't reach the copy: the translator takes SUM only over INTEGER
   columns, as before. Only a stray REAL in an INTEGER column reaches the copy's SUM, and it is
   handed back. MIN, MAX, COUNT(col) and GROUP BY over a REAL column are still refused (not asked).
-- `cb4_ab_both_rebuy_policies_at_the_extremes` failed in r148 (section 4). Its tables have no REAL
-  column and its statements no parameter, so nothing this lane changed runs in it. r183 runs it on
-  main and on the lane to show it.
+- `cb4_ab_both_rebuy_policies_at_the_extremes` fails, and it fails on main too: on 7de5344d (main
+  before R9, r197), on 9fbfdbaf (main with R9, r183) and on the lane (r148, r183, r135), always the
+  same line. Its "both at fleet scale" scenario under `A_rent` drops no copy (`dropped: 0`, asked
+  320, granted 320, build_rows 6528), and the test expects at least one under `Press::Waves`. Its
+  tables have no REAL column and its statements no parameter. Not this lane's; left for its owner.
 - check-production failed once (r148): `bool::then_some` is a disallowed method, and the engine's
   ratchet counted 41 against 40. Fixed in caabee3d.
 
@@ -65,13 +67,22 @@ declared table (three runs), an undeclared one (three runs) and the pager's stor
 
 ## 4. Runs
 
-- r135 (MacBook Pro 2, `cpus=4,mem=12g`, a4fdde43, load 38 to 92): clippy exit 0 at 03:46:18Z.
+- r135 (MacBook Pro 2, `cpus=4,mem=12g`, a4fdde43, load 37 to 92): clippy exit 0 at 03:46:18Z.
+  The focused tests passed on macOS too (handed 540, read by the copy 484). Suites 39 passed, 1
+  failed (cb4, as on Linux). check-production exit 1, the ratchet's `then_some` (fixed after).
 - r148 (adacachy2, `cpus=8,mem=24g`, 8e3685e2): check-production exit 1 (the ratchet, above).
   Focused tests passed. Suites (`columns_sql::`, `columns_path::`, `columns::scan::`,
   `vdbe::morsel::`, `vdbe::morsel_scan_tests::`, `translate::parallel::`): 39 passed, 1 failed,
   `cb4_ab_both_rebuy_policies_at_the_extremes` at `columns_sql.rs:2665` (`dropped > 0` under
   `Press::Waves`).
 - r178, then r183's first ask: refused, adacachy2 had 0 and then 3 of 32 cores idle.
+- r183 (adacachy2, `cpus=3,mem=9g`, caabee3d): check-production exit 0, "10903 left in the engine's
+  production code across 17 lints, as the ratchet holds". cb4 fails on caabee3d and on main 9fbfdbaf.
+- r197 (adacachy2, `cpus=3,mem=9g`): cb4 fails on 7de5344d, main before R9, at the same assertion.
+- r200 (adacachy2, `cpus=4,mem=12g`, ad4db46e = the lane merged with main c67455f6, which moved in
+  crates/engine with T19's Postgres dialect): clippy exit 0, the three focused tests passed (r10:
+  handed 540, read by the copy 484; S8 filter_no_index `path=Rows` once, `path=Copy` once),
+  check-production exit 0 with the ratchet holding.
 
 ## 5. What the next lane inherits
 
