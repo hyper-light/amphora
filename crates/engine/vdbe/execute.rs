@@ -6397,22 +6397,6 @@ pub fn op_program(
                                 return Err(error.into());
                             }
                         },
-                        Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                subprogram_aborted = true;
-                                finish_subprogram(
-                                    program,
-                                    &statement,
-                                    is_trigger,
-                                    subprogram_aborted,
-                                    saved_last_insert_rowid,
-                                    saved_last_changes_value,
-                                );
-                                return Err(LimboError::Constraint(constraint_err).into());
-                            }
-                            subprogram_aborted = true;
-                            break;
-                        }
                         Err(LimboError::RaiseIgnore) => {
                             raise_ignore = true;
                             subprogram_aborted = true;

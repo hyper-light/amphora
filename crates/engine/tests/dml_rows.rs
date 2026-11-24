@@ -1,7 +1,9 @@
-//! AC-T1.8.6: the rows INSERT, UPSERT, REPLACE and UPDATE store, and the NEW and OLD values their
-//! triggers see, as SQLite 3.54.0 has them: `excluded.*` for every column, the rowid and its aliases,
-//! STRICT or not, with a rowid or without, generated columns among them (the oracles' findings DA and
-//! CV, lane C14). T-T1.7.1: every record read back as written.
+//! AC-T1.8.6: the rows INSERT, UPSERT, REPLACE, UPDATE and DELETE store, and the NEW and OLD values
+//! their triggers see, as SQLite 3.54.0 has them: `excluded.*` for every column, the rowid and its
+//! aliases, STRICT or not, with a rowid or without, generated columns among them (the oracles' findings
+//! DA and CV, lane C14), and what Amphora refused of them: STRICT beside WITHOUT ROWID, triggers on
+//! WITHOUT ROWID tables, OR IGNORE of a NULL in a STRICT table's key, a subquery in DO UPDATE (lane C19).
+//! T-T1.7.1: every record read back as written.
 
 use amphora_engine::morsel::ParallelMode;
 use amphora_engine::{
@@ -322,6 +324,184 @@ fn a_column_named_as_the_rowid_is_that_column() {
         ),
         ("SELECT * FROM w", "1,11"),
     ]);
+}
+
+/// Do: create a table STRICT and WITHOUT ROWID, in both orders, and write to it. Expect: SQLite's types, its NULL key refused, and no rowid. Its options were written to the schema
+/// with no comma between them, and the schema refused: 7,701 of the oracles' setup refusals.
+#[test]
+fn a_table_is_strict_and_without_rowid() {
+    for options in [
+        "STRICT, WITHOUT ROWID",
+        "WITHOUT ROWID, STRICT",
+        "strict,without rowid",
+    ] {
+        answers_as_sqlite(&[
+            (
+                &format!("CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) {options}"),
+                "ok",
+            ),
+            ("INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL)", "ok"),
+            (
+                "INSERT INTO t VALUES ('b', 'x', 1)",
+                "cannot store TEXT value in INT column t.n",
+            ),
+            (
+                "INSERT INTO t VALUES (NULL, 1, 1)",
+                "NOT NULL constraint failed: t.k",
+            ),
+            (
+                "INSERT INTO t VALUES ('a', 1, 1)",
+                "UNIQUE constraint failed: t.k",
+            ),
+            (
+                "INSERT INTO t VALUES ('a', 1, 1) ON CONFLICT(k) DO UPDATE SET r = excluded.n",
+                "ok",
+            ),
+            ("ALTER TABLE t RENAME COLUMN n TO m", "ok"),
+            ("UPDATE t SET m = m + 1, k = k || 'z'", "ok"),
+            (
+                "SELECT * FROM t",
+                "'7z',9,r4022000000000000 / 'az',2,r3ff0000000000000",
+            ),
+            ("SELECT rowid FROM t", "no such column: rowid"),
+            ("SELECT * FROM pragma_integrity_check", "'ok'"),
+        ]);
+    }
+}
+
+/// Do: INSERT, UPDATE, DELETE and UPSERT rows of a WITHOUT ROWID table with BEFORE and AFTER triggers of
+/// each event that log NEW and OLD; a trigger that ignores a row; one for `new.rowid`. Expect: SQLite's
+/// log and rows. UPDATE, DELETE and REPLACE beside a trigger were refused, and an UPDATE OF trigger
+/// panicked (finding CP); `new.rowid` was a register's leftover.
+#[test]
+fn triggers_fire_on_a_table_without_rowid() {
+    let mut statements: Vec<(String, &str)> = vec![
+        (
+            "CREATE TABLE t(v TEXT, k INT, n REAL, PRIMARY KEY(k)) WITHOUT ROWID".to_owned(),
+            "ok",
+        ),
+        ("CREATE INDEX i ON t(v)".to_owned(), "ok"),
+        ("CREATE TABLE lg(e, k, v, n, ok, ov)".to_owned(), "ok"),
+    ];
+    for (event, values) in [
+        ("BEFORE INSERT", "new.k, new.v, new.n, NULL, NULL"),
+        ("AFTER INSERT", "new.k, new.v, new.n, NULL, NULL"),
+        ("BEFORE UPDATE", "new.k, new.v, new.n, old.k, old.v"),
+        ("AFTER UPDATE OF v", "new.k, new.v, new.n, old.k, old.v"),
+        ("BEFORE DELETE", "NULL, NULL, NULL, old.k, old.v"),
+        ("AFTER DELETE", "NULL, NULL, NULL, old.k, old.v"),
+    ] {
+        let name = event.replace(' ', "_");
+        let sql = format!("CREATE TRIGGER {name} {event} ON t BEGIN INSERT INTO lg VALUES ('{event}', {values}); END");
+        statements.push((sql, "ok"));
+    }
+    let rest = [
+        ("INSERT INTO t VALUES (1, '5', 2)", "ok"),
+        ("SELECT e, k, v, n FROM lg", "'AFTER INSERT',5,'1',r4000000000000000 / 'BEFORE INSERT',5,'1',r4000000000000000"),
+        ("DELETE FROM lg", "ok"),
+        ("UPDATE t SET v = 'x', k = 6", "ok"),
+        ("UPDATE t SET n = 3", "ok"),
+        ("SELECT * FROM lg", "'AFTER UPDATE OF v',6,'x',r4000000000000000,5,'1' / 'BEFORE UPDATE',6,'x',r4000000000000000,5,'1' / 'BEFORE UPDATE',6,'x',r4008000000000000,6,'x'"),
+        ("DELETE FROM lg", "ok"),
+        ("INSERT INTO t VALUES ('y', 6, 0) ON CONFLICT(k) DO UPDATE SET v = excluded.v || t.v", "ok"),
+        ("SELECT e, v, ov FROM lg", "'AFTER UPDATE OF v','yx','x' / 'BEFORE INSERT','y',NULL / 'BEFORE UPDATE','yx','x'"),
+        ("DELETE FROM lg", "ok"),
+        ("INSERT OR REPLACE INTO t VALUES ('z', 6, 0)", "ok"),
+        ("SELECT e, v FROM lg", "'AFTER INSERT','z' / 'BEFORE INSERT','z'"),
+        ("DELETE FROM lg", "ok"),
+        ("DELETE FROM t WHERE v = 'z'", "ok"),
+        ("SELECT e, ok, ov FROM lg", "'AFTER DELETE',6,'z' / 'BEFORE DELETE',6,'z'"),
+        ("SELECT * FROM t", ""),
+        ("CREATE TRIGGER skip BEFORE UPDATE ON t WHEN new.n > 5 BEGIN SELECT RAISE(IGNORE); END", "ok"),
+        ("INSERT INTO t VALUES ('a', 1, 1), ('b', 2, 2)", "ok"),
+        ("UPDATE t SET n = n + 4", "ok"),
+        ("SELECT k, n FROM t", "1,r4014000000000000 / 2,r4000000000000000"),
+        ("CREATE TRIGGER names AFTER INSERT ON t BEGIN INSERT INTO lg(e) VALUES (new.rowid); END", "ok"),
+        ("INSERT INTO t VALUES ('c', 3, 3)", "no such column: new.rowid"),
+        ("SELECT * FROM pragma_integrity_check", "'ok'"),
+    ];
+    let mut lines: Vec<(&str, &str)> = statements.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+    lines.extend(rest);
+    answers_as_sqlite(&lines);
+}
+
+/// Do: OR IGNORE, OR REPLACE and OR ABORT of a NULL in a STRICT table's key and in a NOT NULL column, on
+/// INSERT and UPDATE, one beside a value of a type its column refuses. Expect: SQLite's rows: a STRICT
+/// table's key is NOT NULL as any column is (stricttables.html), asked before the types are, and the
+/// default put in for a NULL is converted. A NULL key was refused whatever the OR clause, and the
+/// default was stored as typed.
+#[test]
+fn a_strict_tables_key_is_not_null_as_any_column_is() {
+    answers_as_sqlite(&[
+        (
+            "CREATE TABLE t(k TEXT PRIMARY KEY, n INT NOT NULL DEFAULT '7') STRICT",
+            "ok",
+        ),
+        (
+            "INSERT OR IGNORE INTO t VALUES ('a', 1), (NULL, 2), ('b', NULL), (NULL, 'x'), ('c', 3)",
+            "ok",
+        ),
+        ("SELECT * FROM t", "'a',1 / 'c',3"),
+        ("INSERT INTO t VALUES (NULL, 2)", "NOT NULL constraint failed: t.k"),
+        ("INSERT OR REPLACE INTO t VALUES (NULL, 2)", "NOT NULL constraint failed: t.k"),
+        ("INSERT OR REPLACE INTO t VALUES ('b', NULL)", "ok"),
+        ("UPDATE OR IGNORE t SET k = NULL WHERE k = 'a'", "ok"),
+        ("UPDATE t SET k = NULL", "NOT NULL constraint failed: t.k"),
+        ("SELECT k, n, typeof(n) FROM t", "'a',1,'integer' / 'b',7,'integer' / 'c',3,'integer'"),
+        ("SELECT name, \"notnull\" FROM pragma_table_info('t')", "'k',1 / 'n',1"),
+    ]);
+    answers_as_sqlite(&[
+        (
+            "CREATE TABLE t(a INT DEFAULT 5, b TEXT, PRIMARY KEY(a, b)) STRICT",
+            "ok",
+        ),
+        (
+            "INSERT OR IGNORE INTO t VALUES (1, NULL), (NULL, 'x'), (2, 'y')",
+            "ok",
+        ),
+        ("INSERT OR REPLACE INTO t VALUES (NULL, 'z')", "ok"),
+        ("SELECT * FROM t", "2,'y' / 5,'z'"),
+        (
+            "CREATE TABLE i(a INTEGER PRIMARY KEY, b) STRICT",
+            "missing datatype for i.b",
+        ),
+        ("CREATE TABLE i(a INTEGER PRIMARY KEY, b ANY) STRICT", "ok"),
+        ("INSERT INTO i VALUES (NULL, 1)", "ok"),
+        ("SELECT * FROM i", "1,1"),
+    ]);
+}
+
+/// Do: subqueries in DO UPDATE's SET and WHERE, reading excluded, the conflicting row, the target table
+/// and a CTE, on several rows, with a rowid and without. Expect: SQLite's rows: each was refused
+/// ("Subquery is not supported in this position").
+#[test]
+fn do_update_holds_subqueries() {
+    for options in ["", " STRICT", " WITHOUT ROWID", " STRICT, WITHOUT ROWID"] {
+        answers_as_sqlite(&[
+            (
+                &format!("CREATE TABLE kv(id INTEGER PRIMARY KEY, n INT, m INT){options}"),
+                "ok",
+            ),
+            ("CREATE TABLE s(b INT)", "ok"),
+            ("INSERT INTO s VALUES (2), (30)", "ok"),
+            ("INSERT INTO kv VALUES (1, 5, 0), (2, 6, 0)", "ok"),
+            ("INSERT INTO kv VALUES (1, 7, 1), (2, 70, 2) ON CONFLICT(id) DO UPDATE SET n = (SELECT excluded.n + 1), m = (SELECT max(b) FROM s WHERE b > excluded.n)", "ok"),
+            ("SELECT * FROM kv", "1,8,30 / 2,71,NULL"),
+            ("INSERT INTO kv VALUES (1, 7, 1), (2, 70, 2) ON CONFLICT(id) DO UPDATE SET (n, m) = (SELECT kv.n + excluded.n, count(*) FROM s WHERE s.b < kv.n)", "ok"),
+            ("SELECT * FROM kv", "1,15,1 / 2,141,2"),
+            ("INSERT INTO kv VALUES (1, 1, 1), (2, 2, 2) ON CONFLICT(id) DO UPDATE SET n = excluded.n IN (SELECT b FROM s) WHERE EXISTS (SELECT 1 FROM s WHERE b = excluded.m)", "ok"),
+            ("SELECT * FROM kv", "1,15,1 / 2,1,2"),
+            ("INSERT INTO kv VALUES (1, 1, 1), (2, 2, 2) ON CONFLICT(id) DO UPDATE SET n = (SELECT sum(n) FROM kv), m = (SELECT count(*) FROM kv x WHERE x.n < kv.n)", "ok"),
+            ("SELECT * FROM kv", "1,16,1 / 2,16,0"),
+            ("INSERT INTO kv AS q VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT q.n + excluded.id FROM s LIMIT 1)", "ok"),
+            ("WITH c(x) AS (SELECT 100) INSERT INTO kv SELECT 2, 1, 1 WHERE true ON CONFLICT(id) DO UPDATE SET n = (SELECT x FROM c)", "ok"),
+            ("SELECT * FROM kv", "1,17,1 / 2,100,0"),
+            ("INSERT INTO kv VALUES (1, 9, 1), (2, 10, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT t.y FROM (SELECT excluded.n AS y) AS t), m = (SELECT b FROM s AS excluded WHERE excluded.b = 30)", "ok"),
+            ("SELECT * FROM kv", "1,9,30 / 2,10,30"),
+            ("INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT excluded.nosuch)", "no such column: excluded.nosuch"),
+            ("INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET (n, m) = (SELECT 1)", "2 columns assigned 1 values"),
+        ]);
+    }
 }
 
 /// One line of a case: what it is (a CREATE, a statement, a query), its SQL, and SQLite's answer.

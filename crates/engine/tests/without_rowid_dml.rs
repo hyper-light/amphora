@@ -93,8 +93,12 @@ fn upsert_update_aborts_without_changing_outer_fail_policy() {
     );
 }
 
+/// Do: REPLACE a row of a WITHOUT ROWID table with a DELETE trigger, and one of a table with a generated
+/// column. Expect: the first is replaced and its trigger doesn't fire ("delete triggers fire if and only
+/// if recursive triggers are enabled", sqlite.org/lang_conflict.html, and they are not), and the second
+/// is refused with nothing written.
 #[test]
-fn replace_refuses_unsupported_delete_trigger_and_generated_image_before_writing() {
+fn replace_fires_no_delete_trigger_and_refuses_a_generated_image_before_writing() {
     let io = Arc::new(MemoryIO::new());
     let database = Database::open(
         io.clone(),
@@ -113,24 +117,21 @@ fn replace_refuses_unsupported_delete_trigger_and_generated_image_before_writing
         "INSERT INTO triggered VALUES('a',1)",
         "CREATE TRIGGER deleted AFTER DELETE ON triggered BEGIN INSERT INTO audit VALUES(1); END",
         "CREATE TABLE generated(k TEXT PRIMARY KEY,v INTEGER,computed INTEGER GENERATED ALWAYS AS(v+1) VIRTUAL) WITHOUT ROWID",
+        "INSERT OR REPLACE INTO triggered(k,v) VALUES('a',2)",
     ] {
         sql(&io, &connection, statement).unwrap();
     }
-    for table in ["triggered", "generated"] {
-        let error = sql(
-            &io,
-            &connection,
-            &format!("INSERT OR REPLACE INTO {table}(k,v) VALUES('a',2)"),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("WITHOUT ROWID"), "{error:?}");
+    let error = sql(
+        &io,
+        &connection,
+        "INSERT OR REPLACE INTO generated(k,v) VALUES('a',2)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("WITHOUT ROWID"), "{error:?}");
+    for (table, rows) in [("triggered", vec![vec!["a", "2"]]), ("generated", vec![])] {
         assert_eq!(
             sql(&io, &connection, &format!("SELECT k,v FROM {table}")).unwrap(),
-            if table == "triggered" {
-                vec![vec!["a", "1"]]
-            } else {
-                Vec::<Vec<&str>>::new()
-            }
+            rows
         );
     }
     assert!(sql(&io, &connection, "SELECT * FROM audit")
