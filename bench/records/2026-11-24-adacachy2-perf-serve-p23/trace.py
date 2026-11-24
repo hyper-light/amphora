@@ -84,7 +84,7 @@ for d in sys.argv[1:]:
             def nxt(k, at=t):
                 i = after(ts.get(k, []), at)
                 return by[k][i] if i is not None else None
-            go = last("prep_go")
+            go = last("hand_begin") if arm.startswith("H") else last("sess_begin")
             rs = last("read_state")
             if not go or not rs:
                 continue
@@ -97,13 +97,13 @@ for d in sys.argv[1:]:
                 hb, hf, hg, wb = b("hand_begin"), b("hand_flushed"), b("handing"), b("w_begin")
                 sc, sb, sr, si, so, we = b("s_call"), b("s_begun"), b("s_ran"), b("s_imaged"), b("s_rolled"), b("w_end")
                 hd, tk, dc = b("handed"), b("taken"), b("decide")
-                seq = [("go>hand_begin", go, hb), ("hand_begin>hand_flushed", hb, hf), ("hand_flushed>handing", hf, hg), ("handing>w_begin", hg, wb),
+                seq = [("hand_begin>hand_flushed", hb, hf), ("hand_flushed>handing", hf, hg), ("handing>w_begin", hg, wb),
                        ("w_begin>s_call", wb, sc), ("s_call>s_begun", sc, sb), ("s_begun>s_ran", sb, sr), ("s_ran>s_imaged", sr, si),
                        ("s_imaged>s_rolled", si, so), ("s_rolled>w_end", so, we), ("w_end>taken", we, tk), ("taken>decide", tk, dc), ("decide>proposed", dc, pr)]
             else:
                 sb0 = b("sess_begin")
                 sc, sb, sr, si, so, se = b("s_call"), b("s_begun"), b("s_ran"), b("s_imaged"), b("s_rolled"), b("sess_end")
-                seq = [("go>sess_begin", go, sb0), ("sess_begin>s_call", sb0, sc), ("s_call>s_begun", sc, sb), ("s_begun>s_ran", sb, sr), ("s_ran>s_imaged", sr, si),
+                seq = [("sess_begin>s_call", sb0, sc), ("s_call>s_begun", sc, sb), ("s_begun>s_ran", sb, sr), ("s_ran>s_imaged", sr, si),
                        ("s_imaged>s_rolled", si, so), ("s_rolled>sess_end", so, se), ("sess_end>proposed", se, pr)]
             for nm, x, y in seq:
                 if x is not None and y is not None:
