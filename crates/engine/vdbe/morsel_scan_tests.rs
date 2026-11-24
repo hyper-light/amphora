@@ -4299,3 +4299,115 @@ fn r5_constant_columns_in_insert_select_answer_as_sqlite() {
         ),
     ]);
 }
+
+const C1_QUERIES: [(&str, bool); 9] = [
+        ("SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000", false),
+        ("SELECT d.c, count(*), min(f.b) FROM f JOIN d ON f.c = d.c WHERE f.id BETWEEN 500 AND 1500 AND d.id < 300 GROUP BY d.c", false),
+        ("SELECT f.id, d.id, d.b FROM f JOIN d ON f.a = d.a WHERE f.id >= 2900 AND d.id > 550", true),
+        ("SELECT count(*), sum(e.b) FROM f JOIN d ON f.a = d.a JOIN e ON d.c = e.c WHERE d.id <= 100 AND e.id > 200", false),
+        ("SELECT f.id, d.id FROM f JOIN d ON f.a = d.a WHERE f.id < 400 ORDER BY f.id, d.id LIMIT 9 OFFSET 2 -- keys 2", true),
+        ("SELECT count(*), count(d.id), sum(d.b) FROM f LEFT JOIN d ON f.a = d.a AND d.id > 500 WHERE f.id > 2500", false),
+        ("SELECT f.id, d.b FROM f LEFT JOIN d ON f.a = d.a WHERE f.id > 2950", true),
+        ("SELECT count(*), count(f.id), count(d.id) FROM f FULL JOIN d ON f.a = d.a AND d.id > 590", false),
+        ("SELECT count(*), sum(f.b) FROM f JOIN d ON f.a = d.a AND d.id < 50 WHERE f.id > 100", false),
+];
+
+fn c1_value(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Text(t) => format!("'{}'", t.as_str()),
+        other => other.to_string(),
+    }
+}
+
+fn c1_rows(rows: &[Vec<Value>]) -> String {
+    rows.iter().map(|r| r.iter().map(c1_value).collect::<Vec<_>>().join("|")).collect::<Vec<_>>().join(";")
+}
+
+/// Lane C1's probe (diagnostic, not merged).
+#[test]
+#[ignore]
+fn c1_probe() {
+    use std::io::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = std::env::var("C1_OUT").unwrap();
+    let conn = open(":memory:c1");
+    let mut rng = ChaCha8Rng::seed_from_u64(635);
+    fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    let mut data = std::fs::File::create(format!("{dir}/data.sql")).unwrap();
+    writeln!(data, "BEGIN;").unwrap();
+    for name in ["f", "d", "e"] {
+        writeln!(data, "CREATE TABLE {name}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT);").unwrap();
+        for row in sql_rows(&conn, &format!("SELECT id, a, b, c, p FROM {name}")) {
+            writeln!(data, "INSERT INTO {name} VALUES ({});", row.iter().map(c1_value).collect::<Vec<_>>().join(",")).unwrap();
+        }
+    }
+    writeln!(data, "COMMIT;").unwrap();
+    let mut out = std::fs::File::create(format!("{dir}/answers.tsv")).unwrap();
+    for methods in [crate::JoinMethods::ByCost, crate::JoinMethods::HashJoinsOnly, crate::JoinMethods::ByCostWithMerge, crate::JoinMethods::NestedLoopsOnly, crate::JoinMethods::MergeJoinsOnly] {
+        conn.set_join_methods(methods);
+        for (n, (sql, rows)) in C1_QUERIES.iter().enumerate() {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sql_rows(&conn, sql);
+            writeln!(out, "{n}\t{methods:?}\tserial\t-\t-\t0\t0\t{}", c1_rows(&serial)).unwrap();
+            conn.set_parallel_mode(ParallelMode::On);
+            for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+                conn.set_parallel_outer_probe(probe);
+                for links in [crate::SearchedLinks::Off, crate::SearchedLinks::Hash, crate::SearchedLinks::Seek] {
+                    conn.set_parallel_searched_links(links);
+                    if probe == crate::OuterJoinProbe::Padded && links == crate::SearchedLinks::Off {
+                        crate::translate::parallel::C1_STEP.with(|s| s.borrow_mut().clear());
+                        let plan = sql_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                        let code = sql_rows(&conn, &format!("EXPLAIN {sql}"));
+                        let hooked = code.iter().any(|r| r.get(1).is_some_and(|v| v.to_string().contains("MorselAggregate")));
+                        eprintln!("C1 {methods:?} q{n} {sql}");
+                        eprintln!("C1   plan {:?}", plan.iter().map(|r| c1_value(r.last().unwrap())).collect::<Vec<_>>());
+                        eprintln!("C1   MorselAggregate in the program: {hooked}");
+                        let steps = crate::translate::parallel::C1_STEP.with(|s| s.borrow().clone());
+                        let half = steps.iter().rposition(|s| s.starts_with("shape_join: start")).unwrap_or(0);
+                        for step in &steps[half..] {
+                            eprintln!("C1   {step}");
+                        }
+                    }
+                    for cores in [1usize, 2, 3, 4, 8] {
+                        *conn.morsel_costs.lock() = Some(MachineCosts::stated(NonZeroUsize::new(cores).unwrap(), 1.0, 1.0));
+                        let links_before = conn.morsel_join_links.load(Relaxed);
+                        let body_before = conn.morsel_body_rows.load(Relaxed);
+                        let parallel = sql_rows(&conn, sql);
+                        let built = conn.morsel_join_links.load(Relaxed) - links_before;
+                        let body = conn.morsel_body_rows.load(Relaxed) - body_before;
+                        writeln!(out, "{n}\t{methods:?}\tparallel\t{probe:?}/{links:?}\t{cores}\t{built}\t{body}\t{}", c1_rows(&parallel)).unwrap();
+                        let same = if *rows && order_keys(sql).is_none() { canonical(&parallel) == canonical(&serial) } else { parallel == serial };
+                        if !same {
+                            eprintln!("C1   DIFFERS {methods:?} q{n} {probe:?}/{links:?} {cores} cores: built {built} body {body}: {} rows against {} serial", parallel.len(), serial.len());
+                        }
+                    }
+                }
+            }
+            conn.set_parallel_outer_probe(crate::OuterJoinProbe::Padded);
+            conn.set_parallel_searched_links(crate::SearchedLinks::Off);
+            conn.set_parallel_mode(ParallelMode::Off);
+        }
+    }
+    let mut q = std::fs::File::create(format!("{dir}/queries.tsv")).unwrap();
+    for (n, (sql, rows)) in C1_QUERIES.iter().enumerate() {
+        writeln!(q, "{n}\t{}\t{sql}", if order_keys(sql).is_some() { "ordered" } else if *rows { "set" } else { "exact" }).unwrap();
+    }
+}
+
+/// Lane C1's planner trace of the first statement (diagnostic, not merged).
+#[test]
+#[ignore]
+fn c1_planner_trace() {
+    let conn = open(":memory:c1-trace");
+    let mut rng = ChaCha8Rng::seed_from_u64(635);
+    fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    conn.set_parallel_mode(ParallelMode::On);
+    let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_ansi(false).with_writer(std::io::stderr).finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for (n, (sql, _)) in C1_QUERIES.iter().enumerate() {
+            eprintln!("C1TRACE q{n} {sql}");
+            drop(conn.prepare(sql).unwrap());
+        }
+    });
+}

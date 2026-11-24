@@ -47,6 +47,16 @@ use amphora_engine_parser::ast::{
     Expr, Literal, Operator, SortOrder, TableInternalId, UnaryOperator,
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static C1_STEP: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+fn c1_step(step: String) {
+    C1_STEP.with(|s| s.borrow_mut().push(step));
+}
+macro_rules! c1 { ($($t:tt)*) => { #[cfg(test)] c1_step(format!($($t)*)); } }
+
 /// The labels the hook's code jumps to: the serial loop it falls back to, and the statement's end.
 pub(crate) struct MorselHook {
     pub end: crate::vdbe::BranchOffset,
@@ -1371,6 +1381,7 @@ fn shape_join(
 ) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
     // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
     let rows_mode = plan.aggregates.is_empty();
+    c1!("shape_join: start, {} tables", plan.table_references.joined_tables().len());
     if !(if rows_mode {
         plain_rows(plan)
     } else {
@@ -1403,6 +1414,7 @@ fn shape_join(
             }
             outer = Some((at, kind));
         }
+        c1!("shape_join: place {at} {} join_type {:?} op {}", table.table.get_name(), table.join_info.as_ref().map(|j| &j.join_type), c1_op(&table.op));
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
             // A forward search by a rowid range between literals reads the leaves that hold it
@@ -1429,8 +1441,12 @@ fn shape_join(
                 built.push(op.build_table_idx)
             }
             op if searched_by_seek(op, at, searched_links) => searched.push(at),
-            _ => return None,
+            _ => {
+                c1!("shape_join: DECLINES at the op of place {at}");
+                return None;
+            }
         }
+        c1!("shape_join: place {at} op taken; scanned_rowids {:?}", scanned_rowids(&table.op));
         tables.push(stored(table)?);
         ranges.push(scanned_rowids(&table.op).unwrap_or((None, None)));
     }
@@ -1450,7 +1466,9 @@ fn shape_join(
     let padded_at = outer.map(|(at, _)| at);
     let (probe_at, outer) = match outer {
         None => {
+            c1!("shape_join: built {built:?} searched {searched:?}");
             if built.is_empty() && searched.is_empty() {
+                c1!("shape_join: DECLINES: no hash join and no searched link");
                 return None;
             }
             (
@@ -1510,6 +1528,7 @@ fn shape_join(
     // Every term, consumed or not (one the planner made into a hash join's key still holds of
     // every row the join reads): an equality of two tables' columns, a filter on one table, or
     // a term the loop body tests on the joined row.
+    c1!("shape_join: probe_at {probe_at} outer {outer:?} ranges {ranges:?}");
     let mut edges: Vec<((usize, usize), (usize, usize))> = Vec::new();
     let mut filters: Vec<Vec<Predicate>> = tables.iter().map(|_| Vec::new()).collect();
     let mut residual: Vec<&Expr> = Vec::new();
@@ -1560,6 +1579,7 @@ fn shape_join(
             None => residual.push(&term.expr),
         }
     }
+    c1!("shape_join: edges {edges:?} filters {filters:?} residual {} on_terms {}", residual.len(), on_terms.len());
     // The chain: each table's place in the joined row once it is joined.
     let mut offsets: Vec<Option<usize>> = tables.iter().map(|_| None).collect();
     *offsets.get_mut(probe_at)? = Some(0);
@@ -1612,6 +1632,7 @@ fn shape_join(
             searched: searched.contains(&next),
         });
     }
+    c1!("shape_join: chain {:?}", joins.iter().map(|j| (j.columns, j.rowid_range, j.filter.len(), j.probe_key.clone(), j.build_key.clone(), j.searched)).collect::<Vec<_>>());
     // The body's row: each table's columns at its place in the chain, the probe's rowid its own,
     // a link's its INTEGER PRIMARY KEY (lane qs6-12).
     let mut places = Vec::new();
@@ -1640,6 +1661,7 @@ fn shape_join(
         no_real,
         joined_rows,
     ) = join_outputs(plan, &tables, &side)?;
+    c1!("shape_join: outputs taken");
     body_reads(&on_terms, &places)?;
     body_reads(&residual, &places)?;
     body_reads(&outs, &places)?;
@@ -1678,6 +1700,7 @@ fn shape_join(
         sorted: None,
         rows: rows_mode,
     };
+    c1!("shape_join: TAKEN");
     Some((data, looped))
 }
 
@@ -1819,6 +1842,7 @@ fn shape_chain(
     probe: crate::OuterJoinProbe,
     searched_links: bool,
 ) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
+    c1!("shape_chain: start");
     let rows_mode = plan.aggregates.is_empty();
     if !(if rows_mode {
         plain_rows(plan)
@@ -1886,6 +1910,7 @@ fn shape_chain(
         && tables.len() == 2
         && keeps.get(1).is_some_and(|k| k.left);
     if !(outer >= 2 || (right && tables.len() > 2) || two_kept) {
+        c1!("shape_chain: DECLINES: outer {outer} right {right} two_kept {two_kept}");
         return None;
     }
     let last_right = keeps.iter().rposition(|k| k.right);
@@ -2059,5 +2084,24 @@ fn shape_chain(
         sorted: None,
         rows: rows_mode,
     };
+    c1!("shape_chain: TAKEN");
     Some((data, looped))
+}
+
+#[cfg(test)]
+fn c1_op(op: &Operation) -> String {
+    match op {
+        Operation::Scan(Scan::BTreeTable { index, iter_dir }) => format!("Scan(index {:?}, {iter_dir:?})", index.as_ref().map(|i| i.name.clone())),
+        Operation::Search(Search::Seek { index, seek_def }) => format!(
+            "Search::Seek(index {:?}, ephemeral {:?}, prefix {}, skip {}, {:?}, start {:?}, end {:?})",
+            index.as_ref().map(|i| i.name.clone()),
+            index.as_ref().map(|i| i.ephemeral),
+            seek_def.prefix.len(), seek_def.skip, seek_def.iter_dir, seek_def.start, seek_def.end
+        ),
+        Operation::HashJoin(op) => format!(
+            "HashJoin(build {} probe {} type {:?} method {:?} materialize {} group {:?})",
+            op.build_table_idx, op.probe_table_idx, op.join_type, op.method, op.materialize_build_input, op.build_group
+        ),
+        other => format!("{other:?}"),
+    }
 }
