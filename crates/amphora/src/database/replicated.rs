@@ -17795,6 +17795,120 @@ mod tests {
     }
 
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
+    /// measures", B to D; store.md, decision 45; Ada, 2026-11-24: one slow read never holds up a
+    /// write): on a nearly full disk a slow local read gives way to the writes. Do: a voter and its
+    /// learner, the voter's share spent, so only its room makes a restart due, and told it has room
+    /// for 16 frames past its own file; a local read held open on the voter, reading member_items;
+    /// while it is open, values written at the voter, each flushed by it and each followed by a fast
+    /// read, until the log has started again four times; then the read reads again; a fresh read.
+    /// Expect: every write taken; every fast read answered, each with what was written; the slow
+    /// read's second reading refused, typed Serialization naming a snapshot too old; a fresh read
+    /// with every value.
+    #[test]
+    fn a_slow_local_read_past_the_logs_room_ends_typed_and_no_write_is_refused() {
+        own_account();
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let (voter, handle) = (&clients[0], clients[0].handle());
+        write(&mut driven, &mut pump, voter, 1);
+        settle_log(&mut driven, &mut pump, &clients);
+        driven.flushed(&mut pump, 0);
+        log_idle(&mut driven, &mut pump, 0);
+        let spacing = &mut driven.owner_mut(0).spacing;
+        spacing.restarted(0).unwrap();
+        spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
+        driven
+            .owner(0)
+            .replica
+            .machine()
+            .set_free_bytes(free_for(16, 2));
+        let restarts = handle.counters().database_log_restarts;
+        let files = ["state-1.db-wal", "state-1.db-wal2"].map(|name| dir.path().join(name));
+        let bytes = |file: &PathBuf| std::fs::metadata(file).map_or(0, |file| file.len());
+        // What the files took before the room stood: past it already, they are cut at the switch
+        // into each, not before (store.md, decision 31).
+        let began = files.each_ref().map(bytes);
+        let (mut refused, mut last, mut slow) = (None, 1u8, Vec::new());
+        let (mut sizes, mut frames, mut wrong) = (Vec::new(), Vec::new(), Vec::new());
+        let read = voter.read_local(Instant::now() + HANG_READ, |db| {
+            db.query_transaction(|db| {
+                let first = values(db)?;
+                while handle.counters().database_log_restarts < restarts + 4 && last < u8::MAX - 1 {
+                    let value = last + 1;
+                    let answer = driven.call(&mut pump, voter, move |db| {
+                        db.exec(&format!("INSERT INTO member_items VALUES({value})"))?;
+                        Ok(Vec::new())
+                    });
+                    if let Err(refusal) = answer {
+                        refused = Some((value, refusal));
+                        break;
+                    }
+                    last = value;
+                    settle_log(&mut driven, &mut pump, &clients);
+                    driven.flushed(&mut pump, 0);
+                    frames.push((
+                        driven.owner(0).replica.machine().log_frames().unwrap(),
+                        room(&clients, 0),
+                    ));
+                    sizes.push(files.each_ref().map(bytes));
+                    let fast = voter.read_local(Instant::now() + HANG_READ, values);
+                    if fast != Ok((1..=value).collect::<Vec<u8>>()) {
+                        wrong.push((value, fast));
+                    }
+                }
+                slow.push(first);
+                slow.push(values(db)?);
+                Ok(())
+            })
+        });
+        assert_eq!(refused, None, "a write refused under a slow local read");
+        assert_eq!(wrong, [], "a fast read answered otherwise");
+        assert!(
+            handle.counters().database_log_restarts >= restarts + 4,
+            "the log started again too seldom: {:?}",
+            handle.counters()
+        );
+        assert!(
+            matches!(&read, Err(Refusal::Serialization { why, .. }) if why.contains("snapshot too old")),
+            "the slow read was answered: {read:?} {slow:?}"
+        );
+        assert_eq!(slow, [vec![1]], "the slow read saw more than its snapshot");
+        // Each of the log's two files stays within the room, as last learned, plus what two writes
+        // grow it (the flush out as it passed the room, and the one its pass follows).
+        let grew = frames
+            .windows(2)
+            .map(|pair| pair[1].0.saturating_sub(pair[0].0))
+            .max()
+            .unwrap();
+        for (write, (held, _)) in sizes.iter().zip(&frames).enumerate() {
+            // The room is learned at each pass, for the segment current then: the most it was so far.
+            let room = frames
+                .iter()
+                .take(write + 1)
+                .map(|seen| seen.1)
+                .max()
+                .unwrap();
+            let most = log_bound::FRAME_BYTES * (room + 2 * grew) + 32;
+            for ((file, began), bytes) in files.iter().zip(&began).zip(held) {
+                let most = most.max(*began);
+                assert!(
+                    *bytes <= most,
+                    "{} holds {bytes} bytes after write {write}, over {most}: room {room}, a write {grew}",
+                    file.display()
+                );
+            }
+        }
+        assert_eq!(
+            voter.read_local(Instant::now() + HANG_READ, values),
+            Ok((1..=last).collect::<Vec<u8>>())
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
     /// measures", B and D; store.md, decision 45): a restart that went through is owed nothing more
     /// and holds no read back, though nothing is written after it: the owner counts the segment it
     /// switched to, not the one it closed. Do: a voter and its learner, the learner told it has
@@ -17937,20 +18051,18 @@ mod tests {
     }
 
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
-    /// measures", the bound stated; store.md, decision 45): a restart that falls due while a local
-    /// read is out waits for no read: it is made under one with no end; what that read keeps, the
-    /// segment it began on, it keeps until its deadline and no longer, and the restart after that
-    /// one is made once it has let go. Do: a voter and its learner on one filesystem, the learner
-    /// told it has room for 16 frames past its own file; a local read on the learner, on a thread of
-    /// its own, that reads member_items and then runs a query with no end in one transaction, under
-    /// a deadline on a clock the test moves (as `Database::query_local` puts one on every read),
-    /// standing at the read's start until the test passes it, so no wall-clock window decides it;
-    /// once it reads, 2 to 40 written at the voter, each applied and flushed by the learner, and
-    /// rounds until a restart is counted; then the read's deadline passed, and written on until
-    /// another is. Expect: a restart while the read runs, the read still out after it; the read
-    /// refused at its deadline; a restart after it.
+    /// measures", the bound stated; store.md, decision 45; Ada, 2026-11-24): a restart that falls
+    /// due while a local read is out waits for no read, and neither does the one after it that
+    /// needs the segment the read keeps: the read ends, at its next step, whatever it is doing.
+    /// Until lane V21 that one waited for the read's deadline. Do: a voter and its learner on one
+    /// filesystem, the learner told it has room for 16 frames past its own file; a local read on the
+    /// learner, on a thread of its own, that reads member_items and then runs a query with no end in
+    /// one transaction, under a deadline on a clock that stands at its start, so only the owner ends
+    /// it; once it reads, values written at the voter, each applied and flushed by the learner, until
+    /// the read is over. Expect: a restart while it ran; the read refused, typed, not at its deadline
+    /// but by the log's owner; a restart after it.
     #[test]
-    fn a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most() {
+    fn a_restart_due_waits_for_no_read_and_the_next_ends_the_one_that_holds_its_segment() {
         own_account();
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -18000,31 +18112,24 @@ mod tests {
                 })
             };
             reading.recv_timeout(HANG_READ).unwrap();
-            for value in 2..=40 {
-                write(&mut driven, &mut pump, voter, value);
+            let mut last = 1;
+            while !read.is_finished() {
+                last += 1;
+                assert!(last < u8::MAX, "the read was not ended");
+                write(&mut driven, &mut pump, voter, last);
                 settle_log(&mut driven, &mut pump, &clients);
             }
-            for _ in 0..ROUNDS {
-                if handle.counters().database_log_restarts > restarts {
-                    break;
-                }
-                driven.round(&mut pump);
-            }
             let under = handle.counters().database_log_restarts;
-            let out = handle.counters().local_readers_in_use;
-            passed.store(true, Ordering::Release);
             let answer = read.join().unwrap();
-            assert_eq!(out, 1, "the read ended before its deadline was passed");
             assert!(
                 under > restarts,
                 "the log's restart waited for a read: {:?}",
                 handle.counters()
             );
             assert!(
-                answer.is_err(),
-                "the read ran past its deadline: {answer:?}"
+                matches!(&answer, Err(Refusal::Serialization { why, .. }) if why.contains("snapshot too old")),
+                "{answer:?}"
             );
-            let mut last = 40;
             while handle.counters().database_log_restarts == under {
                 last += 1;
                 assert!(last < u8::MAX, "no restart: {:?}", handle.counters());
@@ -18262,14 +18367,15 @@ mod tests {
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
-    /// measures", C): past its room a replica refuses submits, typed, and a restart is due
-    /// whatever its share says: disk before latency. Do: a voter and its learner; the voter's
-    /// share spent (a restart that held a million entries) and its filesystem told it has nothing
-    /// free past one image; a local read held open on the voter while it is written to until a
-    /// write is refused; the read ended, rounds until the voter restarts, then a write. Expect: a
-    /// restart while the read is open (it waits for no read: store.md, decision 45), then, the read
-    /// holding the segment that closed and the other past its room too, a write refused Unavailable
-    /// naming the frames past the room; a restart once the read ended; the write after it taken.
+    /// measures", C): past its room a replica refuses submits, typed, and a restart is due whatever
+    /// its share says: disk before latency. Do: a voter and its learner; the voter's share spent (a
+    /// restart that held a million entries), its filesystem told it has nothing free past one image,
+    /// and its flushes held, so no pass copies its log; it is written to until a write is refused;
+    /// the flushes let go, rounds until the voter restarts, then a write. Expect: a write refused
+    /// Unavailable naming the frames past the room; a restart once a pass has copied the log; the
+    /// write after it taken. A local read holding the closed segment is no cause of it: until lane
+    /// V21 one refused the write that came next, and it ends instead (store.md, decision 45; Ada,
+    /// 2026-11-24; `a_slow_local_read_past_the_logs_room_ends_typed_and_no_write_is_refused`).
     #[test]
     fn past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share() {
         own_account();
@@ -18290,44 +18396,37 @@ mod tests {
             .replica
             .machine()
             .set_free_bytes(free_for(0, 2));
+        // A pass says the room as it now stands; no flush is let through after it.
+        write(&mut driven, &mut pump, voter, 2);
+        settle_log(&mut driven, &mut pump, &clients);
+        driven.flushed(&mut pump, 0);
+        log_idle(&mut driven, &mut pump, 0);
+        let gate = driven.owner(0).replica.machine().flush_gate();
+        gate.hold();
         let before = handle.counters().database_log_restarts;
-        let refused = voter
-            .read_local(Instant::now() + HANG_READ, |db| {
-                db.query_transaction(|db| {
-                    values(db)?;
-                    for value in 2..=u8::MAX - 1 {
-                        let answer = driven.call(&mut pump, voter, move |db| {
-                            db.exec(&format!("INSERT INTO member_items VALUES({value})"))?;
-                            Ok(Vec::new())
-                        });
-                        if let Err(refusal) = answer {
-                            return Ok(Some(refusal));
-                        }
-                        settle_log(&mut driven, &mut pump, &clients);
-                        driven.flushed(&mut pump, 0);
-                    }
-                    Ok(None)
-                })
-            })
-            .unwrap();
+        let mut refused = None;
+        let mut value = 2;
+        while refused.is_none() && value < u8::MAX - 1 {
+            value += 1;
+            let answer = driven.call(&mut pump, voter, move |db| {
+                db.exec(&format!("INSERT INTO member_items VALUES({value})"))?;
+                Ok(Vec::new())
+            });
+            refused = answer.err();
+        }
         assert!(
             matches!(&refused, Some(Refusal::Unavailable(why)) if why.contains("frames, past the")),
             "{refused:?}"
         );
-        let restarts = handle.counters().database_log_restarts;
-        assert!(
-            restarts > before,
-            "the log's restart waited for a read: {:?}",
-            handle.counters()
-        );
+        gate.open();
         for _ in 0..ROUNDS {
-            if handle.counters().database_log_restarts > restarts {
+            if handle.counters().database_log_restarts > before {
                 break;
             }
             driven.round(&mut pump);
         }
         assert!(
-            handle.counters().database_log_restarts > restarts,
+            handle.counters().database_log_restarts > before,
             "{:?}",
             handle.counters()
         );
