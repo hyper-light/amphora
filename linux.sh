@@ -71,6 +71,7 @@ for step in "$@"; do
     draw:*)  # draw:upsert|window:COUNT:SEED   another draw in the fixture's place, the test rebuilt and run
       IFS=: read -r _ what count seed <<< "$step"
       case $what in upsert) g=sqlite_upsert_checks.py; f=upsert_checks;; window) g=sqlite_window_columns.py; f=window_columns;; esac
+      [ -f "$S/$g" ] && cp "$S/$g" bench/$g
       python3 bench/$g "$count" "$seed" > crates/engine/tests/fixtures/$f.tsv || exit 9
       timeout 600 nice -n 10 cargo test -p amphora-engine --locked --features simulator --test $f --no-run > "$O/draw.log" 2>&1 || { tail -20 "$O/draw.log"; exit 8; }
       timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin $f)" --nocapture --test-threads=${JOBS:-8} > "$O/draw-$what-$seed.log" 2>&1; rc=$?
