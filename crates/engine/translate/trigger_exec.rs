@@ -251,6 +251,11 @@ impl TriggerSubprogramContext {
     }
 }
 
+/// Whether `name`, no column of `table`, names its rowid, which a WITHOUT ROWID table has none of.
+fn names_rowid(table: &BTreeTable, name: &str) -> bool {
+    table.has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name))
+}
+
 /// Rewrite NEW and OLD references in trigger expressions to use Variable instructions (parameters)
 fn rewrite_trigger_expr_for_subprogram(
     expr: &mut ast::Expr,
@@ -465,7 +470,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(&ctx.table, &col) {
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
@@ -510,7 +515,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(&ctx.table, &col) {
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
@@ -1340,7 +1345,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(table, &col) {
                         if let Some(register) = new_regs.last() {
                             *expr = Expr::TriggerRegister(*register, ast::TriggerColumn::Rowid);
                             return Ok(());
@@ -1364,7 +1369,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(table, &col) {
                         if let Some(register) = old_regs.last() {
                             *expr = Expr::TriggerRegister(*register, ast::TriggerColumn::Rowid);
                             return Ok(());

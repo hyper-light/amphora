@@ -2180,8 +2180,8 @@ q	SELECT * FROM lg	22:'f1',1,1,1;'f1',1,1,1;'f1',1,1,1;'f3','ABC',0,0;'f3','Abc'
 q	SELECT * FROM t	3:3,0,0.0,'x','a',x'61','a','Abc','x ','x ';4,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';5,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows1
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed1
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2197,7 +2197,7 @@ sql	CREATE TRIGGER f2 AFTER UPDATE ON t WHEN old.nc = new.t BEGIN INSERT INTO lg
 sql	CREATE TRIGGER f3 AFTER INSERT ON t WHEN EXISTS (SELECT 1 FROM m WHERE new.nc = m.t) BEGIN INSERT INTO lg VALUES ('f3', nullif(new.nc, 'admin'), new.id = '1', new.i = '1'); END
 sql	CREATE TRIGGER g0 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.nc WHERE new.n = name; END
 sql	CREATE TRIGGER g1 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (old.rt, old.rt) < ('admin', 'b') BEGIN DELETE FROM m2 WHERE old.tn = m2.t AND m2.id > 2; END
-sql	CREATE TRIGGER g2 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN ((SELECT count(*) FROM (SELECT new.rt UNION SELECT new.nc)) OR 1 <= old.id) BEGIN INSERT INTO lg VALUES ('g2', (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.t = 1)), (SELECT count(DISTINCT v) FROM (SELECT old.rt AS v UNION ALL SELECT new.rowid)), new.rt COLLATE RTRIM BETWEEN old.id COLLATE NOCASE AND 'b'); END
+sql	CREATE TRIGGER g2 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN ((SELECT count(*) FROM (SELECT new.rt UNION SELECT new.nc)) OR 1 <= old.id) BEGIN INSERT INTO lg VALUES ('g2', (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.t = 1)), (SELECT count(DISTINCT v) FROM (SELECT old.rt AS v UNION ALL SELECT new.id)), new.rt COLLATE RTRIM BETWEEN old.id COLLATE NOCASE AND 'b'); END
 sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW WHEN new.rt = 2.5 COLLATE BINARY BEGIN INSERT INTO lg SELECT 'g3', m.id, (new.tn, 1) IN (SELECT m.nc, 1 FROM m), 0 FROM m WHERE new.b >= m.nc; END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (new.nc, 'g4'); END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN max(new.tn, x'61') IS new.tn BEGIN UPDATE OR IGNORE kn SET name = new.nc WHERE new.rt = name; END
@@ -2211,7 +2211,7 @@ sql	UPDATE OR REPLACE t SET id = 6, nc = 'ADMIN' WHERE id = 6
 sql	REPLACE INTO t VALUES (1, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE OR IGNORE t SET id = 3, i = 5 WHERE id = 4
 sql	REPLACE INTO t VALUES (2, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
-q	SELECT * FROM lg	12:'f1',1,1,1;'f1',1,1,1;'f1',1,1,1;'f2',1,1,0;'f3','Abc',0,0;'f3','Abc',0,0;'f3','Abc',1,0;'f3',NULL,0,0;'f3',NULL,0,0;'f3',NULL,1,0;'g2',NULL,2,0;'g2',NULL,2,1
+q	SELECT * FROM lg	12:'f1',1,1,1;'f1',1,1,1;'f1',1,1,1;'f2',1,1,0;'f3','Abc',0,0;'f3','Abc',0,0;'f3','Abc',0,0;'f3',NULL,0,0;'f3',NULL,0,0;'f3',NULL,0,0;'g2',NULL,2,0;'g2',NULL,2,1
 q	SELECT * FROM t	4:1,0,0.0,'x','a',x'61','a','Abc','abc ','x ';2,0,0.0,'x','a',x'61','a','Abc','abc ','x ';3,1,0.0,'x','a',x'61','a','Abc','abc ','x ';6,2,2.5,'admin',2,2,2,'ADMIN','x','aA'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',3
 q	SELECT * FROM kn	4:'ADMIN','g4';'Abc','g4';'admin','start';'x','start'
@@ -2314,8 +2314,8 @@ q	SELECT * FROM lg	20:'f1',1,1,1;'f1',1,1,1;'f3','ABC',0,0;'f3','Abc',0,0;'f3','
 q	SELECT * FROM t	2:1,0,0.0,'x','a',x'61','a','ADMIN','x ','x ';6,7,1.5,'x',1.5,x'31',1.5,'ABC','x ','abc'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	4:'1.5','g0';'a','g0';'admin','start';'x','start'
-db	cx	rows5
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed5
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2329,13 +2329,13 @@ sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER f1 AFTER INSERT ON t WHEN new.nc = 'admin' BEGIN INSERT INTO lg VALUES ('f1', new.nc = 'admin', new.nc IN ('admin'), new.rt = 'x'); END
 sql	CREATE TRIGGER f2 AFTER UPDATE ON t WHEN old.nc = new.t BEGIN INSERT INTO lg VALUES ('f2', old.nc = new.t, new.t = old.nc, old.id = '1'); END
 sql	CREATE TRIGGER f3 AFTER INSERT ON t WHEN EXISTS (SELECT 1 FROM m WHERE new.nc = m.t) BEGIN INSERT INTO lg VALUES ('f3', nullif(new.nc, 'admin'), new.id = '1', new.i = '1'); END
-sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN old.rowid IS NOT 'abc' BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.tn = m2.t; END
+sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN old.id IS NOT 'abc' BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.tn = m2.t; END
 sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT OR REPLACE INTO kn VALUES (new.b, 'g1'); END
 sql	CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW WHEN min(1, new.nc) IS 1 BEGIN UPDATE OR REPLACE kn SET name = new.tn WHERE new.b = name; END
 sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.r; INSERT INTO lg VALUES ('g3', (CASE WHEN old.t = '1' THEN 'yes' END OR old.rt COLLATE RTRIM = old.t), (SELECT m.id FROM m WHERE m.t = old.r ORDER BY m.id LIMIT 1), CASE old.rt WHEN old.t THEN 1 ELSE 0 END); END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT new.nc AS v) AS s WHERE s.v <> 10) BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.u = name; END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT OR REPLACE INTO kn VALUES (new.rt, 'g5'); END
-sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN CASE old.r WHEN (SELECT m.t FROM m WHERE m.id = 2) THEN 1 ELSE 0 END BEGIN INSERT INTO lg VALUES ('g6', (new.rowid, new.nc) < (old.id, 'b'), (old.rowid, 1) = (10, 1), (NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.rt AND old.nc IS NOT NULL) OR (SELECT m.nc FROM m WHERE m.id = 2) IN (old.tn, 'zz'))); END
+sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN CASE old.r WHEN (SELECT m.t FROM m WHERE m.id = 2) THEN 1 ELSE 0 END BEGIN INSERT INTO lg VALUES ('g6', (new.id, new.nc) < (old.id, 'b'), (old.id, 1) = (10, 1), (NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.rt AND old.nc IS NOT NULL) OR (SELECT m.nc FROM m WHERE m.id = 2) IN (old.tn, 'zz'))); END
 sql	CREATE TRIGGER g7 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE m.nc > old.rt) BEGIN SELECT CASE WHEN CASE WHEN new.b = '1' COLLATE RTRIM THEN 'yes' END THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g7', (WITH c(v) AS (SELECT old.rt) SELECT count(*) FROM c WHERE c.v = '1' COLLATE RTRIM), (SELECT count(*) FROM m WHERE new.id = m.nc), NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.n AND old.nc IS NOT NULL)); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT OR IGNORE INTO t VALUES (5, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
@@ -2345,7 +2345,7 @@ sql	DELETE FROM t WHERE nc = 'admin'
 sql	INSERT INTO t VALUES (8, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc') ON CONFLICT(id) DO NOTHING
 sql	UPDATE t SET nc = 'ADMIN' WHERE id = 3
 sql	UPDATE OR IGNORE t SET id = 1, i = 5 WHERE id = 8
-q	SELECT * FROM lg	14:'f1',1,1,1;'f1',1,1,1;'f2',1,0,0;'f2',1,1,0;'f3','ABC',0,0;'f3','Abc',0,0;'f3','Abc',0,0;'f3',NULL,0,0;'f3',NULL,1,0;'g3',0,NULL,0;'g3',NULL,NULL,0;'g7',0,0,1;'g7',0,0,1;'g7',0,0,1
+q	SELECT * FROM lg	14:'f1',1,1,1;'f1',1,1,1;'f2',1,0,0;'f2',1,1,0;'f3','ABC',0,0;'f3','Abc',0,0;'f3','Abc',0,0;'f3',NULL,0,0;'f3',NULL,0,0;'g3',0,NULL,0;'g3',NULL,NULL,0;'g7',0,0,1;'g7',0,0,1;'g7',0,0,1
 q	SELECT * FROM t	3:1,5,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';3,1,0.0,'x','a',x'61','a','ADMIN','abc ','x ';5,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',1;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	9:'1','g1';'2','g1';'ABC','g5';'abc ','g5';'admin','start';'x  ','g5';'x ','g1';'x','g5';x'31','g1'
@@ -2445,8 +2445,8 @@ q	SELECT * FROM lg	6:'g2',1,0,1;'g3',1,NULL,0;'g3',1,NULL,0;'g3',2,NULL,0;'g4',1
 q	SELECT * FROM t	3:2,3,2.5,'admin',2,2,2,'ADMIN','x','aA';3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';5,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',1;2,'abc','x','abc  ',1;3,'ADMIN','Abc','ABC',1
 q	SELECT * FROM kn	5:'ABC','g6';'ADMIN','g1';'Abc','g6';'admin','g1';'x','start'
-db	cx	rows9
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed9
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2463,8 +2463,8 @@ sql	CREATE TRIGGER g2 BEFORE UPDATE ON t FOR EACH ROW WHEN (SELECT count(*) FROM
 sql	CREATE TRIGGER g3 AFTER UPDATE ON t FOR EACH ROW WHEN (new.n IN (new.rt, 'zz') OR EXISTS (SELECT 1 FROM m WHERE old.t IS NOT m.t)) BEGIN INSERT INTO kn VALUES (new.n, 'g3') ON CONFLICT(name) DO UPDATE SET who = excluded.who || CASE old.tn WHEN 10 THEN 1 ELSE 0 END WHERE kn.name = old.tn; END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.t = new.id AND new.b IS NOT NULL) BEGIN INSERT INTO lg VALUES ('g4', (WITH c(v) AS (SELECT new.nc) SELECT count(*) FROM c WHERE c.v = '1' COLLATE RTRIM), (SELECT count(*) FROM (SELECT new.t AS v) AS s WHERE s.v < 'abc'), new.nc NOT IN ('admin', 'x')); END
 sql	CREATE TRIGGER g5 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.nc = m2.t; END
-sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE m.i >= new.b) BEGIN SELECT CASE WHEN new.rt NOT IN (NULL, 'x') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', NOT EXISTS (SELECT 1 FROM m WHERE m.i = new.r AND new.nc IS NOT NULL), EXISTS (SELECT 1 FROM m WHERE m.t > new.rowid), (new.rt BETWEEN (SELECT m.t FROM m WHERE m.id = 1) COLLATE NOCASE AND 'b' OR (new.rowid, new.nc) < ((SELECT m.t FROM m WHERE m.id = 2), 'b'))); END
-sql	CREATE TRIGGER g7 AFTER UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', (EXISTS (SELECT 1 FROM m WHERE m.u = new.t) OR (SELECT count(*) FROM (SELECT old.rowid UNION SELECT (SELECT m.nc FROM m WHERE m.id = 2) COLLATE RTRIM))), (SELECT m.t FROM m WHERE m.id = 2) COLLATE NOCASE IN (old.t, 'zz'), (SELECT count(*) FROM (SELECT old.i UNION SELECT '10'))); END
+sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE m.i >= new.b) BEGIN SELECT CASE WHEN new.rt NOT IN (NULL, 'x') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', NOT EXISTS (SELECT 1 FROM m WHERE m.i = new.r AND new.nc IS NOT NULL), EXISTS (SELECT 1 FROM m WHERE m.t > new.id), (new.rt BETWEEN (SELECT m.t FROM m WHERE m.id = 1) COLLATE NOCASE AND 'b' OR (new.id, new.nc) < ((SELECT m.t FROM m WHERE m.id = 2), 'b'))); END
+sql	CREATE TRIGGER g7 AFTER UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', (EXISTS (SELECT 1 FROM m WHERE m.u = new.t) OR (SELECT count(*) FROM (SELECT old.id UNION SELECT (SELECT m.nc FROM m WHERE m.id = 2) COLLATE RTRIM))), (SELECT m.t FROM m WHERE m.id = 2) COLLATE NOCASE IN (old.t, 'zz'), (SELECT count(*) FROM (SELECT old.i UNION SELECT '10'))); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT OR REPLACE INTO t VALUES (5, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa')
 sql	INSERT OR IGNORE INTO t VALUES (8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
@@ -2562,8 +2562,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	0:
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows13
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed13
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2580,7 +2580,7 @@ sql	CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM
 sql	CREATE TRIGGER g3 BEFORE UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g3', m.id, (SELECT count(*) FROM m WHERE m.rt <> new.tn), 0 FROM m WHERE old.id >= m.rt; END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (new.id, 'g4'); END
 sql	CREATE TRIGGER g5 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = old.u; INSERT INTO lg VALUES ('g5', (2.5 IN (old.t, 'zz') OR EXISTS (SELECT 1 FROM m WHERE m.i = old.i)), (new.id, 1) = ((SELECT m.nc FROM m WHERE m.id = 1), 1), (WITH c(v) AS (SELECT new.rt) SELECT count(*) FROM c WHERE c.v = 0)); END
-sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g6', m.id, EXISTS (SELECT 1 FROM m WHERE new.nc <> m.rt), 0 FROM m WHERE new.rowid >= m.rt; END
+sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g6', m.id, EXISTS (SELECT 1 FROM m WHERE new.nc <> m.rt), 0 FROM m WHERE new.id >= m.rt; END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.n WHERE new.nc = name; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	REPLACE INTO t VALUES (7, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc')
@@ -2684,8 +2684,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	2:5,0,0.0,'admin','a',x'61','a','Abc','x ','x ';8,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	6:'1','g4';'ADMIN','g7';'Aa','start';'admin','g4';'x','start';NULL,'g4'
-db	cx	rows17
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed17
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2700,7 +2700,7 @@ sql	CREATE TRIGGER g0 AFTER INSERT ON t FOR EACH ROW WHEN (max(new.nc, '1') IS n
 sql	CREATE TRIGGER g1 BEFORE INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN new.u < 1 THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g1', (SELECT count(*) FROM m WHERE m.t <= new.nc), (new.nc, 1) = ('admin', 1), new.rt IN (SELECT m.t FROM m WHERE m.t <> new.nc)); END
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (old.nc, 'g2'); END
 sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN CASE new.rt WHEN 'admin' COLLATE NOCASE THEN 1 ELSE 0 END BEGIN UPDATE OR IGNORE kn SET name = new.t WHERE new.nc = name; END
-sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW WHEN CASE new.rt WHEN new.rt THEN 1 ELSE 0 END BEGIN INSERT INTO kn VALUES (coalesce(new.rowid, 'none'), 'g4') ON CONFLICT DO NOTHING; END
+sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW WHEN CASE new.rt WHEN new.rt THEN 1 ELSE 0 END BEGIN INSERT INTO kn VALUES (coalesce(new.id, 'none'), 'g4') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN max(new.t, (SELECT m.t FROM m WHERE m.id = 1)) IS new.t BEGIN DELETE FROM m2 WHERE new.b = m2.rt AND m2.id > 2; END
 sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (coalesce(old.rt, 'none'), 'g6') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g7 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.t = m2.nc; END
@@ -2806,8 +2806,8 @@ q	SELECT * FROM lg	11:'g0',0,0,1;'g0',0,0,1;'g3',NULL,0,NULL;'g7',0,NULL,NULL;'g
 q	SELECT * FROM t	5:17,10,10.0,'1',10,'10',10,'10','x ','10';3,0,0.0,'1','a',x'61','a','Abc','x ','x ';5,7,1.5,'1',1.5,x'31',1.5,'ABC','x ','abc';6,10,10.0,'1',10,'10',10,'10','x ','10';8,NULL,NULL,'1',NULL,NULL,NULL,NULL,'x ',NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	8:'1','g4';'10','g4';'2','g4';'admin','start';'none','g4';'x ','start';x'31','g4';x'61','g4'
-db	cx	rows21
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed21
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2818,12 +2818,12 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN nullif(old.rowid, 'ADMIN') IS NULL BEGIN SELECT CASE WHEN (SELECT count(*) FROM (SELECT old.u AS v) AS s WHERE s.v = 'x ' COLLATE NOCASE) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g0', (SELECT m.id FROM m WHERE m.rt = new.nc ORDER BY m.id LIMIT 1), old.nc IN (SELECT m.u FROM m WHERE m.u IS NOT NULL), nullif(new.rt, (SELECT m.rt FROM m WHERE m.id = 3)) IS NULL); END
+sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN nullif(old.id, 'ADMIN') IS NULL BEGIN SELECT CASE WHEN (SELECT count(*) FROM (SELECT old.u AS v) AS s WHERE s.v = 'x ' COLLATE NOCASE) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g0', (SELECT m.id FROM m WHERE m.rt = new.nc ORDER BY m.id LIMIT 1), old.nc IN (SELECT m.u FROM m WHERE m.u IS NOT NULL), nullif(new.rt, (SELECT m.rt FROM m WHERE m.id = 3)) IS NULL); END
 sql	CREATE TRIGGER g1 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN new.b IS NOT 'abc' BEGIN INSERT INTO lg SELECT 'g1', m.id, (SELECT count(*) FROM (SELECT new.tn AS v) AS s WHERE s.v = NULL), 0 FROM m WHERE old.tn = m.t; END
-sql	CREATE TRIGGER g2 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g2', max(new.rowid, 'admin' COLLATE BINARY) IS new.rowid, new.i IN (SELECT m.t FROM m WHERE m.t IS NOT NULL), 'a' BETWEEN new.rowid AND 'x ' COLLATE NOCASE); END
+sql	CREATE TRIGGER g2 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g2', max(new.id, 'admin' COLLATE BINARY) IS new.id, new.i IN (SELECT m.t FROM m WHERE m.t IS NOT NULL), 'a' BETWEEN new.id AND 'x ' COLLATE NOCASE); END
 sql	CREATE TRIGGER g3 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN max(old.tn, 'ADMIN') IS old.tn BEGIN INSERT INTO lg VALUES ('g3', new.nc NOT IN ('ADMIN', 'x'), EXISTS (SELECT 1 FROM m WHERE CAST(new.tn AS TEXT) IS NOT m.t), 'a' BETWEEN new.nc AND '1'); END
 sql	CREATE TRIGGER g4 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN nullif(old.id, 10 COLLATE BINARY) IS NULL BEGIN INSERT INTO kn VALUES (coalesce(new.id, 'none'), 'g4') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g5 BEFORE UPDATE ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.rowid = m2.rt AND m2.id > 2; END
+sql	CREATE TRIGGER g5 BEFORE UPDATE ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.id = m2.rt AND m2.id > 2; END
 sql	CREATE TRIGGER g6 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.t = new.rt AND new.t IS NOT NULL) BEGIN INSERT INTO lg SELECT 'g6', m.id, min(new.nc, new.rt) IS new.nc, 0 FROM m WHERE new.nc >= m.nc; END
 sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.t = old.nc)), (old.tn, old.rt) < ((SELECT m.nc FROM m WHERE m.id = 2), 'b'), (SELECT count(DISTINCT v) FROM (SELECT +old.rt AS v UNION ALL SELECT 10 COLLATE RTRIM))); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
@@ -2927,8 +2927,8 @@ q	SELECT * FROM lg	16:'g0',0,2,1;'g0',1,2,0;'g0',1,2,0;'g0',1,2,0;'g0',1,2,0;'g3
 q	SELECT * FROM t	5:1,1,1.0,'1',1,'1','1','ADMIN','x ','Aa';2,2,2.5,'1',2,2,2,'admin','x ','aA';3,0,0.0,'1','a',x'61','a','Abc','x ','x ';4,7,1.5,'1',1.5,x'31',1.5,'ABC','x ','abc';6,10,10.0,'1',10,'10',10,'10','x ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'x ','start';'x','start'
-db	cx	rows25
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed25
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -2942,11 +2942,11 @@ sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g0', (new.rt >= 'abc' OR 10 = new.t), ((SELECT m.id FROM m WHERE m.u = new.rt ORDER BY m.id LIMIT 1) OR max(new.tn, 0 COLLATE RTRIM) IS new.tn), new.b NOT IN (SELECT m.i FROM m WHERE m.i IS NOT NULL)); END
 sql	CREATE TRIGGER g1 AFTER DELETE ON t FOR EACH ROW WHEN (old.t, old.t) < (NULL, 'b') BEGIN INSERT INTO lg VALUES ('g1', old.rt IN (SELECT m.i FROM m WHERE m.i IS NOT NULL), (nullif(old.i, (SELECT m.nc FROM m WHERE m.id = 1)) IS NULL OR '10' < CAST(old.r AS TEXT)), old.b NOT IN ('ADMIN' COLLATE BINARY, 'x')); END
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (coalesce(old.rt, 'none'), 'g2') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g3 BEFORE DELETE ON t FOR EACH ROW WHEN old.i >= 0 BEGIN SELECT CASE WHEN 'x' > old.rowid THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', old.u IN (SELECT m.u FROM m WHERE m.u <> old.rt), max(old.b, x'61') IS old.b, max(old.t, 'x') IS old.t); END
+sql	CREATE TRIGGER g3 BEFORE DELETE ON t FOR EACH ROW WHEN old.i >= 0 BEGIN SELECT CASE WHEN 'x' > old.id THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', old.u IN (SELECT m.u FROM m WHERE m.u <> old.rt), max(old.b, x'61') IS old.b, max(old.t, 'x') IS old.t); END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW WHEN min('x ', new.nc) IS 'x ' BEGIN INSERT INTO kn VALUES (coalesce(new.id, 'none'), 'g4') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN (nullif(new.t, new.i) IS NULL OR EXISTS (SELECT 1 FROM m WHERE m.t IS NOT new.nc)) BEGIN UPDATE OR REPLACE kn SET name = new.i WHERE new.rt = name; END
 sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW WHEN (old.u, 1) = (10, 1) BEGIN DELETE FROM m2 WHERE new.tn = m2.t AND m2.id > 2; END
-sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', (NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.r AND old.rt IS NOT NULL) OR EXISTS (SELECT 1 FROM m WHERE m.nc IS NOT old.nc)), (SELECT count(*) FROM m WHERE m.t = old.nc), (SELECT count(*) FROM (SELECT old.rowid UNION SELECT (SELECT m.nc FROM m WHERE m.id = 1)))); END
+sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', (NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.r AND old.rt IS NOT NULL) OR EXISTS (SELECT 1 FROM m WHERE m.nc IS NOT old.nc)), (SELECT count(*) FROM m WHERE m.t = old.nc), (SELECT count(*) FROM (SELECT old.id UNION SELECT (SELECT m.nc FROM m WHERE m.id = 1)))); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE t SET i = i + 1, nc = upper(nc) WHERE id < 4
 sql	UPDATE t SET nc = '1' WHERE id = 6
@@ -3049,8 +3049,8 @@ q	SELECT * FROM lg	17:'g0',3,0,2;'g0',NULL,0,2;'g0',NULL,0,2;'g0',NULL,0,2;'g0',
 q	SELECT * FROM t	4:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';2,2,2.5,'admin',2,2,2,'admin','x','aA';3,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL;6,7,1.5,'abc',1.5,x'31',1.5,'admin','ABC','abc'
 q	SELECT * FROM m2	2:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows29
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed29
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3062,7 +3062,7 @@ sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN max(new.rt, (SELECT m.rt FROM m WHERE m.id = 3)) IS new.rt BEGIN UPDATE OR IGNORE kn SET name = old.t WHERE old.i = name; END
-sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (new.rowid || '') IN (new.nc, 'abc') BEGIN SELECT CASE WHEN (new.n, 1) = (new.r, 1) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g1', ((new.u, new.n) < ('x', 'b') AND 'x ' COLLATE NOCASE IN (new.t, 'zz')), ((SELECT m.id FROM m WHERE m.t = new.nc ORDER BY m.id LIMIT 1) OR (WITH c(v) AS (SELECT new.t) SELECT count(*) FROM c WHERE c.v = x'61')), (SELECT m.rt FROM m WHERE m.id = 1) <= new.tn); END
+sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (new.id || '') IN (new.nc, 'abc') BEGIN SELECT CASE WHEN (new.n, 1) = (new.r, 1) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g1', ((new.u, new.n) < ('x', 'b') AND 'x ' COLLATE NOCASE IN (new.t, 'zz')), ((SELECT m.id FROM m WHERE m.t = new.nc ORDER BY m.id LIMIT 1) OR (WITH c(v) AS (SELECT new.t) SELECT count(*) FROM c WHERE c.v = x'61')), (SELECT m.rt FROM m WHERE m.id = 1) <= new.tn); END
 sql	CREATE TRIGGER g2 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g2', new.rt IN (SELECT m.u FROM m WHERE m.u IS NOT NULL), old.nc IN ('admin', 'abc'), (new.t, 1) IN (SELECT m.rt, 1 FROM m)); END
 sql	CREATE TRIGGER g3 BEFORE DELETE ON t FOR EACH ROW WHEN CASE old.rt WHEN 'x ' THEN 1 ELSE 0 END BEGIN INSERT INTO kn VALUES (coalesce(old.rt, 'none'), 'g3') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g4 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (new.tn, 'g4') ON CONFLICT(name) DO UPDATE SET who = excluded.who || old.t BETWEEN 10 AND 'b' WHERE kn.name = old.t; END
@@ -3171,8 +3171,8 @@ q	SELECT * FROM lg	43:'g0',0,0,0;'g0',0,0,0;'g0',1,0,0;'g0',1,0,0;'g2',2,0,NULL;
 q	SELECT * FROM t	5:1,2,1.0,'x',1,'1','1','ADMIN','x ','Aa';13,NULL,NULL,'x',NULL,NULL,NULL,NULL,'x ',NULL;2,NULL,NULL,'x',NULL,NULL,NULL,'ADMIN','x ',NULL;3,1,0.0,'x','a',x'61','a','ABC','x ','x ';7,10,10.0,'x',10,'10',10,'ADMIN','x ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	9:'1','g7';'10','g7';'2','g7';'a','g7';'admin','start';'x','start';NULL,'g7';NULL,'g7';NULL,'g7'
-db	cx	rows33
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed33
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3188,7 +3188,7 @@ sql	CREATE TRIGGER g1 BEFORE UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits =
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g2', m.id, (WITH c(v) AS (SELECT old.t) SELECT count(*) FROM c WHERE c.v = 'x '), 0 FROM m WHERE old.b >= m.t; END
 sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g3', m.id, old.tn IN (SELECT m.u FROM m WHERE m.u <> old.nc), 0 FROM m WHERE old.i = m.rt; END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW WHEN ((SELECT count(DISTINCT v) FROM (SELECT new.i AS v UNION ALL SELECT x'61' COLLATE NOCASE)) OR nullif(new.i, (SELECT m.t FROM m WHERE m.id = 1)) IS NULL) BEGIN INSERT INTO kn VALUES (coalesce(new.i, 'none'), 'g4') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.n; INSERT INTO lg VALUES ('g5', CASE WHEN new.rt = new.b THEN 'yes' END, EXISTS (SELECT 1 FROM m WHERE m.t <> new.rowid), (new.rt, 1) IN (SELECT m.nc, 1 FROM m)); END
+sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.n; INSERT INTO lg VALUES ('g5', CASE WHEN new.rt = new.b THEN 'yes' END, EXISTS (SELECT 1 FROM m WHERE m.t <> new.id), (new.rt, 1) IN (SELECT m.nc, 1 FROM m)); END
 sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (coalesce(new.tn, 'none'), 'g6') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = old.b WHERE old.tn = name; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
@@ -3293,8 +3293,8 @@ q	SELECT * FROM lg	10:'g4',1,0,0;'g4',1,0,0;'g4',1,0,0;'g4',2,0,0;'g4',2,0,0;'g4
 q	SELECT * FROM t	4:1,5,2.5,'admin',2,2,2,'ADMIN','x','aA';2,5,2.5,'admin',2,2,2,'ADMIN','x','aA';3,3,0.0,'x','a',x'61','a','admin','abc ','x ';7,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',1;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	4:'ABC','g0';'ADMIN','g0';'admin','g0';'x','start'
-db	cx	rows37
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed37
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3415,8 +3415,8 @@ q	SELECT * FROM lg	10:'g1',1,2,0;'g1',1,2,0;'g1',1,2,0;'g1',1,2,0;'g1',1,2,0;'g7
 q	SELECT * FROM t	1:5,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',3;2,'abc','x','abc  ',2;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	5:'1','g6';'ABC','g2';'ADMIN','g2';'admin','start';'x','start'
-db	cx	rows41
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed41
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3532,8 +3532,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	0:
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows45
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed45
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3547,8 +3547,8 @@ sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (old.rt, 1) IN (SELECT m.nc, 1 FROM m) BEGIN INSERT OR IGNORE INTO kn VALUES (old.nc, 'g0'); END
 sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN new.n IN ('10', 'abc') BEGIN INSERT INTO lg VALUES ('g1', EXISTS (SELECT 1 FROM m WHERE new.t = m.t), 'ADMIN' = new.nc, NOT EXISTS (SELECT 1 FROM m WHERE m.u = new.t AND new.i IS NOT NULL)); END
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE m.rt > old.tn) BEGIN INSERT INTO lg VALUES ('g2', (SELECT count(DISTINCT v) FROM (SELECT old.rt COLLATE NOCASE AS v UNION ALL SELECT old.rt COLLATE NOCASE)), old.t <= x'61', (SELECT m.id FROM m WHERE m.rt = old.b ORDER BY m.id LIMIT 1)); END
-sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.u = new.i AND new.nc IS NOT NULL) BEGIN SELECT CASE WHEN (SELECT m.id FROM m WHERE m.t = new.t ORDER BY m.id LIMIT 1) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', (new.u BETWEEN new.r AND 'b' AND 'ADMIN' <> new.rowid), (SELECT count(*) FROM (SELECT new.rt UNION SELECT (SELECT m.rt FROM m WHERE m.id = 3))), (new.rt, 1) = (x'61', 1)); END
-sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN (SELECT count(*) FROM m WHERE new.nc COLLATE RTRIM < m.i) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', (SELECT count(*) FROM (SELECT new.t UNION SELECT 2.5)), (new.rowid, 1) = (new.tn, 1), (new.nc, 1) IN (SELECT m.t, 1 FROM m)); END
+sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.u = new.i AND new.nc IS NOT NULL) BEGIN SELECT CASE WHEN (SELECT m.id FROM m WHERE m.t = new.t ORDER BY m.id LIMIT 1) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', (new.u BETWEEN new.r AND 'b' AND 'ADMIN' <> new.id), (SELECT count(*) FROM (SELECT new.rt UNION SELECT (SELECT m.rt FROM m WHERE m.id = 3))), (new.rt, 1) = (x'61', 1)); END
+sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN (SELECT count(*) FROM m WHERE new.nc COLLATE RTRIM < m.i) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', (SELECT count(*) FROM (SELECT new.t UNION SELECT 2.5)), (new.id, 1) = (new.tn, 1), (new.nc, 1) IN (SELECT m.t, 1 FROM m)); END
 sql	CREATE TRIGGER g5 BEFORE DELETE ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (coalesce(old.r, 'none'), 'g5') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.nc WHERE new.n = name; END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (new.r, 'g7'); END
@@ -3654,8 +3654,8 @@ q	SELECT * FROM lg	8:'g7',0,0,0;'g7',0,1,1;'g7',0,1,1;'g7',0,1,1;'g7',0,1,1;'g7'
 q	SELECT * FROM t	7:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';13,10,10.0,'ADMIN',10,'10',10,'10','10 ','10';2,2,2.5,'admin',2,2,2,'admin','x','aA';3,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';5,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';7,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';8,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	6:'ABC','g4';'ADMIN','g4';'abc ','g4';'admin','start';'x  ','g4';'x','start'
-db	cx	rows49
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed49
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3668,7 +3668,7 @@ sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT m.t FROM m WHERE m.id = 1) IN (new.t, 'zz') BEGIN UPDATE OR REPLACE kn SET name = new.i WHERE new.nc = name; END
 sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.t = name; END
-sql	CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN max(new.id, 'x') IS new.id THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g2', max(new.rowid, NULL) IS new.rowid, 'abc' = +new.rt, ('1' IN (new.r, 'zz') OR new.nc IS NOT new.r)); END
+sql	CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN max(new.id, 'x') IS new.id THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g2', max(new.id, NULL) IS new.id, 'abc' = +new.rt, ('1' IN (new.r, 'zz') OR new.nc IS NOT new.r)); END
 sql	CREATE TRIGGER g3 AFTER UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g3', (SELECT count(*) FROM (SELECT old.t AS v) AS s WHERE s.v = 2.5), 'abc' IS NOT old.b, CASE old.u WHEN old.nc THEN 1 ELSE 0 END); END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (new.r, 'g4'); END
 sql	CREATE TRIGGER g5 BEFORE INSERT ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.t = m2.rt; END
@@ -3776,8 +3776,8 @@ q	SELECT * FROM lg	9:'g0',0,NULL,NULL;'g0',0,NULL,NULL;'g0',0,NULL,NULL;'g0',0,N
 q	SELECT * FROM t	4:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';15,10,10.0,'ADMIN',10,'10',10,'10','10 ','10';3,0,0.0,'x','a',x'61','a','Abc','abc ','x ';6,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows53
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed53
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -3790,8 +3790,8 @@ sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT m.id FROM m WHERE m.u = new.i ORDER BY m.id LIMIT 1) BEGIN SELECT CASE WHEN ((SELECT count(*) FROM (SELECT new.t AS v) AS s WHERE s.v IS NOT 10) AND new.nc IS NOT 10 COLLATE NOCASE) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g0', (SELECT count(*) FROM m WHERE m.rt = new.r), new.b IN (SELECT m.nc FROM m WHERE m.nc IS NOT NULL), NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.t AND new.u IS NOT NULL)); END
 sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (new.rt NOT IN (SELECT m.u FROM m WHERE m.u IS NOT NULL) AND CASE WHEN new.n = (SELECT m.t FROM m WHERE m.id = 1) THEN 'yes' END) BEGIN INSERT INTO lg SELECT 'g1', m.id, ((SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.id = 'admin')) OR min('abc', new.nc) IS 'abc'), 0 FROM m WHERE new.rt < m.nc; END
-sql	CREATE TRIGGER g2 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN old.nc IN (x'61' COLLATE RTRIM, 'abc') BEGIN INSERT INTO lg VALUES ('g2', CASE old.nc WHEN 2.5 COLLATE BINARY THEN 1 ELSE 0 END, new.rt IN (SELECT m.rt FROM m WHERE m.rt <> old.rowid), old.id BETWEEN 0 AND 'b'); END
-sql	CREATE TRIGGER g3 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN SELECT CASE WHEN 'x ' IN (new.rowid, 'zz') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', max(old.rt, new.nc COLLATE BINARY) IS old.rt, (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.b = 'ADMIN')), min('10' COLLATE BINARY, new.r) IS '10' COLLATE BINARY); END
+sql	CREATE TRIGGER g2 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN old.nc IN (x'61' COLLATE RTRIM, 'abc') BEGIN INSERT INTO lg VALUES ('g2', CASE old.nc WHEN 2.5 COLLATE BINARY THEN 1 ELSE 0 END, new.rt IN (SELECT m.rt FROM m WHERE m.rt <> old.id), old.id BETWEEN 0 AND 'b'); END
+sql	CREATE TRIGGER g3 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN SELECT CASE WHEN 'x ' IN (new.id, 'zz') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g3', max(old.rt, new.nc COLLATE BINARY) IS old.rt, (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.b = 'ADMIN')), min('10' COLLATE BINARY, new.r) IS '10' COLLATE BINARY); END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR REPLACE kn SET name = new.u WHERE new.t = name; END
 sql	CREATE TRIGGER g5 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (new.t BETWEEN 0 AND 'b' OR CASE old.tn WHEN 'x ' THEN 1 ELSE 0 END) BEGIN INSERT OR IGNORE INTO kn VALUES (old.id, 'g5'); END
 sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE new.nc = m.t) BEGIN INSERT INTO lg VALUES ('g6', (new.nc, 1) IN (SELECT m.i, 1 FROM m), (CASE WHEN CAST(new.rt AS TEXT) = new.r THEN 'yes' END AND nullif(new.t, 'admin') IS NULL), (WITH c(v) AS (SELECT new.i) SELECT count(*) FROM c WHERE c.v = 'ADMIN')); END
@@ -3898,8 +3898,8 @@ q	SELECT * FROM lg	16:'g2',0,0,1;'g2',0,NULL,0;'g2',0,NULL,1;'g2',0,NULL,1;'g4',
 q	SELECT * FROM t	4:1,2,1.0,'ADMIN',1,'1','1','ADMIN','x ','Aa';2,3,2.5,'ADMIN',2,2,2,'ADMIN','x ','aA';3,10,10.0,'ADMIN',10,'10',10,'10','10 ','10';5,0,0.0,'ADMIN','a',x'61','a','ADMIN','x ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'1','start';'admin','start'
-db	cx	rows57
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed57
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4014,8 +4014,8 @@ q	SELECT * FROM lg	8:'g0',0,NULL,1;'g0',0,NULL,2;'g0',0,NULL,2;'g0',0,NULL,2;'g0
 q	SELECT * FROM t	6:1,1,1.0,'x ',1,'1','1','ADMIN','x ','Aa';2,2,2.5,'x ',2,2,2,'admin','x ','aA';3,0,0.0,'x ','a',x'61','a','Abc','x ','x ';5,7,1.5,'x ',1.5,x'31',1.5,'ABC','x ','abc';7,NULL,NULL,'x ',NULL,NULL,NULL,NULL,'x ',NULL;8,NULL,NULL,'x ',NULL,NULL,NULL,NULL,'x ',NULL
 q	SELECT * FROM m2	2:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows61
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed61
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4136,8 +4136,8 @@ q	SELECT * FROM lg	2:'g1',NULL,2,1;'g7',0,0,1
 q	SELECT * FROM t	6:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';2,2,2.5,'admin',2,2,2,'admin','x','aA';3,0,0.0,'x','a',x'61','a','Abc','abc ','x ';4,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';6,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';7,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	5:'10','g3';'ADMIN','g3';'Abc','g3';'admin','start';'x','start'
-db	cx	rows65
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed65
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4148,14 +4148,14 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (old.rowid, 'g0'); END
+sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (old.id, 'g0'); END
 sql	CREATE TRIGGER g1 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN ('admin' IN (new.id, 'zz') AND (SELECT count(DISTINCT v) FROM (SELECT old.u AS v UNION ALL SELECT 0))) BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.r = m2.t; END
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW WHEN old.n IN ((SELECT m.t FROM m WHERE m.id = 2), 'abc') BEGIN UPDATE OR REPLACE kn SET name = old.n WHERE old.t = name; END
-sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = old.rowid; INSERT INTO lg VALUES ('g3', (SELECT m.rt FROM m WHERE m.id = 2) COLLATE RTRIM IS NOT old.tn, (SELECT count(DISTINCT v) FROM (SELECT lower(old.nc) AS v UNION ALL SELECT old.nc)), (SELECT count(DISTINCT v) FROM (SELECT old.nc AS v UNION ALL SELECT 'x'))); END
+sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = old.id; INSERT INTO lg VALUES ('g3', (SELECT m.rt FROM m WHERE m.id = 2) COLLATE RTRIM IS NOT old.tn, (SELECT count(DISTINCT v) FROM (SELECT lower(old.nc) AS v UNION ALL SELECT old.nc)), (SELECT count(DISTINCT v) FROM (SELECT old.nc AS v UNION ALL SELECT 'x'))); END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW WHEN ('10' >= new.u OR new.rt COLLATE RTRIM BETWEEN 0 COLLATE BINARY AND 'b') BEGIN INSERT OR IGNORE INTO kn VALUES (new.rt, 'g4'); END
 sql	CREATE TRIGGER g5 AFTER DELETE ON t FOR EACH ROW WHEN old.t NOT IN (old.b, 'x') BEGIN UPDATE OR REPLACE kn SET name = old.rt WHERE old.t = name; END
 sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT old.nc UNION SELECT 'admin' COLLATE BINARY)) BEGIN INSERT INTO lg VALUES ('g6', ((old.u || ''), 1) IN (SELECT m.t, 1 FROM m), (new.nc IN (SELECT m.i FROM m WHERE m.i IS NOT NULL) OR (SELECT count(*) FROM m WHERE m.t >= new.rt)), new.t BETWEEN old.tn COLLATE BINARY AND 'b'); END
-sql	CREATE TRIGGER g7 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM m WHERE new.rt IS m.i) BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.rowid = m2.nc; END
+sql	CREATE TRIGGER g7 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM m WHERE new.rt IS m.i) BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.id = m2.nc; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE t SET i = i + 1, nc = upper(nc) WHERE id < 4
 sql	UPDATE OR REPLACE t SET id = 2, nc = 'ADMIN' WHERE id = 6
@@ -4258,8 +4258,8 @@ q	SELECT * FROM lg	15:'g0',1,0,1;'g0',1,0,1;'g0',1,0,1;'g0',1,0,1;'g0',1,0,1;'g0
 q	SELECT * FROM t	4:17,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';2,3,2.5,'admin',2,2,2,'1','x ','aA';3,1,0.0,'admin','a',x'61','a','ABC','x ','x ';4,5,NULL,'admin',NULL,NULL,NULL,NULL,'x ',NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	7:'0','g6';'1','g6';'2','g6';'7','g6';'admin','start';'x','start';NULL,'g6'
-db	cx	rows69
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed69
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4271,12 +4271,12 @@ sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN CASE WHEN CAST(new.nc AS TEXT) = 'admin' THEN 'yes' END BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.tn = m2.t; END
-sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT m.nc FROM m WHERE m.id = 2) IS NOT new.rowid BEGIN SELECT CASE WHEN ((WITH c(v) AS (SELECT new.n) SELECT count(*) FROM c WHERE c.v = x'61') OR new.rt NOT IN ('x' COLLATE BINARY, 'x')) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g1', NOT EXISTS (SELECT 1 FROM m WHERE m.t = +new.nc AND new.t IS NOT NULL), (EXISTS (SELECT 1 FROM m WHERE m.rt < new.u) OR 'abc' > new.r), (new.rt, new.t) < (new.b, 'b')); END
+sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT m.nc FROM m WHERE m.id = 2) IS NOT new.id BEGIN SELECT CASE WHEN ((WITH c(v) AS (SELECT new.n) SELECT count(*) FROM c WHERE c.v = x'61') OR new.rt NOT IN ('x' COLLATE BINARY, 'x')) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g1', NOT EXISTS (SELECT 1 FROM m WHERE m.t = +new.nc AND new.t IS NOT NULL), (EXISTS (SELECT 1 FROM m WHERE m.rt < new.u) OR 'abc' > new.r), (new.rt, new.t) < (new.b, 'b')); END
 sql	CREATE TRIGGER g2 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (SELECT count(DISTINCT v) FROM (SELECT old.u AS v UNION ALL SELECT new.nc)) BEGIN INSERT INTO lg SELECT 'g2', m.id, 'a' BETWEEN old.t AND 0, 0 FROM m WHERE new.i >= m.t; END
 sql	CREATE TRIGGER g3 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (new.t, 'g3') ON CONFLICT(name) DO UPDATE SET who = excluded.who || new.t = old.t WHERE kn.name = old.tn; END
 sql	CREATE TRIGGER g4 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN SELECT CASE WHEN old.r > new.t THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', ((SELECT count(*) FROM m WHERE new.t >= m.u) OR (WITH c(v) AS (SELECT new.nc) SELECT count(*) FROM c WHERE c.v = NULL)), new.tn IN (SELECT m.rt FROM m WHERE m.rt <> old.id), (SELECT count(DISTINCT v) FROM (SELECT old.t AS v UNION ALL SELECT (SELECT m.nc FROM m WHERE m.id = 2)))); END
 sql	CREATE TRIGGER g5 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN old.id BETWEEN 10 COLLATE RTRIM AND 'b' BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.tn AND old.rt IS NOT NULL) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g5', EXISTS (SELECT 1 FROM m WHERE new.t > m.rt), NOT EXISTS (SELECT 1 FROM m WHERE m.u = old.n AND new.tn IS NOT NULL), min((SELECT m.t FROM m WHERE m.id = 3), new.nc) IS (SELECT m.t FROM m WHERE m.id = 3)); END
-sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN '10' = old.i BEGIN INSERT INTO lg VALUES ('g6', new.t BETWEEN 0 AND 'b', (EXISTS (SELECT 1 FROM m WHERE new.u IS NOT m.t) AND 10 IN (lower(old.r), 'zz')), NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.n AND old.rowid IS NOT NULL)); END
+sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN '10' = old.i BEGIN INSERT INTO lg VALUES ('g6', new.t BETWEEN 0 AND 'b', (EXISTS (SELECT 1 FROM m WHERE new.u IS NOT m.t) AND 10 IN (lower(old.r), 'zz')), NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.n AND old.id IS NOT NULL)); END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN (new.i BETWEEN 1 AND 'b' OR new.tn BETWEEN 'ADMIN' AND 'b') BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.t; INSERT INTO lg VALUES ('g7', (SELECT count(*) FROM m WHERE m.nc = new.rt), ((SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.t = 10)) OR new.nc = 'x '), CASE WHEN new.n = (SELECT m.t FROM m WHERE m.id = 2) COLLATE RTRIM THEN 'yes' END); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE OR IGNORE t SET id = 2, i = 5 WHERE id = 5
@@ -4379,8 +4379,8 @@ q	SELECT * FROM lg	9:'g2',0,0,0;'g2',0,0,0;'g3',0,NULL,0;'g3',1,1,0;'g3',1,1,0;'
 q	SELECT * FROM t	5:1,1,1.0,'admin',1,'1','1','ADMIN','x ','Aa';17,10,10.0,'ADMIN',10,'10',10,'10','10 ','10';2,2,2.5,'admin',2,2,2,'admin','x ','aA';3,NULL,NULL,NULL,NULL,NULL,NULL,'ADMIN',NULL,NULL;8,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	4:'admin','start';'x ','g7';'x','start';NULL,'g7'
-db	cx	rows73
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed73
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4392,7 +4392,7 @@ sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (old.tn, old.id) < (old.id, 'b') BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.t; INSERT INTO lg VALUES ('g0', (SELECT count(*) FROM (SELECT old.r AS v) AS s WHERE s.v < new.tn), new.tn NOT IN (2.5 COLLATE BINARY, 'x'), (old.tn = old.nc OR (old.nc, old.r) < ('x', 'b'))); END
-sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.t = +new.nc AND new.u IS NOT NULL) BEGIN INSERT INTO lg SELECT 'g1', m.id, CASE new.rowid WHEN new.tn THEN 1 ELSE 0 END, 0 FROM m WHERE new.n >= m.nc; END
+sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.t = +new.nc AND new.u IS NOT NULL) BEGIN INSERT INTO lg SELECT 'g1', m.id, CASE new.id WHEN new.tn THEN 1 ELSE 0 END, 0 FROM m WHERE new.n >= m.nc; END
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.r = m2.t; END
 sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT count(DISTINCT v) FROM (SELECT new.b AS v UNION ALL SELECT 'ADMIN' COLLATE NOCASE)) BEGIN INSERT INTO lg VALUES ('g3', (EXISTS (SELECT 1 FROM m WHERE m.nc <> new.id) OR EXISTS (SELECT 1 FROM m WHERE m.rt <> new.b)), (SELECT m.t FROM m WHERE m.id = 2) IN (+new.r, 'zz'), (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.tn = new.nc))); END
 sql	CREATE TRIGGER g4 AFTER UPDATE ON t FOR EACH ROW WHEN old.i IN (new.rt, 'abc') BEGIN INSERT INTO lg VALUES ('g4', (WITH c(v) AS (SELECT old.id) SELECT count(*) FROM c WHERE c.v = old.nc), (SELECT count(*) FROM m WHERE m.u <= old.nc), (old.t > new.u COLLATE RTRIM OR (new.t, new.u) < ('10' COLLATE NOCASE, 'b'))); END
@@ -4493,8 +4493,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	0:
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows77
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed77
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4614,8 +4614,8 @@ q	SELECT * FROM lg	4:'g0',0,NULL,1;'g0',0,NULL,1;'g1',1,1,0;'g1',1,1,0
 q	SELECT * FROM t	3:17,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';3,1,0.0,'admin','a',x'61','a','ABC','x ','x ';5,NULL,NULL,NULL,NULL,NULL,NULL,'ADMIN',NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	3:'1','g2';'admin','start';'x','start'
-db	cx	rows81
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed81
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4632,7 +4632,7 @@ sql	CREATE TRIGGER g2 BEFORE DELETE ON t FOR EACH ROW BEGIN SELECT CASE WHEN nul
 sql	CREATE TRIGGER g3 BEFORE UPDATE ON t FOR EACH ROW WHEN CASE WHEN new.t = '1' THEN 'yes' END BEGIN INSERT OR REPLACE INTO kn VALUES (old.nc, 'g3'); END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.nc = m2.rt; END
 sql	CREATE TRIGGER g5 BEFORE UPDATE ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT old.rt AS v) AS s WHERE s.v >= 0) BEGIN INSERT INTO kn VALUES (coalesce(old.t, 'none'), 'g5') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g6 AFTER DELETE ON t FOR EACH ROW WHEN 'x' IN (old.i, 'zz') BEGIN SELECT CASE WHEN nullif((old.rowid || ''), (SELECT m.t FROM m WHERE m.id = 2)) IS NULL THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', (old.nc IN (1, 'abc') AND EXISTS (SELECT 1 FROM m WHERE m.nc IS NOT old.nc)), (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE (old.u || '') = (SELECT m.t FROM m WHERE m.id = 2))), (WITH c(v) AS (SELECT old.nc) SELECT count(*) FROM c WHERE c.v = 'ADMIN' COLLATE RTRIM)); END
+sql	CREATE TRIGGER g6 AFTER DELETE ON t FOR EACH ROW WHEN 'x' IN (old.i, 'zz') BEGIN SELECT CASE WHEN nullif((old.id || ''), (SELECT m.t FROM m WHERE m.id = 2)) IS NULL THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', (old.nc IN (1, 'abc') AND EXISTS (SELECT 1 FROM m WHERE m.nc IS NOT old.nc)), (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE (old.u || '') = (SELECT m.t FROM m WHERE m.id = 2))), (WITH c(v) AS (SELECT old.nc) SELECT count(*) FROM c WHERE c.v = 'ADMIN' COLLATE RTRIM)); END
 sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g7', CASE old.t WHEN old.u THEN 1 ELSE 0 END, (SELECT count(*) FROM (SELECT old.i AS v) AS s WHERE s.v = old.nc), max(old.n, 'x') IS old.n); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT INTO t VALUES (12, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc')
@@ -4736,8 +4736,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	3:1,0,0.0,'x','a',x'61','a','Abc','abc ','x ';2,2,2.5,'admin',2,2,2,'admin','x','aA';4,2,2.5,'admin',2,2,2,'admin','x','aA'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	3:'abc ','g1';'admin','start';'x','start'
-db	cx	rows85
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed85
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4749,12 +4749,12 @@ sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW WHEN (new.rt NOT IN (new.tn COLLATE NOCASE, 'x') OR nullif(new.n, '1' COLLATE BINARY) IS NULL) BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.t = name; END
-sql	CREATE TRIGGER g1 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (CASE old.i WHEN old.b THEN 1 ELSE 0 END OR old.t NOT IN (SELECT m.i FROM m WHERE m.i IS NOT NULL)) BEGIN INSERT INTO lg VALUES ('g1', (EXISTS (SELECT 1 FROM m WHERE old.nc > m.t) OR (new.b, 1) IN (SELECT m.t, 1 FROM m)), old.rowid COLLATE NOCASE IN (old.t, 'zz'), (SELECT count(*) FROM m WHERE old.n = m.t)); END
+sql	CREATE TRIGGER g1 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (CASE old.i WHEN old.b THEN 1 ELSE 0 END OR old.t NOT IN (SELECT m.i FROM m WHERE m.i IS NOT NULL)) BEGIN INSERT INTO lg VALUES ('g1', (EXISTS (SELECT 1 FROM m WHERE old.nc > m.t) OR (new.b, 1) IN (SELECT m.t, 1 FROM m)), old.id COLLATE NOCASE IN (old.t, 'zz'), (SELECT count(*) FROM m WHERE old.n = m.t)); END
 sql	CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM m WHERE m.nc >= new.u) BEGIN INSERT INTO kn VALUES (coalesce(new.nc, 'none'), 'g2') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE new.rowid = m.i) BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.tn = name; END
+sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE new.id = m.i) BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.tn = name; END
 sql	CREATE TRIGGER g4 AFTER DELETE ON t FOR EACH ROW WHEN 'x' IS old.rt BEGIN INSERT INTO lg VALUES ('g4', (SELECT count(*) FROM (SELECT old.id UNION SELECT 2.5)), 'abc' IS (old.t || ''), max(old.t, x'61' COLLATE BINARY) IS old.t); END
 sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE old.id <= m.t) BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.nc; INSERT INTO lg VALUES ('g5', ((CAST(new.id AS TEXT), 1) = ((SELECT m.nc FROM m WHERE m.id = 1), 1) AND (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.t = 2.5))), old.nc IN (SELECT m.nc FROM m WHERE m.nc IS NOT NULL), (SELECT m.id FROM m WHERE m.t = old.b ORDER BY m.id LIMIT 1)); END
-sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (WITH c(v) AS (SELECT old.rowid) SELECT count(*) FROM c WHERE c.v = '10') BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = old.rt; INSERT INTO lg VALUES ('g6', new.r IN (2.5, 'abc'), new.nc IS NOT 10, new.nc IN ((SELECT m.nc FROM m WHERE m.id = 2), 'abc')); END
+sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (WITH c(v) AS (SELECT old.id) SELECT count(*) FROM c WHERE c.v = '10') BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = old.rt; INSERT INTO lg VALUES ('g6', new.r IN (2.5, 'abc'), new.nc IS NOT 10, new.nc IN ((SELECT m.nc FROM m WHERE m.id = 2), 'abc')); END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN nullif(new.nc, 1 COLLATE RTRIM) IS NULL BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.rt = m2.t; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE OR IGNORE t SET id = 3, i = 5 WHERE id = 4
@@ -4858,8 +4858,8 @@ q	SELECT * FROM lg	4:'g4',0,1,0;'g4',1,1,0;'g4',1,1,0;'g4',1,1,0
 q	SELECT * FROM t	4:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';2,2,2.5,'admin',2,2,2,'x','x','aA';3,2,2.5,'admin',2,2,2,'admin','x','aA';8,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',3;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',3
 q	SELECT * FROM kn	4:'7','start';'Abc','g0';'admin','g0';'none','g0'
-db	cx	rows89
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed89
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4870,11 +4870,11 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g0', m.id, old.rowid BETWEEN (SELECT m.rt FROM m WHERE m.id = 1) AND 'b', 0 FROM m WHERE old.nc >= m.t; END
+sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g0', m.id, old.id BETWEEN (SELECT m.rt FROM m WHERE m.id = 1) AND 'b', 0 FROM m WHERE old.nc >= m.t; END
 sql	CREATE TRIGGER g1 AFTER DELETE ON t FOR EACH ROW WHEN (old.nc, 1) IN (SELECT m.rt, 1 FROM m) BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.rt = m2.t; END
 sql	CREATE TRIGGER g2 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN new.rt BETWEEN NULL AND 'b' BEGIN DELETE FROM m2 WHERE old.nc = m2.rt AND m2.id > 2; END
 sql	CREATE TRIGGER g3 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (nullif(old.tn, (SELECT m.rt FROM m WHERE m.id = 1) COLLATE RTRIM) IS NULL OR (SELECT count(DISTINCT v) FROM (SELECT new.rt AS v UNION ALL SELECT 'x'))) BEGIN INSERT INTO kn VALUES (coalesce(old.rt, 'none'), 'g3') ON CONFLICT DO NOTHING; END
-sql	CREATE TRIGGER g4 AFTER UPDATE ON t FOR EACH ROW BEGIN SELECT CASE WHEN max(new.nc, new.rowid) IS new.nc THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', (WITH c(v) AS (SELECT old.b) SELECT count(*) FROM c WHERE c.v = (SELECT m.nc FROM m WHERE m.id = 2)), (old.tn IN (SELECT m.i FROM m WHERE m.i <> new.n) OR 'x ' COLLATE BINARY IS NOT old.rt), EXISTS (SELECT 1 FROM m WHERE m.i IS new.rt)); END
+sql	CREATE TRIGGER g4 AFTER UPDATE ON t FOR EACH ROW BEGIN SELECT CASE WHEN max(new.nc, new.id) IS new.nc THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', (WITH c(v) AS (SELECT old.b) SELECT count(*) FROM c WHERE c.v = (SELECT m.nc FROM m WHERE m.id = 2)), (old.tn IN (SELECT m.i FROM m WHERE m.i <> new.n) OR 'x ' COLLATE BINARY IS NOT old.rt), EXISTS (SELECT 1 FROM m WHERE m.i IS new.rt)); END
 sql	CREATE TRIGGER g5 BEFORE INSERT ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE (new.rt || '') IS NOT m.t) BEGIN INSERT INTO kn VALUES (new.nc, 'g5') ON CONFLICT(name) DO UPDATE SET who = excluded.who || 0 IN (new.nc, 'zz') WHERE kn.name = new.nc; END
 sql	CREATE TRIGGER g6 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT OR IGNORE INTO kn VALUES (old.b, 'g6'); END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.r = m2.t AND m2.id > 2; END
@@ -4980,8 +4980,8 @@ q	SELECT * FROM lg	8:'g1',0,NULL,0;'g6',2,0,0;'g6',2,0,0;'g6',2,0,0;'g7',0,0,'b'
 q	SELECT * FROM t	2:3,0,0.0,'ADMIN','a',x'61','a','Abc','x ','x ';8,10,10.0,'ADMIN',10,'10',10,'10','10 ','10'
 q	SELECT * FROM m2	2:1,'admin','ADMIN','x',3;2,'abc','x','abc  ',0
 q	SELECT * FROM kn	8:'1','g5';'10 ','g3';'2','g5';'ADMIN','g4';'abc ','g3';'admin','start';'x  ','g3';'x','start'
-db	cx	rows93
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed93
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -4997,7 +4997,7 @@ sql	CREATE TRIGGER g1 AFTER DELETE ON t FOR EACH ROW WHEN old.rt IS NOT 0 BEGIN 
 sql	CREATE TRIGGER g2 BEFORE DELETE ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g2', m.id, old.id NOT IN (SELECT m.rt FROM m WHERE m.rt IS NOT NULL), 0 FROM m WHERE old.u = m.t; END
 sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.tn; INSERT INTO lg VALUES ('g3', (SELECT m.id FROM m WHERE m.i = new.rt ORDER BY m.id LIMIT 1), new.nc BETWEEN 2.5 AND 'b', (EXISTS (SELECT 1 FROM m WHERE (new.tn || '') IS m.i) AND (+new.t, 1) IN (SELECT m.t, 1 FROM m))); END
 sql	CREATE TRIGGER g4 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.rt; INSERT INTO lg VALUES ('g4', (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.nc = (SELECT m.t FROM m WHERE m.id = 1))), 'a' BETWEEN new.nc AND new.t COLLATE BINARY, 2.5 <= old.t); END
-sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.nc; INSERT INTO lg VALUES ('g5', NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.id AND old.b IS NOT NULL), (SELECT count(*) FROM m WHERE m.i <= new.rowid), (EXISTS (SELECT 1 FROM m WHERE new.id < m.t) AND (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.rt = 1 COLLATE NOCASE)))); END
+sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.nc; INSERT INTO lg VALUES ('g5', NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.id AND old.b IS NOT NULL), (SELECT count(*) FROM m WHERE m.i <= new.id), (EXISTS (SELECT 1 FROM m WHERE new.id < m.t) AND (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.rt = 1 COLLATE NOCASE)))); END
 sql	CREATE TRIGGER g6 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM m WHERE new.t >= m.t) BEGIN UPDATE OR REPLACE kn SET name = new.nc WHERE new.t = name; END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.nc = m2.nc AND m2.id > 2; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
@@ -5102,8 +5102,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	4:1,2,1.0,'1',1,'1','1','ADMIN','x  ','Aa';12,2,2.5,'admin',2,2,2,'admin','x','aA';3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';4,5,1.0,'1',1,'1','1','ADMIN','x  ','Aa'
 q	SELECT * FROM m2	2:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0
 q	SELECT * FROM kn	3:'1','g5';'admin','start';'x','start'
-db	cx	rows97
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed97
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5224,8 +5224,8 @@ q	SELECT * FROM lg	1:'g0',NULL,0,1
 q	SELECT * FROM t	5:2,2,2.5,'admin',2,2,2,'admin','x','aA';3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';6,0,0.0,'x','a',x'61','a','Abc','abc ','x ';7,2,2.5,'admin',2,2,2,'admin','x','aA';8,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	6:'1','g1';'2','g1';'3','g1';'abc ','g2';'admin','start';'x','start'
-db	cx	rows101
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed101
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5236,14 +5236,14 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT new.rowid UNION SELECT 2.5)) BEGIN INSERT INTO lg VALUES ('g0', ((SELECT count(*) FROM m WHERE new.nc > m.u) OR new.tn IN ('10', 'abc')), new.nc IN (SELECT m.rt FROM m WHERE m.rt IS NOT NULL), nullif(new.r, 2.5) IS NULL); END
+sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT new.id UNION SELECT 2.5)) BEGIN INSERT INTO lg VALUES ('g0', ((SELECT count(*) FROM m WHERE new.nc > m.u) OR new.tn IN ('10', 'abc')), new.nc IN (SELECT m.rt FROM m WHERE m.rt IS NOT NULL), nullif(new.r, 2.5) IS NULL); END
 sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN 'a' BETWEEN new.tn AND new.t BEGIN INSERT INTO lg SELECT 'g1', m.id, NOT EXISTS (SELECT 1 FROM m WHERE m.t = new.t AND new.rt IS NOT NULL), 0 FROM m WHERE new.n < m.rt; END
 sql	CREATE TRIGGER g2 AFTER INSERT ON t FOR EACH ROW WHEN 'a' BETWEEN +new.r AND x'61' BEGIN INSERT INTO kn VALUES (new.nc, 'g2') ON CONFLICT(name) DO UPDATE SET who = excluded.who || 'x' <= new.t WHERE kn.name = new.rt; END
 sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM m WHERE m.i > new.i) BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.nc = m2.nc; END
 sql	CREATE TRIGGER g4 BEFORE DELETE ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.t = old.nc AND old.rt IS NOT NULL) BEGIN INSERT INTO kn VALUES (old.nc, 'g4') ON CONFLICT(name) DO UPDATE SET who = excluded.who || 'a' BETWEEN old.tn AND NULL WHERE kn.name = old.i; END
 sql	CREATE TRIGGER g5 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE OR REPLACE kn SET name = old.rt WHERE old.t = name; END
-sql	CREATE TRIGGER g6 AFTER UPDATE ON t FOR EACH ROW BEGIN SELECT CASE WHEN new.t BETWEEN new.id COLLATE BINARY AND 'b' THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', (SELECT count(*) FROM (SELECT new.rowid UNION SELECT (SELECT m.nc FROM m WHERE m.id = 2))), (new.rt COLLATE BINARY IN (SELECT m.t FROM m WHERE m.t <> new.id) OR EXISTS (SELECT 1 FROM m WHERE m.t <> old.t)), new.t NOT IN ('x ', 'x')); END
-sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN new.n NOT IN (new.rt, 'x') BEGIN INSERT INTO lg VALUES ('g7', (new.t, 1) IN (SELECT m.nc, 1 FROM m), (WITH c(v) AS (SELECT new.rowid) SELECT count(*) FROM c WHERE c.v = 'x' COLLATE BINARY), new.n = new.t); END
+sql	CREATE TRIGGER g6 AFTER UPDATE ON t FOR EACH ROW BEGIN SELECT CASE WHEN new.t BETWEEN new.id COLLATE BINARY AND 'b' THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', (SELECT count(*) FROM (SELECT new.id UNION SELECT (SELECT m.nc FROM m WHERE m.id = 2))), (new.rt COLLATE BINARY IN (SELECT m.t FROM m WHERE m.t <> new.id) OR EXISTS (SELECT 1 FROM m WHERE m.t <> old.t)), new.t NOT IN ('x ', 'x')); END
+sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN new.n NOT IN (new.rt, 'x') BEGIN INSERT INTO lg VALUES ('g7', (new.t, 1) IN (SELECT m.nc, 1 FROM m), (WITH c(v) AS (SELECT new.id) SELECT count(*) FROM c WHERE c.v = 'x' COLLATE BINARY), new.n = new.t); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT OR IGNORE INTO t VALUES (8, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA')
 sql	INSERT INTO t VALUES (1, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc') ON CONFLICT(id) DO NOTHING
@@ -5346,8 +5346,8 @@ q	SELECT * FROM lg	8:'g1',0,1,0;'g2',1,0,1;'g4',0,0,0;'g4',0,1,0;'g4',0,1,0;'g7'
 q	SELECT * FROM t	2:3,0,0.0,'x','a',x'61','a','Abc','abc ','x ';6,10,10.0,'ADMIN',10,'10',10,'10','10 ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows105
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed105
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5358,13 +5358,13 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g0', nullif(new.t, 'x ') IS NULL, (WITH c(v) AS (SELECT new.rt) SELECT count(*) FROM c WHERE c.v = 1 COLLATE NOCASE), 2.5 COLLATE RTRIM IN (new.rowid, 'zz')); END
+sql	CREATE TRIGGER g0 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g0', nullif(new.t, 'x ') IS NULL, (WITH c(v) AS (SELECT new.rt) SELECT count(*) FROM c WHERE c.v = 1 COLLATE NOCASE), 2.5 COLLATE RTRIM IN (new.id, 'zz')); END
 sql	CREATE TRIGGER g1 AFTER UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = old.n; INSERT INTO lg VALUES ('g1', min('10', new.nc) IS '10', (SELECT count(*) FROM m WHERE m.t = new.rt), (SELECT count(*) FROM m WHERE old.nc = m.t)); END
 sql	CREATE TRIGGER g2 AFTER UPDATE ON t FOR EACH ROW WHEN ((WITH c(v) AS (SELECT new.nc) SELECT count(*) FROM c WHERE c.v = new.b) OR (old.n, 1) IN (SELECT m.u, 1 FROM m)) BEGIN INSERT INTO lg VALUES ('g2', old.rt IN ('10', 'abc'), new.i = new.b, EXISTS (SELECT 1 FROM m WHERE new.rt <= m.rt)); END
 sql	CREATE TRIGGER g3 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN new.nc IN (SELECT m.nc FROM m WHERE m.nc <> new.rt) BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = new.nc; INSERT INTO lg VALUES ('g3', (old.nc IN (SELECT m.i FROM m WHERE m.i IS NOT NULL) AND old.t IN (10 COLLATE NOCASE, 'abc')), new.b BETWEEN 2.5 AND 'b', (SELECT count(*) FROM m WHERE new.rt <> m.t)); END
-sql	CREATE TRIGGER g4 AFTER DELETE ON t FOR EACH ROW BEGIN SELECT CASE WHEN (SELECT count(*) FROM (SELECT old.i AS v) AS s WHERE s.v IS NOT x'61') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', ((old.nc, 1) = ('10' COLLATE BINARY, 1) OR CASE WHEN old.id = old.tn COLLATE BINARY THEN 'yes' END), (SELECT m.t FROM m WHERE m.id = 3) >= old.rt, min(old.rowid, old.t) IS old.rowid); END
+sql	CREATE TRIGGER g4 AFTER DELETE ON t FOR EACH ROW BEGIN SELECT CASE WHEN (SELECT count(*) FROM (SELECT old.i AS v) AS s WHERE s.v IS NOT x'61') THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g4', ((old.nc, 1) = ('10' COLLATE BINARY, 1) OR CASE WHEN old.id = old.tn COLLATE BINARY THEN 'yes' END), (SELECT m.t FROM m WHERE m.id = 3) >= old.rt, min(old.id, old.t) IS old.id); END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (new.rt, 'g5') ON CONFLICT(name) DO UPDATE SET who = excluded.who || new.rt IN (2.5 COLLATE BINARY, 'abc') WHERE kn.name = new.rt; END
-sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g6', ((new.t, new.rowid) < ((SELECT m.nc FROM m WHERE m.id = 1), 'b') OR CASE WHEN new.t = 'admin' THEN 'yes' END), (SELECT count(*) FROM (SELECT CAST(new.nc AS TEXT) AS v) AS s WHERE s.v = new.n), (CASE new.t WHEN 10 COLLATE RTRIM THEN 1 ELSE 0 END OR new.nc >= new.i)); END
+sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g6', ((new.t, new.id) < ((SELECT m.nc FROM m WHERE m.id = 1), 'b') OR CASE WHEN new.t = 'admin' THEN 'yes' END), (SELECT count(*) FROM (SELECT CAST(new.nc AS TEXT) AS v) AS s WHERE s.v = new.n), (CASE new.t WHEN 10 COLLATE RTRIM THEN 1 ELSE 0 END OR new.nc >= new.i)); END
 sql	CREATE TRIGGER g7 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g7', m.id, ((SELECT count(*) FROM m WHERE old.rt IS NOT m.t) OR lower(new.r) BETWEEN (SELECT m.rt FROM m WHERE m.id = 1) AND 'b'), 0 FROM m WHERE old.b = m.rt; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT INTO t VALUES (13, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc')
@@ -5468,8 +5468,8 @@ q	SELECT * FROM lg	14:'g0',0,0,0;'g0',0,0,0;'g0',0,0,0;'g0',0,0,0;'g0',0,0,0;'g0
 q	SELECT * FROM t	2:11,10,10.0,'abc',10,'10',10,'10','x ','10';4,10,10.0,'abc',10,'10',10,'10','x ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	9:'1','g4';'11','g4';'15','g4';'2','g4';'3','g4';'4','g4';'7','g4';'ADMIN','g6';'x','start'
-db	cx	rows109
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed109
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5590,8 +5590,8 @@ q	SELECT * FROM lg	3:'g5',0,1,0;'g5',0,1,0;'g5',0,1,1
 q	SELECT * FROM t	4:1,1,1.0,'1',1,'1','1','ADMIN','x ','Aa';2,2,2.5,'1',2,2,2,'abc','x ','aA';4,0,0.0,'1','a',x'61','a','ADMIN','x ','x ';7,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	8:'0','g4';'1',0;'2',0;'aA','g1';'admin','start';'x ','g1';'x','start';NULL,'g1'
-db	cx	rows113
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed113
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5712,8 +5712,8 @@ q	SELECT * FROM lg	10:'g1',NULL,1,1;'g1',NULL,1,1;'g1',NULL,1,1;'g1',NULL,1,1;'g
 q	SELECT * FROM t	3:2,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';4,5,1.0,'x',1,'1','1','Abc','x  ','Aa'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	6:'ADMIN','g4';'admin','start';'x','start';1,'g2';2,'g2';3,'g2'
-db	cx	rows117
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed117
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5726,11 +5726,11 @@ sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN INSERT INTO kn VALUES (coalesce(old.t, 'none'), 'g0') ON CONFLICT DO NOTHING; END
 sql	CREATE TRIGGER g1 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN EXISTS (SELECT 1 FROM m WHERE new.id < m.rt) BEGIN UPDATE OR IGNORE kn SET name = new.n WHERE old.rt = name; END
-sql	CREATE TRIGGER g2 AFTER UPDATE ON t FOR EACH ROW WHEN new.nc <= new.rowid BEGIN INSERT INTO lg SELECT 'g2', m.id, (WITH c(v) AS (SELECT old.r) SELECT count(*) FROM c WHERE c.v = new.n), 0 FROM m WHERE new.rt = m.rt; END
+sql	CREATE TRIGGER g2 AFTER UPDATE ON t FOR EACH ROW WHEN new.nc <= new.id BEGIN INSERT INTO lg SELECT 'g2', m.id, (WITH c(v) AS (SELECT old.r) SELECT count(*) FROM c WHERE c.v = new.n), 0 FROM m WHERE new.rt = m.rt; END
 sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW WHEN ((SELECT count(DISTINCT v) FROM (SELECT old.tn AS v UNION ALL SELECT (SELECT m.rt FROM m WHERE m.id = 3))) AND max(old.i, 1 COLLATE BINARY) IS old.i) BEGIN UPDATE OR REPLACE kn SET name = old.nc WHERE old.nc = name; END
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g4', (WITH c(v) AS (SELECT new.nc) SELECT count(*) FROM c WHERE c.v = new.tn), new.rt BETWEEN x'61' COLLATE RTRIM AND 'b', EXISTS (SELECT 1 FROM m WHERE m.t IS new.t)); END
-sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN CASE new.rt WHEN 'x ' THEN 1 ELSE 0 END BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.tn; INSERT INTO lg VALUES ('g5', 'admin' IN (new.rowid, 'zz'), new.id = '1', max(new.t, 2.5) IS new.t); END
-sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN new.rowid NOT IN (new.r, 'x') BEGIN SELECT CASE WHEN (new.n BETWEEN 'ADMIN' AND 'b' OR (new.nc, 1) IN (SELECT m.t, 1 FROM m)) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', new.tn IN (SELECT m.u FROM m WHERE m.u IS NOT NULL), (new.rowid, 1) = ('admin' COLLATE BINARY, 1), new.t <= new.tn); END
+sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN CASE new.rt WHEN 'x ' THEN 1 ELSE 0 END BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.tn; INSERT INTO lg VALUES ('g5', 'admin' IN (new.id, 'zz'), new.id = '1', max(new.t, 2.5) IS new.t); END
+sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN new.id NOT IN (new.r, 'x') BEGIN SELECT CASE WHEN (new.n BETWEEN 'ADMIN' AND 'b' OR (new.nc, 1) IN (SELECT m.t, 1 FROM m)) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g6', new.tn IN (SELECT m.u FROM m WHERE m.u IS NOT NULL), (new.id, 1) = ('admin' COLLATE BINARY, 1), new.t <= new.tn); END
 sql	CREATE TRIGGER g7 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g7', m.id, (SELECT count(*) FROM (SELECT new.rt AS v) AS s WHERE s.v > 2.5), 0 FROM m WHERE new.tn < m.rt; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT OR REPLACE INTO t VALUES (7, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA')
@@ -5740,7 +5740,7 @@ sql	INSERT INTO t VALUES (4, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa') O
 sql	INSERT INTO t VALUES (6, 10, 10, 'ADMIN', '10', '10', 10, '10', '10 ', '10') ON CONFLICT(id) DO UPDATE SET nc = excluded.nc, t = excluded.t, i = excluded.i + 1
 sql	UPDATE t SET nc = 'abc' WHERE id = 5
 sql	DELETE FROM t WHERE nc = 'admin'
-q	SELECT * FROM lg	8:'g4',0,0,0;'g4',0,0,0;'g4',0,0,0;'g4',0,0,1;'g4',0,0,1;'g4',1,0,1;'g5',0,1,1;'g6',0,0,0
+q	SELECT * FROM lg	8:'g4',0,0,0;'g4',0,0,0;'g4',0,0,0;'g4',0,0,1;'g4',0,0,1;'g4',1,0,1;'g5',0,0,1;'g6',0,0,0
 q	SELECT * FROM t	1:6,10,10.0,'ADMIN',10,'10',10,'10','10 ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	3:'1','g0';'admin','start';'x','start'
@@ -5834,8 +5834,8 @@ q	SELECT * FROM lg	6:'g4',1,0,0;'g4',1,0,0;'g6',0,0,1;'g6',0,0,1;'g6',1,0,1;'g6'
 q	SELECT * FROM t	3:2,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';3,0,0.0,'x','a',x'61','a','x ','abc ','x ';6,5,1.0,'admin',1,'1','1','admin','x  ','Aa'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows121
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed121
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -5956,8 +5956,8 @@ q	SELECT * FROM lg	8:'g0',0,NULL,0;'g0',0,NULL,0;'g0',0,NULL,0;'g0',0,NULL,0;'g0
 q	SELECT * FROM t	2:15,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL;6,10,10.0,'ADMIN',10,'10',10,'10','10 ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows125
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed125
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6078,8 +6078,8 @@ q	SELECT * FROM lg	2:'g6',NULL,NULL,1;'g6',NULL,NULL,1
 q	SELECT * FROM t	2:16,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL;3,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	5:'16','g0';'3','g0';'admin','start';'none','g5';'x','start'
-db	cx	rows129
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed129
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6097,7 +6097,7 @@ sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW WHEN new.rt NOT IN (SELECT m.rt FROM m WHERE m.rt IS NOT NULL) BEGIN INSERT OR REPLACE INTO kn VALUES (new.t, 'g4'); END
 sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN (WITH c(v) AS (SELECT new.t) SELECT count(*) FROM c WHERE c.v = new.b) BEGIN INSERT INTO kn VALUES (new.t, 'g5') ON CONFLICT(name) DO UPDATE SET who = excluded.who || 'abc' <= new.rt WHERE kn.name = new.t; END
 sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW WHEN (lower(old.rt), 1) IN (SELECT m.rt, 1 FROM m) BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.nc = m2.t; END
-sql	CREATE TRIGGER g7 BEFORE INSERT ON t FOR EACH ROW WHEN max(new.nc, 10) IS new.nc BEGIN INSERT INTO lg VALUES ('g7', (EXISTS (SELECT 1 FROM m WHERE new.rt COLLATE NOCASE IS NOT m.nc) OR (new.rowid || '') NOT IN ('10', 'x')), ((new.id, 1) IN (SELECT m.t, 1 FROM m) AND (SELECT count(DISTINCT v) FROM (SELECT new.rt AS v UNION ALL SELECT 'admin'))), CAST(new.rt AS TEXT) <= 1 COLLATE NOCASE); END
+sql	CREATE TRIGGER g7 BEFORE INSERT ON t FOR EACH ROW WHEN max(new.nc, 10) IS new.nc BEGIN INSERT INTO lg VALUES ('g7', (EXISTS (SELECT 1 FROM m WHERE new.rt COLLATE NOCASE IS NOT m.nc) OR (new.id || '') NOT IN ('10', 'x')), ((new.id, 1) IN (SELECT m.t, 1 FROM m) AND (SELECT count(DISTINCT v) FROM (SELECT new.rt AS v UNION ALL SELECT 'admin'))), CAST(new.rt AS TEXT) <= 1 COLLATE NOCASE); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE t SET i = i + 1, nc = upper(nc) WHERE id < 4
 sql	REPLACE INTO t VALUES (4, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa')
@@ -6200,8 +6200,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	4:2,3,2.5,'admin',2,2,2,'ADMIN','x','aA';3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';4,2,2.5,'admin',2,2,2,'admin','x','aA';8,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',1;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	6:'1','start';'a','g6';'admin','start';'x  ','g0';'x','g6';2,'g6'
-db	cx	rows133
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed133
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6213,13 +6213,13 @@ sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER UPDATE ON t FOR EACH ROW WHEN min(NULL, lower(old.nc)) IS NULL BEGIN INSERT INTO lg VALUES ('g0', min(new.r COLLATE RTRIM, old.nc) IS new.r COLLATE RTRIM, ((SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE old.r = NULL COLLATE NOCASE)) AND (WITH c(v) AS (SELECT new.t) SELECT count(*) FROM c WHERE c.v = new.i)), new.rt = x'61' COLLATE NOCASE); END
-sql	CREATE TRIGGER g1 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g1', (new.nc, 1) = ('1' COLLATE NOCASE, 1), new.t < 'x ', new.rowid NOT IN ('1', 'x')); END
+sql	CREATE TRIGGER g1 BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g1', (new.nc, 1) = ('1' COLLATE NOCASE, 1), new.t < 'x ', new.id NOT IN ('1', 'x')); END
 sql	CREATE TRIGGER g2 AFTER UPDATE ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.u = old.rt AND old.rt IS NOT NULL) BEGIN INSERT OR REPLACE INTO kn VALUES (old.t, 'g2'); END
 sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g3', (new.tn, new.nc) < (new.nc, 'b'), new.t IS NOT 10, (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.i = new.nc))); END
-sql	CREATE TRIGGER g4 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.rt; INSERT INTO lg VALUES ('g4', min((SELECT m.nc FROM m WHERE m.id = 1) COLLATE NOCASE, new.t) IS (SELECT m.nc FROM m WHERE m.id = 1) COLLATE NOCASE, EXISTS (SELECT 1 FROM m WHERE new.id >= m.i), (WITH c(v) AS (SELECT old.rowid) SELECT count(*) FROM c WHERE c.v = new.rowid)); END
+sql	CREATE TRIGGER g4 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.rt; INSERT INTO lg VALUES ('g4', min((SELECT m.nc FROM m WHERE m.id = 1) COLLATE NOCASE, new.t) IS (SELECT m.nc FROM m WHERE m.id = 1) COLLATE NOCASE, EXISTS (SELECT 1 FROM m WHERE new.id >= m.i), (WITH c(v) AS (SELECT old.id) SELECT count(*) FROM c WHERE c.v = new.id)); END
 sql	CREATE TRIGGER g5 AFTER UPDATE ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.rt = m2.nc AND m2.id > 2; END
 sql	CREATE TRIGGER g6 AFTER DELETE ON t FOR EACH ROW WHEN ((SELECT count(*) FROM (SELECT old.n AS v) AS s WHERE s.v = old.id) AND EXISTS (SELECT 1 FROM m WHERE m.u = old.u)) BEGIN UPDATE m2 SET hits = hits + 1 WHERE old.nc = m2.t; END
-sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN new.n IS NOT new.i BEGIN INSERT INTO lg VALUES ('g7', (+new.i, new.r) < (1, 'b'), NOT EXISTS (SELECT 1 FROM m WHERE m.rt = new.rowid AND new.t IS NOT NULL), new.id IN (SELECT m.nc FROM m WHERE m.nc <> new.nc)); END
+sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN new.n IS NOT new.i BEGIN INSERT INTO lg VALUES ('g7', (+new.i, new.r) < (1, 'b'), NOT EXISTS (SELECT 1 FROM m WHERE m.rt = new.id AND new.t IS NOT NULL), new.id IN (SELECT m.nc FROM m WHERE m.nc <> new.nc)); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE t SET nc = 'ADMIN' WHERE id = 3
 sql	UPDATE t SET nc = 1 WHERE id = 5
@@ -6228,7 +6228,7 @@ sql	UPDATE OR IGNORE t SET id = 3, i = 5 WHERE id = 7
 sql	INSERT INTO t VALUES (11, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA')
 sql	INSERT INTO t VALUES (2, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ') ON CONFLICT(id) DO UPDATE SET nc = excluded.nc, t = excluded.t, i = excluded.i + 1
 sql	INSERT INTO t VALUES (5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL) ON CONFLICT(id) DO NOTHING
-q	SELECT * FROM lg	19:'g0',1,0,0;'g0',1,0,0;'g1',0,1,0;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',NULL,NULL,1;'g3',0,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',NULL,1,NULL;'g4',1,1,1;'g4',1,1,1;'g7',0,1,0;'g7',1,1,0
+q	SELECT * FROM lg	19:'g0',1,0,0;'g0',1,0,0;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',0,1,1;'g1',NULL,NULL,1;'g3',0,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',1,1,NULL;'g3',NULL,1,NULL;'g4',1,1,1;'g4',1,1,1;'g7',0,1,0;'g7',1,1,0
 q	SELECT * FROM t	5:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';11,2,2.5,'admin',2,2,2,'admin','x','aA';2,1,2.5,'x',2,2,2,'Abc','x','aA';3,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',1;2,'abc','x','abc  ',1;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','g2'
@@ -6321,8 +6321,8 @@ q	SELECT * FROM lg	1:'g0',0,0,0
 q	SELECT * FROM t	5:1,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';2,2,2.5,'admin',2,2,2,'x ','x','aA';3,2,2.5,'admin',2,2,2,'admin','x','aA';7,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';8,2,2.5,'admin',2,2,2,'admin','x','aA'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	4:'Aa','g6';'aA','g6';'admin','start';'x','g60'
-db	cx	rows137
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed137
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6339,7 +6339,7 @@ sql	CREATE TRIGGER g2 BEFORE UPDATE ON t FOR EACH ROW BEGIN INSERT INTO lg VALUE
 sql	CREATE TRIGGER g3 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg SELECT 'g3', m.id, EXISTS (SELECT 1 FROM m WHERE new.id = m.t), 0 FROM m WHERE old.id < m.nc; END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.t = m2.t AND m2.id > 2; END
 sql	CREATE TRIGGER g5 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW WHEN 'x ' IN (old.t, 'zz') BEGIN INSERT INTO lg VALUES ('g5', (SELECT count(*) FROM m WHERE old.nc = m.i), CASE old.id WHEN 'ADMIN' THEN 1 ELSE 0 END, ((old.tn, old.rt) < (new.b, 'b') OR new.nc BETWEEN 'ADMIN' AND 'b')); END
-sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.rowid WHERE new.t = name; END
+sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.id WHERE new.t = name; END
 sql	CREATE TRIGGER g7 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT new.tn UNION SELECT old.t)) BEGIN DELETE FROM m2 WHERE old.nc = m2.nc AND m2.id > 2; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	REPLACE INTO t VALUES (7, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA')
@@ -6443,8 +6443,8 @@ q	SELECT * FROM lg	4:'g2',0,0,1;'g2',0,0,1;'g7',1,0,1;'g7',1,0,1
 q	SELECT * FROM t	3:1,2,1.0,'1',1,'1','1','1','x  ','Aa';18,0,0.0,'x','a',x'61','a','Abc','abc ','x ';3,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows141
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed141
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6462,7 +6462,7 @@ sql	CREATE TRIGGER g3 AFTER DELETE ON t FOR EACH ROW WHEN old.b > '10' BEGIN DEL
 sql	CREATE TRIGGER g4 BEFORE INSERT ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = new.tn; INSERT INTO lg VALUES ('g4', (SELECT count(*) FROM m WHERE new.t = m.t), (SELECT count(*) FROM (SELECT new.u UNION SELECT '1')), nullif(new.r, new.tn) IS NULL); END
 sql	CREATE TRIGGER g5 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g5', x'61' = new.n, 'admin' < old.nc, (new.rt, new.t) < (new.nc, 'b')); END
 sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN (max(new.rt, 10) IS new.rt OR EXISTS (SELECT 1 FROM m WHERE m.t = new.nc)) BEGIN INSERT OR IGNORE INTO kn VALUES (new.t, 'g6'); END
-sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN (new.i, 1) IN (SELECT m.u, 1 FROM m) BEGIN INSERT INTO lg VALUES ('g7', new.rt NOT IN (x'61', 'x'), 1 COLLATE NOCASE IS new.rowid, (new.rt, new.nc) < ('x', 'b')); END
+sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN (new.i, 1) IN (SELECT m.u, 1 FROM m) BEGIN INSERT INTO lg VALUES ('g7', new.rt NOT IN (x'61', 'x'), 1 COLLATE NOCASE IS new.id, (new.rt, new.nc) < ('x', 'b')); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	UPDATE OR REPLACE t SET id = 3, nc = 'ADMIN' WHERE id = 7
 sql	UPDATE t SET i = i + 1, nc = upper(nc) WHERE id < 4
@@ -6564,8 +6564,8 @@ q	SELECT * FROM lg	15:'g3',1,0,0;'g3',1,0,1;'g3',1,0,1;'g3',1,0,1;'g3',1,1,0;'g3
 q	SELECT * FROM t	4:2,0,0.0,'x','a',x'61','a','Abc','abc ','x ';3,2,2.5,'admin',2,2,2,'admin','x','aA';4,7,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';7,0,0.0,'x','a',x'61','a','Abc','abc ','x '
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows145
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed145
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6578,11 +6578,11 @@ sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
 sql	CREATE TRIGGER g0 AFTER UPDATE ON t FOR EACH ROW BEGIN DELETE FROM m2 WHERE new.t = m2.nc AND m2.id > 2; END
 sql	CREATE TRIGGER g1 BEFORE UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE new.nc = m2.t; END
-sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW WHEN CASE old.i WHEN (SELECT m.rt FROM m WHERE m.id = 1) THEN 1 ELSE 0 END BEGIN INSERT INTO lg VALUES ('g2', NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.rowid AND old.b IS NOT NULL), (old.id, 1) IN (SELECT m.t, 1 FROM m), (WITH c(v) AS (SELECT old.u COLLATE RTRIM) SELECT count(*) FROM c WHERE c.v = '10')); END
+sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW WHEN CASE old.i WHEN (SELECT m.rt FROM m WHERE m.id = 1) THEN 1 ELSE 0 END BEGIN INSERT INTO lg VALUES ('g2', NOT EXISTS (SELECT 1 FROM m WHERE m.nc = old.id AND old.b IS NOT NULL), (old.id, 1) IN (SELECT m.t, 1 FROM m), (WITH c(v) AS (SELECT old.u COLLATE RTRIM) SELECT count(*) FROM c WHERE c.v = '10')); END
 sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT new.tn UNION SELECT 'x ' COLLATE BINARY)) BEGIN INSERT INTO lg VALUES ('g3', EXISTS (SELECT 1 FROM m WHERE new.nc < m.u), (SELECT count(*) FROM m WHERE new.b <> m.t), 'a' BETWEEN new.rt AND 'x '); END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW BEGIN UPDATE OR IGNORE kn SET name = new.t WHERE new.nc = name; END
 sql	CREATE TRIGGER g5 BEFORE INSERT ON t FOR EACH ROW WHEN NOT EXISTS (SELECT 1 FROM m WHERE m.nc = new.tn AND new.b IS NOT NULL) BEGIN INSERT INTO lg VALUES ('g5', new.t BETWEEN 2.5 AND 'b', new.n IS 'x ', (WITH c(v) AS (SELECT new.rt) SELECT count(*) FROM c WHERE c.v = new.rt)); END
-sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = old.t; INSERT INTO lg VALUES ('g6', CASE old.rowid WHEN (SELECT m.rt FROM m WHERE m.id = 1) THEN 1 ELSE 0 END, (nullif(new.n, NULL) IS NULL AND new.i COLLATE RTRIM IN (old.tn, 'zz')), ((new.rt, 1) = ('admin', 1) AND 1 IN (old.rowid, 'zz'))); END
+sql	CREATE TRIGGER g6 BEFORE UPDATE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.t = old.t; INSERT INTO lg VALUES ('g6', CASE old.id WHEN (SELECT m.rt FROM m WHERE m.id = 1) THEN 1 ELSE 0 END, (nullif(new.n, NULL) IS NULL AND new.i COLLATE RTRIM IN (old.tn, 'zz')), ((new.rt, 1) = ('admin', 1) AND 1 IN (old.id, 'zz'))); END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN new.nc BETWEEN 'admin' AND 'b' BEGIN INSERT INTO lg VALUES ('g7', new.id = new.t, EXISTS (SELECT 1 FROM m WHERE new.i IS m.t), max(new.nc, new.rt) IS new.nc); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT OR REPLACE INTO t VALUES (7, 7, 1.5, 'abc', 1.5, x'31', 1.5, 'ABC', 'ABC', 'abc')
@@ -6592,7 +6592,7 @@ sql	DELETE FROM t WHERE id = 1
 sql	INSERT INTO t VALUES (18, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa')
 sql	UPDATE t SET t = 'abc', rt = 'x '
 sql	INSERT INTO t VALUES (8, 10, 10, 'ADMIN', '10', '10', 10, '10', '10 ', '10') ON CONFLICT(id) DO NOTHING
-q	SELECT * FROM lg	17:'g3',1,3,0;'g3',1,3,0;'g3',1,3,0;'g3',1,3,0;'g3',1,3,1;'g3',1,3,1;'g5',0,0,1;'g5',1,0,1;'g5',1,0,1;'g5',1,0,1;'g5',1,0,1;'g6',0,0,0;'g6',0,0,0;'g6',0,0,0;'g7',0,0,0;'g7',0,0,0;'g7',1,0,0
+q	SELECT * FROM lg	17:'g3',1,3,0;'g3',1,3,0;'g3',1,3,0;'g3',1,3,0;'g3',1,3,1;'g3',1,3,1;'g5',0,0,1;'g5',1,0,1;'g5',1,0,1;'g5',1,0,1;'g5',1,0,1;'g6',0,0,0;'g6',0,0,0;'g6',0,0,0;'g7',0,0,0;'g7',0,0,0;'g7',0,0,0
 q	SELECT * FROM t	4:18,1,1.0,'abc',1,'1','1','ADMIN','x ','Aa';2,2,2.5,'abc',2,2,2,'admin','x ','aA';3,0,0.0,'abc','a',x'61','a','Abc','x ','x ';8,10,10.0,'ADMIN',10,'10',10,'10','10 ','10'
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',3;2,'abc','x','abc  ',1;3,'ADMIN','Abc','ABC',2
 q	SELECT * FROM kn	2:'1','start';'x','start'
@@ -6686,8 +6686,8 @@ q	SELECT * FROM lg	0:
 q	SELECT * FROM t	3:2,8,1.5,'abc',1.5,x'31',1.5,'ABC','ABC','abc';3,1,0.0,'x','a',x'61','a','1','abc ','x ';8,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	3:'admin','start';'x  ','g2';'x','start'
-db	cx	rows149
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed149
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6805,8 +6805,8 @@ q	SELECT * FROM lg	9:'g2',0,0,0;'g2',0,0,0;'g2',0,1,0;'g2',NULL,0,0;'g3',NULL,1,
 q	SELECT * FROM t	4:2,1,2.5,'x',2,2,2,'abc','x','aA';3,0,0.0,'x','a',x'61','a','Abc','abc ','x ';5,1,1.0,'1',1,'1','1','ADMIN','x  ','Aa';7,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',1;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	2:'admin','start';'x','start'
-db	cx	rows153
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed153
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6822,8 +6822,8 @@ sql	CREATE TRIGGER g1 AFTER DELETE ON t FOR EACH ROW WHEN old.rt IN (SELECT m.rt
 sql	CREATE TRIGGER g2 AFTER DELETE ON t FOR EACH ROW BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.rt = old.id; INSERT INTO lg VALUES ('g2', (SELECT m.id FROM m WHERE m.nc = old.t ORDER BY m.id LIMIT 1), lower(old.rt) IN (SELECT m.t FROM m WHERE m.t <> old.nc), CASE old.tn WHEN 'ADMIN' THEN 1 ELSE 0 END); END
 sql	CREATE TRIGGER g3 BEFORE INSERT ON t FOR EACH ROW WHEN (nullif(new.nc, 0) IS NULL AND nullif(new.n, 2.5) IS NULL) BEGIN INSERT OR REPLACE INTO kn VALUES (new.r, 'g3'); END
 sql	CREATE TRIGGER g4 BEFORE UPDATE ON t FOR EACH ROW WHEN new.rt >= 'abc' BEGIN INSERT INTO lg VALUES ('g4', ((SELECT count(*) FROM m WHERE m.u = old.rt) AND CASE new.nc WHEN 'x ' THEN 1 ELSE 0 END), (SELECT count(*) FROM (SELECT new.b UNION SELECT 'ADMIN')), (old.tn, 1) IN (SELECT m.u, 1 FROM m)); END
-sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN new.nc BETWEEN NULL AND 'b' BEGIN DELETE FROM m2 WHERE new.rowid = m2.nc AND m2.id > 2; END
-sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g6', new.t BETWEEN 2.5 COLLATE NOCASE AND 'b', old.rowid IS (SELECT m.t FROM m WHERE m.id = 3) COLLATE RTRIM, max(new.rt, 2.5) IS new.rt); END
+sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW WHEN new.nc BETWEEN NULL AND 'b' BEGIN DELETE FROM m2 WHERE new.id = m2.nc AND m2.id > 2; END
+sql	CREATE TRIGGER g6 AFTER UPDATE OF nc, t, i ON t FOR EACH ROW BEGIN INSERT INTO lg VALUES ('g6', new.t BETWEEN 2.5 COLLATE NOCASE AND 'b', old.id IS (SELECT m.t FROM m WHERE m.id = 3) COLLATE RTRIM, max(new.rt, 2.5) IS new.rt); END
 sql	CREATE TRIGGER g7 AFTER INSERT ON t FOR EACH ROW WHEN CAST(new.r AS TEXT) IN (SELECT m.i FROM m WHERE m.i <> new.t) BEGIN INSERT INTO lg VALUES ('g7', NOT EXISTS (SELECT 1 FROM m WHERE m.t = new.rt AND new.u IS NOT NULL), (+new.t, 1) = ('abc', 1), (SELECT count(*) FROM (SELECT new.t UNION SELECT new.rt COLLATE RTRIM))); END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	INSERT INTO t VALUES (3, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa') ON CONFLICT(id) DO UPDATE SET nc = excluded.nc, t = excluded.t, i = excluded.i + 1
@@ -6927,8 +6927,8 @@ q	SELECT * FROM lg	27:'g0',0,NULL,NULL;'g0',0,NULL,NULL;'g0',1,NULL,1;'g0',1,NUL
 q	SELECT * FROM t	2:3,1,0.0,'x','a',x'61','a','ABC','abc ','x ';7,5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
 q	SELECT * FROM m2	3:1,'admin','ADMIN','x',0;2,'abc','x','abc  ',0;3,'ADMIN','Abc','ABC',0
 q	SELECT * FROM kn	4:'1','g5';'admin','start';'none','g5';'x','start'
-db	cx	rows157
-sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE)
+db	cx	keyed157
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, tn COLLATE NOCASE) WITHOUT ROWID
 sql	CREATE TABLE m(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, i INTEGER, u)
 sql	INSERT INTO m VALUES (1, 'admin', 'ADMIN', 'x', 1, '1'), (2, 'abc', 'x', 'abc  ', 2, 1), (3, 'ADMIN', 'Abc', 'ABC', 10, 'x'), (4, NULL, NULL, NULL, NULL, NULL)
 sql	CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)
@@ -6939,13 +6939,13 @@ sql	CREATE TABLE lg(g, a, b, c)
 sql	CREATE INDEX m_t ON m(t)
 sql	CREATE INDEX m_nc ON m(nc)
 sql	CREATE INDEX t_nc ON t(nc)
-sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN SELECT CASE WHEN nullif(old.rt, 'ADMIN') IS NULL THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g0', CAST(old.nc AS TEXT) BETWEEN 2.5 AND 'b', old.t IS '10' COLLATE NOCASE, max((old.rt || ''), old.rowid COLLATE NOCASE) IS (old.rt || '')); END
-sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE +new.id = (SELECT m.t FROM m WHERE m.id = 2))) BEGIN INSERT INTO kn VALUES (new.t, 'g1') ON CONFLICT(name) DO UPDATE SET who = excluded.who || new.nc IN ('ADMIN', 'abc') WHERE kn.name = new.rowid; END
+sql	CREATE TRIGGER g0 AFTER DELETE ON t FOR EACH ROW BEGIN SELECT CASE WHEN nullif(old.rt, 'ADMIN') IS NULL THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g0', CAST(old.nc AS TEXT) BETWEEN 2.5 AND 'b', old.t IS '10' COLLATE NOCASE, max((old.rt || ''), old.id COLLATE NOCASE) IS (old.rt || '')); END
+sql	CREATE TRIGGER g1 AFTER INSERT ON t FOR EACH ROW WHEN (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE +new.id = (SELECT m.t FROM m WHERE m.id = 2))) BEGIN INSERT INTO kn VALUES (new.t, 'g1') ON CONFLICT(name) DO UPDATE SET who = excluded.who || new.nc IN ('ADMIN', 'abc') WHERE kn.name = new.id; END
 sql	CREATE TRIGGER g2 AFTER INSERT ON t FOR EACH ROW WHEN new.nc = 'abc' BEGIN INSERT INTO lg VALUES ('g2', (SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE new.nc = 2.5 COLLATE BINARY)), new.u NOT IN (SELECT m.rt FROM m WHERE m.rt IS NOT NULL), EXISTS (SELECT 1 FROM m WHERE new.nc IS m.t)); END
-sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW WHEN new.t IN (SELECT m.nc FROM m WHERE m.nc IS NOT NULL) BEGIN INSERT INTO lg VALUES ('g3', new.r IN (SELECT m.t FROM m WHERE m.t <> new.nc), new.rt <> NULL COLLATE BINARY, (new.rowid IN (new.nc COLLATE NOCASE, 'abc') AND CAST(new.u AS TEXT) BETWEEN (SELECT m.rt FROM m WHERE m.id = 1) AND 'b')); END
+sql	CREATE TRIGGER g3 AFTER INSERT ON t FOR EACH ROW WHEN new.t IN (SELECT m.nc FROM m WHERE m.nc IS NOT NULL) BEGIN INSERT INTO lg VALUES ('g3', new.r IN (SELECT m.t FROM m WHERE m.t <> new.nc), new.rt <> NULL COLLATE BINARY, (new.id IN (new.nc COLLATE NOCASE, 'abc') AND CAST(new.u AS TEXT) BETWEEN (SELECT m.rt FROM m WHERE m.id = 1) AND 'b')); END
 sql	CREATE TRIGGER g4 AFTER INSERT ON t FOR EACH ROW WHEN new.b IN ((SELECT m.t FROM m WHERE m.id = 2), 'abc') BEGIN INSERT INTO lg SELECT 'g4', m.id, EXISTS (SELECT 1 FROM m WHERE m.t <> new.t), 0 FROM m WHERE new.id < m.rt; END
-sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN ((new.nc, 1) = ('10', 1) AND new.rt NOT IN ('x', 'x')) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g5', new.rowid IN (SELECT m.i FROM m WHERE m.i <> new.nc), EXISTS (SELECT 1 FROM m WHERE (new.nc || '') IS NOT m.u), new.tn NOT IN (NULL COLLATE BINARY, 'x')); END
-sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN (new.nc IN (SELECT m.u FROM m WHERE m.u <> new.t) OR (SELECT count(*) FROM (SELECT new.t AS v) AS s WHERE s.v = 'admin' COLLATE BINARY)) BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.n; INSERT INTO lg VALUES ('g6', (EXISTS (SELECT 1 FROM m WHERE m.u <= new.tn) AND 'x' COLLATE NOCASE IN (new.rt, 'zz')), new.n > 10, new.r IN (new.rowid, 'abc')); END
+sql	CREATE TRIGGER g5 AFTER INSERT ON t FOR EACH ROW BEGIN SELECT CASE WHEN ((new.nc, 1) = ('10', 1) AND new.rt NOT IN ('x', 'x')) THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g5', new.id IN (SELECT m.i FROM m WHERE m.i <> new.nc), EXISTS (SELECT 1 FROM m WHERE (new.nc || '') IS NOT m.u), new.tn NOT IN (NULL COLLATE BINARY, 'x')); END
+sql	CREATE TRIGGER g6 AFTER INSERT ON t FOR EACH ROW WHEN (new.nc IN (SELECT m.u FROM m WHERE m.u <> new.t) OR (SELECT count(*) FROM (SELECT new.t AS v) AS s WHERE s.v = 'admin' COLLATE BINARY)) BEGIN UPDATE m2 SET hits = hits + 1 WHERE m2.nc = new.n; INSERT INTO lg VALUES ('g6', (EXISTS (SELECT 1 FROM m WHERE m.u <= new.tn) AND 'x' COLLATE NOCASE IN (new.rt, 'zz')), new.n > 10, new.r IN (new.id, 'abc')); END
 sql	CREATE TRIGGER g7 AFTER DELETE ON t FOR EACH ROW WHEN (SELECT count(*) FROM (SELECT old.nc AS v) AS s WHERE s.v <= 0) BEGIN UPDATE OR REPLACE kn SET name = old.n WHERE old.nc = name; END
 sql	INSERT INTO t VALUES (1, 1, 1.0, '1', '1', '1', '1', 'ADMIN', 'x  ', 'Aa'), (2, 2, 2.5, 'admin', 2, 2, 2, 'admin', 'x', 'aA'), (3, 0, 0.0, 'x', 'a', x'61', 'a', 'Abc', 'abc ', 'x ')
 sql	DELETE FROM t WHERE id = 3

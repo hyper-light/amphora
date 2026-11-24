@@ -18,7 +18,6 @@ Not drawn, and why:
 - generate_series: an extension, which the SQLite library Python links doesn't have.
 - A bare column's value, a text of a group or a tie's value: any of its rows may give it (lower(), rtrim()).
 - new.rowid in a BEFORE INSERT that gives no rowid: undefined (lang_createtrigger.html).
-- A trigger on a WITHOUT ROWID table: Amphora refuses it (lane C11's record).
 - A subquery in a window function's argument: Amphora refuses it (finding CS).
 - json_tree right of a RIGHT or FULL JOIN: its root's rowid, 0, reads NULL in Amphora (finding DK).
 - A subquery in an UPSERT's DO UPDATE: Amphora refuses it ("Scalar subquery is not supported in this context").
@@ -402,9 +401,11 @@ def triggers(seed):
     out = []
     for number in range(160):
         rng = random.Random(f"{seed} cx {number}")
-        strict = number % 4 == 3
-        table = STRICT_TABLE if strict else ROW_TABLE
-        statements = [f"CREATE TABLE t(id INTEGER PRIMARY KEY, {table}){' STRICT' if strict else ''}"] + M_TABLE + [
+        kind = ["rows", "keyed", "rows", "strict"][number % 4]
+        strict = kind == "strict"
+        # A WITHOUT ROWID table's row has no rowid for new and old to name.
+        keyed = lambda statement: statement.replace(".rowid", ".id") if kind == "keyed" else statement
+        statements = [f"CREATE TABLE t(id INTEGER PRIMARY KEY, {STRICT_TABLE if strict else ROW_TABLE}){dict(rows='', keyed=' WITHOUT ROWID', strict=' STRICT')[kind]}"] + M_TABLE + [
             "CREATE TABLE m2(id INTEGER PRIMARY KEY, t TEXT, nc TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, hits INTEGER DEFAULT 0)",
             "INSERT INTO m2(id, t, nc, rt) VALUES (1, 'admin', 'ADMIN', 'x'), (2, 'abc', 'x', 'abc  '), (3, 'ADMIN', 'Abc', 'ABC')",
             f"CREATE TABLE kn(name {rng.choice(['TEXT', 'TEXT COLLATE NOCASE', 'TEXT COLLATE RTRIM', ''])} UNIQUE, who)",
@@ -413,12 +414,12 @@ def triggers(seed):
         ]
         if number % 2:
             statements += ["CREATE INDEX m_t ON m(t)", "CREATE INDEX m_nc ON m(nc)", "CREATE INDEX t_nc ON t(nc)"]
-        database = Database("cx", f"{'strict' if strict else 'rows'}{number}", statements)
+        database = Database("cx", f"{kind}{number}", statements)
         for statement in (ROW_FOUND if number < 8 else []):
             database.run(statement)
         made = 0
         while made < 8:
-            made += database.run(trigger(rng, made))
+            made += database.run(keyed(trigger(rng, made)))
         for statement in writes(rng, strict):
             database.run(statement)
         database.ask("SELECT * FROM lg")
