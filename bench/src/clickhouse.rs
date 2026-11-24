@@ -34,18 +34,38 @@ impl ClickHouse {
     pub fn connect(url: &str, durable: bool, connections: usize) -> anyhow::Result<Self> {
         // Idle connections are let go well inside the server's keep-alive (keep_alive_timeout, 30 s
         // by default), so none is reused as the server closes it.
-        let agent: ureq::Agent =
-            ureq::Agent::config_builder().max_idle_connections(connections).max_idle_connections_per_host(connections).max_idle_age(Duration::from_secs(5)).no_delay(true).http_status_as_error(false).build().into();
-        let ch = Self { agent, url: format!("{}/", url.trim_end_matches('/')), durable, rev: AtomicU64::new(0) };
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .max_idle_connections(connections)
+            .max_idle_connections_per_host(connections)
+            .max_idle_age(Duration::from_secs(5))
+            .no_delay(true)
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let ch = Self {
+            agent,
+            url: format!("{}/", url.trim_end_matches('/')),
+            durable,
+            rev: AtomicU64::new(0),
+        };
         ch.post(None, &[], "DROP TABLE IF EXISTS events SYNC".to_owned())?;
-        let settings = if durable { " SETTINGS fsync_after_insert = 1, fsync_part_directory = 1" } else { "" };
+        let settings = if durable {
+            " SETTINGS fsync_after_insert = 1, fsync_part_directory = 1"
+        } else {
+            ""
+        };
         ch.post(None, &[], format!("{TABLE}{settings}"))?;
         Ok(ch)
     }
 
     /// Posts `body`, with `query` (none: the body is the query) and `params` in the URL; the
     /// response's body once it succeeded.
-    fn post(&self, query: Option<&str>, params: &[(&str, &str)], body: String) -> anyhow::Result<String> {
+    fn post(
+        &self,
+        query: Option<&str>,
+        params: &[(&str, &str)],
+        body: String,
+    ) -> anyhow::Result<String> {
         let mut request = self.agent.post(&self.url);
         if let Some(q) = query {
             request = request.query("query", q);
@@ -72,13 +92,25 @@ impl Blocking for ClickHouse {
             rows.push_str(&row.to_string());
             rows.push('\n');
         }
-        let settings: &[(&str, &str)] = if self.durable { &[("async_insert", "1"), ("wait_for_async_insert", "1")] } else { &[] };
-        self.post(Some("INSERT INTO events FORMAT JSONEachRow"), settings, rows)?;
+        let settings: &[(&str, &str)] = if self.durable {
+            &[("async_insert", "1"), ("wait_for_async_insert", "1")]
+        } else {
+            &[]
+        };
+        self.post(
+            Some("INSERT INTO events FORMAT JSONEachRow"),
+            settings,
+            rows,
+        )?;
         Ok(())
     }
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
-        let out = self.post(None, &[("param_s", session), ("param_n", &limit.to_string())], EVENTS_LAST.to_owned())?;
+        let out = self.post(
+            None,
+            &[("param_s", session), ("param_n", &limit.to_string())],
+            EVENTS_LAST.to_owned(),
+        )?;
         // Every column taken, as a reader of the page would: each row split into its columns.
         let mut n = 0;
         for line in out.lines() {
@@ -89,7 +121,14 @@ impl Blocking for ClickHouse {
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
-        let out = self.post(None, &[("param_w", &format!("%{word}%")), ("param_n", &limit.to_string())], SEARCH.to_owned())?;
+        let out = self.post(
+            None,
+            &[
+                ("param_w", &format!("%{word}%")),
+                ("param_n", &limit.to_string()),
+            ],
+            SEARCH.to_owned(),
+        )?;
         Ok(out.lines().count())
     }
 }

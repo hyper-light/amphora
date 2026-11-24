@@ -20,16 +20,16 @@
 //! usage: amphora-bench --cc [--validation precision,ssi,occ] [--classes all|name,...]
 //!        [--writers 32] [--seconds 10] [--items 200000] [--row-bytes 600] [--text-bytes 600]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use amphora_engine::LimboError;
 use amphora_engine::storage::versioned::blink::Descender;
 use amphora_engine::storage::versioned::page::PAGE_SIZE;
 use amphora_engine::storage::versioned::version::{Txn, Validation, Versioned};
-use amphora_engine::LimboError;
 
-use crate::{summary, Hist, Rng};
+use crate::{Hist, Rng, summary};
 
 const CLASSES: [&str; 9] = [
     "insert_one",
@@ -76,7 +76,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--cc" => {}
             "--validation" => {
@@ -87,7 +90,9 @@ fn opts() -> anyhow::Result<Opts> {
                         "precision" => Ok(Validation::Precision),
                         "ssi" => Ok(Validation::Ssi),
                         "occ" => Ok(Validation::Occ),
-                        other => Err(anyhow::anyhow!("no validation {other}: snapshot, precision, ssi or occ")),
+                        other => Err(anyhow::anyhow!(
+                            "no validation {other}: snapshot, precision, ssi or occ"
+                        )),
                     })
                     .collect::<anyhow::Result<_>>()?
             }
@@ -135,7 +140,9 @@ fn row(indexed: u64, bytes: usize) -> Vec<u8> {
 }
 
 fn indexed_of(row: &[u8]) -> u64 {
-    row.get(..8).and_then(|b| b.try_into().ok()).map_or(0, u64::from_be_bytes)
+    row.get(..8)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u64::from_be_bytes)
 }
 
 fn event_key(session: u64, seq: u64) -> [u8; 16] {
@@ -146,14 +153,19 @@ fn event_key(session: u64, seq: u64) -> [u8; 16] {
 /// available now holds (the storage keeps every page in memory until eviction comes: a frame's
 /// page costs memory once it is used). A run that fills it ends there, and says so.
 fn database(validation: Validation, trees: usize) -> anyhow::Result<Versioned> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|err| anyhow::anyhow!("--cc sizes its pool by /proc/meminfo (Linux): {err}"))?;
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|err| anyhow::anyhow!("--cc sizes its pool by /proc/meminfo (Linux): {err}"))?;
     let kib: u64 = meminfo
         .lines()
         .find_map(|l| l.strip_prefix("MemAvailable:"))
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
         .ok_or_else(|| anyhow::anyhow!("/proc/meminfo has no MemAvailable"))?;
     let frames = usize::try_from(kib * 1024 / PAGE_SIZE as u64)?;
-    Ok(Versioned::new(frames, trees, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).map_err(e)?.with_validation(validation))
+    Ok(
+        Versioned::new(frames, trees, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b)))
+            .map_err(e)?
+            .with_validation(validation),
+    )
 }
 
 /// What a run counted, across its writers.
@@ -166,7 +178,12 @@ struct Counts {
 
 /// Runs `body` in a transaction until it commits, counting what refused it: the first writer's
 /// win (`WriteWriteConflict`) or validation (`SerializationFailure`). False: the pool is full.
-fn until_committed(v: &Versioned, d: &mut Descender, c: &mut Counts, mut body: impl FnMut(&Versioned, &mut Descender, &mut Txn) -> Result<(), LimboError>) -> anyhow::Result<bool> {
+fn until_committed(
+    v: &Versioned,
+    d: &mut Descender,
+    c: &mut Counts,
+    mut body: impl FnMut(&Versioned, &mut Descender, &mut Txn) -> Result<(), LimboError>,
+) -> anyhow::Result<bool> {
     loop {
         let mut txn = v.clock.begin().map_err(e)?;
         match body(v, d, &mut txn) {
@@ -196,8 +213,22 @@ fn until_committed(v: &Versioned, d: &mut Descender, c: &mut Counts, mut body: i
     }
 }
 
+/// Writer `w` of `o.writers`, with its own random draws.
+struct Writer<'a> {
+    w: usize,
+    rng: &'a mut Rng,
+}
+
 /// One write class's transaction by writer `w` of `n`, ids `next` handing out new rows' ids.
-fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v: &Versioned, d: &mut Descender, c: &mut Counts) -> anyhow::Result<bool> {
+fn class_txn(
+    class: &str,
+    o: &Opts,
+    Writer { w, rng }: Writer<'_>,
+    next: &AtomicU64,
+    v: &Versioned,
+    d: &mut Descender,
+    c: &mut Counts,
+) -> anyhow::Result<bool> {
     let per = (o.items / o.writers.max(1) as u64).max(1);
     let first = per * w as u64;
     let own = |rng: &mut Rng| first + rng.next() % per;
@@ -207,7 +238,9 @@ fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v
     match class {
         "insert_one" | "insert_batch_100" => {
             let n = if class == "insert_one" { 1 } else { 100 };
-            let ids: Vec<u64> = (0..n).map(|_| next.fetch_add(1, Ordering::Relaxed)).collect();
+            let ids: Vec<u64> = (0..n)
+                .map(|_| next.fetch_add(1, Ordering::Relaxed))
+                .collect();
             until_committed(v, d, c, |v, d, t| {
                 for id in &ids {
                     items.put(&v.pool, d, &v.clock, t, &k(*id), &row(*id, bytes))?;
@@ -219,7 +252,9 @@ fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v
         "update_plain" => {
             let id = own(rng);
             until_committed(v, d, c, |v, d, t| {
-                let r = items.read(&v.pool, d, &v.clock, t, &k(id))?.unwrap_or_default();
+                let r = items
+                    .read(&v.pool, d, &v.clock, t, &k(id))?
+                    .unwrap_or_default();
                 items.put(&v.pool, d, &v.clock, t, &k(id), &row(indexed_of(&r), bytes))?;
                 Ok(())
             })
@@ -227,7 +262,9 @@ fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v
         "update_indexed" => {
             let (id, value) = (own(rng), rng.next());
             until_committed(v, d, c, |v, d, t| {
-                let r = items.read(&v.pool, d, &v.clock, t, &k(id))?.unwrap_or_default();
+                let r = items
+                    .read(&v.pool, d, &v.clock, t, &k(id))?
+                    .unwrap_or_default();
                 index.remove(&v.pool, d, &v.clock, t, &ix(indexed_of(&r), id))?;
                 index.put(&v.pool, d, &v.clock, t, &ix(value, id), &[])?;
                 items.put(&v.pool, d, &v.clock, t, &k(id), &row(value, bytes))?;
@@ -246,7 +283,9 @@ fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v
         "delete_insert" => {
             let id = own(rng);
             until_committed(v, d, c, |v, d, t| {
-                let r = items.read(&v.pool, d, &v.clock, t, &k(id))?.unwrap_or_default();
+                let r = items
+                    .read(&v.pool, d, &v.clock, t, &k(id))?
+                    .unwrap_or_default();
                 items.remove(&v.pool, d, &v.clock, t, &k(id))?;
                 items.put(&v.pool, d, &v.clock, t, &k(id), &r)?;
                 Ok(())
@@ -270,7 +309,9 @@ fn class_txn(class: &str, o: &Opts, w: usize, rng: &mut Rng, next: &AtomicU64, v
             let (a, b, new) = (own(rng), own(rng), next.fetch_add(1, Ordering::Relaxed));
             until_committed(v, d, c, |v, d, t| {
                 for id in [a, b] {
-                    let r = items.read(&v.pool, d, &v.clock, t, &k(id))?.unwrap_or_default();
+                    let r = items
+                        .read(&v.pool, d, &v.clock, t, &k(id))?
+                        .unwrap_or_default();
                     items.put(&v.pool, d, &v.clock, t, &k(id), &row(indexed_of(&r), bytes))?;
                 }
                 items.put(&v.pool, d, &v.clock, t, &k(new), &row(new, bytes))?;
@@ -288,8 +329,19 @@ fn load_items(v: &Versioned, o: &Opts) -> anyhow::Result<()> {
     let mut d = Descender::new();
     for id in 0..o.items {
         let mut t = v.clock.begin().map_err(e)?;
-        items.put(&v.pool, &mut d, &v.clock, &mut t, &k(id), &row(id, o.row_bytes)).map_err(e)?;
-        index.put(&v.pool, &mut d, &v.clock, &mut t, &ix(id, id), &[]).map_err(e)?;
+        items
+            .put(
+                &v.pool,
+                &mut d,
+                &v.clock,
+                &mut t,
+                &k(id),
+                &row(id, o.row_bytes),
+            )
+            .map_err(e)?;
+        index
+            .put(&v.pool, &mut d, &v.clock, &mut t, &ix(id, id), &[])
+            .map_err(e)?;
         v.commit(t, &mut d).map_err(e)?;
     }
     v.collect(&mut d).map_err(e)?;
@@ -302,9 +354,27 @@ fn load_k0(v: &Versioned, o: &Opts) -> anyhow::Result<()> {
     let mut d = Descender::new();
     for s in 0..SESSIONS {
         let mut t = v.clock.begin().map_err(e)?;
-        sessions.put(&v.pool, &mut d, &v.clock, &mut t, &k(s), &PRELOAD.to_be_bytes()).map_err(e)?;
+        sessions
+            .put(
+                &v.pool,
+                &mut d,
+                &v.clock,
+                &mut t,
+                &k(s),
+                &PRELOAD.to_be_bytes(),
+            )
+            .map_err(e)?;
         for seq in 0..PRELOAD {
-            events.put(&v.pool, &mut d, &v.clock, &mut t, &event_key(s, seq), &vec![b'e'; o.text_bytes]).map_err(e)?;
+            events
+                .put(
+                    &v.pool,
+                    &mut d,
+                    &v.clock,
+                    &mut t,
+                    &event_key(s, seq),
+                    &vec![b'e'; o.text_bytes],
+                )
+                .map_err(e)?;
         }
         v.commit(t, &mut d).map_err(e)?;
     }
@@ -313,11 +383,20 @@ fn load_k0(v: &Versioned, o: &Opts) -> anyhow::Result<()> {
 }
 
 /// One K0 write: an event appended to `session`, its row's count read and written.
-fn k0_write(o: &Opts, session: u64, v: &Versioned, d: &mut Descender, c: &mut Counts) -> anyhow::Result<bool> {
+fn k0_write(
+    o: &Opts,
+    session: u64,
+    v: &Versioned,
+    d: &mut Descender,
+    c: &mut Counts,
+) -> anyhow::Result<bool> {
     let (events, sessions) = (v.tree(EVENTS).map_err(e)?, v.tree(SESSION_ROWS).map_err(e)?);
     let text = vec![b'e'; o.text_bytes];
     until_committed(v, d, c, |v, d, t| {
-        let n = sessions.read(&v.pool, d, &v.clock, t, &k(session))?.and_then(|r| r.try_into().ok()).map_or(0, u64::from_be_bytes);
+        let n = sessions
+            .read(&v.pool, d, &v.clock, t, &k(session))?
+            .and_then(|r| r.try_into().ok())
+            .map_or(0, u64::from_be_bytes);
         events.put(&v.pool, d, &v.clock, t, &event_key(session, n), &text)?;
         sessions.put(&v.pool, d, &v.clock, t, &k(session), &(n + 1).to_be_bytes())?;
         Ok(())
@@ -328,9 +407,19 @@ fn k0_write(o: &Opts, session: u64, v: &Versioned, d: &mut Descender, c: &mut Co
 fn k0_read(session: u64, v: &Versioned, d: &mut Descender, c: &mut Counts) -> anyhow::Result<bool> {
     let (events, sessions) = (v.tree(EVENTS).map_err(e)?, v.tree(SESSION_ROWS).map_err(e)?);
     until_committed(v, d, c, |v, d, t| {
-        let n = sessions.read(&v.pool, d, &v.clock, t, &k(session))?.and_then(|r| r.try_into().ok()).map_or(0, u64::from_be_bytes);
+        let n = sessions
+            .read(&v.pool, d, &v.clock, t, &k(session))?
+            .and_then(|r| r.try_into().ok())
+            .map_or(0, u64::from_be_bytes);
         let from = n.saturating_sub(PAGE_EVENTS as u64);
-        events.read_range(&v.pool, d, &v.clock, t, Some(&event_key(session, from)), PAGE_EVENTS)?;
+        events.read_range(
+            &v.pool,
+            d,
+            &v.clock,
+            t,
+            Some(&event_key(session, from)),
+            PAGE_EVENTS,
+        )?;
         Ok(())
     })
 }
@@ -347,28 +436,52 @@ pub fn main() -> anyhow::Result<()> {
                 load_items(&v, &o)?;
             }
             let v = Arc::new(v);
-            let stop = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(crate::Stop::default());
             // When the pool filled, in microseconds from the start (0: it didn't).
             let full = Arc::new(AtomicU64::new(0));
             let next = Arc::new(AtomicU64::new(o.items));
             let began = Instant::now();
             let spawn = |w: usize, reader: bool| {
-                let (v, stop, full, next, o, class) = (v.clone(), stop.clone(), full.clone(), next.clone(), o.clone(), class.clone());
+                let (v, stop, full, next, o, class) = (
+                    v.clone(),
+                    stop.clone(),
+                    full.clone(),
+                    next.clone(),
+                    o.clone(),
+                    class.clone(),
+                );
                 std::thread::spawn(move || -> anyhow::Result<(Counts, Hist)> {
                     let mut d = Descender::new();
-                    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (w as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9) | 1);
+                    let mut rng = Rng(0x9e37_79b9_7f4a_7c15
+                        ^ (w as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                        | 1);
                     let (mut c, mut h) = (Counts::default(), Hist::new());
-                    while !stop.load(Ordering::Relaxed) {
+                    while !stop.stopped() {
                         let at = Instant::now();
                         let session = rng.next() % SESSIONS;
                         let room = match (k0, reader) {
                             (true, true) => k0_read(session, &v, &mut d, &mut c)?,
                             (true, false) => k0_write(&o, session, &v, &mut d, &mut c)?,
-                            _ => class_txn(&class, &o, w, &mut rng, &next, &v, &mut d, &mut c)?,
+                            _ => class_txn(
+                                &class,
+                                &o,
+                                Writer { w, rng: &mut rng },
+                                &next,
+                                &v,
+                                &mut d,
+                                &mut c,
+                            )?,
                         };
                         if !room {
-                            let _ = full.compare_exchange(0, u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX).max(1), Ordering::AcqRel, Ordering::Acquire);
-                            stop.store(true, Ordering::Relaxed);
+                            let _ = full.compare_exchange(
+                                0,
+                                u64::try_from(began.elapsed().as_micros())
+                                    .unwrap_or(u64::MAX)
+                                    .max(1),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            stop.stop();
                             break;
                         }
                         h.record(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
@@ -377,11 +490,19 @@ pub fn main() -> anyhow::Result<()> {
                 })
             };
             let writers: Vec<_> = (0..o.writers).map(|w| spawn(w, false)).collect();
-            let readers: Vec<_> = if k0 { (0..READERS).map(|r| spawn(o.writers + r, true)).collect() } else { Vec::new() };
-            std::thread::sleep(Duration::from_secs_f64(o.seconds));
-            stop.store(true, Ordering::Relaxed);
+            let readers: Vec<_> = if k0 {
+                (0..READERS).map(|r| spawn(o.writers + r, true)).collect()
+            } else {
+                Vec::new()
+            };
+            stop.wait_until(Instant::now() + Duration::from_secs_f64(o.seconds));
+            stop.stop();
             let filled = full.load(Ordering::Acquire);
-            let window = if filled == 0 { began.elapsed().as_secs_f64() } else { filled as f64 / 1e6 };
+            let window = if filled == 0 {
+                began.elapsed().as_secs_f64()
+            } else {
+                filled as f64 / 1e6
+            };
             let gather = |handles: Vec<std::thread::JoinHandle<anyhow::Result<(Counts, Hist)>>>| -> anyhow::Result<(Counts, Hist)> {
                 let (mut all, mut hist) = (Counts::default(), Hist::new());
                 for h in handles {
@@ -397,7 +518,11 @@ pub fn main() -> anyhow::Result<()> {
             let (r, rh) = gather(readers)?;
             let share = |c: &Counts| {
                 let attempts = c.commits + c.conflicts + c.refused;
-                if attempts == 0 { 0.0 } else { (c.conflicts + c.refused) as f64 / attempts as f64 }
+                if attempts == 0 {
+                    0.0
+                } else {
+                    (c.conflicts + c.refused) as f64 / attempts as f64
+                }
             };
             println!(
                 "{}",

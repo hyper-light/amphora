@@ -3,13 +3,13 @@
 //! for until it is durable; a read takes the session's latest page whole.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use amphora::db::Db;
 use amphora::groups::Groups;
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener};
-use amphora::db::Db;
 use amphora_engine::Value;
 
 use crate::schema;
@@ -28,7 +28,8 @@ pub struct Convo {
 }
 
 /// The slowest COMMIT and commit, in µs (where a slow commit waits); the first is unused.
-static SLOWEST: (AtomicU64, AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+static SLOWEST: (AtomicU64, AtomicU64, AtomicU64) =
+    (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
 
 fn one_row() -> bool {
     static ONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -41,8 +42,15 @@ const CHUNKS: [usize; 4] = [64, 16, 4, 1];
 /// The upsert of `rows` events in one statement (one of [`CHUNKS`]).
 fn event_upsert(rows: usize) -> &'static str {
     static SQL: std::sync::OnceLock<Vec<(usize, String)>> = std::sync::OnceLock::new();
-    let all = SQL.get_or_init(|| CHUNKS.iter().map(|&n| (n, schema::event_upsert_rows(n))).collect());
-    all.iter().find(|(n, _)| *n == rows).map_or(schema::EVENT_UPSERT, |(_, sql)| sql.as_str())
+    let all = SQL.get_or_init(|| {
+        CHUNKS
+            .iter()
+            .map(|&n| (n, schema::event_upsert_rows(n)))
+            .collect()
+    });
+    all.iter()
+        .find(|(n, _)| *n == rows)
+        .map_or(schema::EVENT_UPSERT, |(_, sql)| sql.as_str())
 }
 
 /// An event's thirteen columns, in the upsert's order.
@@ -82,7 +90,9 @@ impl Engine for Convo {
     fn row_bytes(row: &Row) -> usize {
         let owned = match row {
             Row::Session(id) => id.capacity(),
-            Row::Event(e) => [&e.session, &e.id, &e.text, &e.body].iter().fold(0usize, |n, s| n.saturating_add(s.capacity())),
+            Row::Event(e) => [&e.session, &e.id, &e.text, &e.body]
+                .iter()
+                .fold(0usize, |n, s| n.saturating_add(s.capacity())),
         };
         std::mem::size_of::<Row>().saturating_add(owned)
     }
@@ -99,7 +109,16 @@ impl Engine for Convo {
                 rev += 1;
                 match row {
                     Row::Session(id) => {
-                        let params = [t(id), t("{}"), Value::Null, Value::Null, Value::Null, Value::from_i64(0), Value::from_i64(0), Value::from_i64(rev)];
+                        let params = [
+                            t(id),
+                            t("{}"),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::from_i64(0),
+                            Value::from_i64(0),
+                            Value::from_i64(rev),
+                        ];
                         db.query(schema::SESSION_UPSERT, params, |_| Ok(true))?;
                     }
                     Row::Event(e) => events.push((e, rev)),
@@ -109,19 +128,40 @@ impl Engine for Convo {
             let mut at = 0;
             while at < events.len() {
                 // AMPHORA_ONE_ROW: a statement a row (to compare).
-                let take = if one_row() { 1 } else { CHUNKS.iter().copied().find(|&c| c <= events.len() - at).unwrap_or(1) };
-                let params: Vec<Value> = events[at..at + take].iter().flat_map(|(e, rev)| event_params(e, *rev)).collect();
+                let take = if one_row() {
+                    1
+                } else {
+                    CHUNKS
+                        .iter()
+                        .copied()
+                        .find(|&c| c <= events.len() - at)
+                        .unwrap_or(1)
+                };
+                let params: Vec<Value> = events[at..at + take]
+                    .iter()
+                    .flat_map(|(e, rev)| event_params(e, *rev))
+                    .collect();
                 db.query(event_upsert(take), params, |_| Ok(true))?;
                 at += take;
             }
             // The store's number, kept with its rows (kiln's store keeps its own so).
-            db.query(schema::META_SET, [t("rev"), Value::from_text(rev.to_string())], |_| Ok(true))?;
+            db.query(
+                schema::META_SET,
+                [t("rev"), Value::from_text(rev.to_string())],
+                |_| Ok(true),
+            )?;
             Ok((Instant::now(), rev))
         });
         let (rows_done, rev) = applied?;
         // Where a slow commit spent its time: its COMMIT, and all of it.
-        SLOWEST.1.fetch_max(u64::try_from(rows_done.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
-        SLOWEST.2.fetch_max(u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        SLOWEST.1.fetch_max(
+            u64::try_from(rows_done.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        SLOWEST.2.fetch_max(
+            u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         self.rev = rev;
         Ok(n)
     }
@@ -167,9 +207,14 @@ impl Engine for Convo {
 /// A session's latest page, every column taken.
 fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
     let mut n = 0;
-    let params = [t(session), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+    let params = [
+        t(session),
+        Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+    ];
     db.query(schema::EVENTS_LAST, params, |r| {
-        let row: Vec<Value> = (0..schema::EVENT_COLUMNS).map(|i| r.get_value(i).clone()).collect();
+        let row: Vec<Value> = (0..schema::EVENT_COLUMNS)
+            .map(|i| r.get_value(i).clone())
+            .collect();
         std::hint::black_box(row);
         n += 1;
         Ok(true)
@@ -180,7 +225,10 @@ fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
 /// A session's latest page's event ids, newest first.
 fn page_ids(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
     let mut ids = Vec::new();
-    let params = [t(session), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+    let params = [
+        t(session),
+        Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+    ];
     db.query(schema::EVENTS_LAST, params, |r| {
         ids.push(r.get_value(1).to_text().unwrap_or_default().to_owned());
         Ok(true)
@@ -190,7 +238,10 @@ fn page_ids(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<Vec<Stri
 
 fn search_on(db: &mut Db, word: &str, limit: usize) -> anyhow::Result<usize> {
     let mut n = 0;
-    let params = [Value::from_text(format!("%{word}%")), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+    let params = [
+        Value::from_text(format!("%{word}%")),
+        Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+    ];
     db.query(schema::SEARCH, params, |_| {
         n += 1;
         Ok(true)
@@ -213,17 +264,27 @@ impl Amphora {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir)?;
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i64>().ok());
-        let groups = env("AMPHORA_GROUPS").and_then(|g| usize::try_from(g).ok()).unwrap_or(1);
+        let groups = env("AMPHORA_GROUPS")
+            .and_then(|g| usize::try_from(g).ok())
+            .unwrap_or(1);
         let defaults = Config::default();
         let config = Config {
             // AMPHORA_FLUSHERS: flusher threads a group.
-            flushers: env("AMPHORA_FLUSHERS").and_then(|f| usize::try_from(f).ok()).unwrap_or(defaults.flushers),
+            flushers: env("AMPHORA_FLUSHERS")
+                .and_then(|f| usize::try_from(f).ok())
+                .unwrap_or(defaults.flushers),
             // AMPHORA_CHECKPOINT_MS: how often a checkpointer copies its log.
-            checkpoint_every: env("AMPHORA_CHECKPOINT_MS").and_then(|ms| u64::try_from(ms).ok()).map_or(defaults.checkpoint_every, Duration::from_millis),
+            checkpoint_every: env("AMPHORA_CHECKPOINT_MS")
+                .and_then(|ms| u64::try_from(ms).ok())
+                .map_or(defaults.checkpoint_every, Duration::from_millis),
             // AMPHORA_LOG_FRAMES: a log's bound in frames.
-            log_frames: env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(defaults.log_frames),
+            log_frames: env("AMPHORA_LOG_FRAMES")
+                .and_then(|f| u64::try_from(f).ok())
+                .unwrap_or(defaults.log_frames),
             // AMPHORA_COMMIT_ROWS: rows that make a commit at once.
-            commit_rows: env("AMPHORA_COMMIT_ROWS").and_then(|r| usize::try_from(r).ok()).unwrap_or(defaults.commit_rows),
+            commit_rows: env("AMPHORA_COMMIT_ROWS")
+                .and_then(|r| usize::try_from(r).ok())
+                .unwrap_or(defaults.commit_rows),
             ..defaults
         };
         // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).
@@ -242,9 +303,16 @@ impl Amphora {
             if let Some(p) = env("AMPHORA_WRITER_PAGES") {
                 db.keep_pages(p)?;
             }
-            Ok(Convo { db, rev: 0, reader_pages: env("AMPHORA_READER_PAGES") })
+            Ok(Convo {
+                db,
+                rev: 0,
+                reader_pages: env("AMPHORA_READER_PAGES"),
+            })
         })?;
-        Ok(Self { groups, seen: Mutex::new(HashSet::new()) })
+        Ok(Self {
+            groups,
+            seen: Mutex::new(HashSet::new()),
+        })
     }
 }
 
@@ -262,7 +330,10 @@ impl Driver for Amphora {
         rows.extend(events.into_iter().map(Row::Event));
         // Told once durable: committed, then flushed by a flush begun after its commit.
         // A write is one session's events: one group's batch.
-        self.groups.put_then(rows, Instant::now() + WAIT, move |answer| done(answer.map_err(anyhow::Error::from)))?;
+        self.groups
+            .put_then(rows, Instant::now() + WAIT, move |answer| {
+                done(answer.map_err(anyhow::Error::from))
+            })?;
         Ok(())
     }
 
@@ -270,17 +341,32 @@ impl Driver for Amphora {
         let (s, w) = (session.to_owned(), session.to_owned());
         // What is committed now: the bench's readers aren't the writers of what they read, and read
         // as any database's readers do, waiting for no one's writes.
-        self.groups.read_committed(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
+        self.groups.read_committed(
+            session,
+            Instant::now() + WAIT,
+            move |db| page(db, &s, limit),
+            move |e| page(&mut e.db, &w, limit),
+        )
     }
 
     fn page(&self, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
         let (s, w) = (session.to_owned(), session.to_owned());
-        self.groups.read_committed(session, Instant::now() + WAIT, move |db| page_ids(db, &s, limit), move |e| page_ids(&mut e.db, &w, limit))
+        self.groups.read_committed(
+            session,
+            Instant::now() + WAIT,
+            move |db| page_ids(db, &s, limit),
+            move |e| page_ids(&mut e.db, &w, limit),
+        )
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (word.to_owned(), word.to_owned());
-        let each = self.groups.read_each(Instant::now() + WAIT, true, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
+        let each = self.groups.read_each(
+            Instant::now() + WAIT,
+            true,
+            move |db| search_on(db, &s, limit),
+            move |e| search_on(&mut e.db, &w, limit),
+        )?;
         Ok(each.into_iter().sum::<usize>().min(limit))
     }
 
@@ -328,18 +414,27 @@ mod tests {
     // `Groups::start` asked every engine for its group's holding and this one kept none.
     #[test]
     fn q5_k0_amphora_opens_and_reads_what_it_wrote() {
-        let dir = std::env::temp_dir().join(format!("amphora-q5-k0-{}", std::process::id()));
-        let amphora = Amphora::open(dir.to_str().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let amphora = Amphora::open(dir.path().join("k0").to_str().unwrap()).unwrap();
         let events: Vec<Event> = (0..3)
-            .map(|seq| Event { session: "s-000001".into(), id: format!("e-{seq}"), seq, at: 0, kind: "user", text: "quorum".into(), body: "{}".into() })
+            .map(|seq| Event {
+                session: "s-000001".into(),
+                id: format!("e-{seq}"),
+                seq,
+                at: 0,
+                kind: "user",
+                text: "quorum".into(),
+                body: "{}".into(),
+            })
             .collect();
         let (tx, rx) = std::sync::mpsc::channel();
-        amphora.write(events, Box::new(move |r| drop(tx.send(r)))).unwrap();
+        amphora
+            .write(events, Box::new(move |r| drop(tx.send(r))))
+            .unwrap();
         rx.recv().unwrap().unwrap();
         assert_eq!(amphora.history("s-000001", 50).unwrap(), 3);
         assert_eq!(amphora.history("s-000002", 50).unwrap(), 0);
         assert_eq!(amphora.page("s-000001", 50).unwrap(), ["e-2", "e-1", "e-0"]);
         drop(amphora);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

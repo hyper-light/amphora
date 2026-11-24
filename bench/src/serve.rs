@@ -20,7 +20,10 @@ use crate::schema as sql;
 
 /// The member config servers/amphora.sh writes, unless `--dsn` names another.
 pub fn default_config() -> String {
-    format!("{}/.config/amphora-bench/amphora-serve/member.conf", std::env::var("HOME").unwrap_or_default())
+    format!(
+        "{}/.config/amphora-bench/amphora-serve/member.conf",
+        std::env::var("HOME").unwrap_or_default()
+    )
 }
 
 pub struct AmphoraServe {
@@ -33,7 +36,10 @@ pub struct AmphoraServe {
 }
 
 fn st(sql: &str, params: Vec<Value>) -> Statement {
-    Statement { sql: sql.to_owned(), params }
+    Statement {
+        sql: sql.to_owned(),
+        params,
+    }
 }
 
 fn text(s: &str) -> Value {
@@ -50,9 +56,19 @@ impl AmphoraServe {
             .find(|m| m.node == config.node)
             .map(|m| m.addr.clone())
             .ok_or_else(|| anyhow::anyhow!("the config names no member {}", config.node))?;
-        let s = Self { addr, keys: config.keys()?, deadline: config.deadline, pool: Mutex::new(Vec::new()), rev: AtomicU64::new(0), seen: Mutex::new(HashSet::new()) };
+        let s = Self {
+            addr,
+            keys: config.keys()?,
+            deadline: config.deadline,
+            pool: Mutex::new(Vec::new()),
+            rev: AtomicU64::new(0),
+            seen: Mutex::new(HashSet::new()),
+        };
         let mut c = s.connection()?;
-        let mut schema: Vec<Statement> = ["events", "sessions", "meta"].iter().map(|t| st(&format!("DROP TABLE IF EXISTS {t}"), Vec::new())).collect();
+        let mut schema: Vec<Statement> = ["events", "sessions", "meta"]
+            .iter()
+            .map(|t| st(&format!("DROP TABLE IF EXISTS {t}"), Vec::new()))
+            .collect();
         schema.extend(sql::SCHEMA.iter().map(|s| st(s, Vec::new())));
         c.write(schema)?;
         s.give(c);
@@ -60,7 +76,12 @@ impl AmphoraServe {
     }
 
     fn connection(&self) -> anyhow::Result<SqlClient> {
-        if let Some(c) = self.pool.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.pop() {
+        if let Some(c) = self
+            .pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?
+            .pop()
+        {
             return Ok(c);
         }
         SqlClient::connect(&self.addr, &self.keys, self.deadline)
@@ -101,12 +122,28 @@ impl Blocking for AmphoraServe {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            events.iter().filter(|e| seen.insert(e.session.clone())).map(|e| e.session.clone()).collect()
+            events
+                .iter()
+                .filter(|e| seen.insert(e.session.clone()))
+                .map(|e| e.session.clone())
+                .collect()
         };
         let mut statements = Vec::with_capacity(new.len() + events.len());
         for s in &new {
             let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
-            statements.push(st(sql::SESSION_UPSERT, vec![text(s), text("{}"), Value::Null, Value::Null, Value::Null, Value::Integer(0), Value::Integer(0), Value::Integer(rev as i64)]));
+            statements.push(st(
+                sql::SESSION_UPSERT,
+                vec![
+                    text(s),
+                    text("{}"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(rev as i64),
+                ],
+            ));
         }
         for e in events {
             let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
@@ -137,10 +174,19 @@ impl Blocking for AmphoraServe {
     }
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
-        self.read(st(sql::EVENTS_LAST, vec![text(session), Value::Integer(limit as i64)]))
+        self.read(st(
+            sql::EVENTS_LAST,
+            vec![text(session), Value::Integer(limit as i64)],
+        ))
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
-        self.read(st(sql::SEARCH, vec![Value::Text(format!("%{word}%")), Value::Integer(limit as i64)]))
+        self.read(st(
+            sql::SEARCH,
+            vec![
+                Value::Text(format!("%{word}%")),
+                Value::Integer(limit as i64),
+            ],
+        ))
     }
 }

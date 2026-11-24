@@ -53,8 +53,14 @@ impl Refusal {
     /// Its line: `\!`, its kind, a space and why, escaped as a value is so it stays one line.
     fn line(&self) -> Vec<u8> {
         let (kind, why) = match self {
-            Refusal::Rows(cap) => ("too_many_rows", format!("more than {cap} rows, the answer writer's cap")),
-            Refusal::Bytes(cap) => ("too_many_bytes", format!("more than {cap} bytes, the answer writer's cap")),
+            Refusal::Rows(cap) => (
+                "too_many_rows",
+                format!("more than {cap} rows, the answer writer's cap"),
+            ),
+            Refusal::Bytes(cap) => (
+                "too_many_bytes",
+                format!("more than {cap} bytes, the answer writer's cap"),
+            ),
             Refusal::Value(why) => ("unwritten_value", why.clone()),
             Refusal::TimedOut => ("timed_out", "the run passed its deadline".to_owned()),
             Refusal::Failed(words) => ("failed", words.clone()),
@@ -79,7 +85,9 @@ fn escape(byte: u8) -> Option<&'static [u8]> {
 
 /// `value`'s length once escaped; None past `usize`.
 fn escaped_len(value: &[u8]) -> Option<usize> {
-    value.iter().try_fold(0usize, |n, &b| n.checked_add(escape(b).map_or(1, <[u8]>::len)))
+    value.iter().try_fold(0usize, |n, &b| {
+        n.checked_add(escape(b).map_or(1, <[u8]>::len))
+    })
 }
 
 fn escape_into(out: &mut Vec<u8>, value: &[u8]) {
@@ -106,7 +114,15 @@ pub struct Answer {
 
 impl Answer {
     pub fn new(max_rows: u64, max_bytes: usize) -> Self {
-        Self { text: Vec::new(), rows: 0, in_row: false, scratch: String::new(), refused: None, max_rows, max_bytes }
+        Self {
+            text: Vec::new(),
+            rows: 0,
+            in_row: false,
+            scratch: String::new(),
+            refused: None,
+            max_rows,
+            max_bytes,
+        }
     }
 
     /// Stops the answer for `why` and lets its rows go: the file will hold the refusal.
@@ -119,7 +135,11 @@ impl Answer {
 
     /// Whether `need` more bytes fit under the cap; the answer is refused if not.
     fn room(&mut self, need: usize) -> bool {
-        let fits = self.text.len().checked_add(need).is_some_and(|total| total <= self.max_bytes);
+        let fits = self
+            .text
+            .len()
+            .checked_add(need)
+            .is_some_and(|total| total <= self.max_bytes);
         if !fits {
             self.refuse(Refusal::Bytes(self.max_bytes));
         }
@@ -132,9 +152,16 @@ impl Answer {
         if self.refused.is_some() {
             return;
         }
-        let len = if escaped { escaped_len(value) } else { Some(value.len()) };
+        let len = if escaped {
+            escaped_len(value)
+        } else {
+            Some(value.len())
+        };
         // A length past `usize` can't fit: it asks for every byte there is.
-        if !self.room(len.and_then(|n| n.checked_add(usize::from(self.in_row))).unwrap_or(usize::MAX)) {
+        if !self.room(
+            len.and_then(|n| n.checked_add(usize::from(self.in_row)))
+                .unwrap_or(usize::MAX),
+        ) {
             return;
         }
         if self.in_row {
@@ -165,7 +192,9 @@ impl Answer {
         scratch.clear();
         match write!(scratch, "{value}") {
             Ok(()) => self.put(scratch.as_bytes(), true),
-            Err(_) => self.refuse(Refusal::Value("a value whose text could not be formatted".to_owned())),
+            Err(_) => self.refuse(Refusal::Value(
+                "a value whose text could not be formatted".to_owned(),
+            )),
         }
         self.scratch = scratch;
     }
@@ -217,7 +246,9 @@ impl Answer {
                 Ok(ValueRef::Real(f)) => self.real(f),
                 Ok(ValueRef::Text(t)) => self.text(t),
                 Ok(ValueRef::Blob(_)) => self.refuse(Refusal::Value(BLOB.to_owned())),
-                Err(e) => self.refuse(Refusal::Value(format!("a value SQLite's client could not read: {e}"))),
+                Err(e) => self.refuse(Refusal::Value(format!(
+                    "a value SQLite's client could not read: {e}"
+                ))),
             }
         }
         self.end_row();
@@ -238,11 +269,20 @@ impl Answer {
                 Ok(ValueRef::Decimal(d)) => self.formatted(d),
                 Ok(ValueRef::Text(t)) => self.text(t),
                 Ok(ValueRef::Date32(days)) => match civil(i64::from(days)) {
-                    Some((year, month, day)) => self.formatted(format_args!("{year:04}-{month:02}-{day:02}")),
-                    None => self.refuse(Refusal::Value(format!("a DATE {days} days from 1970-01-01, past the calendar's arithmetic"))),
+                    Some((year, month, day)) => {
+                        self.formatted(format_args!("{year:04}-{month:02}-{day:02}"))
+                    }
+                    None => self.refuse(Refusal::Value(format!(
+                        "a DATE {days} days from 1970-01-01, past the calendar's arithmetic"
+                    ))),
                 },
-                Ok(other) => self.refuse(Refusal::Value(format!("a {} value, which the answer writer has no text for", other.data_type()))),
-                Err(e) => self.refuse(Refusal::Value(format!("a value DuckDB's client could not read: {e}"))),
+                Ok(other) => self.refuse(Refusal::Value(format!(
+                    "a {} value, which the answer writer has no text for",
+                    other.data_type()
+                ))),
+                Err(e) => self.refuse(Refusal::Value(format!(
+                    "a value DuckDB's client could not read: {e}"
+                ))),
             }
         }
         self.end_row();
@@ -254,7 +294,9 @@ impl Answer {
             match row.try_get(i) {
                 Ok(Some(text)) => self.text(text.as_bytes()),
                 Ok(None) => self.null(),
-                Err(e) => self.refuse(Refusal::Value(format!("a value PostgreSQL's client could not read: {e}"))),
+                Err(e) => self.refuse(Refusal::Value(format!(
+                    "a value PostgreSQL's client could not read: {e}"
+                ))),
             }
         }
         self.end_row();
@@ -315,7 +357,10 @@ mod tests {
         a.end_row();
         a.formatted(7);
         a.end_row();
-        assert_eq!(a.finish(), b"\\N\t\ta\\tb\\nc\\\\d\\re\t\\\\N\t-42\t0.30000000000000004\t323.0\t1e16\n7\n");
+        assert_eq!(
+            a.finish(),
+            b"\\N\t\ta\\tb\\nc\\\\d\\re\t\\\\N\t-42\t0.30000000000000004\t323.0\t1e16\n7\n"
+        );
     }
 
     /// Do: write an answer of no rows. Expect: an empty file, apart from one row of empty text.
@@ -341,7 +386,10 @@ mod tests {
             a.finish()
         };
         assert_eq!(rows(2), b"0\n1\n");
-        assert_eq!(rows(3), b"\\!too_many_rows more than 2 rows, the answer writer's cap\n");
+        assert_eq!(
+            rows(3),
+            b"\\!too_many_rows more than 2 rows, the answer writer's cap\n"
+        );
     }
 
     /// Do: give an answer a row that fills its byte cap exactly, then one of as many bytes that
@@ -355,18 +403,27 @@ mod tests {
             a.finish()
         };
         assert_eq!(one(b"1234567"), b"1234567\n");
-        assert_eq!(one(b"123456\t"), b"\\!too_many_bytes more than 8 bytes, the answer writer's cap\n");
+        assert_eq!(
+            one(b"123456\t"),
+            b"\\!too_many_bytes more than 8 bytes, the answer writer's cap\n"
+        );
     }
 
     /// Do: refuse an answer with an engine's words over two lines. Expect: one line, escaped.
     #[test]
     fn a_refusal_is_one_line() {
-        assert_eq!(Refusal::Failed("no such\ttable:\nx".to_owned()).line(), b"\\!failed no such\\ttable:\\nx\n");
+        assert_eq!(
+            Refusal::Failed("no such\ttable:\nx".to_owned()).line(),
+            b"\\!failed no such\\ttable:\\nx\n"
+        );
         let mut a = Answer::new(MAX_ROWS, MAX_BYTES);
         a.text(b"kept?");
         a.refuse(Refusal::Value(BLOB.to_owned()));
         a.text(b"after");
         a.end_row();
-        assert_eq!(a.finish(), b"\\!unwritten_value a BLOB value, which the answer writer has no text for\n");
+        assert_eq!(
+            a.finish(),
+            b"\\!unwritten_value a BLOB value, which the answer writer has no text for\n"
+        );
     }
 }

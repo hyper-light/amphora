@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use super::checks::{Case, Failure, Kind};
 use super::engines::V;
-use super::synth::{Join, Sel, E};
+use super::synth::{E, Join, Sel};
 
 #[derive(Clone, Debug)]
 pub struct Repro {
@@ -21,7 +21,10 @@ fn rows(stmt: &str) -> Option<(String, Vec<String>)> {
     let i = stmt.find(" VALUES (")?;
     let (head, tail) = stmt.split_at(i + " VALUES ".len());
     let inner = tail.strip_prefix('(')?.strip_suffix(')')?;
-    Some((head.to_owned(), inner.split("), (").map(|r| format!("({r})")).collect()))
+    Some((
+        head.to_owned(),
+        inner.split("), (").map(|r| format!("({r})")).collect(),
+    ))
 }
 
 fn count(e: &E) -> usize {
@@ -61,14 +64,25 @@ fn cuts(r: &Repro) -> Vec<Repro> {
         out.push(c);
     }
     for (i, s) in r.stmts.iter().enumerate() {
-        if let Some((head, rs)) = rows(s) {
-            if rs.len() > 1 {
-                for j in 0..rs.len() {
-                    let mut c = r.clone();
-                    let kept: Vec<&String> = rs.iter().enumerate().filter(|(k, _)| *k != j).map(|(_, x)| x).collect();
-                    c.stmts[i] = format!("{head}{}", kept.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
-                    out.push(c);
-                }
+        if let Some((head, rs)) = rows(s)
+            && rs.len() > 1
+        {
+            for j in 0..rs.len() {
+                let mut c = r.clone();
+                let kept: Vec<&String> = rs
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != j)
+                    .map(|(_, x)| x)
+                    .collect();
+                c.stmts[i] = format!(
+                    "{head}{}",
+                    kept.iter()
+                        .map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                out.push(c);
             }
         }
     }
@@ -90,16 +104,16 @@ fn cuts(r: &Repro) -> Vec<Repro> {
         }
     }
     // clauses: the same cut to every query of the case (EET's two forms stay equivalent)
-    let clause_cuts: Vec<Box<dyn Fn(&mut Sel) -> bool>> = vec![
-        Box::new(|q: &mut Sel| q.wh.take().is_some()),
-        Box::new(|q: &mut Sel| q.having.take().is_some()),
-        Box::new(|q: &mut Sel| std::mem::take(&mut q.distinct)),
-        Box::new(|q: &mut Sel| {
+    let clause_cuts: [fn(&mut Sel) -> bool; 4] = [
+        |q| q.wh.take().is_some(),
+        |q| q.having.take().is_some(),
+        |q| std::mem::take(&mut q.distinct),
+        |q| {
             let had = !q.order.is_empty() || q.limit.is_some();
             q.order.clear();
             q.limit = None;
             had
-        }),
+        },
     ];
     let n_sels = {
         let mut c = r.clone();
@@ -107,14 +121,25 @@ fn cuts(r: &Repro) -> Vec<Repro> {
     };
     for cut in &clause_cuts {
         let mut c = r.clone();
-        let changed = c.case.parts_mut().0.into_iter().map(|q| cut(q)).fold(false, |a, b| a | b);
+        let changed = c
+            .case
+            .parts_mut()
+            .0
+            .into_iter()
+            .map(cut)
+            .fold(false, |a, b| a | b);
         if changed {
             out.push(c);
         }
     }
     let ncols = {
         let mut c = r.clone();
-        c.case.parts_mut().0.first().map(|q| q.cols.len()).unwrap_or(0)
+        c.case
+            .parts_mut()
+            .0
+            .first()
+            .map(|q| q.cols.len())
+            .unwrap_or(0)
     };
     for k in 0..ncols {
         let mut c = r.clone();
@@ -132,7 +157,12 @@ fn cuts(r: &Repro) -> Vec<Repro> {
     }
     let nfrom = {
         let mut c = r.clone();
-        c.case.parts_mut().0.first().map(|q| q.from.len()).unwrap_or(0)
+        c.case
+            .parts_mut()
+            .0
+            .first()
+            .map(|q| q.from.len())
+            .unwrap_or(0)
     };
     for k in (1..nfrom).rev() {
         let mut c = r.clone();
@@ -144,11 +174,11 @@ fn cuts(r: &Repro) -> Vec<Repro> {
         out.push(c);
         let mut c = r.clone();
         for q in c.case.parts_mut().0 {
-            if let Some(f) = q.from.get_mut(k) {
-                if f.on.is_some() || f.join != Join::Comma {
-                    f.on = None;
-                    f.join = Join::Comma;
-                }
+            if let Some(f) = q.from.get_mut(k)
+                && (f.on.is_some() || f.join != Join::Comma)
+            {
+                f.on = None;
+                f.join = Join::Comma;
             }
         }
         out.push(c);
@@ -209,7 +239,12 @@ fn target(c: &mut Repro, si: usize, ri: usize, k: usize) -> Option<&mut E> {
 
 /// The smallest case `fails` still fails the same way on (it builds both databases from the
 /// statements and runs the case), by `deadline`.
-pub fn reduce(start: Repro, kind: Kind, deadline: Instant, mut fails: impl FnMut(&Repro) -> Option<Failure>) -> Repro {
+pub fn reduce(
+    start: Repro,
+    kind: Kind,
+    deadline: Instant,
+    mut fails: impl FnMut(&Repro) -> Option<Failure>,
+) -> Repro {
     let mut cur = start;
     'outer: loop {
         for c in cuts(&cur) {

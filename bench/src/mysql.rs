@@ -48,17 +48,24 @@ pub struct MySql {
 
 impl MySql {
     pub fn connect(dsn: &str, connections: usize) -> anyhow::Result<Self> {
-        let constraints = PoolConstraints::new(connections.min(8), connections.max(8)).ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
-        let opts = mysql::OptsBuilder::from_opts(Opts::from_url(dsn)?).pool_opts(PoolOpts::default().with_constraints(constraints));
+        let constraints = PoolConstraints::new(connections.min(8), connections.max(8))
+            .ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
+        let opts = mysql::OptsBuilder::from_opts(Opts::from_url(dsn)?)
+            .pool_opts(PoolOpts::default().with_constraints(constraints));
         let pool = Pool::new(opts)?;
         let mut conn = pool.get_conn()?;
         for table in ["events", "sessions", "meta"] {
             conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))?;
         }
         for table in TABLES {
-            conn.query_drop(table).map_err(|e| anyhow::anyhow!("{e} (in: {table})"))?;
+            conn.query_drop(table)
+                .map_err(|e| anyhow::anyhow!("{e} (in: {table})"))?;
         }
-        Ok(Self { pool, rev: AtomicU64::new(0), seen: Mutex::new(HashSet::new()) })
+        Ok(Self {
+            pool,
+            rev: AtomicU64::new(0),
+            seen: Mutex::new(HashSet::new()),
+        })
     }
 }
 
@@ -66,13 +73,29 @@ impl Blocking for MySql {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            events.iter().filter(|e| seen.insert(e.session.clone())).map(|e| e.session.clone()).collect()
+            events
+                .iter()
+                .filter(|e| seen.insert(e.session.clone()))
+                .map(|e| e.session.clone())
+                .collect()
         };
         let mut conn = self.pool.get_conn()?;
         let mut tx = conn.start_transaction(TxOpts::default())?;
         for s in &new {
             let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
-            tx.exec_drop(SESSION_UPSERT, (s, "{}", None::<&str>, None::<&str>, None::<&str>, 0i64, 0i64, rev))?;
+            tx.exec_drop(
+                SESSION_UPSERT,
+                (
+                    s,
+                    "{}",
+                    None::<&str>,
+                    None::<&str>,
+                    None::<&str>,
+                    0i64,
+                    0i64,
+                    rev,
+                ),
+            )?;
         }
         for e in events {
             let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
@@ -102,7 +125,9 @@ impl Blocking for MySql {
         // Every column taken, as a reader of the page would (the store builds its rows).
         let rows: Vec<mysql::Row> = conn.exec(EVENTS_LAST, (session, limit as u64))?;
         for r in &rows {
-            let row: Vec<mysql::Value> = (0..12).map(|i| r.as_ref(i).cloned().unwrap_or(mysql::Value::NULL)).collect();
+            let row: Vec<mysql::Value> = (0..12)
+                .map(|i| r.as_ref(i).cloned().unwrap_or(mysql::Value::NULL))
+                .collect();
             std::hint::black_box(row);
         }
         Ok(rows.len())
