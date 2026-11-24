@@ -1360,12 +1360,16 @@ mod tests {
         for id in 0..rows {
             let (k, owner) = ((id * 7919) % rows, id % 97);
             writer
-                .execute(format!("INSERT INTO items VALUES ({id}, {k}, {owner}, '{body}')"))
+                .execute(format!(
+                    "INSERT INTO items VALUES ({id}, {k}, {owner}, '{body}')"
+                ))
                 .unwrap();
         }
         writer.execute("COMMIT").unwrap();
         writer.execute("CREATE INDEX items_k ON items (k)").unwrap();
-        writer.execute("CREATE INDEX items_owner ON items (owner)").unwrap();
+        writer
+            .execute("CREATE INDEX items_owner ON items (owner)")
+            .unwrap();
         writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
         let reader = db.connect(ConnectOpts::new()).unwrap();

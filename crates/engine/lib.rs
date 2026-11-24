@@ -150,7 +150,7 @@ pub use connection::{
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
-#[cfg(feature = "simulator")]
+#[cfg(any(feature = "simulator", feature = "bench"))]
 pub use translate::optimizer::learned_costs::LearnedWeights;
 pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;

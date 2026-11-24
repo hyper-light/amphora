@@ -1500,8 +1500,9 @@ where
 /// `VALUE_MAX`, its real worst case, or the one key a conflict or a condition names.
 fn step_answer(envelope: &Envelope) -> AnswerMax<(Reply, Vec<Vec<u8>>)> {
     let reply = match &envelope.step {
-        super::Step::Scan { .. } => amphora_api::SCAN_MAX
-            .saturating_mul(std::mem::size_of::<(TxnId, GroupId)>()),
+        super::Step::Scan { .. } => {
+            amphora_api::SCAN_MAX.saturating_mul(std::mem::size_of::<(TxnId, GroupId)>())
+        }
         super::Step::Lock { reads, .. } | super::Step::LockIf { reads, .. } => {
             reads_bytes(reads).max(amphora_api::KEY_MAX)
         }
@@ -2475,9 +2476,9 @@ mod sessions {
             };
             let key = row(1);
             db.call_internal(until(), AnswerMax::fixed(), move |db| {
-                    SqlTablet::new(db).put_lock(&key, &lock)
-                })
-                .unwrap();
+                SqlTablet::new(db).put_lock(&key, &lock)
+            })
+            .unwrap();
             let refused = ns.commit(put(3), until());
             assert!(
                 matches!(refused, Err(Refusal::Conflict { .. })),
@@ -2486,7 +2487,7 @@ mod sessions {
             db.call_internal(until(), AnswerMax::fixed(), move |db| {
                 SqlTablet::new(db).drop_locks_of(txn)
             })
-                .unwrap();
+            .unwrap();
             assert!(ns.commit(put(3), until()).is_ok());
         }
     }

@@ -72,6 +72,9 @@ struct Opts {
     limit: Option<u64>,
     /// ClickHouse's HTTP interface (`--clickhouse`).
     clickhouse: String,
+    /// Lane T17: every cost weight and the page-miss share each Amphora target plans on, read from
+    /// `--pin-weights <file>`, in place of the ones its process learns and measures.
+    pin_weights: Option<amphora_engine::LearnedWeights>,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -101,6 +104,7 @@ fn opts() -> anyhow::Result<Opts> {
         cores: Vec::new(),
         limit: None,
         clickhouse: "http://127.0.0.1:58123".into(),
+        pin_weights: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -138,7 +142,8 @@ fn opts() -> anyhow::Result<Opts> {
             "--cores" => o.cores = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--limit" => o.limit = Some(v()?.parse()?),
             "--clickhouse" => o.clickhouse = v()?,
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped, --cores, --limit, --clickhouse)"),
+            "--pin-weights" => o.pin_weights = Some(pinned_weights(Path::new(&v()?))?),
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped, --cores, --limit, --clickhouse, --pin-weights)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
@@ -157,6 +162,38 @@ fn opts() -> anyhow::Result<Opts> {
         }
     }
     Ok(o)
+}
+
+fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights> {
+    let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))?;
+    weights_json(&text).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))
+}
+
+/// `--pin-weights`' file: a JSON object of `LearnedWeights`' eight fields, each a number;
+/// `row_in_pages` and `page_miss` may be null, as a process that has read no page from its file
+/// has them. The trace's "the weights this plan is made on" prints the same fields.
+fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
+    const FIELDS: [&str; 8] = ["row_in_pages", "seek", "hash_build", "hash_probe", "sort", "bloom_probe", "where_step", "page_miss"];
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    let fields = v.as_object().ok_or_else(|| anyhow::anyhow!("not a JSON object"))?;
+    if let Some(other) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+        anyhow::bail!("{other} is not one of {}", FIELDS.join(", "));
+    }
+    let number = |k: &str| fields.get(k).and_then(serde_json::Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| anyhow::anyhow!("{k} is a finite number"));
+    let maybe = |k: &str| match fields.get(k) {
+        Some(serde_json::Value::Null) => Ok(None),
+        _ => number(k).map(Some),
+    };
+    Ok(amphora_engine::LearnedWeights {
+        row_in_pages: maybe("row_in_pages")?,
+        seek: number("seek")?,
+        hash_build: number("hash_build")?,
+        hash_probe: number("hash_probe")?,
+        sort: number("sort")?,
+        bloom_probe: number("bloom_probe")?,
+        where_step: number("where_step")?,
+        page_miss: maybe("page_miss")?,
+    })
 }
 
 /// The benchmark's schema, its indexes, its tables' files and its queries, by name.
@@ -339,7 +376,7 @@ fn sh(cmd: &str) -> String {
 
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
-    Ok(match target {
+    let mut opened: Box<dyn Target> = match target {
         "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false, false)?),
         // PL.13 (lane replan-6): the same engine with adaptive joins and re-planning on
         // (`Connection::set_adaptive_joins`), on a copy of its own; `amphora` is its control.
@@ -362,7 +399,11 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
         // The scaling ladder's server engine (QT.6 lane qs6-12), a database of the benchmark's own.
         "clickhouse-mt" => Box::new(ClickHouse::open(&o.clickhouse, &format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_")))?),
         t => anyhow::bail!("--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt, postgres or clickhouse-mt, not {t}"),
-    })
+    };
+    if let (Some(weights), Some(amphora)) = (o.pin_weights, opened.amphora()) {
+        amphora.pin_cost_weights(weights);
+    }
+    Ok(opened)
 }
 
 fn outcome_json(outcome: &Outcome, load: Option<f64>) -> serde_json::Value {
@@ -466,6 +507,7 @@ pub fn main() -> anyhow::Result<()> {
         "queries": b.queries.len(),
         "runs": o.runs, "timeout_s": o.timeout.as_secs(), "count_timeout_s": o.count_timeout.as_secs(),
         "max_load": o.max_load,
+        "pinned_weights": o.pin_weights.map(|w| format!("{w:?}")),
         "phase": if o.cold { "cold" } else { "warm" },
         "engines": engines,
         "cores_ladder": o.cores, "limit": o.limit,
@@ -680,5 +722,23 @@ mod tests {
         let meminfo = "MemTotal:       65536000 kB\nSwapCached:          12 kB\nCached:          4096 kB\nActive:  1 kB\n";
         assert_eq!(cached_kib(meminfo), Some(4096));
         assert_eq!(cached_kib("MemTotal: 1 kB\nSwapCached: 12 kB\n"), None);
+    }
+
+    /// Do: read `--pin-weights`' JSON (lane T17): T16's r1894 A-1 run 2 set, a set with
+    /// `row_in_pages` and `page_miss` null, one with a field misspelt, one without `seek`.
+    /// Expect: the eight fields as written, None for the nulls, and a refusal naming the field.
+    #[test]
+    fn pinned_weights_are_the_files_fields() -> anyhow::Result<()> {
+        let w = weights_json(r#"{"row_in_pages": 0.000224, "seek": 16.88, "hash_build": 657.9, "hash_probe": 161.0, "sort": 0.717, "bloom_probe": 6.37, "where_step": 11.05, "page_miss": 0.294}"#)?;
+        let want = amphora_engine::LearnedWeights { row_in_pages: Some(0.000224), seek: 16.88, hash_build: 657.9, hash_probe: 161.0, sort: 0.717, bloom_probe: 6.37, where_step: 11.05, page_miss: Some(0.294) };
+        assert_eq!(w, want);
+        let w = weights_json(r#"{"row_in_pages": null, "seek": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#)?;
+        assert_eq!((w.row_in_pages, w.seek, w.page_miss), (None, 1.0, None));
+        let refused = |text: &str| weights_json(text).err().map(|e| e.to_string()).unwrap_or_default();
+        let misspelt = refused(r#"{"row_in_pages": null, "seeks": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        assert!(misspelt.starts_with("seeks is not one of"), "{misspelt}");
+        let missing = refused(r#"{"row_in_pages": null, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        assert_eq!(missing, "seek is a finite number");
+        Ok(())
     }
 }
