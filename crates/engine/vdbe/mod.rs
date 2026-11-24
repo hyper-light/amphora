@@ -830,6 +830,32 @@ impl ActiveOpStateSlot {
         }
     }
 
+    /// Take any suspended `HashBuild` state without mutating `ActiveOpState::None` on the common
+    /// non-suspended path.
+    #[inline]
+    pub(crate) fn take_hash_build(&mut self) -> Option<OpHashBuildState> {
+        if let ActiveOpState::HashBuild(inner) = &mut self.state {
+            let taken = inner.take();
+            self.state = ActiveOpState::None;
+            taken
+        } else {
+            None
+        }
+    }
+
+    /// Take any suspended `HashProbe` state without mutating `ActiveOpState::None` on the common
+    /// non-suspended path.
+    #[inline]
+    pub(crate) fn take_hash_probe(&mut self) -> Option<OpHashProbeState> {
+        if let ActiveOpState::HashProbe(inner) = &mut self.state {
+            let taken = inner.take();
+            self.state = ActiveOpState::None;
+            taken
+        } else {
+            None
+        }
+    }
+
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {
             ActiveOpState::Program(state) => Some(state),
@@ -881,6 +907,12 @@ pub struct SequenceInnerTxState {
 /// its statement to the next (64 KiB of 4 KiB pages): an IN list or a small materialized subquery
 /// is a page or two, and a large one is not worth the memory between runs.
 const KEPT_EPHEMERAL_PAGES: usize = 16;
+
+/// Byte ceiling for idle statement-reuse spares (`spare_sorters`, `spare_hash_tables`,
+/// `spare_group_tables`, `register_spares`), derived directly from [`KEPT_EPHEMERAL_PAGES`] so
+/// finished cached statements never retain large uncharged sort/hash/group/buffer allocations.
+pub(crate) const KEPT_EPHEMERAL_BYTES: usize =
+    KEPT_EPHEMERAL_PAGES * crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE;
 
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
@@ -1085,23 +1117,28 @@ pub struct ProgramState {
 }
 
 /// Owned TEXT/BLOB backing buffers reclaimed across `ProgramState::reset()` when re-running the
-/// same prepared statement. Bounded by the program's register count and a single database page
-/// (`BufferPool::DEFAULT_PAGE_SIZE`) per buffer.
+/// same prepared statement. Bounded by the program's register count, a single database page
+/// (`BufferPool::DEFAULT_PAGE_SIZE`) per buffer, and [`KEPT_EPHEMERAL_BYTES`] total.
 #[derive(Default)]
 pub(crate) struct RegisterSpares {
     texts: Vec<String>,
     blobs: Vec<crate::types::ValueBlob>,
+    total_bytes: usize,
 }
 
 impl RegisterSpares {
     #[inline(always)]
     pub(crate) fn pop_text(&mut self) -> Option<String> {
-        self.texts.pop()
+        let text = self.texts.pop()?;
+        self.total_bytes = self.total_bytes.saturating_sub(text.capacity());
+        Some(text)
     }
 
     #[inline(always)]
     pub(crate) fn pop_blob(&mut self) -> Option<crate::types::ValueBlob> {
-        self.blobs.pop()
+        let blob = self.blobs.pop()?;
+        self.total_bytes = self.total_bytes.saturating_sub(blob.capacity());
+        Some(blob)
     }
 
     #[inline(always)]
@@ -1110,8 +1147,10 @@ impl RegisterSpares {
         if cap > 0
             && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
             && self.texts.len() < max_count
+            && self.total_bytes.saturating_add(cap) <= KEPT_EPHEMERAL_BYTES
         {
             text.clear();
+            self.total_bytes = self.total_bytes.saturating_add(cap);
             self.texts.push(text);
         }
     }
@@ -1122,8 +1161,10 @@ impl RegisterSpares {
         if cap > 0
             && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
             && self.blobs.len() < max_count
+            && self.total_bytes.saturating_add(cap) <= KEPT_EPHEMERAL_BYTES
         {
             blob.clear();
+            self.total_bytes = self.total_bytes.saturating_add(cap);
             self.blobs.push(blob);
         }
     }
@@ -1131,6 +1172,7 @@ impl RegisterSpares {
     pub(crate) fn clear(&mut self) {
         self.texts.clear();
         self.blobs.clear();
+        self.total_bytes = 0;
     }
 }
 
@@ -1453,7 +1495,7 @@ impl ProgramState {
             if keep_ephemeral {
                 self.hash_tables
                     .move_into(&mut self.spare_hash_tables, |ht| {
-                        !ht.has_spilled() && ht.clear().is_ok()
+                        ht.can_reuse() && ht.clear().is_ok()
                     });
             } else {
                 self.hash_tables.clear();
@@ -1471,8 +1513,12 @@ impl ProgramState {
             if keep_ephemeral {
                 self.group_tables
                     .move_into(&mut self.spare_group_tables, |gt| {
-                        gt.clear_entries();
-                        true
+                        if gt.can_reuse() {
+                            gt.clear_entries();
+                            true
+                        } else {
+                            false
+                        }
                     });
             } else {
                 self.group_tables.clear();

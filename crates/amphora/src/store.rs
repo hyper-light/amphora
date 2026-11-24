@@ -1292,7 +1292,7 @@ impl<R: Send + 'static> Readers<R> {
     }
 
     fn with_checkout(most: usize, meter: Arc<Meter>, checkout: ReadCheckout) -> Self {
-        let bounded = most.min(machine_readers()).max(1);
+        let bounded = most.max(1);
         Self {
             open: Mutex::new(None),
             pool: Mutex::new(Pool {

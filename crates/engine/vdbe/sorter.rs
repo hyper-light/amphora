@@ -187,21 +187,70 @@ impl PartialEq for KeptRecord {
 
 impl Eq for KeptRecord {}
 
+/// Outcome of checking a candidate row against an active top-K heap's byte budget.
+enum KeptBudget {
+    /// Row orders after the worst kept row and is discarded without allocating.
+    Reject,
+    /// Row wins a spot in the top-K heap and fits within `Sorter::max_buffer_size`.
+    Fits,
+    /// Row wins a spot in the top-K heap, and retaining it would exceed `Sorter::max_buffer_size`;
+    /// demote the heap into the spilling external sorter.
+    Exceeds,
+}
+
 /// Amphora: the rows a bounded sorter keeps: the first `limit` in sort order of those offered, in a
 /// max-heap, so the worst of them is the one a new row must beat; then, sorted, in reverse output
 /// order (served from the end, as `Sorter::records` are).
 struct Kept {
     limit: usize,
     heap: BinaryHeap<KeptRecord>,
+    /// Sum of `ImmutableRecord::as_blob().capacity()` currently held in `heap`.
+    bytes: usize,
     arrived: u64,
     sorted: Vec<KeptRecord>,
 }
 
 impl Kept {
-    /// Offers `record`: kept if fewer than `limit` are, or if it orders before the worst kept one,
-    /// which then goes. A row that can't be kept is dropped with no copy; a row that evicts the
-    /// worst reuses its `ImmutableRecord` buffer in place (zero heap allocations on replacement).
-    fn offer(
+    /// Classifies `record` against the heap order and `max_buffer_size` without mutating the heap.
+    fn classify_insert(
+        &self,
+        record: &ImmutableRecord,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+        max_buffer_size: usize,
+    ) -> Result<KeptBudget> {
+        let payload_len = record.get_payload().len();
+        if self.heap.len() >= self.limit {
+            let Some(worst) = self.heap.peek() else {
+                return Ok(KeptBudget::Fits);
+            };
+            if !orders_before(record, key_len, index_key_info, comparators, &worst.record)? {
+                return Ok(KeptBudget::Reject);
+            }
+            let evicted_cap = worst.record.record.as_blob().capacity();
+            let next_cap = if evicted_cap <= payload_len.saturating_mul(2) {
+                evicted_cap.max(payload_len)
+            } else {
+                payload_len
+            };
+            let projected = self
+                .bytes
+                .saturating_sub(evicted_cap)
+                .saturating_add(next_cap);
+            if projected > max_buffer_size {
+                return Ok(KeptBudget::Exceeds);
+            }
+        } else if self.bytes.saturating_add(payload_len) > max_buffer_size {
+            return Ok(KeptBudget::Exceeds);
+        }
+        Ok(KeptBudget::Fits)
+    }
+
+    /// Inserts a row already classified as [`KeptBudget::Fits`], reusing the evicted buffer in
+    /// place only when its allocation stays within 2x the replacement payload (standard geometric
+    /// hysteresis) so wide evicted rows do not stay pinned when tiny rows replace them.
+    fn insert_winner(
         &mut self,
         record: &ImmutableRecord,
         key_len: usize,
@@ -212,17 +261,20 @@ impl Kept {
         self.arrived = self.arrived.saturating_add(1);
         let payload = record.get_payload();
         let copy = if self.heap.len() >= self.limit {
-            let Some(worst) = self.heap.peek() else {
-                return Ok(());
-            };
-            if !orders_before(record, key_len, index_key_info, comparators, &worst.record)? {
-                return Ok(());
-            }
             if let Some(evicted) = self.heap.pop() {
                 let mut reused = evicted.record.record;
-                reused.invalidate();
-                reused.start_serialization(payload)?;
-                reused
+                let evicted_cap = reused.as_blob().capacity();
+                self.bytes = self.bytes.saturating_sub(evicted_cap);
+                if evicted_cap <= payload.len().saturating_mul(2) {
+                    reused.invalidate();
+                    reused.start_serialization(payload)?;
+                    reused
+                } else {
+                    drop(reused);
+                    let mut copy = ImmutableRecord::new(payload.len())?;
+                    copy.start_serialization(payload)?;
+                    copy
+                }
             } else {
                 let mut copy = ImmutableRecord::new(payload.len())?;
                 copy.start_serialization(payload)?;
@@ -233,9 +285,11 @@ impl Kept {
             copy.start_serialization(payload)?;
             copy
         };
+        let added_cap = copy.as_blob().capacity();
         let record =
             BoxedSortableRecord::new(copy, key_len, index_key_info.clone(), comparators.clone())?;
         self.heap.try_push(KeptRecord { record, arrived })?;
+        self.bytes = self.bytes.saturating_add(added_cap);
         Ok(())
     }
 }
@@ -324,6 +378,10 @@ pub struct Sorter {
     temp_store: crate::TempStore,
     /// Amphora: the rows kept when the reader takes only some (decision 5), else None.
     kept: Option<Kept>,
+    /// Row cap active when a top-K sorter demotes to external spilling on byte-budget overflow.
+    output_limit: Option<usize>,
+    /// Rows already returned by [`Self::next`] under [`Self::output_limit`].
+    emitted: usize,
     /// Amphora: whether the first insert has decided `kept`.
     limit_decided: bool,
     /// Amphora (PL.13, lane replan-5): every row put in, kept or not, in memory or spilled.
@@ -378,6 +436,8 @@ impl Sorter {
             pending_completion: None,
             temp_store,
             kept: None,
+            output_limit: None,
+            emitted: 0,
             limit_decided: false,
             inserted: 0,
             in_memory_sort: None,
@@ -385,9 +445,34 @@ impl Sorter {
         Ok(this)
     }
 
-    /// True when this sorter has not spilled to disk and can be reused across `Statement::reset()`.
+    /// Heap bytes currently retained by this sorter's bump arena, pointer slab, and top-K heap.
+    pub fn allocated_bytes(&self) -> usize {
+        let kept_bytes = self.kept.as_ref().map_or(0, |kept| {
+            let sorted_bytes: usize = kept
+                .sorted
+                .iter()
+                .map(|r| r.record.record.as_blob().capacity())
+                .sum();
+            kept.bytes.saturating_add(sorted_bytes)
+        });
+        self.arena
+            .allocated_bytes()
+            .saturating_add(
+                self.records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NonNull<ArenaSortableRecord>>()),
+            )
+            .saturating_add(kept_bytes)
+    }
+
+    /// True when this sorter has not spilled to disk and its retained arena/vector capacity fits
+    /// within [`crate::vdbe::KEPT_EPHEMERAL_BYTES`] so idle cached statements never retain large
+    /// uncharged sort buffers across resets.
     pub fn can_reuse(&self) -> bool {
-        self.chunks.is_empty() && self.temp_file.is_none() && self.pending_completion.is_none()
+        self.chunks.is_empty()
+            && self.temp_file.is_none()
+            && self.pending_completion.is_none()
+            && self.allocated_bytes() <= crate::vdbe::KEPT_EPHEMERAL_BYTES
     }
 
     /// Clears rows and resets the bump arena while dropping all top-K record payloads so idle
@@ -402,6 +487,8 @@ impl Sorter {
         self.insert_state = InsertState::Start;
         self.init_chunk_heap_state = InitChunkHeapState::Start;
         self.kept = None;
+        self.output_limit = None;
+        self.emitted = 0;
         self.limit_decided = false;
         self.inserted = 0;
         self.in_memory_sort = None;
@@ -462,14 +549,43 @@ impl Sorter {
         self.limit_decided = true;
         if let Some(limit) = limit.filter(|&l| l > 0 && l <= MAX_KEPT) {
             if self.records.is_empty() && self.chunks.is_empty() {
+                self.output_limit = Some(limit);
                 self.kept = Some(Kept {
                     limit,
                     heap: BinaryHeap::new(),
+                    bytes: 0,
                     arrived: 0,
                     sorted: Vec::new(),
                 });
             }
         }
+    }
+
+    /// Moves all rows currently held in `self.kept` into the arena/records buffer in original
+    /// arrival order and clears `self.kept`, so the regular spilling sorter enforces
+    /// `self.max_buffer_size` when top-K winners exceed the byte budget.
+    fn demote_kept_to_spilling(&mut self) -> Result<()> {
+        let Some(kept) = self.kept.take() else {
+            return Ok(());
+        };
+        let mut rows = kept.heap.into_vec();
+        rows.sort_unstable_by_key(|row| row.arrived);
+        for row in rows {
+            let payload_size = row.record.record.get_payload().len();
+            let sortable_record = ArenaSortableRecord::new(
+                &self.arena,
+                &row.record.record,
+                self.key_len,
+                &self.index_key_info,
+                &self.comparators,
+            )?;
+            let record_ref = self.arena.try_alloc(sortable_record)?;
+            // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
+            self.records.try_push(NonNull::from(record_ref))?;
+            self.current_buffer_size = self.current_buffer_size.saturating_add(payload_size);
+            self.max_payload_size_in_buffer = self.max_payload_size_in_buffer.max(payload_size);
+        }
+        Ok(())
     }
 
     pub const fn has_more(&self) -> bool {
@@ -555,6 +671,12 @@ impl Sorter {
             self.current = kept.sorted.pop().map(|kept| kept.record.record);
             return Ok(IOResult::Done(()));
         }
+        if let Some(limit) = self.output_limit {
+            if self.emitted >= limit {
+                self.current = None;
+                return Ok(IOResult::Done(()));
+            }
+        }
         if self.chunks.is_empty() {
             match self.records.pop() {
                 Some(ptr) => {
@@ -571,6 +693,7 @@ impl Sorter {
                             self.current = Some(arena_record.to_immutable_record()?);
                         }
                     }
+                    self.emitted = self.emitted.saturating_add(1);
 
                     if self.records.is_empty() {
                         self.arena.reset();
@@ -595,6 +718,7 @@ impl Sorter {
                             self.current = Some(boxed_record.record);
                         }
                     }
+                    self.emitted = self.emitted.saturating_add(1);
                 }
                 None => self.current = None,
             }
@@ -619,14 +743,31 @@ impl Sorter {
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
         if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
-            kept.offer(
+            match kept.classify_insert(
                 record,
                 self.key_len,
                 &self.index_key_info,
                 &self.comparators,
-            )?;
-            self.inserted = self.inserted.saturating_add(1);
-            return Ok(IOResult::Done(()));
+                self.max_buffer_size,
+            )? {
+                KeptBudget::Reject => {
+                    self.inserted = self.inserted.saturating_add(1);
+                    return Ok(IOResult::Done(()));
+                }
+                KeptBudget::Fits => {
+                    kept.insert_winner(
+                        record,
+                        self.key_len,
+                        &self.index_key_info,
+                        &self.comparators,
+                    )?;
+                    self.inserted = self.inserted.saturating_add(1);
+                    return Ok(IOResult::Done(()));
+                }
+                KeptBudget::Exceeds => {
+                    self.demote_kept_to_spilling()?;
+                }
+            }
         }
         let payload_size = record.get_payload().len();
         loop {
@@ -2136,5 +2277,151 @@ mod tests {
             io.block(|| sorter.next()).unwrap();
         }
         assert_eq!(second_run, std::vec![1, 2, 5]);
+    }
+
+    /// Review blocker 4 regression: a sorter whose bump arena grew past `KEPT_EPHEMERAL_BYTES`
+    /// must refuse statement-reset reuse so finished statements never retain megabytes of uncharged
+    /// sort memory while idle.
+    #[test]
+    fn review_large_sorter_refuses_reuse_to_bound_idle_statement_memory() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            4 * 1024 * 1024,
+            4 * 1024,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        // Small sort stays within KEPT_EPHEMERAL_BYTES and remains reusable.
+        for i in 0..8i64 {
+            let rec = ImmutableRecord::from_values(&[Value::from_i64(i)], 1).unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        assert!(sorter.can_reuse());
+
+        // Large sort exceeds KEPT_EPHEMERAL_BYTES and must NOT be retained in spare_sorters.
+        let wide = std::vec![b'a'; 2048];
+        for i in 0..200i64 {
+            let rec =
+                ImmutableRecord::from_values(&[Value::from_i64(i), Value::Blob(wide.clone())], 2)
+                    .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        assert!(sorter.allocated_bytes() > crate::vdbe::KEPT_EPHEMERAL_BYTES);
+        assert!(
+            !sorter.can_reuse(),
+            "large sorter ({} bytes) must be dropped on reset, not kept idle",
+            sorter.allocated_bytes()
+        );
+    }
+
+    /// Review P1 regression: evicting wide rows with tiny rows in an active top-K sorter must
+    /// release the oversized evicted record buffers instead of retaining peak capacities across
+    /// every heap slot for the lifetime of the query.
+    #[test]
+    fn review_top_k_sorter_releases_oversized_evicted_buffers_during_sort() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            2 * 1024 * 1024,
+            4 * 1024,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        sorter.limit_to(Some(16));
+        let wide = std::vec![b'w'; 64 * 1024];
+        for i in 100..116i64 {
+            let rec =
+                ImmutableRecord::from_values(&[Value::from_i64(i), Value::Blob(wide.clone())], 2)
+                    .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        assert!(sorter.kept.is_some());
+        // Replace all 16 wide rows with tiny rows that sort earlier.
+        for i in 0..16i64 {
+            let rec = ImmutableRecord::from_values(
+                &[Value::from_i64(i), Value::Blob(std::vec![1u8; 8])],
+                2,
+            )
+            .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        let retained_bytes: usize = sorter
+            .kept
+            .as_ref()
+            .unwrap()
+            .heap
+            .iter()
+            .map(|k| k.record.record.as_blob().capacity())
+            .sum();
+        assert!(
+            retained_bytes < 4096,
+            "evicted 64 KiB buffers must be released during active sort; retained {retained_bytes} bytes"
+        );
+        io.block(|| sorter.sort()).unwrap();
+        let mut out = Vec::new();
+        while sorter.has_more() {
+            let vals = sorter.record().unwrap().get_values().unwrap();
+            out.push(vals[0].as_int().unwrap());
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(out, (0..16i64).collect::<Vec<_>>());
+    }
+
+    /// Review P2 regression: active top-K winners that exceed the sorter's byte budget must demote
+    /// to external chunk spilling rather than retaining unbounded memory in `Kept`.
+    #[test]
+    fn review_top_k_sorter_spills_when_winners_exceed_byte_budget() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let budget = 64 * 1024;
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            budget,
+            4 * 1024,
+            io.clone(),
+            crate::TempStore::Memory,
+        )
+        .unwrap();
+
+        sorter.limit_to(Some(16));
+        let wide = std::vec![b'w'; 32 * 1024];
+        for i in (0..24i64).rev() {
+            let rec =
+                ImmutableRecord::from_values(&[Value::from_i64(i), Value::Blob(wide.clone())], 2)
+                    .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+            // Active in-memory buffered payload must stay bounded by `budget` (at most one
+            // buffer's worth in RAM between chunk flushes).
+            assert!(
+                sorter.current_buffer_size <= budget,
+                "buffered payload {} exceeded budget {budget}",
+                sorter.current_buffer_size
+            );
+        }
+        assert!(
+            sorter.kept.is_none() && !sorter.chunks.is_empty(),
+            "top-K sorter must spill to chunks once winners exceed the byte budget"
+        );
+        io.block(|| sorter.sort()).unwrap();
+        let mut out = Vec::new();
+        while sorter.has_more() {
+            let vals = sorter.record().unwrap().get_values().unwrap();
+            out.push(vals[0].as_int().unwrap());
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(out, (0..16i64).collect::<Vec<_>>());
     }
 }

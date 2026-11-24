@@ -416,14 +416,12 @@ pub(super) fn choose_best_btree_candidate(
             Some(index) if table_primary_key(index) => IndexInfo {
                 unique: index.unique,
                 covering: true,
-                is_rowid: false,
                 column_count: index.columns.len(),
                 rows_per_leaf_page: params.rows_per_table_page,
             },
             Some(index) => IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
-                is_rowid: false,
                 column_count: index.columns.len(),
                 rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
@@ -432,7 +430,6 @@ pub(super) fn choose_best_btree_candidate(
             None => IndexInfo {
                 unique: true,
                 covering: true,
-                is_rowid: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
             },
@@ -761,14 +758,12 @@ pub(super) fn choose_best_in_seek_candidate(
             Some(index) => IndexInfo {
                 unique: index.unique,
                 covering: rowid_only || rhs_table.index_is_covering(index),
-                is_rowid: false,
                 column_count: index.columns.len(),
                 rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
                 covering: false,
-                is_rowid: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
             },
@@ -1109,14 +1104,12 @@ fn find_best_access_method_for_btree(
             Some(index) => IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
-                is_rowid: false,
                 column_count: index.columns.len(),
                 rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
                 covering: true,
-                is_rowid: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
             },
@@ -1204,7 +1197,6 @@ fn find_best_access_method_for_btree(
                 unique: false,
                 column_count,
                 covering: true,
-                is_rowid: false,
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     column_count,
                     rhs_table,
@@ -2464,7 +2456,6 @@ fn find_best_access_method_for_subquery(
                     unique: false,
                     column_count: key_col_positions.len(),
                     covering: true,
-                    is_rowid: false,
                     rows_per_leaf_page: params.rows_per_table_page,
                 },
                 &rhs_constraints.constraints,

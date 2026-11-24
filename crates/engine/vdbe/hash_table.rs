@@ -24,13 +24,28 @@ use std::{cell::RefCell, cmp::Ordering, hash::Hasher};
 
 /// Inline storage for hash join key values (1 key inline avoids heap allocs for single-key joins).
 pub(crate) type HashKeyValues = SmallVec<[Value; 1]>;
-/// Inline storage for hash join payload values (2 values inline avoids heap allocs for common joins).
-pub(crate) type HashPayloadValues = SmallVec<[Value; 2]>;
+/// Storage for hash join payload values. Kept as `Vec<Value>` rather than `SmallVec` so
+/// `HashEntry` stays compact in L1 cache and 3+ payload columns allocate once at exact capacity
+/// without an inline-to-heap spill copy.
+pub(crate) type HashPayloadValues = Vec<Value>;
 
 /// Sentinel index for the end of an intrusive hash bucket chain in `HashTable::heads` / `next`.
 const EMPTY_ENTRY: u32 = u32::MAX;
 
-const DEFAULT_SEED: u64 = 1337;
+/// Per-process CSPRNG hash seeds derived once from `std::collections::hash_map::RandomState` so
+/// chosen SQL keys cannot invert the single-key mixer or collide into one bucket chain.
+#[inline]
+fn hash_seeds() -> (u64, u64) {
+    static SEEDS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *SEEDS.get_or_init(|| {
+        use std::collections::hash_map::RandomState;
+        use std::hash::BuildHasher;
+        let state = RandomState::new();
+        let s0 = state.hash_one(0x9e37_79b9_7f4a_7c15u64) | 1;
+        let s1 = state.hash_one(0x517c_c1b7_2722_0a95u64);
+        (s0, s1)
+    })
+}
 
 /// Amphora (docs/design/executor.md, decision 8; QT.5): the share of a statement's memory
 /// budget (`Pager::statement_memory_budget`) each of its `tables` hash and group tables holds
@@ -71,26 +86,27 @@ const fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Fast single-key hash for `GROUP BY` and single-key hash joins: hashes exact-f64 integers and
-/// floats with a 2-multiply SplitMix64 mix (preserving SQLite's `10 == 10.0` and `0.0 == -0.0`
-/// equivalence) without initializing `RapidHasher`.
+/// Fast single-key hash for `GROUP BY`, `DISTINCT`, and single-key hash joins: mixes exact-f64
+/// integers and floats with a per-process CSPRNG-seeded SplitMix64 finalizer (preserving SQLite's
+/// `10 == 10.0` and `0.0 == -0.0` equivalence) without initializing `RapidHasher`.
 #[inline]
 pub(crate) fn hash_single_key_ref(value: &ValueRef, collation: CollationSeq) -> u64 {
+    let (s0, s1) = hash_seeds();
     match value {
-        ValueRef::Null => mix64(DEFAULT_SEED ^ u64::from(NULL_HASH)),
+        ValueRef::Null => mix64((s0 ^ s1) ^ u64::from(NULL_HASH)),
         ValueRef::Numeric(Numeric::Integer(i)) => {
             let f = *i as f64;
             if (f as i64) == *i && f.is_finite() {
-                mix64(normalized_f64_bits(f) ^ 0x9e37_79b9_7f4a_7c15)
+                mix64(normalized_f64_bits(f).wrapping_mul(s0) ^ s1)
             } else {
-                mix64(u64::from_ne_bytes(i.to_ne_bytes()) ^ 0x517c_c1b7_2722_0a95)
+                mix64(u64::from_ne_bytes(i.to_ne_bytes()).wrapping_mul(s0) ^ s1.rotate_left(32))
             }
         }
         ValueRef::Numeric(Numeric::Float(f)) => {
-            mix64(normalized_f64_bits(f64::from(*f)) ^ 0x9e37_79b9_7f4a_7c15)
+            mix64(normalized_f64_bits(f64::from(*f)).wrapping_mul(s0) ^ s1)
         }
         ValueRef::Text(_) | ValueRef::Blob(_) => {
-            let mut hasher = RapidHasher::new(DEFAULT_SEED);
+            let mut hasher = RapidHasher::new(s0);
             hash_key_part(&mut hasher, 0, value, &[collation]);
             hasher.finish()
         }
@@ -104,7 +120,8 @@ pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]
         let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
         return hash_single_key_ref(only, collation);
     }
-    let mut hasher = RapidHasher::new(DEFAULT_SEED);
+    let (s0, _) = hash_seeds();
+    let mut hasher = RapidHasher::new(s0);
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, value, collations);
     }
@@ -117,7 +134,8 @@ fn hash_join_values(key_values: &[Value], collations: &[CollationSeq]) -> u64 {
         let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
         return hash_single_key_ref(&only.as_ref(), collation);
     }
-    let mut hasher = RapidHasher::new(DEFAULT_SEED);
+    let (s0, _) = hash_seeds();
+    let mut hasher = RapidHasher::new(s0);
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, &value.as_ref(), collations);
     }
@@ -599,14 +617,9 @@ impl HashEntry {
         let (num_payload, varint_len) = read_varint(&buf[offset..])?;
         offset += varint_len;
 
-        let mut payload_values = HashPayloadValues::new();
         let num_payload_usize =
             usize::try_from(num_payload).map_err(|_| LimboError::IntegerOverflow)?;
-        if num_payload_usize > payload_values.inline_size() {
-            payload_values
-                .try_reserve_exact(num_payload_usize)
-                .map_err(|_| LimboError::OutOfMemory)?;
-        }
+        let mut payload_values = Vec::try_with_capacity_ext(num_payload_usize)?;
         for _ in 0..num_payload_usize {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
             payload_values.push(value);
@@ -1268,6 +1281,44 @@ impl HashTable {
         })
     }
 
+    /// Heap bytes currently retained by this hash table's backing slabs and bucket arrays.
+    pub fn allocated_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<HashEntry>())
+            .saturating_add(
+                self.heads
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.next
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.matched_bits
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<bool>()),
+            )
+            .saturating_add(
+                self.non_empty_buckets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                self.merge_order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+    }
+
+    /// True when this hash table has not spilled and its retained backing capacity fits within
+    /// [`crate::vdbe::KEPT_EPHEMERAL_BYTES`] for idle statement reuse.
+    pub fn can_reuse(&self) -> bool {
+        !self.has_spilled() && self.allocated_bytes() <= crate::vdbe::KEPT_EPHEMERAL_BYTES
+    }
+
     /// Reconfigures an unspilled `HashTable` for reuse in a subsequent statement run, preserving
     /// its `heads`, `entries`, `next`, `matched_bits`, `non_empty_buckets`, and `merge_order`
     /// allocations without hitting the global allocator.
@@ -1519,7 +1570,7 @@ impl HashTable {
         let pending = PendingHashInsert {
             key_values: key_values.into(),
             rowid,
-            payload_values: payload_values.into(),
+            payload_values,
         };
         match self.insert_pending(pending, metrics)? {
             HashInsertResult::Done => Ok(IOResult::Done(())),
@@ -1528,21 +1579,30 @@ impl HashTable {
     }
 
     /// Push `entry` into the flat slab and prepend it to bucket `bucket_idx`'s intrusive chain.
+    /// Pre-reserves all parallel vectors before mutating any of them so an OOM error never leaves
+    /// a half-inserted entry behind.
     #[inline]
     fn push_slab_entry(&mut self, bucket_idx: usize, entry: HashEntry) -> Result<()> {
         let entry_idx =
             u32::try_from(self.entries.len()).map_err(|_| LimboError::IntegerOverflow)?;
-        let Some(head) = self.heads.get_mut(bucket_idx) else {
+        let Some(&prev_head) = self.heads.get(bucket_idx) else {
             return Err(LimboError::InternalError("hash bucket out of range".into()));
         };
-        let prev_head = *head;
         if prev_head == EMPTY_ENTRY {
-            self.non_empty_buckets.try_push(bucket_idx)?;
+            self.non_empty_buckets.try_reserve(1)?;
         }
-        self.entries.try_push(entry)?;
-        self.next.try_push(prev_head)?;
+        self.entries.try_reserve(1)?;
+        self.next.try_reserve(1)?;
         if self.track_matched {
-            self.matched_bits.try_push(false)?;
+            self.matched_bits.try_reserve(1)?;
+        }
+        if prev_head == EMPTY_ENTRY {
+            self.non_empty_buckets.push(bucket_idx);
+        }
+        self.entries.push(entry);
+        self.next.push(prev_head);
+        if self.track_matched {
+            self.matched_bits.push(false);
         }
         if let Some(slot) = self.heads.get_mut(bucket_idx) {
             *slot = entry_idx;
@@ -1837,7 +1897,13 @@ impl HashTable {
         self.merge_next = 0;
         self.probe_current_entry = None;
         self.probe_next_entry = EMPTY_ENTRY;
-        if self.num_entries == 0 && self.spill_state.is_none() {
+        if self.num_entries == 0
+            && self.entries.is_empty()
+            && self.next.is_empty()
+            && self.matched_bits.is_empty()
+            && self.non_empty_buckets.is_empty()
+            && self.spill_state.is_none()
+        {
             self.state = HashTableState::Building;
             self.current_probe_keys = None;
             self.current_probe_hash = None;
@@ -2386,6 +2452,9 @@ impl HashTable {
         if has_null_key(&probe_keys) {
             self.current_probe_keys = Some(probe_keys);
             self.current_probe_hash = None;
+            self.probe_current_entry = None;
+            self.probe_next_entry = EMPTY_ENTRY;
+            self.probe_entry_idx = 0;
             return Ok(None);
         }
 
@@ -2491,6 +2560,84 @@ impl HashTable {
             }
             Ok(None)
         }
+    }
+
+    /// Fast-path probe for non-spilled tables reading probe keys straight from VDBE registers,
+    /// avoiding `Option<Vec<Value>>` take/restore churn and multi-key loop overhead for single-key
+    /// joins.
+    pub fn probe_registers(
+        &mut self,
+        regs: &[crate::vdbe::Register],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<Option<&HashEntry>> {
+        if self.state != HashTableState::Probing {
+            return Err(LimboError::InternalError(format!(
+                "Cannot probe hash table in unexpected state: {:?}",
+                self.state
+            )));
+        }
+        if self.spill_state.is_some() || !self.merge_order.is_empty() {
+            let keys = self.probe_keys_from(regs.iter().map(crate::vdbe::Register::get_value))?;
+            return self.probe(keys, metrics);
+        }
+        if let [only_reg] = regs {
+            let key_val = only_reg.get_value();
+            if matches!(key_val, Value::Null) {
+                let buf = self.current_probe_keys.get_or_insert_with(Vec::new);
+                buf.clear();
+                buf.try_reserve(1)?;
+                buf.push(Value::Null);
+                self.current_probe_hash = None;
+                self.probe_current_entry = None;
+                self.probe_next_entry = EMPTY_ENTRY;
+                self.probe_entry_idx = 0;
+                return Ok(None);
+            }
+            let collation = self
+                .collations
+                .first()
+                .copied()
+                .unwrap_or(CollationSeq::Binary);
+            let hash = hash_single_key_ref(&key_val.as_ref(), collation);
+            self.current_probe_hash = Some(hash);
+            let buf = self.current_probe_keys.get_or_insert_with(Vec::new);
+            if let [existing] = buf.as_mut_slice() {
+                existing.try_clone_from(key_val)?;
+            } else {
+                buf.clear();
+                buf.try_reserve(1)?;
+                buf.push(key_val.try_clone()?);
+            }
+            self.record_probe_call(metrics);
+            let bucket_idx = Self::bucket_of(hash, self.heads.len());
+            self.probe_current_entry = None;
+            self.probe_next_entry = EMPTY_ENTRY;
+            let mut cur = self.heads.get(bucket_idx).copied().unwrap_or(EMPTY_ENTRY);
+            let key_ref = key_val.as_ref();
+            while cur != EMPTY_ENTRY {
+                let Ok(i) = usize::try_from(cur) else {
+                    break;
+                };
+                let Some(entry) = self.entries.get(i) else {
+                    break;
+                };
+                let next_idx = self.next.get(i).copied().unwrap_or(EMPTY_ENTRY);
+                if entry.hash == hash
+                    && entry
+                        .key_values
+                        .first()
+                        .is_some_and(|v| values_equal(v.as_ref(), key_ref, collation))
+                {
+                    self.probe_current_entry = Some(cur);
+                    self.probe_next_entry = next_idx;
+                    return Ok(self.entries.get(i));
+                }
+                cur = next_idx;
+            }
+            return Ok(None);
+        }
+        let keys = self.probe_keys_from(regs.iter().map(crate::vdbe::Register::get_value))?;
+        self.probe(keys, metrics)
     }
 
     /// AUDIT 3.1: `keys` copied into the last probe's key buffer, for [Self::probe]: a probe row
@@ -5949,5 +6096,107 @@ mod hashtests {
                 );
             }
         }
+    }
+
+    /// Review blocker 6 regression: chosen integers engineered to invert the old unseeded
+    /// SplitMix64 mixer must distribute cleanly across hash buckets under the per-process random
+    /// seed rather than collapsing into a single O(N^2) chain.
+    #[test]
+    fn review_chosen_keys_cannot_defeat_seeded_single_key_hash() {
+        const BUCKETS: usize = 4096;
+        const MASK: u64 = (BUCKETS as u64) - 1;
+        // Exact inverse of SplitMix64 finalizer (mod 2^64).
+        let unmix64 = |mut x: u64| -> u64 {
+            x ^= x >> 31;
+            x ^= x >> 62;
+            x = x.wrapping_mul(0x3196_42b2_d24d_8ec3);
+            x ^= x >> 27;
+            x ^= x >> 54;
+            x = x.wrapping_mul(0x96de_1b17_3f11_9089);
+            x ^= x >> 30;
+            x ^= x >> 60;
+            x
+        };
+        let mut counts = vec![0usize; BUCKETS];
+        for k in 0..BUCKETS as u64 {
+            // Craft an integer whose raw bits inverted the old fixed `mix64(x ^ 0x517c...)` to bucket 0.
+            let target = k << 12;
+            let crafted = unmix64(target) ^ 0x517c_c1b7_2722_0a95;
+            let key = i64::from_ne_bytes(crafted.to_ne_bytes());
+            let h = hash_single_key_ref(&ValueRef::from_i64(key), CollationSeq::Binary);
+            counts[(h & MASK) as usize] += 1;
+        }
+        let max_chain = counts.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_chain <= 32,
+            "seeded single-key hash must resist crafted unmix64 inputs; max bucket chain = {max_chain}"
+        );
+    }
+
+    /// Review blocker 4 regression: a large hash table whose backing capacity exceeds
+    /// `KEPT_EPHEMERAL_BYTES` must not be retained in idle statement spares across resets.
+    #[test]
+    fn review_large_hash_table_refuses_idle_reuse() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 16,
+            mem_budget: 8 * 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        assert!(ht.can_reuse());
+        for i in 0..4_000i64 {
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, vec![Value::from_i64(i)], None)
+                .unwrap();
+        }
+        assert!(ht.allocated_bytes() > crate::vdbe::KEPT_EPHEMERAL_BYTES);
+        assert!(
+            !ht.can_reuse(),
+            "large hash table ({} bytes) must be dropped on reset",
+            ht.allocated_bytes()
+        );
+    }
+
+    /// Review P2 regression: calling `probe_registers` with a NULL key on a fresh hash table must
+    /// initialize `current_probe_keys` so a subsequent `next_match()` returns `Ok(None)` without
+    /// panicking.
+    #[test]
+    fn review_probe_registers_null_then_next_match_does_not_panic() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let mut ht = HashTable::new(HashTableConfig::default(), io).unwrap();
+        let _ = ht
+            .insert(vec![Value::from_i64(1)], 10, vec![], None)
+            .unwrap();
+        let _ = ht.finalize_build(None).unwrap();
+
+        let null_reg = [crate::vdbe::Register::Value(Value::Null)];
+        assert!(ht.probe_registers(&null_reg, None).unwrap().is_none());
+        assert!(
+            ht.next_match().unwrap().is_none(),
+            "next_match after NULL probe_registers must return None without panicking"
+        );
+    }
+
+    /// Review P2 regression: `clear()` must clear stray slab vectors even if `num_entries == 0`.
+    #[test]
+    fn review_clear_drops_stray_slab_entries_even_when_num_entries_is_zero() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let mut ht = HashTable::new(HashTableConfig::default(), io).unwrap();
+        ht.entries.push(HashEntry::new(
+            0,
+            HashKeyValues::from([Value::from_i64(1)]),
+            1,
+        ));
+        assert_eq!(ht.num_entries, 0);
+        ht.clear().unwrap();
+        assert!(
+            ht.entries.is_empty(),
+            "clear() must not skip clearing non-empty slab vectors when num_entries == 0"
+        );
     }
 }

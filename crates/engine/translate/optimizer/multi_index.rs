@@ -305,14 +305,12 @@ fn index_info_for_branch(
         Some(index) => Some(IndexInfo {
             unique: index.unique,
             covering: rowid_only || rhs_table.index_is_covering(index),
-            is_rowid: false,
             column_count: index.columns.len(),
             rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
         }),
         None => Some(IndexInfo {
             unique: true,
             covering: true,
-            is_rowid: true,
             column_count: 1,
             rows_per_leaf_page: params.rows_per_table_page,
         }),

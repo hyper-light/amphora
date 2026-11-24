@@ -580,7 +580,7 @@ impl SegmentsCell {
         self.state.store(next_word, Ordering::SeqCst);
 
         // Dekker re-check: if a concurrent reader finished between our first sum and publishing
-        // COPIED|SHIPPED, free the closing segment now.
+        // COPIED|SHIPPED, free the closing segment now and reflect that reset in `out`.
         if (next_word & Self::READY_TO_RESET) == Self::READY_TO_RESET {
             let closing_id = Segments::unpack(next_word).current().other();
             let (f, s) = self.sum_reads();
@@ -589,6 +589,8 @@ impl SegmentsCell {
                 SegmentId::Second => s,
             };
             if rem == 0 {
+                let mut ready = Self::assemble(next_word, f, s);
+                out = step(&mut ready);
                 let cleared = (next_word & !(CLOSING | COPIED | SHIPPED)) & !VERSION_MASK
                     | (next_word.wrapping_add(1) & VERSION_MASK);
                 self.state.store(cleared, Ordering::SeqCst);
@@ -601,17 +603,28 @@ impl SegmentsCell {
     /// (SeqCst Dekker ordering), and frees the closing segment only if it is also shipped and no
     /// reader still counts on it.
     pub fn copied(&self) -> Option<SegmentId> {
+        self.mark_closing_flag(COPIED)
+    }
+
+    /// Publishes `SHIPPED` on the closing segment before counting active readers across shards
+    /// (SeqCst Dekker ordering), and frees the closing segment only if it is also copied and no
+    /// reader still counts on it.
+    pub fn shipped(&self) -> Option<SegmentId> {
+        self.mark_closing_flag(SHIPPED)
+    }
+
+    fn mark_closing_flag(&self, flag: u64) -> Option<SegmentId> {
         let _guard = self.transition.lock();
         let word = self.state.load(Ordering::SeqCst);
         if (word & CLOSING) == 0 {
             return None;
         }
-        let with_copied = ((word | COPIED) & !VERSION_MASK) | (word.wrapping_add(1) & VERSION_MASK);
-        self.state.store(with_copied, Ordering::SeqCst);
-        if (with_copied & Self::READY_TO_RESET) != Self::READY_TO_RESET {
+        let published = ((word | flag) & !VERSION_MASK) | (word.wrapping_add(1) & VERSION_MASK);
+        self.state.store(published, Ordering::SeqCst);
+        if (published & Self::READY_TO_RESET) != Self::READY_TO_RESET {
             return None;
         }
-        let closing_id = Segments::unpack(with_copied).current().other();
+        let closing_id = Segments::unpack(published).current().other();
         let (first, second) = self.sum_reads();
         let rem = match closing_id {
             SegmentId::First => first,
@@ -620,8 +633,8 @@ impl SegmentsCell {
         if rem != 0 {
             return None;
         }
-        let cleared = (with_copied & !(CLOSING | COPIED | SHIPPED) & !VERSION_MASK)
-            | (with_copied.wrapping_add(1) & VERSION_MASK);
+        let cleared = (published & !(CLOSING | COPIED | SHIPPED) & !VERSION_MASK)
+            | (published.wrapping_add(1) & VERSION_MASK);
         self.state.store(cleared, Ordering::SeqCst);
         Some(closing_id)
     }
@@ -1228,6 +1241,75 @@ mod tests {
         });
         let final_state = cell.load();
         assert_eq!(final_state.closing(), None);
+        assert!(matches!(
+            final_state.state(final_state.current()),
+            Segment::Current { reads: 0 }
+        ));
+    }
+
+    /// Review blocker 1 regression (no-pause stress): 8 concurrent reader threads racing against
+    /// continuous segment switches, `copied()`, and `shipped()` must never recycle a segment while
+    /// a reader holds a span on it and must never leave the closing segment stuck once readers end.
+    #[test]
+    fn review_no_pause_stress_never_frees_active_segment_or_sticks_log() {
+        use std::sync::atomic::AtomicBool;
+
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(span) = cell.begin_read() {
+                            if let Some(closing) = span.closing() {
+                                assert_ne!(
+                                    cell.load().state(closing),
+                                    Segment::Free,
+                                    "closing segment freed under active reader"
+                                );
+                            }
+                            assert_ne!(
+                                cell.load().state(span.current()),
+                                Segment::Free,
+                                "current segment freed under active reader"
+                            );
+                            cell.end_read(span);
+                        }
+                    }
+                });
+            }
+            for i in 0..10_000usize {
+                let backed_up = i % 3 == 0;
+                let mut spins = 0usize;
+                while matches!(cell.update(|s| s.switch(backed_up)), Some(None)) {
+                    spins = spins.saturating_add(1);
+                    assert!(
+                        spins < 1_000_000,
+                        "log stuck waiting for closing segment to free at iteration {i}: {:?}",
+                        cell.load()
+                    );
+                    std::thread::yield_now();
+                }
+                if backed_up {
+                    if i % 2 == 0 {
+                        let _ = cell.copied();
+                        let _ = cell.shipped();
+                    } else {
+                        let _ = cell.shipped();
+                        let _ = cell.copied();
+                    }
+                } else {
+                    let _ = cell.copied();
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        let final_state = cell.load();
+        assert_eq!(
+            final_state.closing(),
+            None,
+            "closing segment stuck after all readers ended: {final_state:?}"
+        );
         assert!(matches!(
             final_state.state(final_state.current()),
             Segment::Current { reads: 0 }

@@ -74,9 +74,6 @@ pub struct IndexInfo {
     /// True for genuinely covering indexes and for multi-index branches
     /// that only harvest rowids into a RowSet.
     pub covering: bool,
-    /// True for a table's integer rowid (`INTEGER PRIMARY KEY`) B-tree, which searches raw `i64`
-    /// rowids (`SeekRowid` / table `SeekGE`) without index record decoding or collations.
-    pub is_rowid: bool,
     /// Estimated rows per index leaf page, derived from the column count
     /// ratio between the index and its parent table.
     pub rows_per_leaf_page: f64,
@@ -211,10 +208,8 @@ pub(super) fn estimate_scan_cost(
 
     // CPU cost for processing all rows on each scan
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
-    let disk_reads = file_reads(io_cost, table_pages, params.cache_pages, params.page_miss);
-    let cached_fetches = (io_cost - disk_reads).max(0.0);
 
-    Cost(disk_reads + cached_fetches * params.cached_page_cost + cpu_cost)
+    Cost(file_reads(io_cost, table_pages, params.cache_pages, params.page_miss) + cpu_cost)
 }
 
 /// Amphora (QT.5): the pages `scans` whole reads of `pages` pages read from a cold cache of
@@ -305,17 +300,6 @@ pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     } else {
         (row_count.ln() / rows_per_page.ln()).ceil().max(1.0)
     }
-}
-
-/// Discounts `cpu_cost_per_seek` for small trees holding fewer rows than one calibration page
-/// (`PAGE_KEYS`) by `log2(rows) / log2(PAGE_KEYS)` when learned costs are active, without inflating
-/// larger trees above the runtime-observed `Work::Seek` rate.
-fn learned_seek_scale(base_row_count: f64, params: &CostModelParams) -> f64 {
-    if params.cached_page_cost <= 0.0 {
-        return 1.0;
-    }
-    let cal_log2 = (super::learned_costs::PAGE_KEYS.max(2) as f64).log2();
-    (base_row_count.max(2.0).log2() / cal_log2).min(1.0)
 }
 
 /// Amphora: the table pages that `rows` looked up at random among `table_pages` read from the file,
@@ -411,8 +395,6 @@ pub fn estimate_index_cost(
             + (input_cardinality - 1.0) * ((tree_depth - 2.0).max(0.0) + index_leaf_pages_count)
     };
 
-    let seek_scale = learned_seek_scale(base_row_count, params);
-
     // For non-covering indexes, we need to fetch from the table for each row. Amphora: each row
     // is a seek of the table of its own, its page read unless the cache holds it (decision 5).
     let table_lookup_cost = if index_info.covering {
@@ -420,17 +402,12 @@ pub fn estimate_index_cost(
     } else {
         let table_pages_count = (base_row_count / params.rows_per_table_page).max(1.0);
         let looked_up = input_cardinality * rows_per_seek;
-        let table_fetched = table_pages_fetched(looked_up, table_pages_count, params.cache_pages);
-        let table_disk_reads = file_reads(
-            table_fetched,
+        file_reads(
+            table_pages_fetched(looked_up, table_pages_count, params.cache_pages),
             table_pages_count,
             params.cache_pages,
             params.page_miss,
-        );
-        let table_cached_fetches = (table_fetched - table_disk_reads).max(0.0);
-        table_disk_reads
-            + table_cached_fetches * params.cached_page_cost
-            + looked_up * params.cpu_cost_per_rowid_seek * seek_scale
+        ) + looked_up * params.cpu_cost_per_seek
     };
 
     // Amphora: many searches of an index read each of its pages once at most while the cache
@@ -453,20 +430,13 @@ pub fn estimate_index_cost(
         search_reads
     };
 
-    let index_disk_reads = file_reads(index_io, index_pages, params.cache_pages, params.page_miss);
-    let index_cached_fetches = (index_io - index_disk_reads).max(0.0);
     let io_cost =
-        index_disk_reads + index_cached_fetches * params.cached_page_cost + table_lookup_cost;
+        file_reads(index_io, index_pages, params.cache_pages, params.page_miss) + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
-    let seek_unit = if index_info.is_rowid {
-        params.cpu_cost_per_rowid_seek
-    } else {
-        params.cpu_cost_per_seek
-    };
     let cpu_cost =
-        input_cardinality * seek_unit * seek_scale + total_rows * params.cpu_cost_per_row;
+        input_cardinality * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
 
     Cost(io_cost + cpu_cost)
 }
@@ -499,14 +469,12 @@ pub(crate) fn index_access_is_unique_point_lookup(
             unique: index.unique,
             column_count: index.columns.len(),
             covering: false,
-            is_rowid: false,
             rows_per_leaf_page: 0.0,
         },
         None => IndexInfo {
             unique: true,
             column_count: 1,
             covering: false,
-            is_rowid: true,
             rows_per_leaf_page: 0.0,
         },
     };
@@ -940,7 +908,6 @@ mod tests {
             unique: false,
             column_count: 2,
             covering: true,
-            is_rowid: false,
             rows_per_leaf_page: 100.0,
         }
     }

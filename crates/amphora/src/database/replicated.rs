@@ -1291,7 +1291,7 @@ fn run_session(
 ) -> anyhow::Result<Answer> {
     // The guard ends with application evaluation, before prepare_pages rolls back its
     // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-    let _deadline = db.deadline_on(until, move || clock());
+    let _deadline = db.deadline_on_owned(until, move || clock());
     if restore::incomplete(db)? {
         return Err(api::invalid("database", "restore is incomplete").into());
     }
@@ -17898,7 +17898,7 @@ mod tests {
                         // and the read ends before the test means it to.
                         let began = Instant::now();
                         let until = began + HANG_READ;
-                        let _deadline = db.deadline_on(until, move || {
+                        let _deadline = db.deadline_on_owned(until, move || {
                             if passed.load(Ordering::Acquire) {
                                 until
                             } else {

@@ -28,7 +28,6 @@ pub mod page_cache;
 #[cfg(not(feature = "aristo-instr"))]
 pub(crate) mod page_cache;
 pub use page_cache::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES;
-pub const PAGE_CACHE_ENTRY_BYTES: usize = page_cache::PageCache::ESTIMATED_ENTRY_BYTES;
 pub(crate) mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;

@@ -1492,7 +1492,8 @@ impl Page {
         if current == TAG_UNSET {
             tracing::debug!(
                 "try_set_wal_tag(page={}, frame={}) SKIPPED: wal_tag is TAG_UNSET (page was modified)",
-                page_id, frame
+                page_id,
+                frame
             );
             return false;
         }
@@ -2066,9 +2067,6 @@ pub struct Pager {
     /// their recent share (`page_miss_ratio`).
     page_fetches: AtomicU64,
     page_file_reads: AtomicU64,
-    /// Amphora (QT.5): fetches that missed this connection's `PageCache` (served by `SharedPages`
-    /// or disk), so `timed_run` excludes shared-pool lookup/eviction overhead from pure CPU rates.
-    page_cache_misses: AtomicU64,
     page_miss_window: Mutex<PageMissWindow>,
 }
 
@@ -2369,7 +2367,6 @@ impl Pager {
             learned_costs: std::sync::OnceLock::new(),
             page_fetches: AtomicU64::new(0),
             page_file_reads: AtomicU64::new(0),
-            page_cache_misses: AtomicU64::new(0),
             page_miss_window: Mutex::new(PageMissWindow::default()),
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
@@ -3429,7 +3426,11 @@ impl Pager {
                                         )
                                     }));
 
-                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
+                                turso_assert_greater_than!(
+                                    root_page_num,
+                                    0,
+                                    "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled"
+                                );
                                 root_page_num += 1;
                                 turso_assert_greater_than_or_equal!(
                                     root_page_num,
@@ -4187,6 +4188,10 @@ impl Pager {
             Some(buffer) => buffer,
             None => Arc::new(self.buffer_pool.get_page()),
         };
+        let read_timer = self
+            .learned_costs
+            .get()
+            .and_then(|costs| costs.start_page_read());
         let read = {
             let io_ctx = self.io_ctx.read();
             self.db_file
@@ -4195,9 +4200,14 @@ impl Pager {
         let Some(read) = read else {
             return Ok(false);
         };
-        // Inline reads complete synchronously without a Completion; count them as file reads so
-        // `page_miss_ratio` stays accurate and `timed_run` excludes them from pure CPU rates.
+        // Inline reads complete synchronously without a Completion; count them as file reads and
+        // feed their latency to LearnedCosts just like completion-driven reads so `page_miss_ratio`
+        // and `Work::PageRead` stay accurate on `PagePath::Plain` (and `timed_run` excludes them
+        // from pure CPU rates).
         self.page_file_reads.fetch_add(1, Ordering::Relaxed);
+        if let (Some(costs), Some(timer)) = (self.learned_costs.get(), read_timer) {
+            costs.finish_page_read(timer);
+        }
         let expected = buffer.len();
         if (read == 0 && !allow_empty) || (read != 0 && read != expected) {
             return Err(LimboError::CompletionError(CompletionError::ShortRead {
@@ -4309,7 +4319,11 @@ impl Pager {
         page_idx: i64,
         mut group: Option<&mut CompletionGroup>,
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
-        turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        turso_assert_greater_than_or_equal!(
+            page_idx,
+            0,
+            "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug"
+        );
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         if self.recording.load(Ordering::Acquire) {
             self.note_read(page_idx);
@@ -4358,7 +4372,6 @@ impl Pager {
                 }
             }
 
-            self.page_cache_misses.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             // Amphora: a version another connection read in is shared, and one read now is
             // shared once read (decision 20).
@@ -4493,18 +4506,6 @@ impl Pager {
     /// cost model (`cost_fit`).
     pub(crate) fn page_file_reads(&self) -> u64 {
         self.page_file_reads.load(Ordering::Relaxed)
-    }
-
-    /// Amphora (QT.5): fetches that missed this connection's `PageCache`.
-    pub(crate) fn page_cache_misses(&self) -> u64 {
-        self.page_cache_misses.load(Ordering::Relaxed)
-    }
-
-    /// Approximate count of concurrent WAL transactions active on this database.
-    /// Used only on sampled cost-learning runs to avoid skewing one operator's rate under
-    /// multi-core saturation while unobserved operators remain on uncontended calibration.
-    pub(crate) fn concurrent_readers(&self) -> u64 {
-        self.wal.as_ref().map_or(1, |wal| wal.concurrent_readers())
     }
 
     /// Lane T13: the standing share once an epoch has closed; before that, the share so far.
@@ -5396,17 +5397,17 @@ impl Pager {
                             } else {
                                 // Page was modified during write, it will need to be re-spilled
                                 tracing::debug!(
-                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                                page.get().id()
-                            );
+                                    "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                    page.get().id()
+                                );
                             }
                         }
                     }
                     if spilled_count == 0 && !pages.is_empty() {
                         tracing::warn!(
-                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
-                        pages.len()
-                    );
+                            "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                            pages.len()
+                        );
                     }
                     *self.spill_state.write() = SpillState::Idle;
                     trace!(
@@ -5606,7 +5607,12 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    #[aristo::intent("A commit frame must reach stable storage via fsync before the transaction is reported as durable\n", id = "aristos:wal_commit_requires_fsync", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "A commit frame must reach stable storage via fsync before the transaction is reported as durable\n",
+        id = "aristos:wal_commit_requires_fsync",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
@@ -6136,7 +6142,12 @@ impl Pager {
         )
     }
 
-    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n",
+        id = "aristos:wal_nbackfills_orders_with_recovery",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,

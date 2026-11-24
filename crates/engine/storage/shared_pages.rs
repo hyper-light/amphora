@@ -1064,5 +1064,46 @@ mod tests {
             meta_entries, 0,
             "latest_frame metadata must be empty when zero frames are resident"
         );
+
+        // Stress with a 4 MiB pool (1024 pages) and 20,000 distinct published & superseded pages:
+        // metadata entries and map capacity must remain strictly bounded by pool capacity.
+        let pool4m = Arc::new(SharedPages::new(1024));
+        let f4m = SharedFile::join(pool4m.clone());
+        for page in 1..=20_000u64 {
+            assert!(pool4m.publish(
+                f4m.key(
+                    page,
+                    Version::Frame {
+                        generation: 1,
+                        frame: page
+                    }
+                ),
+                buffer(2)
+            ));
+            if page % 2 == 0 {
+                f4m.supersede_frame(page, 1, page + 1);
+            }
+        }
+        let resident = pool4m.len();
+        let total_meta: usize = pool4m
+            .shards
+            .iter()
+            .map(|cell| cell.shard.read().latest_frame.len())
+            .sum();
+        let total_meta_cap: usize = pool4m
+            .shards
+            .iter()
+            .map(|cell| cell.shard.read().latest_frame.capacity())
+            .sum();
+        assert!(resident <= pool4m.capacity());
+        assert!(
+            total_meta <= resident,
+            "latest_frame entries ({total_meta}) must never exceed resident frames ({resident})"
+        );
+        assert!(
+            total_meta_cap <= pool4m.capacity().saturating_mul(4),
+            "latest_frame capacity ({total_meta_cap}) grew unboundedly behind pool capacity {}",
+            pool4m.capacity()
+        );
     }
 }

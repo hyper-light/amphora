@@ -241,14 +241,10 @@ pub fn translate(
     };
     // Amphora (PL.13, lane T9): a test's whole set of pinned weights in their place
     // (`Connection::pin_cost_weights`).
-    let pinned = connection.pinned_cost_weights();
-    let weights = pinned.or_else(|| connection.db.learned_costs.weights_at(page_miss));
+    let weights = connection
+        .pinned_cost_weights()
+        .or_else(|| connection.db.learned_costs.weights_at(page_miss));
     resolver.set_learned_weights(weights);
-    resolver.set_learned_rowid_seek(if pinned.is_some() {
-        None
-    } else {
-        connection.db.learned_costs.rowid_seek_weight()
-    });
     // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
     let fitted = connection.db.cost_fit.weights();
     // Lane T12 (PL.13): what each plan is made on, so a plan that changes between two prepares

@@ -199,13 +199,6 @@ impl PageCacheKey {
 }
 
 impl PageCache {
-    /// Metadata footprint of one cached shared-page entry (`Page`, `PageCacheEntry`, `Slot`, plus
-    /// hash table load-factor overhead per Knuth TAOCP §6.4 at 0.7 load). Used to size per-reader
-    /// local frame tables against a core's L1 data cache when `SharedPages` backs the data buffers.
-    pub const ESTIMATED_ENTRY_BYTES: usize = std::mem::size_of::<Page>()
-        + std::mem::size_of::<PageCacheEntry>()
-        + (std::mem::size_of::<(PageCacheKey, Slot)>() * 10) / 7;
-
     #[cfg(not(target_family = "wasm"))]
     pub fn new(capacity: usize) -> Self {
         Self::new_with_spill(capacity, true)

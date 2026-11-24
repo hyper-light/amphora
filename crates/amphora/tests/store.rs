@@ -858,3 +858,116 @@ fn a_sender_told_durable_that_sends_nothing_more_holds_no_flush() {
     });
     assert_eq!(held.began(), 2);
 }
+
+/// Review blocker 1 end-to-end regression: concurrent WAL segment switches and checkpoints while
+/// readers pause mid-snapshot must never overwrite a closing segment still referenced by an active
+/// reader (which previously produced wrong sums and could leave the log stuck).
+#[test]
+fn review_concurrent_log_switches_and_paused_readers_keep_exact_sum() {
+    use std::sync::atomic::AtomicBool;
+
+    const ACCOUNTS: i64 = 200;
+    const INITIAL_VAL: i64 = 1_000;
+    const EXPECTED_SUM: i64 = ACCOUNTS * INITIAL_VAL;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sums.db");
+    let mut writer = Db::open(&path).unwrap();
+    writer.keep_log(32);
+    writer
+        .exec("CREATE TABLE accounts (id INTEGER PRIMARY KEY, val INTEGER NOT NULL, pad TEXT NOT NULL)")
+        .unwrap();
+    let pad = "p".repeat(600);
+    writer
+        .transaction(|db| {
+            for id in 1..=ACCOUNTS {
+                db.query(
+                    "INSERT INTO accounts (id, val, pad) VALUES (?1, ?2, ?3)",
+                    [
+                        Value::from_i64(id),
+                        Value::from_i64(INITIAL_VAL),
+                        Value::from_text(pad.clone()),
+                    ],
+                    |_| Ok(true),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let reader = writer.reader().unwrap();
+        let stop = Arc::clone(&stop);
+        let checks = Arc::clone(&checks);
+        readers.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                reader.exec("BEGIN").unwrap();
+                let mut left = 0i64;
+                reader
+                    .query("SELECT SUM(val) FROM accounts WHERE id <= 100", [], |r| {
+                        left = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Ok(true)
+                    })
+                    .unwrap();
+                // Hold the snapshot across segment switches and checkpoints.
+                std::thread::park_timeout(Duration::from_millis(3));
+                let mut right = 0i64;
+                reader
+                    .query("SELECT SUM(val) FROM accounts WHERE id > 100", [], |r| {
+                        right = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Ok(true)
+                    })
+                    .unwrap();
+                reader.exec("COMMIT").unwrap();
+                assert_eq!(
+                    left + right,
+                    EXPECTED_SUM,
+                    "snapshot saw torn or overwritten WAL segment: left={left} right={right}"
+                );
+                checks.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    let mut switches = 0usize;
+    for step in 0..160i64 {
+        let from = (step % 100) + 1;
+        let to = from + 100;
+        let tag = format!("{step:04}-{}", "x".repeat(595));
+        writer
+            .transaction(|db| {
+                db.query(
+                    "UPDATE accounts SET val = val - 1, pad = ?2 WHERE id = ?1",
+                    [Value::from_i64(from), Value::from_text(tag.clone())],
+                    |_| Ok(true),
+                )?;
+                db.query(
+                    "UPDATE accounts SET val = val + 1, pad = ?2 WHERE id = ?1",
+                    [Value::from_i64(to), Value::from_text(tag)],
+                    |_| Ok(true),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        if step % 2 == 0 && writer.restart_log().unwrap() {
+            switches += 1;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for handle in readers {
+        handle.join().unwrap();
+    }
+    assert!(
+        writer.restart_log().unwrap(),
+        "log must not be stuck after all readers finish"
+    );
+    assert!(switches > 0, "expected at least one concurrent log switch");
+    assert!(
+        checks.load(Ordering::Relaxed) >= 20,
+        "expected paused readers to complete snapshot checks"
+    );
+}

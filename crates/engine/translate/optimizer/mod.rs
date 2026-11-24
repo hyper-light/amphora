@@ -1176,7 +1176,6 @@ fn find_select_plan_form(
         .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
-        .with_rowid_seek(resolver.learned_rowid_seek())
         .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values())
         .with_is_value_estimate(resolver.is_value_estimate());
@@ -3083,7 +3082,6 @@ fn find_table_access_plan(
         .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
-        .with_rowid_seek(resolver.learned_rowid_seek())
         .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values())
         .with_is_value_estimate(resolver.is_value_estimate());
@@ -4169,7 +4167,7 @@ pub(crate) mod bushy_test_hook {
                 "SELECT count(*), sum(p.w) FROM a, b, c, p WHERE b.x = a.x AND c.y = b.y AND p.z = c.z",
                 "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x = a.x JOIN c ON c.y = b.y \
                  JOIN p ON p.z = c.z AND p.w > a.x",
-                            "SELECT a.id, b.id, c.id, p.id FROM a, b JOIN c ON c.y = b.y JOIN p ON p.z = c.z \
+                "SELECT a.id, b.id, c.id, p.id FROM a, b JOIN c ON c.y = b.y JOIN p ON p.z = c.z \
                  WHERE a.id = 2",
                 "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b JOIN c ON c.y = b.y \
                  JOIN p ON p.z = c.z WHERE a.id = 3 AND b.x <> a.x AND p.w > a.x + c.id",

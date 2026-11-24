@@ -127,6 +127,39 @@ impl GroupTable {
         self.next = 0;
     }
 
+    /// Heap bytes currently retained by this group table's backing slabs and slot index.
+    pub fn allocated_bytes(&self) -> usize {
+        self.all_values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(
+                self.all_accs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Register>()),
+            )
+            .saturating_add(
+                self.hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.slots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+    }
+
+    /// True when this group table's retained backing capacity fits within
+    /// [`crate::vdbe::KEPT_EPHEMERAL_BYTES`] for idle statement reuse.
+    pub fn can_reuse(&self) -> bool {
+        self.allocated_bytes() <= crate::vdbe::KEPT_EPHEMERAL_BYTES
+    }
+
     /// Clears values and accumulators in place before stashing this table for reuse so owned
     /// text/blob buffers are released immediately on `Statement::reset()`.
     pub fn clear_entries(&mut self) {
@@ -589,5 +622,22 @@ mod tests {
         assert_eq!(t.find_or_insert(&[&int(2)], 1).unwrap(), Some(1));
         assert_eq!(t.find_or_insert(&[&int(3)], 1).unwrap(), None);
         assert_eq!(t.find_or_insert(&[&int(1)], 1).unwrap(), Some(0));
+    }
+
+    /// Review blocker 4 regression: a large group table whose backing slabs exceed
+    /// `KEPT_EPHEMERAL_BYTES` must not be retained in idle statement spares across resets.
+    #[test]
+    fn review_large_group_table_refuses_idle_reuse() {
+        let mut t = GroupTable::new(1, vec![CollationSeq::Binary], usize::MAX);
+        assert!(t.can_reuse());
+        for i in 0..4_000i64 {
+            assert!(t.find_or_insert(&[&int(i)], 2).unwrap().is_some());
+        }
+        assert!(t.allocated_bytes() > crate::vdbe::KEPT_EPHEMERAL_BYTES);
+        assert!(
+            !t.can_reuse(),
+            "large group table ({} bytes) must be dropped on reset",
+            t.allocated_bytes()
+        );
     }
 }

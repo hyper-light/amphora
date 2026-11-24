@@ -2684,7 +2684,7 @@ fn op_column_range_fetch(
                 start_column,
                 dest,
                 defaults,
-            )
+            );
         }
         None => return Err(cursor_out_of_range("ColumnRange", cursor_id).into()),
     };
@@ -3823,7 +3823,7 @@ pub fn op_blob_read(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3892,7 +3892,7 @@ pub fn op_blob_write(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -6765,9 +6765,7 @@ pub fn op_seek_rowid(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = timed_run_rowid_seek(program, pager, || {
-        seek_rowid_run(program, state, insn, pager)
-    });
+    let result = seek_rowid_run(program, state, insn, pager);
     seek_trace_end(state, traced, &result);
     result
 }
@@ -6962,23 +6960,12 @@ pub fn op_seek(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let is_index = matches!(
-        insn,
-        Insn::SeekGE { is_index: true, .. }
-            | Insn::SeekLE { is_index: true, .. }
-            | Insn::SeekGT { is_index: true, .. }
-            | Insn::SeekLT { is_index: true, .. }
+    let result = timed_run(
+        program,
+        pager,
+        crate::translate::optimizer::learned_costs::Work::Seek,
+        || seek_run(program, state, insn, pager),
     );
-    let result = if is_index {
-        timed_run(
-            program,
-            pager,
-            crate::translate::optimizer::learned_costs::Work::Seek,
-            || seek_run(program, state, insn, pager),
-        )
-    } else {
-        timed_run_rowid_seek(program, pager, || seek_run(program, state, insn, pager))
-    };
     seek_trace_end(state, traced, &result);
     result
 }
@@ -7099,56 +7086,12 @@ fn timed_run(
     if !costs.sampled(work, &program.connection.cost_runs) {
         return run();
     }
-    if pager.concurrent_readers() > 1 {
-        costs.discard_sampled_batch(work);
-        return run();
-    }
     let reads_before = pager.page_file_reads();
-    let misses_before = pager.page_cache_misses();
     let started = std::time::Instant::now();
     let result = run();
-    if matches!(result, Ok(InsnFunctionStepResult::Step))
-        && pager.page_file_reads() == reads_before
-        && pager.page_cache_misses() == misses_before
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) && pager.page_file_reads() == reads_before
     {
-        if pager.concurrent_readers() <= 1 {
-            costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
-        } else {
-            costs.discard_sampled_batch(work);
-        }
-    }
-    result
-}
-
-/// Samples a table-rowid (`INTEGER PRIMARY KEY`) seek (`op_seek_rowid` or table `op_seek`)
-/// separately from secondary-index record seeks, excluding disk/cache misses and multi-reader
-/// contention just like `timed_run`.
-fn timed_run_rowid_seek(
-    program: &Program,
-    pager: &Pager,
-    run: impl FnOnce() -> InsnResult,
-) -> InsnResult {
-    let costs = &program.connection.db.learned_costs;
-    if !costs.sampled_rowid_seek(&program.connection.cost_runs) {
-        return run();
-    }
-    if pager.concurrent_readers() > 1 {
-        costs.discard_sampled_rowid_seek_batch();
-        return run();
-    }
-    let reads_before = pager.page_file_reads();
-    let misses_before = pager.page_cache_misses();
-    let started = std::time::Instant::now();
-    let result = run();
-    if matches!(result, Ok(InsnFunctionStepResult::Step))
-        && pager.page_file_reads() == reads_before
-        && pager.page_cache_misses() == misses_before
-    {
-        if pager.concurrent_readers() <= 1 {
-            costs.observe_sampled_rowid_seek(started.elapsed().as_nanos() as f64);
-        } else {
-            costs.discard_sampled_rowid_seek_batch();
-        }
+        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
     }
     result
 }
@@ -8717,7 +8660,7 @@ pub(crate) fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<
     match func {
         AggFunc::Avg if payload.len() > EXACT_AVG_SLOTS => return exact_avg_final(payload),
         AggFunc::Sum | AggFunc::Total if payload.len() > EXACT_SUM_SLOTS => {
-            return exact_sum_final(func, payload)
+            return exact_sum_final(func, payload);
         }
         _ => {}
     }
@@ -19412,25 +19355,12 @@ fn hash_build_run(
 ) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
-    let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
+    let resumed_state = state.active_op_state.take_hash_build().filter(|s| {
         s.hash_table_id == data.hash_table_id
             && s.cursor_id == data.cursor_id
             && s.key_start_reg == data.key_start_reg
             && s.num_keys == data.num_keys
-    }) {
-        Some(op_state) => op_state,
-        None => OpHashBuildState {
-            key_values: crate::vdbe::hash_table::HashKeyValues::new(),
-            key_idx: 0,
-            payload_values: crate::vdbe::hash_table::HashPayloadValues::new(),
-            payload_idx: 0,
-            rowid: None,
-            cursor_id: data.cursor_id,
-            hash_table_id: data.hash_table_id,
-            key_start_reg: data.key_start_reg,
-            num_keys: data.num_keys,
-        },
-    };
+    });
 
     // Create hash table if it doesn't exist yet
     if !state.hash_tables.contains_key(&data.hash_table_id) {
@@ -19458,44 +19388,123 @@ fn hash_build_run(
         state.hash_tables.insert(data.hash_table_id, table);
     }
 
-    // Read pre-computed key values directly from registers
-    while op_state.key_idx < data.num_keys {
-        let i = op_state.key_idx;
-        let reg = &state.registers[data.key_start_reg + i];
-        let value = reg.get_value().clone();
-        // The resume state preallocates space for every key register before the loop starts.
-        op_state.key_values.push(value);
-        op_state.key_idx += 1;
-    }
-
-    // Read payload values from registers if provided
-    if let Some(payload_reg) = data.payload_start_reg {
-        while op_state.payload_idx < data.num_payload {
-            let i = op_state.payload_idx;
-            let reg = &state.registers[payload_reg + i];
-            let value = reg.get_value().clone();
-            // The resume state preallocates space for every payload register before the loop starts.
-            op_state.payload_values.push(value);
-            op_state.payload_idx += 1;
+    let (key_values, payload_values, rowid) = if let Some(mut op_state) = resumed_state {
+        if data.num_keys > op_state.key_values.inline_size() {
+            op_state
+                .key_values
+                .try_reserve(data.num_keys.saturating_sub(op_state.key_values.len()))
+                .map_err(|_| LimboError::OutOfMemory)?;
         }
-    }
-
-    // Get the rowid from the cursor
-    if op_state.rowid.is_none() {
+        while op_state.key_idx < data.num_keys {
+            let i = op_state.key_idx;
+            let reg = &state.registers[data.key_start_reg + i];
+            op_state.key_values.push(reg.get_value().clone());
+            op_state.key_idx += 1;
+        }
+        if let Some(payload_reg) = data.payload_start_reg {
+            op_state.payload_values.try_reserve(
+                data.num_payload
+                    .saturating_sub(op_state.payload_values.len()),
+            )?;
+            while op_state.payload_idx < data.num_payload {
+                let i = op_state.payload_idx;
+                let reg = &state.registers[payload_reg + i];
+                op_state.payload_values.push(reg.get_value().clone());
+                op_state.payload_idx += 1;
+            }
+        }
+        let rowid = if let Some(rowid) = op_state.rowid {
+            rowid
+        } else {
+            let cursor = state.get_cursor(data.cursor_id);
+            let rowid_val = match cursor {
+                Cursor::BTree(..) | Cursor::Dyn(..) => {
+                    let btree_cursor = cursor.as_btree_mut();
+                    let rowid_opt = match btree_cursor.rowid() {
+                        Ok(IOResult::Done(v)) => v,
+                        Ok(IOResult::IO(io)) => {
+                            *state.active_op_state.hash_build() = Some(op_state);
+                            return Ok(state.suspend_on_io(io));
+                        }
+                        Err(e) => {
+                            *state.active_op_state.hash_build() = Some(op_state);
+                            return Err(e);
+                        }
+                    };
+                    rowid_opt.ok_or_else(|| {
+                        LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
+                    })?
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "HashBuild: unsupported cursor type".to_string(),
+                    )
+                    .into());
+                }
+            };
+            rowid_val
+        };
+        (op_state.key_values, op_state.payload_values, rowid)
+    } else {
+        // Common fast path: no prior IO suspension — avoid constructing `OpHashBuildState` on
+        // the stack unless `rowid()` or `insert_pending()` actually suspends on IO.
         let cursor = state.get_cursor(data.cursor_id);
-        let rowid_val = match cursor {
+        let rowid = match cursor {
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid_opt = match btree_cursor.rowid() {
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
+                        let key_end = data
+                            .key_start_reg
+                            .checked_add(data.num_keys)
+                            .ok_or(LimboError::IntegerOverflow)?;
+                        let key_regs = state
+                            .registers
+                            .get(data.key_start_reg..key_end)
+                            .ok_or_else(|| {
+                                register_out_of_range("HashBuild", data.key_start_reg)
+                            })?;
+                        let mut key_values = crate::vdbe::hash_table::HashKeyValues::new();
+                        if data.num_keys > key_values.inline_size() {
+                            key_values
+                                .try_reserve_exact(data.num_keys)
+                                .map_err(|_| LimboError::OutOfMemory)?;
+                        }
+                        for reg in key_regs {
+                            key_values.push(reg.get_value().clone());
+                        }
+                        let payload_values = if let Some(payload_reg) = data.payload_start_reg {
+                            let payload_end = payload_reg
+                                .checked_add(data.num_payload)
+                                .ok_or(LimboError::IntegerOverflow)?;
+                            let payload_regs = state
+                                .registers
+                                .get(payload_reg..payload_end)
+                                .ok_or_else(|| register_out_of_range("HashBuild", payload_reg))?;
+                            let mut v = crate::alloc::Vec::try_with_capacity_ext(data.num_payload)?;
+                            for reg in payload_regs {
+                                v.push(reg.get_value().clone());
+                            }
+                            v
+                        } else {
+                            crate::alloc::Vec::new()
+                        };
+                        let payload_idx = payload_values.len();
+                        *state.active_op_state.hash_build() = Some(OpHashBuildState {
+                            key_values,
+                            key_idx: data.num_keys,
+                            payload_values,
+                            payload_idx,
+                            rowid: None,
+                            cursor_id: data.cursor_id,
+                            hash_table_id: data.hash_table_id,
+                            key_start_reg: data.key_start_reg,
+                            num_keys: data.num_keys,
+                        });
                         return Ok(state.suspend_on_io(io));
                     }
-                    Err(e) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 };
                 rowid_opt.ok_or_else(|| {
                     LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
@@ -19508,16 +19517,49 @@ fn hash_build_run(
                 .into());
             }
         };
-        op_state.rowid = Some(rowid_val);
-    }
+
+        let key_end = data
+            .key_start_reg
+            .checked_add(data.num_keys)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let key_regs = state
+            .registers
+            .get(data.key_start_reg..key_end)
+            .ok_or_else(|| register_out_of_range("HashBuild", data.key_start_reg))?;
+        let mut key_values = crate::vdbe::hash_table::HashKeyValues::new();
+        if data.num_keys > key_values.inline_size() {
+            key_values
+                .try_reserve_exact(data.num_keys)
+                .map_err(|_| LimboError::OutOfMemory)?;
+        }
+        for reg in key_regs {
+            key_values.push(reg.get_value().clone());
+        }
+        let payload_values = if let Some(payload_reg) = data.payload_start_reg {
+            let payload_end = payload_reg
+                .checked_add(data.num_payload)
+                .ok_or(LimboError::IntegerOverflow)?;
+            let payload_regs = state
+                .registers
+                .get(payload_reg..payload_end)
+                .ok_or_else(|| register_out_of_range("HashBuild", payload_reg))?;
+            let mut v = crate::alloc::Vec::try_with_capacity_ext(data.num_payload)?;
+            for reg in payload_regs {
+                v.push(reg.get_value().clone());
+            }
+            v
+        } else {
+            crate::alloc::Vec::new()
+        };
+        (key_values, payload_values, rowid)
+    };
 
     // Insert the rowid into the hash table
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
-        let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::take(&mut op_state.key_values),
+            key_values,
             rowid,
-            payload_values: std::mem::take(&mut op_state.payload_values),
+            payload_values,
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {
@@ -19525,9 +19567,18 @@ fn hash_build_run(
                     state.metrics.hash_join.build_rows.saturating_add(1);
             }
             HashInsertResult::IO { io, pending } => {
-                op_state.key_values = pending.key_values;
-                op_state.payload_values = pending.payload_values;
-                *state.active_op_state.hash_build() = Some(op_state);
+                let payload_idx = pending.payload_values.len();
+                *state.active_op_state.hash_build() = Some(OpHashBuildState {
+                    key_values: pending.key_values,
+                    key_idx: data.num_keys,
+                    payload_values: pending.payload_values,
+                    payload_idx,
+                    rowid: Some(pending.rowid),
+                    cursor_id: data.cursor_id,
+                    hash_table_id: data.hash_table_id,
+                    key_start_reg: data.key_start_reg,
+                    num_keys: data.num_keys,
+                });
                 return Ok(state.suspend_on_io(io));
             }
         }
@@ -19710,8 +19761,10 @@ pub fn op_group_clear(
 ) -> InsnResult {
     load_insn!(GroupClear { table_id }, insn);
     if let Some(mut table) = state.group_tables.remove(table_id) {
-        table.clear_entries();
-        state.spare_group_tables.insert(*table_id, table);
+        if table.can_reuse() {
+            table.clear_entries();
+            state.spare_group_tables.insert(*table_id, table);
+        }
     }
     state.pc = next_pc(state)?;
     Ok(InsnFunctionStepResult::Step)
@@ -19846,6 +19899,7 @@ pub fn op_hash_build_finalize(
 }
 
 /// Write payload values from a hash entry to registers.
+#[inline]
 fn write_hash_payload_to_registers(
     registers: &mut [Register],
     entry: &HashEntry,
@@ -19853,9 +19907,20 @@ fn write_hash_payload_to_registers(
     num_payload: usize,
 ) -> Result<()> {
     if let Some(dest_reg) = payload_dest_reg {
-        for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
-            // try_clone_value_from reuses the destination register's allocation.
-            registers[dest_reg + i].try_clone_value_from(value)?;
+        let count = entry.payload_values.len().min(num_payload);
+        let end = dest_reg
+            .checked_add(count)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let dest_slice = registers
+            .get_mut(dest_reg..end)
+            .ok_or_else(|| register_out_of_range("HashProbe", dest_reg))?;
+        for (reg, value) in dest_slice.iter_mut().zip(entry.payload_values.iter()) {
+            match value {
+                Value::Null => reg.set_null(),
+                Value::Numeric(Numeric::Integer(i)) => reg.set_int(*i),
+                Value::Numeric(Numeric::Float(f)) => reg.set_float(*f),
+                _ => reg.try_clone_value_from(value)?,
+            }
         }
     }
     Ok(())
@@ -19904,8 +19969,7 @@ fn hash_probe_run(
     let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
     let resumed = state
         .active_op_state
-        .hash_probe()
-        .take()
+        .take_hash_probe()
         .filter(|op_state| op_state.hash_table_id == hash_table_id);
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
@@ -19914,6 +19978,36 @@ fn hash_probe_run(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     };
+
+    // Common fast path: non-spilled, non-resumed probe reads registers directly in place.
+    if resumed.is_none() && !hash_table.has_spilled() {
+        let keys_end = key_start_reg.checked_add(num_keys).or_overflow()?;
+        let key_regs = state
+            .registers
+            .get(key_start_reg..keys_end)
+            .ok_or_else(|| register_out_of_range("HashProbe", key_start_reg))?;
+        return match hash_table.probe_registers(key_regs, Some(&mut state.metrics.hash_join))? {
+            Some(entry) => {
+                if let Some(reg) = state.registers.get_mut(dest_reg) {
+                    reg.set_int(entry.rowid);
+                } else {
+                    return Err(register_out_of_range("HashProbe", dest_reg).into());
+                }
+                write_hash_payload_to_registers(
+                    &mut state.registers,
+                    entry,
+                    payload_dest_reg,
+                    num_payload,
+                )?;
+                state.pc = next_pc(state)?;
+                Ok(InsnFunctionStepResult::Step)
+            }
+            None => {
+                state.pc = target_pc.as_offset_int();
+                Ok(InsnFunctionStepResult::Step)
+            }
+        };
+    }
 
     let (probe_keys, partition_idx, probe_buffered) = match resumed {
         Some(op_state) => (
@@ -20081,7 +20175,7 @@ pub fn op_hash_close(
 ) -> InsnResult {
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
-        if !hash_table.has_spilled() && hash_table.clear().is_ok() {
+        if hash_table.can_reuse() && hash_table.clear().is_ok() {
             state.spare_hash_tables.insert(*hash_table_id, hash_table);
         } else {
             hash_table.close();

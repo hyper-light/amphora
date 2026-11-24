@@ -3668,7 +3668,7 @@ impl Engine for Local {
                         if Instant::now() >= row.until {
                             return Err(Refusal::Timeout.into());
                         }
-                        let _deadline = db.deadline(row.until);
+                        let _deadline = db.deadline_owned(row.until);
                         application::check(db, row.application.as_ref(), &row.operation)?;
                         if !restoring && restore::incomplete(db)? {
                             return Err(api::invalid("database", "restore is incomplete").into());

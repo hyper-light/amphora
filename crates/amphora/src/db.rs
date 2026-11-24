@@ -53,9 +53,8 @@ const UNKNOWN_MEMORY_PAGES: usize = 65_536;
 const MIN_PROCESS_PAGES: usize = 4096;
 
 /// Whose shared pages a database's connections read through (docs/design/store.md, decisions 20
-/// and 26): a page one connection read in, the others read from memory. [`Db::open`] shares none;
-/// whether it should share the process's pool by default, and its budget, are the person's call
-/// (STATUS.md).
+/// and 26): a page one connection read in, the others read from memory. [`Db::open`] defaults to
+/// [`Sharing::Process`] unless `AMPHORA_SHARE_PAGES=off` is set.
 #[derive(Clone)]
 pub enum Sharing {
     /// The process's pool ([`process_pages`]), which every database opened so joins.
@@ -129,88 +128,6 @@ pub fn default_pages(memory: Option<u64>) -> usize {
 /// caps a single writer's private page cache so large-RAM hosts do not accumulate unbounded
 /// flushed append pages instead of recycling page buffers through the buffer pool.
 const MAX_WRITER_PAGES: usize = (64 * 1024 * 1024) / 4096;
-
-/// Hardware-derived per-reader local page-cache size when `SharedPages` backs the database: sized
-/// to half a core's measured L1 data cache (leaving the other half for query registers and row
-/// payloads) divided by `PageCache::ESTIMATED_ENTRY_BYTES`, floored at the engine's
-/// `MINIMUM_PAGE_CACHE_SIZE_IN_PAGES` and capped at `READER_PAGES`.
-#[must_use]
-fn shared_reader_pages() -> i64 {
-    static PAGES: OnceLock<i64> = OnceLock::new();
-    *PAGES.get_or_init(|| {
-        let min_pages = amphora_engine::storage::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES;
-        let max_pages = usize::try_from(READER_PAGES).unwrap_or(min_pages);
-        let entry_bytes = amphora_engine::storage::PAGE_CACHE_ENTRY_BYTES
-            .saturating_mul(2)
-            .max(1);
-        let pages = l1_data_cache_bytes()
-            .and_then(|l1| l1.checked_div(entry_bytes))
-            .map_or(min_pages, |n| n.clamp(min_pages, max_pages));
-        i64::try_from(pages).unwrap_or(READER_PAGES)
-    })
-}
-
-/// The core's L1 data cache size in bytes, read once per process from the OS (sysfs on Linux,
-/// sysctl on macOS).
-fn l1_data_cache_bytes() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        for entry in std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache")
-            .ok()?
-            .flatten()
-        {
-            let path = entry.path();
-            let level = std::fs::read_to_string(path.join("level")).ok();
-            let kind = std::fs::read_to_string(path.join("type")).ok();
-            if level.as_deref().map(str::trim) != Some("1")
-                || kind.as_deref().map(str::trim) != Some("Data")
-            {
-                continue;
-            }
-            let raw = std::fs::read_to_string(path.join("size")).ok()?;
-            let text = raw.trim();
-            let (digits, unit) = match text.strip_suffix(['K', 'k']) {
-                Some(d) => (d, 1024usize),
-                None => match text.strip_suffix(['M', 'm']) {
-                    Some(d) => (d, 1024usize * 1024),
-                    None => (text, 1),
-                },
-            };
-            if let Some(bytes) = digits
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| n.checked_mul(unit))
-                .filter(|b| *b > 0)
-            {
-                return Some(bytes);
-            }
-        }
-        None
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for name in ["hw.perflevel0.l1dcachesize", "hw.l1dcachesize"] {
-            let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
-                .args(["-n", name])
-                .output()
-            else {
-                continue;
-            };
-            if let Some(bytes) = std::str::from_utf8(&out.stdout)
-                .ok()
-                .and_then(|t| t.trim().parse::<usize>().ok())
-                .filter(|b| *b > 0)
-            {
-                return Some(bytes);
-            }
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
 
 /// The pages a database's single writer keeps at most, derived from the process's memory budget:
 /// one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`] (1/16th of memory), bounded between
@@ -337,11 +254,22 @@ struct EngineHandles {
     owner: Option<crate::database::Owned>,
 }
 
-pub(crate) struct Deadline {
+pub(crate) struct Deadline<'a> {
+    connection: &'a Connection,
+}
+impl Drop for Deadline<'_> {
+    fn drop(&mut self) {
+        self.connection.set_deadline(0, None);
+    }
+}
+
+/// Owned variant of [`Deadline`] for call sites that pass `&mut Db` into a nested session closure
+/// while keeping the cancellation guard alive across the call.
+pub(crate) struct OwnedDeadline {
     connection: Arc<Connection>,
     custom_handler: bool,
 }
-impl Drop for Deadline {
+impl Drop for OwnedDeadline {
     fn drop(&mut self) {
         if self.custom_handler {
             self.connection.set_progress_handler(0, None);
@@ -395,30 +323,39 @@ impl Db {
         })
     }
 
-    /// Bound SQL VM work by the request's absolute deadline. The owning caller drops this guard
-    /// before COMMIT/ROLLBACK cleanup, so cancellation cannot interrupt recovery of its session.
-    pub(crate) fn deadline(&self, until: Instant) -> Deadline {
+    /// Bound SQL VM work by the request's absolute deadline without `Arc` reference-count traffic.
+    /// The owning caller drops this guard before COMMIT/ROLLBACK cleanup, so cancellation cannot
+    /// interrupt recovery of its session.
+    pub(crate) fn deadline(&self, until: Instant) -> Deadline<'_> {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
         // execute at most 1024 further instructions between deadline checks.
         self.conn.set_deadline(1024, Some(until));
         Deadline {
+            connection: &self.conn,
+        }
+    }
+
+    /// Owned deadline guard for `&mut Db` call sites that cannot hold a shared borrow of `self`.
+    pub(crate) fn deadline_owned(&self, until: Instant) -> OwnedDeadline {
+        self.conn.set_deadline(1024, Some(until));
+        OwnedDeadline {
             connection: Arc::clone(&self.conn),
             custom_handler: false,
         }
     }
 
     /// [`Db::deadline`] on `clock`: a replicated owner's, which its shell gives it
-    /// (replication.md, "The owner's time").
-    pub(crate) fn deadline_on(
+    /// (replication.md, "The owner's time"), owned for `&mut Db` call sites.
+    pub(crate) fn deadline_on_owned(
         &self,
         until: Instant,
         clock: impl Fn() -> Instant + Send + Sync + 'static,
-    ) -> Deadline {
+    ) -> OwnedDeadline {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
         // execute at most 1024 further instructions between deadline checks.
         self.conn
             .set_progress_handler(1024, Some(Box::new(move || clock() >= until)));
-        Deadline {
+        OwnedDeadline {
             connection: Arc::clone(&self.conn),
             custom_handler: true,
         }
@@ -543,12 +480,7 @@ impl Db {
             log_kept: self.log_kept,
             backup: None,
         };
-        let reader_pages = if self.db.shared_page_counts().is_some() {
-            shared_reader_pages()
-        } else {
-            READER_PAGES
-        };
-        r.keep_pages(reader_pages)?;
+        r.keep_pages(READER_PAGES)?;
         Ok(r)
     }
 
@@ -578,12 +510,7 @@ impl Db {
                 log_kept,
                 backup: None,
             };
-            let reader_pages = if held.db.shared_page_counts().is_some() {
-                shared_reader_pages()
-            } else {
-                READER_PAGES
-            };
-            r.keep_pages(reader_pages)?;
+            r.keep_pages(READER_PAGES)?;
             Ok(r)
         })
     }
@@ -2071,5 +1998,45 @@ mod tests {
             writer_pages(None),
             i64::try_from((UNKNOWN_MEMORY_PAGES / 4).min(MAX_WRITER_PAGES)).unwrap()
         );
+    }
+
+    /// Review blocker 2 regression: readers on a shared database keep the full `READER_PAGES`
+    /// (2,000 pages) cache so 60,000-row DISTINCT and count(*) stay in memory instead of spilling
+    /// to disk early.
+    #[test]
+    fn review_shared_reader_keeps_full_reader_pages_and_distinct_stays_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_sharing(&dir.path().join("distinct.db"), &Sharing::Process).unwrap();
+        db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        db.exec(
+            "INSERT INTO items(id, k) \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 60000) \
+             SELECT x, x % 30000 FROM n",
+        )
+        .unwrap();
+        db.flusher()().unwrap();
+        let check_reader = |reader: &mut Db| {
+            let mut cache_size = 0i64;
+            reader
+                .query("PRAGMA cache_size", [], |row| {
+                    cache_size = row.get::<i64>(0).unwrap();
+                    Ok(false)
+                })
+                .unwrap();
+            assert_eq!(cache_size, READER_PAGES);
+            let mut distinct = 0i64;
+            reader
+                .query("SELECT COUNT(DISTINCT k) FROM items", [], |row| {
+                    distinct = row.get::<i64>(0).unwrap();
+                    Ok(false)
+                })
+                .unwrap();
+            assert_eq!(distinct, 30_000);
+        };
+        let mut reader = db.reader().unwrap();
+        check_reader(&mut reader);
+        let mut opened = (db.opener())().unwrap();
+        check_reader(&mut opened);
     }
 }
