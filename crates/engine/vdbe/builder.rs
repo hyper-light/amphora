@@ -925,26 +925,32 @@ impl ProgramBuilder {
 
     /// Hide CTEs being defined whose names an inner WITH clause redefines:
     /// the inner definitions shadow the outer names for that lexical scope,
-    /// so references to them are not circular. Returns the hidden names for
-    /// [Self::unmask_shadowed_ctes_being_defined].
+    /// so references to them are not circular. Returns the CTEs being defined
+    /// around it for [Self::unmask_shadowed_ctes_being_defined].
     pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
-        let mut masked = Vec::new();
-        self.ctes_being_defined.retain(|name| {
-            if shadowing_names.contains(name) {
-                masked.push(name.clone());
-                false
-            } else {
-                true
-            }
-        });
-        masked
+        let around = self.ctes_being_defined.clone();
+        self.ctes_being_defined
+            .retain(|name| !shadowing_names.contains(name));
+        around
     }
 
-    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
-    /// their shadowing scope ends. Membership is all that matters for the
-    /// circular-reference check, so restore order is irrelevant.
-    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
-        self.ctes_being_defined.extend(masked);
+    /// Give back what [Self::mask_shadowed_ctes_being_defined] returned when
+    /// the shadowing scope ends, in its order: a CTE's definition ends by
+    /// taking the last.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, around: Vec<String>) {
+        self.ctes_being_defined = around;
+    }
+
+    /// Plans a use of a CTE without the names of the CTEs being defined around the use: its body reads
+    /// the names around its own definition.
+    pub fn outside_ctes_being_defined<T>(
+        &mut self,
+        plan: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let around_the_use = std::mem::take(&mut self.ctes_being_defined);
+        let planned = plan(self);
+        self.ctes_being_defined = around_the_use;
+        planned
     }
 
     /// Expand a view with circular-reference tracking and without the caller's
