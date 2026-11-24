@@ -12,6 +12,8 @@ for sha in ${ARMS:?}; do
   echo "== arm $(git rev-parse --short HEAD) $exe load $(cut -d' ' -f1-3 /proc/loadavg) $(date -u +%H:%M:%SZ)"
   unshare --user --map-root-user --mount bash -c "mount -t tmpfs -o size=2m tmpfs '$D' && B26_DISK='$D' '$exe' --exact b26_full_disk --nocapture" > $B/disk-$sha.log 2>&1; echo "exit $?"
   grep -E "^B26|panicked|test result" -A1 $B/disk-$sha.log | cut -c1-260 | head -40
+  "$exe" --exact b26_left --nocapture > $B/left-$sha.log 2>&1; echo "exit $?"
+  grep -E "^B26|panicked|test result" -A1 $B/left-$sha.log | cut -c1-900 | head -20
   git checkout -q -f .
 done
 echo "done $(date -u +%H:%M:%SZ)"
