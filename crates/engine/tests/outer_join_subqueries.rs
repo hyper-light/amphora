@@ -40,7 +40,8 @@ fn cases() -> Vec<Cases> {
 fn open(fill: &[&str]) -> (Arc<MemoryIO>, Arc<Connection>) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let io = Arc::new(MemoryIO::new());
-    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(DatabaseOpts::new().with_without_rowid(true));
     let name = format!(
         "outer_join_subqueries_{}.db",
         N.fetch_add(1, Ordering::Relaxed)
