@@ -4919,7 +4919,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         let context = self.read_context()?;
-        self.replica.read(context).map_err(raft_error)
+        let read = self.replica.read(context).map_err(raft_error);
+        #[cfg(test)]
+        eprintln!("V15DIAG close read {:?}", read.as_ref().map(|_| ()));
+        read
     }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
         if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {
@@ -18945,6 +18948,15 @@ mod tests {
             let losing = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let (counted, lost) = (Arc::clone(&closes), Arc::clone(&losing));
             pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from == 3 {
+                    eprintln!(
+                        "V15DIAG pump from 3 to {} {:?} mark {:?} len {:?}",
+                        message.to,
+                        message.msg_type,
+                        message.entries.first().and_then(|entry| entry.data.get(32).copied()),
+                        message.entries.first().map(|entry| entry.data.len())
+                    );
+                }
                 if from == 3
                     && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
                     && message.entries.first().is_some_and(|entry| reads(&entry.data))
