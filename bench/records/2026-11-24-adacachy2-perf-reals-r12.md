@@ -27,6 +27,12 @@ Verdict, losses first.
 - The suites the brief asked for (columns, path, scan, morsel, parallel) are not a result: they were still
   running at 2 threads on a loaded adacachy2. The focused tests, clippy and check-production are. The rule
   5b of the swarm's RULES puts the suites after the merge, on main, with a regression fixed forward.
+- A test fails on the landed tree: `vdbe::morsel_scan::tests::t_qt_6_35_joins_over_rowid_ranges_run_on_
+  morsels_as_the_serial_loop` (morsel_scan_tests.rs:3504), "SELECT count(*), sum(d.b) FROM f JOIN d ON
+  f.a = d.a WHERE f.id > 2000 on 1 cores: the hook built no link". Found after landing, alone on the merged
+  binary 7659d3e1 (r509's build) and in r368's suites at c62c8d05. Whether it fails on main before this
+  lane is not known: not bisected. The lane's diff doesn't touch the join path (`shape_join`), and R10's
+  suites never ran that module (`vdbe::morsel_scan_tests::` is not its path).
 - Lane R11 left work that broke what R10 had landed. At R11's state (cb704058, merged with main
   a64549cc), `rowid_range` turned every bound parameter into a key range from i64::MIN to i64::MAX. The
   copy prices an unmeasured range as no path, so no statement with a parameter read the copy: r10 and
