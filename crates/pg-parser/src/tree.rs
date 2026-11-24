@@ -13,6 +13,7 @@ pub struct NodeId(u32);
 pub enum TransactionStmtKind {
     Begin = 0,
     Commit = 2,
+    Rollback = 3,
 }
 
 /// value.h's ValUnion as an A_Const holds it.
