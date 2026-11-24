@@ -18924,7 +18924,8 @@ mod tests {
     /// write waits on that slot; then member 3's clock passes the deadline. Expect: member 3's
     /// write refused `Timeout`; the leader's answered Ok; one slot ended released and none
     /// expired; and no clock moved for a slot's end (`Driven::lapses` 0). Before lane V14 such a
-    /// write sent no close, and its slot held until the leader's clock passed its length.
+    /// write sent no close, and before lane V16 its close waited in the core for the owner's next
+    /// wake: either way its slot held until the leader's clock passed its end.
     #[test]
     fn v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot() {
         use crate::meter::SlotEnd;
