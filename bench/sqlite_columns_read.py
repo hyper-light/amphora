@@ -20,6 +20,8 @@ Not drawn, and why:
 - new.rowid in a BEFORE INSERT that gives no rowid: undefined (lang_createtrigger.html).
 - A trigger on a WITHOUT ROWID table: Amphora refuses it (lane C11's record).
 - A subquery in a window function's argument: Amphora refuses it (finding CS).
+- json_tree right of a RIGHT or FULL JOIN: its root's rowid, 0, reads NULL in Amphora (finding DK).
+- A subquery in an UPSERT's DO UPDATE: Amphora refuses it ("Scalar subquery is not supported in this context").
 usage: python3 bench/sqlite_columns_read.py [seed] > crates/engine/tests/fixtures/columns_read.tsv"""
 import random
 import sqlite3
@@ -138,10 +140,11 @@ def argument_query(rng):
         tables += f" {rng.choice(['JOIN', 'LEFT JOIN', 'FULL JOIN', 'RIGHT JOIN'])} {rng.choice('abz')} AS y ON {rng.choice(['x.k = y.k', 'x.v = y.k', 'y.k < x.k', '1'])}"
         names.append("y")
     reads = rng.choice(names)
-    function = rng.choice(["json_each", "json_each", "json_each", "json_tree"])
+    join = rng.choice(joins)
+    function = rng.choice(["json_each", "json_each", "json_each", "json_tree"] if "RIGHT" not in join and "FULL" not in join else ["json_each"])
     on = rng.choice(["je.value = 7", f"je.value = {reads}.v", "je.key = 0", f"je.value >= {reads}.k", "1", "NULL", "je.atom IS NOT NULL",
                      f"je.value IN (SELECT r.x FROM r WHERE r.x <> {reads}.k)"])
-    tables += f" {rng.choice(joins)} {function}({argument(rng, reads)}) AS je ON {on}"
+    tables += f" {join} {function}({argument(rng, reads)}) AS je ON {on}"
     values = [f"{name}.k" for name in names] + ["je.value"]
     if rng.random() < 0.3:
         second = rng.choice([argument(rng, reads), "json_array(je.value, 7)", "(SELECT json_array(min(t.k), max(t.k)) FROM t WHERE t.k < je.value)"])
@@ -310,9 +313,9 @@ def row_value(rng, rows):
     return f"{row}.{column}"
 
 
-def row_test(rng, rows, depth=1):
+def row_test(rng, rows, depth=1, subqueries=True):
     x = row_value(rng, rows)
-    y = rng.choice(LITERALS * 2 + [row_value(rng, rows)] * 8 + [f"(SELECT m.{rng.choice(['t', 'nc', 'rt'])} FROM m WHERE m.id = {rng.choice('123')})"] * 4)
+    y = rng.choice(LITERALS * 2 + [row_value(rng, rows)] * 8 + [f"(SELECT m.{rng.choice(['t', 'nc', 'rt'])} FROM m WHERE m.id = {rng.choice('123')})"] * (4 if subqueries else 0))
     if rng.random() < 0.2:
         y = f"{y} COLLATE {rng.choice(['NOCASE', 'RTRIM', 'BINARY'])}"
     if rng.random() < 0.1:
@@ -335,9 +338,9 @@ def row_test(rng, rows, depth=1):
         f"(SELECT group_concat(v) FROM (SELECT 'b' AS v WHERE {x} = {y}))",
         f"(WITH c(v) AS (SELECT {x}) SELECT count(*) FROM c WHERE c.v = {y})", f"(SELECT count(*) FROM (SELECT {x} AS v) AS s WHERE s.v {operator} {y})",
     ]
-    test = rng.choice(forms)
+    test = rng.choice([form for form in forms if subqueries or "SELECT" not in form])
     if depth and rng.random() < 0.15:
-        test = f"({test} {rng.choice(['AND', 'OR'])} {row_test(rng, rows, 0)})"
+        test = f"({test} {rng.choice(['AND', 'OR'])} {row_test(rng, rows, 0, subqueries)})"
     return test
 
 
@@ -356,7 +359,7 @@ def trigger(rng, number):
         f"UPDATE m2 SET hits = hits + 1 WHERE {row_value(rng, rows)} = m2.{rng.choice(['t', 'nc', 'rt'])};",
         f"DELETE FROM m2 WHERE {row_value(rng, rows)} = m2.{rng.choice(['t', 'nc', 'rt'])} AND m2.id > 2;",
         f"INSERT OR {rng.choice(['IGNORE', 'REPLACE'])} INTO kn VALUES ({row_value(rng, rows)}, 'g{number}');",
-        f"INSERT INTO kn VALUES ({row_value(rng, rows)}, 'g{number}') ON CONFLICT(name) DO UPDATE SET who = excluded.who || {row_test(rng, rows)} WHERE kn.name = {row_value(rng, rows)};",
+        f"INSERT INTO kn VALUES ({row_value(rng, rows)}, 'g{number}') ON CONFLICT(name) DO UPDATE SET who = excluded.who || {row_test(rng, rows, 1, False)} WHERE kn.name = {row_value(rng, rows)};",
         f"INSERT INTO kn VALUES (coalesce({row_value(rng, rows)}, 'none'), 'g{number}') ON CONFLICT DO NOTHING;",
         f"UPDATE OR {rng.choice(['IGNORE', 'REPLACE'])} kn SET name = {row_value(rng, rows)} WHERE {row_value(rng, rows)} = name;",
         f"SELECT CASE WHEN {row_test(rng, rows)} THEN RAISE(IGNORE) END; INSERT INTO lg VALUES ('g{number}', {values});",
