@@ -354,7 +354,7 @@ portals (`portal.rs`), and each message does what REL_19_0's `src/backend/tcop/p
   `42883` as there; one Amphora has no values of (numeric among them) `0A000`.
 - A prepared statement and a portal are charged to the process's budget, refused `53200` when it has no room for them.
 - Not built: FunctionCall, a plan kept between Binds, an ErrorResponse's CONTEXT but a Bind parameter's.
-- Checked against a 19.0 server: T-PG.10.1 (the wire core, 250 steps, every message of each), T-PG.10.2 and T-PG.10.3 (the
+- Checked against a 19.0 server: T-PG.10.1 (the wire core, 252 steps, every message of each), T-PG.10.2 and T-PG.10.3 (the
   listener, over sockets), and `scripts/postgres-clients.sh`, where the postgres:19 image's own pgbench runs TPC-B at
   `-M extended` and `-M prepared` and its psql runs `\bind`, `\parse`, `\bind_named` and pipelines on both.
 
