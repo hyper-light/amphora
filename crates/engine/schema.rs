@@ -2767,9 +2767,11 @@ impl Schema {
                         && idx.unique
                         && idx.where_clause.is_none()
                         && idx.columns.len() == parent_cols.len()
-                        && idx.columns.iter().zip(parent_cols.iter()).all(|(ic, pc)| {
-                            ic.name.eq_ignore_ascii_case(pc)
-                                && parent_tbl.get_column(pc).is_some_and(|(_, column)| {
+                        // The key's columns in any order (SQLite's sqlite3FkLocateIndex).
+                        && idx.columns.iter().all(|ic| {
+                            ic.expr.is_none()
+                                && parent_cols.iter().any(|pc| ic.name.eq_ignore_ascii_case(pc))
+                                && parent_tbl.get_column(&ic.name).is_some_and(|(_, column)| {
                                     ic.collation.unwrap_or_default() == column.collation()
                                 })
                         })
@@ -2781,11 +2783,11 @@ impl Schema {
             if found.is_none()
                 && !parent_tbl.has_rowid
                 && parent_tbl.primary_key_columns.len() == parent_cols.len()
-                && parent_tbl
-                    .primary_key_columns
-                    .iter()
-                    .zip(&parent_cols)
-                    .all(|((name, _), parent)| name.eq_ignore_ascii_case(parent))
+                && parent_tbl.primary_key_columns.iter().all(|(name, _)| {
+                    parent_cols
+                        .iter()
+                        .any(|parent| name.eq_ignore_ascii_case(parent))
+                })
             {
                 // FK eligibility is narrower than query access: a referenced key's
                 // collation must agree with its declared column collation.

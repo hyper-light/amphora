@@ -595,6 +595,8 @@ enum RowStep {
     Removed,
     /// The row is about to be written.
     Added,
+    /// The row is about to be written, alone (`Coming::Alone`).
+    AddedAlone,
 }
 
 /// The counters' change for a row about to leave its table (SQLite's `sqlite3FkCheck`): a key of
@@ -621,26 +623,45 @@ pub fn emit_fk_row_removed(
 }
 
 /// The counters' change for a row about to be written: a key of its own without a parent is
-/// broken, and each row that references it no more. `update` is an UPDATE's: the columns it sets,
-/// and the row as it was, which SQLite has removed by now and Amphora hasn't yet.
+/// broken, and each row that references it no more.
 pub fn emit_fk_row_added(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Arc<BTreeTable>,
     row: &FkRow,
-    update: Option<(&ColumnMask, &FkRow)>,
+    coming: Coming<'_>,
     database_id: usize,
 ) -> Result<()> {
+    let (replaced, updated, step) = match coming {
+        Coming::Alone => (None, None, RowStep::AddedAlone),
+        Coming::Among => (None, None, RowStep::Added),
+        Coming::Updated { columns, old } => (Some(old), Some(columns), RowStep::Added),
+    };
     emit_fk_row_check(
         program,
         resolver,
         table,
         row,
-        update.map(|(_, replaced)| replaced),
-        update.map(|(updated, _)| updated),
-        RowStep::Added,
+        replaced,
+        updated,
+        step,
         database_id,
     )
+}
+
+/// How a row comes to its table.
+pub enum Coming<'a> {
+    /// The only row its statement writes, which runs no program: an immediate key without a parent
+    /// is refused before anything is written, as no statement savepoint is there to undo it, and
+    /// no other key can have been broken (SQLite's `fkLookupParent` and `sqlite3FkCheck`).
+    Alone,
+    Among,
+    /// By an UPDATE, which sets `columns`. `old` is the row as it was, which SQLite has removed by
+    /// now and Amphora hasn't yet.
+    Updated {
+        columns: &'a ColumnMask,
+        old: &'a FkRow,
+    },
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -673,8 +694,7 @@ fn emit_fk_row_check(
             if !fk.parent_key_may_change_with_affected_columns(updated, affected, table) {
                 continue;
             }
-        } else if step == RowStep::Added && !fk.fk.deferred && writes_one_row(program) {
-            // Nothing the statement did before it can have broken the key.
+        } else if step == RowStep::AddedAlone && !fk.fk.deferred {
             continue;
         }
         emit_children_scan(
@@ -697,22 +717,28 @@ fn references_itself(fk: &ResolvedFkRef) -> bool {
         .eq_ignore_ascii_case(&fk.fk.parent_table)
 }
 
-/// Whether the statement writes a single row and runs no program: what breaks an immediate key is
-/// refused before anything is written, as no statement savepoint may be there to undo it.
-const fn writes_one_row(program: &ProgramBuilder) -> bool {
-    !program.flags.is_subprogram() && !program.flags.is_multi_write()
-}
-
-fn emit_fk_counter(
-    program: &mut ProgramBuilder,
-    fk: &ResolvedFkRef,
-    step: RowStep,
-    broken: RowStep,
-) {
+fn emit_fk_counter(program: &mut ProgramBuilder, fk: &ResolvedFkRef, breaks: bool) {
     program.emit_insn(Insn::FkCounter {
-        increment_value: if step == broken { 1 } else { -1 },
+        increment_value: if breaks { 1 } else { -1 },
         deferred: fk.fk.deferred,
     });
+}
+
+/// The places in `fk`'s key of the columns of the index its parent's key has, in the index's order.
+fn key_places(fk: &ResolvedFkRef) -> Result<Vec<usize>> {
+    let Some(index) = &fk.parent_unique_index else {
+        return Ok((0..fk.parent_cols.len()).collect());
+    };
+    index
+        .columns
+        .iter()
+        .map(|column| {
+            fk.parent_cols
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&column.name))
+                .ok_or_else(|| LimboError::InternalError("FK parent column has no index".into()))
+        })
+        .collect()
 }
 
 /// Looks up the parent of a row's key and counts the violation it makes (`Added`) or takes away
@@ -746,11 +772,12 @@ fn emit_parent_lookup(
         .ok_or_else(|| LimboError::InternalError("FK parent table missing".into()))?;
     // The row being written may be its own parent: it isn't in its table yet, and an UPDATE's old
     // row, which is, is no parent of it.
-    let own = step == RowStep::Added && references_itself(fk);
+    let own = step != RowStep::Removed && references_itself(fk);
     let probe = program.alloc_registers(child_key.len());
-    for (at, src_reg) in child_key.iter().enumerate() {
+    let places = key_places(fk)?;
+    for (at, place) in places.iter().enumerate() {
         program.emit_insn(Insn::Copy {
-            src_reg: *src_reg,
+            src_reg: *child_key.get(*place).ok_or_else(register_overflow)?,
             dst_reg: probe.checked_add(at).ok_or_else(register_overflow)?,
             extra_amount: 0,
         });
@@ -820,12 +847,11 @@ fn emit_parent_lookup(
             // UPDATE's old row are no parent's.
             for gone in std::iter::once(row).chain(replaced) {
                 let differs = program.allocate_label();
-                for (at, (rhs, column)) in
-                    gone.parent_key(fk).iter().zip(&index.columns).enumerate()
-                {
+                let key = gone.parent_key(fk);
+                for (at, (place, column)) in places.iter().zip(&index.columns).enumerate() {
                     program.emit_insn(Insn::Ne {
                         lhs: probe.checked_add(at).ok_or_else(register_overflow)?,
-                        rhs: *rhs,
+                        rhs: *key.get(*place).ok_or_else(register_overflow)?,
                         target_pc: differs,
                         flags: CmpInsFlags::default().jump_if_null(),
                         collation: Some(column.collation.unwrap_or_default()),
@@ -850,10 +876,10 @@ fn emit_parent_lookup(
         program.emit_insn(Insn::Goto { target_pc: ok });
     }
     program.preassign_label_to_next_insn(missing);
-    if step == RowStep::Added && !fk.fk.deferred && writes_one_row(program) {
+    if step == RowStep::AddedAlone && !fk.fk.deferred {
         emit_fk_restrict_halt(program)?;
     } else {
-        emit_fk_counter(program, fk, step, RowStep::Added);
+        emit_fk_counter(program, fk, step != RowStep::Removed);
     }
     program.preassign_label_to_next_insn(ok);
     Ok(())
@@ -873,7 +899,7 @@ fn emit_children_scan(
     database_id: usize,
 ) -> Result<()> {
     let done = program.allocate_label();
-    if step == RowStep::Added {
+    if step != RowStep::Removed {
         program.emit_insn(Insn::FkIfZero {
             deferred: fk.fk.deferred,
             target_pc: done,
@@ -900,7 +926,7 @@ fn emit_children_scan(
         done,
         database_id,
         |program| {
-            emit_fk_counter(program, fk, step, RowStep::Removed);
+            emit_fk_counter(program, fk, step == RowStep::Removed);
             Ok(())
         },
     )?;

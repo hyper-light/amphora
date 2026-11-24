@@ -1,7 +1,7 @@
 use super::{Resolver, Result, TranslateCtx};
 use crate::{
     emit_explain,
-    schema::{BTreeTable, ColumnLayout},
+    schema::ColumnLayout,
     sync::Arc,
     translate::{
         emitter::{
@@ -502,20 +502,11 @@ fn emit_delete_insns<'a>(
         columns_start_reg,
         main_table_cursor_id,
         iteration_index,
+        iteration_idx_delete_ctx,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
         returning_buffer,
     )?;
 
-    // Delete from the iteration index after deleting from the main table,
-    // using the key values captured above.
-    if let Some((iteration_index_cursor, start_reg, num_regs)) = iteration_idx_delete_ctx {
-        program.emit_insn(Insn::IdxDelete {
-            start_reg,
-            num_regs,
-            cursor_id: iteration_index_cursor,
-            raise_error_if_no_matching_entry: true,
-        });
-    }
     Ok(())
 }
 
@@ -539,6 +530,8 @@ fn emit_delete_row_common(
     columns_start_reg: Option<usize>, // must be provided when there are triggers or RETURNING
     main_table_cursor_id: usize,
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
+    // the entry of that index to delete after the row: its cursor, and its key's registers
+    iteration_index_entry: Option<(usize, usize, usize)>,
     virtual_table_cursor_id: Option<usize>,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
@@ -674,6 +667,17 @@ fn emit_delete_row_common(
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+
+        // The iteration index's entry goes after the row's, by the key captured before, and before
+        // any foreign key's action, which must find the key gone.
+        if let Some((cursor_id, start_reg, num_regs)) = iteration_index_entry {
+            program.emit_insn(Insn::IdxDelete {
+                start_reg,
+                num_regs,
+                cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+        }
     }
 
     // Emit RETURNING after the row is deleted, but against the cached OLD row image.
@@ -879,6 +883,7 @@ fn emit_delete_insns_when_triggers_present(
         columns_start_reg,
         main_table_cursor_id,
         None, // Don't skip any indexes when deleting from RowSet
+        None,
         None, // Use main_table_cursor_id for virtual tables
         returning_buffer,
     )?;

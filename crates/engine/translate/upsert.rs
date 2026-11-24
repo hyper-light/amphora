@@ -7,12 +7,12 @@ use amphora_engine_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_row_added, emit_fk_row_removed, fire_fk_update_actions,
-    FkRow,
+    Coming, FkRow,
 };
 use crate::translate::insert::{
     expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
@@ -1268,7 +1268,10 @@ pub fn emit_upsert(
                     resolver,
                     &bt,
                     &new_row,
-                    Some((&updated_positions, &old_row)),
+                    Coming::Updated {
+                        columns: &updated_positions,
+                        old: &old_row,
+                    },
                     upsert_database_id,
                 )?;
             }

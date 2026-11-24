@@ -31,7 +31,7 @@ use crate::{
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_row_added, emit_fk_row_removed,
-            fire_fk_update_actions, stabilize_new_row_for_fk, FkRow, ForeignKeyActions,
+            fire_fk_update_actions, stabilize_new_row_for_fk, Coming, FkRow, ForeignKeyActions,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -2274,7 +2274,10 @@ fn emit_update_insns<'a>(
                     &t_ctx.resolver,
                     &table_btree,
                     &new_row,
-                    Some((&updated_column_indices, &old_row)),
+                    Coming::Updated {
+                        columns: &updated_column_indices,
+                        old: &old_row,
+                    },
                     update_database_id,
                 )?;
             }

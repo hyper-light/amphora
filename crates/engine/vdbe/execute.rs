@@ -4072,6 +4072,12 @@ fn violates_immediate_fk(program: &Program, state: &ProgramState) -> bool {
     program.connection.foreign_keys_enabled() && state.get_fk_immediate_violations_during_stmt() > 0
 }
 
+/// Whether the transaction would leave a deferred foreign key broken if it ended now.
+fn violates_deferred_fk(program: &Program) -> bool {
+    program.connection.foreign_keys_enabled()
+        && program.connection.get_deferred_foreign_key_violations() > 0
+}
+
 fn fk_constraint_failed() -> LimboError {
     LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
 }
@@ -4125,7 +4131,10 @@ pub fn halt(
             return Err(LimboError::RaiseIgnore.into());
         }
         if err_code > 0 {
-            if resolve_type == ResolveType::Fail && violates_immediate_fk(program, state) {
+            if resolve_type == ResolveType::Fail
+                && (violates_immediate_fk(program, state)
+                    || can_autocommit_now && violates_deferred_fk(program))
+            {
                 return Err(fk_constraint_failed().into());
             }
             let error = match resolve_type {
@@ -4184,7 +4193,10 @@ pub fn halt(
         };
         // FAIL keeps what the statement wrote only while its foreign keys hold (SQLite's
         // sqlite3VdbeHalt: the violation is the error then, and it aborts).
-        if state.constraint_action == ResolveType::Fail && violates_immediate_fk(program, state) {
+        if state.constraint_action == ResolveType::Fail
+            && (violates_immediate_fk(program, state)
+                || can_autocommit_now && violates_deferred_fk(program))
+        {
             state.constraint_action = ResolveType::Abort;
             return Err(fk_constraint_failed().into());
         }

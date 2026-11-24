@@ -6,7 +6,7 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, Table,
         EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
@@ -22,7 +22,7 @@ use crate::{
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
-        fkeys::{emit_fk_row_added, FkRow, ForeignKeyActions},
+        fkeys::{emit_fk_row_added, Coming, FkRow, ForeignKeyActions},
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, OuterQueryReference, QueryDestination,
             ResultSetColumn, TableReferences,
@@ -32,7 +32,9 @@ use crate::{
             plan_ctes_as_outer_refs, ROWID_STRS,
         },
         select::translate_select,
-        stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
+        stmt_journal::{
+            any_index_or_ipk_has_replace, insert_writes_one_row, set_insert_stmt_journal_flags,
+        },
         subquery::{
             emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
             plan_subqueries_from_returning,
@@ -49,9 +51,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{
-            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
-        },
+        insn::{to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -1008,7 +1008,24 @@ pub fn translate_insert(
             insertion.key_register(),
             btree_table.column_layout()?,
         );
-        emit_fk_row_added(program, resolver, &btree_table, &row, None, database_id)?;
+        let alone = !program.flags.is_subprogram()
+            && insert_writes_one_row(
+                resolver,
+                database_id,
+                &btree_table,
+                ctx.statement_on_conflict,
+                inserting_multiple_rows,
+                has_triggers_including_temp(
+                    resolver,
+                    database_id,
+                    TriggerEvent::Insert,
+                    None,
+                    &btree_table,
+                ),
+                has_upsert,
+            );
+        let coming = if alone { Coming::Alone } else { Coming::Among };
+        emit_fk_row_added(program, resolver, &btree_table, &row, coming, database_id)?;
     }
 
     // Emit deferred index inserts for cases where preflight only checked constraints
