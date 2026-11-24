@@ -1932,7 +1932,8 @@ started in eight minutes and was stopped.
   more. Not measured.
 - `checkpoint_shutdown` takes any error but Busy for done (`while let Err(Busy)`): `Connection::close` then answers Ok for a close that failed (read, not run). The file stays marked, so nothing is
   read wrong, but `Database::close` says closed.
-- A database on the versioned storage closed cleanly says read version 2 while its rows are in `<path>-versioned` (read, not run): sqlite3 would read an empty database, not a refused one.
+- A database on the versioned storage closed cleanly says read version 2 on main while its rows are in `<path>-versioned` (read, not run): sqlite3 would find no table in it. The orderly end would have made that
+  every end of such a store (`AMPHORA_STORAGE=versioned`), so its last close leaves the file marked now; test `d45_sqlite3_is_refused_a_closed_database_whose_rows_are_not_in_its_file`, not run.
 - `Database::close` answers Ok wherever `Connection::close` does: also where another connection of the process kept the database open, or the fold was Busy three times (read, not run). The file is then as a
   kill leaves it.
 - Noted, not run: a new `-wal2`'s directory entry is never synced (unix.rs `open_file`), where SQLite syncs the directory of a log it makes; the open's removal of a dead database's `-wal2` isn't
@@ -1976,7 +1977,7 @@ Every recovery that opened passed its integrity check: the loss is silent. The r
 flush or upkeep. `Store::close` and `Database::close` let a handle go and wait for it. Tests (not run): crates/amphora/tests/shutdown.rs (three lives ended in order, sqlite3 refused while open and reading all after;
 a handle held elsewhere; an owner killed in a process of its own), the drill's clean close at every change, and half the 200 seeds' stores ended in order.
 
-**Where it is.** `perf/pagepath-b30-land`, four commits on main aef6fc8a: 21c21a24 (red test), 8d1a4ae8 (the fix), f0e36f56 (the format), cffeb944 (the orderly end); `perf/pagepath-b30` holds the same tree on fa4117c0 as WIP, `perf/pagepath-b30-wip` (128d4ca2) the red run's.
+**Where it is.** `perf/pagepath-b30-land` on main aef6fc8a: 21c21a24 (red test), 8d1a4ae8 (the fix; the two can land alone), f0e36f56 (the format), cffeb944 (the orderly end), then the versioned storage's close; `perf/pagepath-b30` holds the same tree on fa4117c0 as WIP, `perf/pagepath-b30-wip` (128d4ca2) the red run's.
 fmt 0 at each commit; main's crates/engine and crates/amphora files this changes are the same at fa4117c0 and aef6fc8a.
 
 **Runs.** | r2278, r2280 (adacachy2, cpus=8) | main fa4117c0 | the pass set's baseline: r2278 ended with no exit code and no output; r2280 accepted, nothing back |
