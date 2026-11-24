@@ -716,9 +716,12 @@ impl Db {
         step_between(self.io.as_ref(), &mut stmt, [], each, between)
     }
 
-    /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
+    /// The frames the log's current segment holds now, from the log's shared state. This
+    /// connection's own view is no count of it: a switch (decision 45, [`Db::restart_log`]) leaves
+    /// that view on the segment it closed until the connection's next transaction, so a replica
+    /// past its room would refuse every submit after the restart that brought it back within.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
-        Ok(self.conn.wal_state().map_err(fail)?.max_frame)
+        Ok(self.db.wal_backfill().0)
     }
 
     /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing

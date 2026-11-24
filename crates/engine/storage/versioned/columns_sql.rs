@@ -48,7 +48,7 @@ use super::columns::scan::{
 };
 use super::columns::{as_u64, Block, Columns, Feed, Plain, Rows, Rowset};
 use super::columns_path::{self, CopyScan, OnCopy, Scanned};
-use super::cursor::key_rowid;
+use super::cursor::{key_rowid, rowid_key};
 use super::durable::Database as VDatabase;
 use super::memory::{self, Source};
 use super::switch::{tree_of, Switch};
@@ -791,13 +791,13 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
     }
 }
 
-/// The kind of the first value that isn't a number in a column `q` sums (None: every one is a
-/// number or null).
+/// The kind of the first value that isn't a number in a column `q` sums or averages (None: every
+/// one is a number or null).
 fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
     q.aggs
         .iter()
         .filter_map(|a| match a {
-            Agg::Sum(c) => Some(*c),
+            Agg::Sum(c) | Agg::Avg(c) => Some(*c),
             _ => None,
         })
         .find_map(|c| {
@@ -815,12 +815,13 @@ fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
         })
 }
 
-/// Whether a column `q` sums holds a REAL in any granule.
+/// Whether a column `q` sums or averages holds a REAL in any granule (AVG's REALs follow SUM's
+/// rule, lane R11).
 fn sums_real(q: &Query, granules: &[Placed]) -> bool {
     q.aggs
         .iter()
         .filter_map(|a| match a {
-            Agg::Sum(c) => Some(*c),
+            Agg::Sum(c) | Agg::Avg(c) => Some(*c),
             _ => None,
         })
         .any(|c| {
@@ -892,20 +893,30 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
             Aggregate::Sum(c) => Agg::Sum(*c),
             Aggregate::Min(c) => Agg::Min(*c),
             Aggregate::Max(c) => Agg::Max(*c),
-            // Only the loop body's copy takes them, which `aggregate` hands to the rows.
-            Aggregate::Avg(_) | Aggregate::Total(_) => {
+            Aggregate::Avg(c) => Agg::Avg(*c),
+            // Only the loop body's copy takes it, which `aggregate` hands to the rows.
+            Aggregate::Total(_) => {
                 return Err(LimboError::InternalError(
-                    "the column copy has no AVG or TOTAL".into(),
+                    "the column copy has no TOTAL".into(),
                 ))
             }
         });
     }
+    // The rowids the scan reads (lane R11), as the copy's keys order them.
+    let key = |rowid: Option<i64>| {
+        rowid.map_or(std::ops::Bound::Unbounded, |r| {
+            std::ops::Bound::Included(rowid_key(r).to_vec())
+        })
+    };
     Ok(Query {
         filters,
         group: data.group_by.clone(),
         aggs,
         budget,
-        keys: KeyRange::default(),
+        keys: KeyRange {
+            lo: key(data.rowid_range.0),
+            hi: key(data.rowid_range.1),
+        },
     })
 }
 
@@ -1409,6 +1420,7 @@ mod tests {
     /// the copies counted for it.
     #[test]
     fn r8_s8_statements_on_declared_tables_say_why_they_skip_the_copy() {
+        trace();
         let (_a, on) = connect();
         let (_b, off) = connect();
         let tables = [
@@ -1919,6 +1931,634 @@ mod tests {
         assert!(after.copy > before.copy, "the copy read some");
         eprintln!(
             "== r10: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
+    }
+
+    /// Lane R11: S8's aggregates_range, a search by a rowid range between parameters, with
+    /// SQLite's answers, and the same ranges under statements the copy answers itself. Do: S8's
+    /// `items` columns the statements read, with rows at both ends of the rowids and NULLs among
+    /// the averaged ones; declared `COLUMNAR` and not, and on the pager's storage; each statement
+    /// bound as `bench/sqlite_answers_r10.py` binds it (ranges at and past both ends, one row,
+    /// empty, reversed; each bound an integer, a real, a numeric text, another text, a blob and
+    /// NULL), one worker and then the workers the switch picks, three runs each, under
+    /// `RealSums::Serial`. Expect: every answer bit for bit the one that script printed from
+    /// SQLite 3.54.0; every statement's program holding the copies' hook, every run handed to
+    /// them and none skipped as `body`; the copy reading the statements with no REAL to sum.
+    #[test]
+    fn r11_a_rowid_range_between_parameters_reaches_the_copies_with_sqlites_answers() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        // The pager's storage, whose scan hook reads the rows on morsels (`TableSource`).
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let paged_db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let paged = paged_db.connect(ConnectOpts::new()).unwrap();
+        for (c, declared) in [(&on, true), (&off, false), (&paged, false)] {
+            create(
+                c,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, price REAL NOT NULL, qty INTEGER, created INTEGER NOT NULL)",
+                declared,
+            );
+            c.execute("INSERT INTO items SELECT value, (value % 1000) * 1.25, CASE WHEN value % 97 = 0 THEN NULL ELSE value % 100 END, 1700000000 + value FROM generate_series(1, 3000)")
+                .unwrap();
+            c.execute("INSERT INTO items VALUES (-9223372036854775808, -0.0, 4503599627370496, -5), (9223372036854775807, 0.1, 7, 4611686018427387904)")
+                .unwrap();
+        }
+        let sql = [
+            "SELECT SUM(price), AVG(qty), MIN(created), MAX(created) FROM items WHERE id BETWEEN ? AND ?",
+            "SELECT AVG(qty), MIN(created), MAX(created), COUNT(*) FROM items WHERE id BETWEEN ? AND ?",
+            "SELECT COUNT(*), SUM(qty) FROM items WHERE id >= ? AND id < ?",
+            "SELECT COUNT(*), AVG(qty) FROM items WHERE id > ?",
+            "SELECT COUNT(*), MAX(created) FROM items WHERE id <= ?",
+        ];
+        let sqlite: Vec<(usize, Vec<Value>, &str)> = vec![
+            (
+                0,
+                vec![Value::from_i64(10), Value::from_i64(1009)],
+                "r41230dee00000000,r4048940a57eb5029,i1700000010,i1700001009",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1), Value::from_i64(3000)],
+                "r413c94e500000000,r4048bad40a57eb50,i1700000001,i1700003000",
+            ),
+            (
+                0,
+                vec![Value::from_i64(0), Value::from_i64(3001)],
+                "r413c94e500000000,r4048bad40a57eb50,i1700000001,i1700003000",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_i64(i64::MIN),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r413c94e51999999a,r42760d17c620b874,i-5,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_i64(3000), Value::from_i64(3000)],
+                "r0000000000000000,r0000000000000000,i1700003000,i1700003000",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1), Value::from_i64(1)],
+                "r3ff4000000000000,r3ff0000000000000,i1700000001,i1700000001",
+            ),
+            (
+                0,
+                vec![Value::from_i64(1009), Value::from_i64(10)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(5000), Value::from_i64(6000)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_i64(9223372036854775807),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r3fb999999999999a,r401c000000000000,i4611686018427387904,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "r0000000000000000,r4330000000000000,i-5,i-5",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xbfe0000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r400e000000000000,r3ff8000000000000,i1700000001,i1700000002",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r4004000000000000,r4000000000000000,i1700000002,i1700000002",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_f64(f64::from_bits(0x400599999999999a)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e47e43c8800759c)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xfe37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                ],
+                "r413c94e51999999a,r42760d17c620b874,i-5,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4008000000000000)),
+                ],
+                "r401e000000000000,r4000000000000000,i1700000001,i1700000003",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0x43e0000000000000)),
+                    Value::from_f64(f64::from_bits(0x43e158e460913d00)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![
+                    Value::from_f64(f64::from_bits(0xc3e158e460913d00)),
+                    Value::from_f64(f64::from_bits(0xc3e0000000000000)),
+                ],
+                "r0000000000000000,r4330000000000000,i-5,i-5",
+            ),
+            (
+                0,
+                vec![Value::build_text("10"), Value::build_text("1009")],
+                "r41230dee00000000,r4048940a57eb5029,i1700000010,i1700001009",
+            ),
+            (
+                0,
+                vec![Value::build_text(" 10 "), Value::build_text("20")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("9.5"), Value::build_text("20.5")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("1e1"), Value::build_text("2e1")],
+                "r4069c80000000000,r402e000000000000,i1700000010,i1700000020",
+            ),
+            (
+                0,
+                vec![Value::build_text("1e400"), Value::from_i64(5)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::build_text("-1e400"), Value::build_text("3")],
+                "r401e000000000000,r4310000000000006,i-5,i1700000003",
+            ),
+            (
+                0,
+                vec![Value::build_text("abc"), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "r413c94acd999999a,r4048ca48f1ffa77f,i1700000010,i4611686018427387904",
+            ),
+            (
+                0,
+                vec![Value::from_blob(vec![1]), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::from_i64(10), Value::from_blob(vec![1])],
+                "r413c94acd999999a,r4048ca48f1ffa77f,i1700000010,i4611686018427387904",
+            ),
+            (0, vec![Value::Null, Value::from_i64(20)], "n,n,n,n"),
+            (0, vec![Value::from_i64(10), Value::Null], "n,n,n,n"),
+            (
+                0,
+                vec![
+                    Value::from_i64(5),
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                ],
+                "n,n,n,n",
+            ),
+            (
+                0,
+                vec![Value::build_text("12abc"), Value::from_i64(20)],
+                "n,n,n,n",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::from_i64(1009)],
+                "r4048940a57eb5029,i1700000010,i1700001009,i1000",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1), Value::from_i64(3000)],
+                "r4048bad40a57eb50,i1700000001,i1700003000,i3000",
+            ),
+            (
+                1,
+                vec![Value::from_i64(0), Value::from_i64(3001)],
+                "r4048bad40a57eb50,i1700000001,i1700003000,i3000",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_i64(i64::MIN),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r42760d17c620b874,i-5,i4611686018427387904,i3002",
+            ),
+            (
+                1,
+                vec![Value::from_i64(3000), Value::from_i64(3000)],
+                "r0000000000000000,i1700003000,i1700003000,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1), Value::from_i64(1)],
+                "r3ff0000000000000,i1700000001,i1700000001,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(1009), Value::from_i64(10)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(5000), Value::from_i64(6000)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_i64(9223372036854775807),
+                    Value::from_i64(9223372036854775807),
+                ],
+                "r401c000000000000,i4611686018427387904,i4611686018427387904,i1",
+            ),
+            (
+                1,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "r4330000000000000,i-5,i-5,i1",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xbfe0000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r3ff8000000000000,i1700000001,i1700000002,i2",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4000000000000000)),
+                ],
+                "r4000000000000000,i1700000002,i1700000002,i1",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_f64(f64::from_bits(0x400599999999999a)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e47e43c8800759c)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xfe37e43c8800759c)),
+                    Value::from_f64(f64::from_bits(0x7e37e43c8800759c)),
+                ],
+                "r42760d17c620b874,i-5,i4611686018427387904,i3002",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                    Value::from_f64(f64::from_bits(0x4008000000000000)),
+                ],
+                "r4000000000000000,i1700000001,i1700000003,i3",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0x43e0000000000000)),
+                    Value::from_f64(f64::from_bits(0x43e158e460913d00)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![
+                    Value::from_f64(f64::from_bits(0xc3e158e460913d00)),
+                    Value::from_f64(f64::from_bits(0xc3e0000000000000)),
+                ],
+                "r4330000000000000,i-5,i-5,i1",
+            ),
+            (
+                1,
+                vec![Value::build_text("10"), Value::build_text("1009")],
+                "r4048940a57eb5029,i1700000010,i1700001009,i1000",
+            ),
+            (
+                1,
+                vec![Value::build_text(" 10 "), Value::build_text("20")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("9.5"), Value::build_text("20.5")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("1e1"), Value::build_text("2e1")],
+                "r402e000000000000,i1700000010,i1700000020,i11",
+            ),
+            (
+                1,
+                vec![Value::build_text("1e400"), Value::from_i64(5)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::build_text("-1e400"), Value::build_text("3")],
+                "r4310000000000006,i-5,i1700000003,i4",
+            ),
+            (
+                1,
+                vec![Value::build_text("abc"), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "r4048ca48f1ffa77f,i1700000010,i4611686018427387904,i2992",
+            ),
+            (
+                1,
+                vec![Value::from_blob(vec![1]), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::from_i64(10), Value::from_blob(vec![1])],
+                "r4048ca48f1ffa77f,i1700000010,i4611686018427387904,i2992",
+            ),
+            (1, vec![Value::Null, Value::from_i64(20)], "n,n,n,i0"),
+            (1, vec![Value::from_i64(10), Value::Null], "n,n,n,i0"),
+            (
+                1,
+                vec![
+                    Value::from_i64(5),
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                ],
+                "n,n,n,i0",
+            ),
+            (
+                1,
+                vec![Value::build_text("12abc"), Value::from_i64(20)],
+                "n,n,n,i0",
+            ),
+            (
+                2,
+                vec![Value::from_i64(10), Value::from_i64(20)],
+                "i10,i145",
+            ),
+            (2, vec![Value::from_i64(10), Value::from_i64(10)], "i0,n"),
+            (
+                2,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4023000000000000)),
+                    Value::from_f64(f64::from_bits(0x4025000000000000)),
+                ],
+                "i1,i10",
+            ),
+            (
+                2,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(i64::MIN)],
+                "i0,n",
+            ),
+            (
+                2,
+                vec![Value::from_i64(2999), Value::from_i64(9223372036854775807)],
+                "i2,i99",
+            ),
+            (
+                2,
+                vec![Value::from_i64(i64::MIN), Value::from_i64(-4)],
+                "i1,i4503599627370496",
+            ),
+            (
+                2,
+                vec![
+                    Value::build_text("10"),
+                    Value::from_f64(f64::from_bits(0x4034800000000000)),
+                ],
+                "i11,i165",
+            ),
+            (
+                2,
+                vec![Value::from_i64(10), Value::build_text("abc")],
+                "i2992,i146857",
+            ),
+            (3, vec![Value::from_i64(2999)], "i2,r400c000000000000"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x40a76f0000000000))],
+                "i2,r400c000000000000",
+            ),
+            (3, vec![Value::from_i64(3000)], "i1,r401c000000000000"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (
+                3,
+                vec![Value::from_i64(i64::MIN)],
+                "i3001,r4048b8ffbdd3056e",
+            ),
+            (3, vec![Value::from_i64(9223372036854775807)], "i0,n"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x7e37e43c8800759c))],
+                "i0,n",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0xfe37e43c8800759c))],
+                "i3002,r42760d17c620b874",
+            ),
+            (3, vec![Value::build_text("2999")], "i2,r400c000000000000"),
+            (3, vec![Value::build_text("abc")], "i0,n"),
+            (3, vec![Value::from_blob(vec![0])], "i0,n"),
+            (3, vec![Value::Null], "i0,n"),
+            (4, vec![Value::from_i64(2999)], "i3000,i1700002999"),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x40a76f0000000000))],
+                "i3000,i1700002999",
+            ),
+            (4, vec![Value::from_i64(3000)], "i3001,i1700003000"),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "i1,i-5",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i1,i-5",
+            ),
+            (4, vec![Value::from_i64(i64::MIN)], "i1,i-5"),
+            (
+                4,
+                vec![Value::from_i64(9223372036854775807)],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0x7e37e43c8800759c))],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_f64(f64::from_bits(0xfe37e43c8800759c))],
+                "i0,n",
+            ),
+            (4, vec![Value::build_text("2999")], "i3000,i1700002999"),
+            (
+                4,
+                vec![Value::build_text("abc")],
+                "i3002,i4611686018427387904",
+            ),
+            (
+                4,
+                vec![Value::from_blob(vec![0])],
+                "i3002,i4611686018427387904",
+            ),
+            (4, vec![Value::Null], "i0,n"),
+        ];
+        let cell = |v: &Value| match v {
+            Value::Null => "n".to_string(),
+            Value::Numeric(Numeric::Integer(i)) => format!("i{i}"),
+            Value::Numeric(Numeric::Float(f)) => format!("r{:016x}", f64::from(*f).to_bits()),
+            Value::Text(t) => format!("t{}", t.as_str()),
+            Value::Blob(b) => format!("b{b:?}"),
+        };
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<String> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().map(cell).collect::<Vec<_>>().join(","));
+                Ok(())
+            })
+            .unwrap();
+            out.join(";")
+        };
+        for text in sql {
+            let hooked = rows(&on, &format!("EXPLAIN {text}")).iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            assert!(
+                hooked,
+                "{text}: the statement's program holds the copies' hook"
+            );
+        }
+        let before = copies(&on).counts();
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            on.set_parallel_mode(mode);
+            off.set_parallel_mode(mode);
+            paged.set_parallel_mode(mode);
+            for (at, params, answer) in &sqlite {
+                let text = sql[*at];
+                assert_eq!(
+                    bound(&paged, text, params),
+                    *answer,
+                    "the pager's storage, {mode:?}: {text} {params:?}"
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        bound(&on, text, params),
+                        *answer,
+                        "declared, {mode:?}: {text} {params:?}"
+                    );
+                    assert_eq!(
+                        bound(&off, text, params),
+                        *answer,
+                        "not declared, {mode:?}: {text} {params:?}"
+                    );
+                }
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(sqlite.len() * 3 * 2).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert!(after.copy > before.copy, "the copy read some");
+        eprintln!(
+            "== r11: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
             after.handed - before.handed,
             after.copy - before.copy,
             after.rows - before.rows,

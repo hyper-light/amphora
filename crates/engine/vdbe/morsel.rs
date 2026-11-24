@@ -942,6 +942,95 @@ impl Predicate {
     }
 }
 
+/// The rowids a scan reads (lane R11): those every term of `filter` on the rowid's alias column
+/// `alias` admits, within `range`, each end inclusive, None unbounded: a term's bound that admits
+/// every rowid on its side (an i64's end, a text or a blob as an upper bound) bounds nothing, so a
+/// statement no term bounds, or bounds at both ends of the i64s, is a scan of the whole table. A
+/// term admits the rowids [`Predicate::holds`] passes, as SQLite compares an INTEGER with the
+/// value under NUMERIC affinity: an integer as itself, a real by its value (a start of 4.5 seeks
+/// 5: `OP_SeekGE` in vdbe.c shifts the seek past the integer it truncates to), a text or a blob
+/// no number reads as above every rowid, NULL true of none (`OP_SeekGE` jumps past the table for
+/// one of them; the end's `OP_Gt` carries `SQLITE_JUMPIFNULL`, wherecode.c). It may admit rowids
+/// the terms don't, never fewer: the terms still decide each row. When none is admitted,
+/// `(Some(i64::MAX), Some(i64::MIN))`, which no rowid is between.
+pub(crate) fn rowid_range(
+    filter: &[Predicate],
+    alias: usize,
+    range: (Option<i64>, Option<i64>),
+) -> (Option<i64>, Option<i64>) {
+    let (mut lo, mut hi) = range;
+    for term in filter {
+        let Predicate::Compare { column, op, value } = term else {
+            continue;
+        };
+        if *column != alias {
+            continue;
+        }
+        let Some((least, greatest)) = admitted(*op, value) else {
+            return (Some(i64::MAX), Some(i64::MIN));
+        };
+        if least > i64::MIN {
+            lo = Some(lo.map_or(least, |at| at.max(least)));
+        }
+        if greatest < i64::MAX {
+            hi = Some(hi.map_or(greatest, |at| at.min(greatest)));
+        }
+    }
+    match (lo, hi) {
+        (Some(least), Some(greatest)) if least > greatest => (Some(i64::MAX), Some(i64::MIN)),
+        _ => (lo, hi),
+    }
+}
+
+/// The least and greatest rowid `rowid op value` holds for; None: none.
+fn admitted(op: CmpOp, value: &Value) -> Option<(i64, i64)> {
+    let all = Some((i64::MIN, i64::MAX));
+    // The least rowid at or above the value, and the greatest at or below it (None: no rowid is).
+    let (up, down) = match value {
+        Value::Null => return None,
+        Value::Text(_) | Value::Blob(_) => {
+            return match op {
+                CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+            }
+        }
+        Value::Numeric(Numeric::Integer(i)) => (Some(*i), Some(*i)),
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            // Strictly between the ends a double's ceiling and floor are integers in range.
+            let (Some(ceiling), Some(floor)) = (integral(f.ceil()), integral(f.floor())) else {
+                return if f.is_nan() {
+                    all
+                } else if f >= I64_HIGH {
+                    match op {
+                        CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+                    }
+                } else if f < I64_LOW {
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Lt | CmpOp::Le => None,
+                    }
+                } else {
+                    all
+                };
+            };
+            (Some(ceiling), Some(floor))
+        }
+    };
+    match op {
+        CmpOp::Ge => Some((up?, i64::MAX)),
+        CmpOp::Gt => Some((down.map_or(Some(i64::MIN), |d| d.checked_add(1))?, i64::MAX)),
+        CmpOp::Le => Some((i64::MIN, down?)),
+        CmpOp::Lt => Some((i64::MIN, up.map_or(Some(i64::MAX), |u| u.checked_sub(1))?)),
+        CmpOp::Eq => match (up, down) {
+            (Some(u), Some(d)) if u == d => Some((u, u)),
+            _ => None,
+        },
+        CmpOp::Ne => all,
+    }
+}
+
 /// An aggregate a scan computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aggregate {
@@ -959,7 +1048,7 @@ pub enum Aggregate {
 /// Integers a double holds exactly: below 2^53, its significand's 53 bits (IEEE 754 binary64).
 /// While the magnitudes of AVG's or TOTAL's integers sum below it, every partial sum the serial
 /// loop's compensated double sum takes, in any order, is exact, and so equals the exact sum.
-const DOUBLE_EXACT: u128 = 1 << 53;
+pub(crate) const DOUBLE_EXACT: u128 = 1 << 53;
 
 #[derive(Clone, Debug)]
 enum Accumulator {

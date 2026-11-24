@@ -17426,8 +17426,9 @@ mod tests {
     /// learner's database from a second reader, and reads again; then a read after it.
     /// Expect: the learner installed the image; both of the open read's views are the state
     /// before it (no table), while the second reader, at the same time, sees the image whole (1
-    /// and 2, and all 200 rows of spread); the restart answered Ok(false), not gone through; the
-    /// read after sees the image whole.
+    /// and 2, and all 200 rows of spread); the restart answered Ok(true): it switched the log to
+    /// its free segment and waited for no read, the open read reading on in the segment it began
+    /// on (store.md, decision 45); the read after sees the image whole.
     #[test]
     fn a_local_read_open_across_an_image_install_sees_one_side_whole() {
         let dir = tempfile::tempdir().unwrap();
@@ -17523,8 +17524,8 @@ mod tests {
             "the image wasn't committed beside the open read"
         );
         assert!(
-            matches!(restarted, Ok(false)),
-            "the log restart under an open read: {restarted:?}"
+            matches!(restarted, Ok(true)),
+            "the log restart under an open read switches and waits for no read (decision 45): {restarted:?}"
         );
         assert_eq!(
             learner.read_local(Instant::now() + HANG_READ, |db| db.query_transaction(seen)),

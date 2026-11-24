@@ -4299,8 +4299,15 @@ impl SharedLog {
     /// next commit before any frame. It takes no read mark and waits for no read: the segment
     /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
     /// now current, or None while the other one is still closing (the writer appends on and asks
-    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
-    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    /// again at its next turn) or while the current one holds no frame. A free segment's file
+    /// longer than `cut_past` bytes is cut to nothing first: nothing in it is needed (decision
+    /// 31's bound, kept at each segment's reuse).
+    ///
+    /// A segment with no frame has no header of its own on disk: its first commit writes it. A
+    /// switch from it would give the other segment a sequence two past the header its file still
+    /// holds, three past once that one's first commit lands, a pair recovery refuses as corrupt
+    /// (lane B19: tests/crash.rs's power cut at seed 45 reopened to sequences 4 and 1). Its log is
+    /// at its start already, so there is nothing to switch from.
     pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
@@ -4310,6 +4317,9 @@ impl SharedLog {
         let to = from.other();
         let (header, epoch, transaction_count) = {
             let closing = self.segment(from).read();
+            if closing.metadata.max_frame.load(Ordering::Acquire) == 0 {
+                return Ok(None);
+            }
             let header = *closing.metadata.wal_header.lock();
             (
                 header,
@@ -5534,6 +5544,21 @@ impl WalFile {
         )
     }
 
+    /// The epoch a page read from `segment`'s frames is labelled with for the checkpoint's cache
+    /// lookup, or None: the cache keys a page by its frame in the current segment (decision 45),
+    /// and frame numbers start again in each, so a page read from a closing segment is not
+    /// labelled (lane B20). The epoch is read first: a switch stores the free segment's epoch,
+    /// one past, before it makes that segment current, so a read that sees `segment` current
+    /// after it labels with an epoch no frame of the next segment is copied under.
+    fn label_epoch(&self, segment: SegmentId) -> Option<u32> {
+        let epoch = self.coordination.checkpoint_epoch();
+        if segment == self.coordination.current_segment() {
+            Some(epoch)
+        } else {
+            None
+        }
+    }
+
     /// A page the read's own segment lacks, in the closing segment the read counts on (decision
     /// 45): the file lacks that segment's frames until its copy. Every frame of it was committed
     /// before any of the read's own segment, so the newest there is the read's version.
@@ -6067,16 +6092,18 @@ impl Wal for WalFile {
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         let frame_id = at.frame;
-        tracing::debug!(
-            "read_frame(page_idx = {}, frame_id = {})",
-            page.get().id(),
-            frame_id
-        );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id();
-        let epoch_at_issue = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(at.segment);
+        tracing::debug!(
+            "read_frame(page_idx = {}, frame_id = {}, segment = {:?}, label epoch = {:?})",
+            page_idx,
+            frame_id,
+            at.segment,
+            label
+        );
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6099,7 +6126,10 @@ impl Wal for WalFile {
             }
             let cloned = frame.clone();
             finish_read_page(page.get().id(), buf, cloned);
-            frame.set_wal_tag(frame_id, epoch_at_issue);
+            match label {
+                Some(epoch) => frame.set_wal_tag(frame_id, epoch),
+                None => frame.clear_wal_tag(),
+            }
             None
         });
         // Amphora: a page a record holds is read from the record, in the frame's own segment
@@ -6194,7 +6224,7 @@ impl Wal for WalFile {
             slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
         }
 
-        let epoch = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(start.segment);
         let page_transform = self.io_ctx.read().page_transform().clone();
         let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
@@ -6288,7 +6318,10 @@ impl Wal for WalFile {
             for (i, (page, page_buf)) in slots.iter().enumerate() {
                 let page_id = page.get().id();
                 finish_read_page(page_id, page_buf.clone(), page.clone());
-                page.set_wal_tag(start_frame + i as u64, epoch);
+                match label {
+                    Some(epoch) => page.set_wal_tag(start_frame + i as u64, epoch),
+                    None => page.clear_wal_tag(),
+                }
             }
             None
         });
@@ -8894,15 +8927,19 @@ impl WalFileShared {
     /// writing frames into the start of the log file.
     /// Make this free segment the one that follows `closing`'s header (decision 45): the same
     /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
-    /// the epoch and transaction count carried on so that neither comes back to a value a
-    /// connection took from the closing segment.
+    /// the transaction count carried on so that it never comes back to a value a connection took
+    /// from the closing segment, and the epoch one past the closing one's `epoch`, as a restart
+    /// bumps it: frame numbers start again here, so no page labelled from the closing segment's
+    /// frames passes for this one's (lane B20).
     fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
         *self.metadata.wal_header.lock() = closing;
         self.metadata.loaded.store(true, Ordering::Release);
         self.metadata
             .transaction_count
             .store(transaction_count, Ordering::Release);
-        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.runtime
+            .epoch
+            .store(epoch.wrapping_add(1), Ordering::Release);
         self.restart_wal_header(io);
     }
 
@@ -11811,6 +11848,215 @@ pub mod test {
             0,
             "nothing of the closing segment was copied"
         );
+    }
+
+    /// Do (lane B19, tests/crash.rs's power cut at seed 45): write, switch, write, copy the closing
+    /// segment, switch, copy it again, ask for a third switch with nothing written since the
+    /// second, write; open a copy of the database and both log files. Expect: the copy opens and
+    /// holds every row; the third switch was refused, its segment holding no frame (so no header
+    /// of its own on disk), and the log's two headers are one sequence apart.
+    #[test]
+    fn d45_a_switch_never_leaves_two_headers_recovery_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let source = dir.path().join("source.db");
+        let copy = dir.path().join("copy.db");
+        let (source_path, copy_path) = (source.to_str().unwrap(), copy.to_str().unwrap());
+        let db = Database::open_file(io.clone(), source_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        conn.execute("insert into t values(1, 'first segment')")
+            .unwrap();
+        let pager = conn.pager.load();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        assert!(db.switch_log(None).unwrap());
+        conn.execute("insert into t values(2, 'second segment')")
+            .unwrap();
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(db.switch_log(None).unwrap());
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        let third = db.switch_log(None).unwrap();
+        conn.execute("insert into t values(3, 'after the third ask')")
+            .unwrap();
+
+        std::fs::copy(&source, &copy).unwrap();
+        for suffix in ["-wal", "-wal2"] {
+            std::fs::copy(
+                format!("{source_path}{suffix}"),
+                format!("{copy_path}{suffix}"),
+            )
+            .unwrap();
+        }
+        let reopened = Database::open_file(io, copy_path, Arc::new(SqliteDialect));
+        let reopened = match reopened {
+            Ok(db) => db,
+            Err(e) => panic!("the copy doesn't open (third switch made: {third}): {e}"),
+        };
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&conn, "t"), 3);
+        assert!(!third, "a segment with no frame is not switched from");
+        let sequence = |id| {
+            reopened
+                .shared_wal
+                .segment(id)
+                .read()
+                .metadata
+                .wal_header
+                .lock()
+                .checkpoint_seq
+        };
+        assert_eq!(
+            sequence(SegmentId::First),
+            sequence(SegmentId::Second).wrapping_add(1)
+        );
+    }
+
+    /// A database holding `t` (row 1, 'base'), its log's frames copied into the file, then
+    /// switched to its second segment, the first reset: the next commit is the second segment's
+    /// frame 1. The connection that wrote it, autocheckpoint off.
+    fn switched_database(dir: &std::path::Path) -> (Arc<Database>, Arc<Connection>) {
+        let path = dir.join("cached.db");
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer.execute("pragma wal_autocheckpoint=0").unwrap();
+        writer
+            .execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        writer.execute("insert into t values(1, 'base')").unwrap();
+        assert!(db.switch_log(None).unwrap());
+        run_checkpoint_until_done(
+            &writer.pager.load(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert_eq!(db.shared_wal.current_id(), SegmentId::Second);
+        (db, writer)
+    }
+
+    /// `t`'s rows whose `v` is `value`, in a copy of `db`'s file alone: what its checkpoints put
+    /// there.
+    fn rows_in_the_file(dir: &std::path::Path, value: &str) -> i64 {
+        let alone = dir.join("alone.db");
+        std::fs::copy(dir.join("cached.db"), &alone).unwrap();
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            alone.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        count_rows(&conn, &format!("t where v = '{value}'"))
+    }
+
+    /// Passes on `conn` that keep its page cache, as a checkpoint after a commit does, until the
+    /// closing segment is reset and the current one copied whole.
+    fn copy_everything_keeping_the_cache(db: &Database, conn: &Arc<Connection>) {
+        let pager = conn.pager.load();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        for _ in 0..4 {
+            let pass = pager
+                .io
+                .block(|| pager.checkpoint(passive, crate::SyncMode::Full, false))
+                .unwrap();
+            if pass.closing.is_none() && pass.everything_backfilled() {
+                break;
+            }
+        }
+        let (log, copied) = db.wal_backfill();
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(log > 0 && copied == log, "{copied} of {log} frames copied");
+    }
+
+    /// Do (decision 45, lane B19): row 1 set to 'A' as the second segment's frame 1, copied; a
+    /// switch to the first segment; a new connection reads row 1, its page from the closing
+    /// segment; row 1 set to 'B' as the first segment's frame 1 by the writer; the reader's
+    /// connection checkpoints both segments, its page cache kept; the file read alone. Expect:
+    /// the file holds 'B': the page the reader cached from the closing segment's frame 1 never
+    /// passes for the current segment's frame 1.
+    #[test_log::test]
+    fn d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, writer) = switched_database(dir.path());
+        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        writer.execute("update t set v = 'A' where id = 1").unwrap();
+        let frames = |id| {
+            db.shared_wal
+                .segment(id)
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::Acquire)
+        };
+        let a_frames = frames(SegmentId::Second);
+        run_checkpoint_until_done(
+            &checkpointer.pager.load(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(db.switch_log(None).unwrap());
+
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&reader, "t where v = 'A'"), 1);
+        writer.execute("update t set v = 'B' where id = 1").unwrap();
+        assert_eq!(
+            frames(SegmentId::First),
+            a_frames,
+            "the two commits' frames line up"
+        );
+        copy_everything_keeping_the_cache(&db, &reader);
+        assert_eq!(rows_in_the_file(dir.path(), "B"), 1);
+    }
+
+    /// Do (decision 45, lane B19): row 1 set to 'A' as the second segment's frame 1, copied; a
+    /// switch to the first segment; a new connection reads row 1 from the closing segment; that
+    /// segment reset; a switch asked with nothing written; then row 1 set to 'X' (the first
+    /// segment's frame 1), a switch back to the second segment, row 1 set to 'B' as its frame 1
+    /// again; the reader's connection checkpoints both segments, its page cache kept; the file
+    /// read alone. Expect: the empty segment isn't switched from; the file holds 'B': the page
+    /// the reader cached from the second segment's frame 1 never passes for that frame after the
+    /// segment's reuse.
+    #[test_log::test]
+    fn d45_a_page_cached_from_a_segment_never_passes_for_its_frames_after_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, writer) = switched_database(dir.path());
+        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        writer.execute("update t set v = 'A' where id = 1").unwrap();
+        run_checkpoint_until_done(&checkpointer.pager.load(), passive);
+        assert!(db.switch_log(None).unwrap());
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&reader, "t where v = 'A'"), 1);
+        run_checkpoint_until_done(&checkpointer.pager.load(), passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(
+            !db.switch_log(None).unwrap(),
+            "no switch from an empty segment"
+        );
+
+        writer.execute("update t set v = 'X' where id = 1").unwrap();
+        assert!(db.switch_log(None).unwrap());
+        assert_eq!(db.shared_wal.current_id(), SegmentId::Second);
+        writer.execute("update t set v = 'B' where id = 1").unwrap();
+        copy_everything_keeping_the_cache(&db, &reader);
+        assert_eq!(rows_in_the_file(dir.path(), "B"), 1);
     }
 
     #[test]
