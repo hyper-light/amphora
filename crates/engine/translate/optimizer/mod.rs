@@ -2105,7 +2105,7 @@ fn unmark_unread_columns(plan: &mut SelectPlan) -> Result<()> {
         .retain(|subquery| subqueries.contains(&subquery.internal_id));
     let lateral = |table: &JoinedTable| {
         matches!(&table.table, Table::FromClauseSubquery(subquery)
-            if crate::translate::plan::plan_is_correlated(&subquery.plan))
+            if crate::translate::plan::plan_has_outer_scope_dependency(&subquery.plan))
     };
     let tables = plan.table_references.joined_tables();
     if !plan.non_from_clause_subqueries.is_empty() || tables.iter().any(lateral) {
