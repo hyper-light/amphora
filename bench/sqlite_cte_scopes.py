@@ -60,6 +60,7 @@ FOUND = [
 class Draw:
     def __init__(self, rng):
         self.rng = rng
+        self.held = None
 
     def start(self):
         self.aliases = 0
