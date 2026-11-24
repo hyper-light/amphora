@@ -146,8 +146,9 @@ fn t_pg_8_5_a_time_zone_19_does_not_have_is_refused() {
     }
 }
 
-/// T-PG.8.6: an expression as deep as the grammar reads is analyzed and computed with no recursion
-/// (CLAUDE.md section 11): a test thread's stack would not hold 9,000 levels of one.
+/// T-PG.8.6: an expression is analyzed and computed with no recursion (CLAUDE.md section 11): 100,000
+/// operators in a row, each the left operand of the next, and 1,500 in each other's parentheses, on a test
+/// thread's stack.
 #[test]
 fn t_pg_8_6_a_deep_expression_takes_no_stack() {
     let utc = tz::time_zone("UTC").unwrap();
