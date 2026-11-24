@@ -888,7 +888,8 @@ A21's (8a2c25bd, 7c753719); this lane's one code change is 63017ae8 (the term-ch
 (1f4a8e88: PG14's OID counter, crates/engine), cdcdef9f (731240ed: V18's close behind a follower's forward in
 replicated.rs, V18's mvcc, F6's engine ratchet) and e53b671b (ac2c429a: T21's optimizer/lip.rs, crates/engine). `cargo
 fmt --all --check` clean on each. main moved inside crates/ each time, so each was re-run on clippy and the touched
-tests, at smaller `needs` when adacachy2 was busy.
+tests, at smaller `needs` when adacachy2 was busy; 8f59e5b8 (219603df: Q8's wal.rs and sqlite3_ondisk.rs, crates/engine)
+was the landed tree.
 
 **Losses.**
 - v13 (`v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base`) fails on macOS on both
@@ -898,16 +899,25 @@ tests, at smaller `needs` when adacachy2 was busy.
   Timeout). Not traced here. On Linux it passed on both sides in every run (9 a side on the first merge and main
   a64549cc, 4 a side on 0ba7307d and main 3a58a13f's). Not run on macOS on main 3a58a13f, whose V13 test changed
   (P20's 8e0eced3).
-- The replicated suites fail tests on both sides at this load (41-61). Every failure on the change's side also fails on
-  main's side in the same rounds, but two. `a21_a_replicated_writes_charge_is_given_back_on_a_term_change` failed on
-  0ba7307d (r402, fixed below). `session_reads::t_t1_10_r5_…` failed once, in r312's round 3 on 0f65a665 (its read
-  counted `at_once: 1, waited: 0`), in none of main a64549cc's 6 rounds. Alone (r365, r392) it failed in none of 70
-  runs a side: 10 under the suites' load, 40 beside six busy loops, 20 without. The assertion fits its read's thread
-  running after the main thread had caught the follower up; inferred from the counters, not traced.
+- The brief's bar of three suite rounds a side with no failure belonging only to the change is NOT cleanly met. In the
+  three planned rounds (r312) two tests failed only on the change's side: `a_restart_due_waits_…` (due) and
+  `session_reads::t_t1_10_r5_…` (r5; its read counted `at_once: 1, waited: 0`). After seeing that, this lane ran three
+  more rounds a side (r369): due then failed on main too (round 4); r5 failed on neither side again. Over all six
+  rounds r5 is 1 of 6 on the change and 0 of 6 on main. Every other failure on the change's side also failed on main in
+  some round. r5 alone afterwards: 0 failures of 70 a side (r365: 10, `session_reads::` by itself at load 29-30; r392: 40
+  beside six busy loops, 20 without). That does not show the cause. The assertion would fit the test's read thread
+  starting after the main thread had caught the follower up; that is inferred from the counters, not traced.
+- check-production was last run on cdcdef9f (main 731240ed), not on the landed tree 8f59e5b8: since then main brought
+  T21's optimizer/lip.rs and Q8's wal.rs and sqlite3_ondisk.rs. Clippy, the five `a21_` tests and v13 were re-run on it.
+- The ladder was not run on main, and only on 0f65a665 and 0ba7307d, not on the landed tree. On 0ba7307d its commits/s is
+  about half 0f65a665's, at a higher load (62-66 against 41-44) and with main's P20 and P22 between them: not compared, no
+  cause claimed.
+- The suites and the v13 counts on 0ba7307d and later trees are from one round and from v13 alone; the six-round table is
+  0f65a665 and main a64549cc.
 - The release bench and the ladder ran under load 41-66 of other lanes: it shows refusals, not throughput.
-- Stopped by this lane before any result was read: r316 and r331 (the bench script had copied f2cb8681's binary after
-  its own build failed on the untracked `bench/Cargo.lock`; fixed by building offline without --locked); their cells are
-  not in this record.
+- Stopped by this lane: r316 and r331. The bench script had copied f2cb8681's stale binary after its own build failed on
+  the untracked `bench/Cargo.lock` (fixed by building offline without --locked); one stale cell of r316 was seen, none is
+  in this record.
 
 **The term-change test and main 3a58a13f (63017ae8).** On 0ba7307d it failed, the write answered Ok though its term
 moved. A proposal's append now goes out in the step that proposes it (`Actor::propose_stamped` sets `driving`, so the
@@ -933,6 +943,7 @@ re-asked smaller). Scripts: `~/.cache/amphora-perf/cross-a23-scripts/` (`check23
 | r439, 05:35Z | a12bea22 (main 1f4a8e88), needs cpus=4 | clippy clean (36 s, engine re-checked); check-production rc 0 (10903); built 68 s; `a21_` 5 of 5, 3 rounds; v13 alone passes once (load 49) |
 | r457, 05:39Z | cdcdef9f (main 731240ed), needs cpus=2 (cpus=4 refused: 3 of 32 cores idle) | clippy clean (41 s); check-production rc 0 (F6's new ratchet, 10617); built 71 s; `a21_` 5 of 5, 3 rounds; v13 alone passes |
 | r478, 05:44Z | e53b671b (main ac2c429a: T21's optimizer/lip.rs), needs cpus=2 | clippy clean (29 s); built 61 s (engine compiled); `a21_` 5 of 5, 3 rounds; v13 alone passes |
+| r497, 05:46Z | 8f59e5b8 (main 219603df: Q8's wal.rs), needs cpus=2 | clippy clean (38 s, engine re-checked); built 69 s (engine compiled); `a21_` 5 of 5, 3 rounds; v13 alone passes |
 
 Ladder (`ladder13.sh`, Amphora alone, spread writers, one round each; commits/s, p50/p99 ms, refused by node, misses),
 0f65a665 (r335, load 41-44) and 0ba7307d (r410, load 62-66, two cells' drivers also printed "node N closed the
@@ -961,5 +972,5 @@ flooded = `window_slow_flooded_fast_starved`, r5 = `session_reads::t_t1_10_r5_�
 | 6 (r369) | ckpt, image, due, room | ckpt, image, dblog, room |
 | r402 round 1 (0ba7307d, main 3a58a13f) | term, ckpt, image, dblog, room | ckpt, image, dblog, holds, room, flooded |
 
-Rounds 1-6 on 0f65a665 and main a64549cc; the last on 0ba7307d and main 3a58a13f. v13 passed in every one of those suite
-runs (12 logs checked) and the suites' other failures on the change's side all fail on main's side too, except as above.
+Rounds 1-6 on 0f65a665 and main a64549cc; the last on 0ba7307d and main 3a58a13f. v13 passed in all 12 suite logs of rounds
+1-6 (grepped for its "ok"); r402's two suite runs list no v13 failure.
