@@ -765,6 +765,23 @@ e7d493fc (r10) and six times more on 78a9fe56's own binary, and A18's r1892 saw 
 lan.rs:720 before A19 existed. Landed on clippy and the tests of what A19 touched (rule 5b); the error text is the
 next thing to capture if it fails again.
 
+| run | commit | result |
+|---|---|---|
+| r51, 02:45Z | 238114df (013846ba + main a5ae048c: B18's decision 45 switch) | needs cpus=4: clippy clean; `a19_` 3/3, `memory::` 11/11, `store::` 6/6, `serve::` 12/12, tests/store.rs 17/17; `database::` 257/260 (6 ignored), `xgroup::` 33/34, tests/crash.rs 9/10 (3 ignored); load 46-55 |
+| 02:48Z, foreground | 238114df's binary, each failing test alone, twice | the three `database::replicated::tests` fail every time (below); `ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly` passes 2/2 |
+| 02:49Z, foreground | main a5ae048c alone (no A19) | the same three fail with the same messages, and tests/crash.rs's power cut fails: seed 45 of 200, "reopen: opening /crash/events.db: Corrupt database: the log's segments have checkpoint sequences Some(4) and Some(1), neither one past the other: no switch leaves such a pair" |
+
+main a5ae048c's own failures, A19 absent (B18's decision 45 switch; they passed on 78a9fe56, main c10b1a09):
+- `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`, replicated.rs:16931: left 77, right 17.
+- `a_local_read_open_across_an_image_install_sees_one_side_whole`, replicated.rs:16670: "the log restart under an open read: Ok(true)".
+- `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`, replicated.rs:10557: Unavailable("the
+  database's log holds 13 frames, past the 6 it may hold: an equal share of its filesystem's free bytes ...").
+- tests/crash.rs `a_power_cut_at_any_change_loses_nothing_acknowledged_and_tears_no_batch`, crash.rs:821: a power cut at
+  seed 45 reopens to a corrupt log (above). A durability defect on main, for lane B18's successor.
+
+A19 landed on 238114df: every module it touches passes wherever main passes, and the tree's failures are main's own,
+the same tests with the same messages (rule 5b).
+
 **rustfmt (502375c9).** Of the five call sites A19 fixed in 1a19ead8, two ran past 100 columns (serve.rs's
 `let SqlAnswer::Tables(tables) = answer(..)` at 2542 and 2583); rustfmt's two hunks are applied alone. At 2912576e `cargo
 fmt -p amphora --check` also flagged main's own lines, present at 14fbf220 before A19 (database.rs, database/
