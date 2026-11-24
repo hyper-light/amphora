@@ -733,9 +733,7 @@ impl Analysis<'_> {
                 // A subquery without an alias has no name (addRangeTableEntryForSubquery).
                 let named = match oid {
                     Some(oid) => table.oid == oid && !table.aliased,
-                    None => {
-                        table.refname == name && (table.outputs.is_none() || table.aliased)
-                    }
+                    None => table.refname == name && (table.outputs.is_none() || table.aliased),
                 };
                 if !named || (item.lateral_only && !scope.lateral) {
                     continue;
@@ -770,9 +768,10 @@ impl Analysis<'_> {
                 .resolve(Kind::Relation, |ns| relations.relation(ns, name)),
         };
         // searchRangeTableForRel (:360): the tables read so far, whether names can mean them here or not.
-        let there = self.tables.iter().any(|table| {
-            (table.oid != 0 && Some(table.oid) == oid) || table.refname == name
-        });
+        let there = self
+            .tables
+            .iter()
+            .any(|table| (table.oid != 0 && Some(table.oid) == oid) || table.refname == name);
         let what = if there {
             "invalid reference to"
         } else {
@@ -842,22 +841,20 @@ impl Analysis<'_> {
                 .path
                 .resolve(Kind::Type, |namespace| type_named(namespace, &name.name)),
         };
-        let t = found.ok_or_else(|| {
+        let undefined = || {
+            let brackets = if array_bounds.is_empty() { "" } else { "[]" };
             Error::new(
                 sqlstate::UNDEFINED_OBJECT,
-                format!("type \"{}\" does not exist", name.text()),
+                format!("type \"{}{brackets}\" does not exist", name.text()),
             )
             .at(*location)
-        })?;
+        };
+        let t = found.ok_or_else(undefined)?;
         // LookupTypeNameExtended (parse_type.c): an array's dimensions say nothing of its type.
         let array = |oid: u32| match type_by_oid(oid).map(|t| t.array) {
             _ if array_bounds.is_empty() => Ok(oid),
             Some(array) if array != 0 => Ok(array),
-            _ => Err(Error::new(
-                sqlstate::UNDEFINED_OBJECT,
-                format!("type \"{}[]\" does not exist", name.text()),
-            )
-            .at(*location)),
+            _ => Err(undefined()),
         };
         if typmods.is_empty() {
             return Ok((array(t.oid)?, -1, *location));
@@ -1093,9 +1090,8 @@ impl Analysis<'_> {
             literal,
         )
         .map_err(|e| e.at(location))?;
-        let wrong = |message: String| {
-            Err(Error::new(sqlstate::WRONG_OBJECT_TYPE, message).at(location))
-        };
+        let wrong =
+            |message: String| Err(Error::new(sqlstate::WRONG_OBJECT_TYPE, message).at(location));
         let aggregate = matches!(&call, Call::Function { function, .. } if function.kind == b'a');
         if star && !aggregate {
             let name = name.text();
@@ -1139,8 +1135,8 @@ impl Analysis<'_> {
                         Error::unsupported(&format!("the call of {}", name.text())).at(location)
                     );
                 }
-                let declared = coerce::resolve_generics(&inputs, declared)
-                    .map_err(|e| e.at(location))?;
+                let declared =
+                    coerce::resolve_generics(&inputs, declared).map_err(|e| e.at(location))?;
                 let args = self.arguments(args, &declared)?;
                 let kind = ExprKind::Func {
                     function,
@@ -1180,9 +1176,7 @@ impl Analysis<'_> {
             Place::Update => Some("UPDATE"),
             Place::Values => Some("VALUES"),
             Place::InsertSelect => {
-                return Err(
-                    Error::unsupported("an aggregate in an INSERT's SELECT").at(location)
-                );
+                return Err(Error::unsupported("an aggregate in an INSERT's SELECT").at(location));
             }
             // Its level is its arguments' columns' query's, which is the one the subquery is read in: a
             // subquery here reads no table of its own.

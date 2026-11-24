@@ -410,8 +410,7 @@ impl Writer<'_> {
         let mut conditions = std::mem::take(&mut self.conditions);
         conditions.extend(self.query.filter);
         for (at, condition) in conditions.into_iter().enumerate() {
-            self.sql
-                .push_str(if at == 0 { " WHERE " } else { " AND " });
+            self.sql.push_str(if at == 0 { " WHERE " } else { " AND " });
             self.expr(condition)?;
         }
         Ok(())
@@ -436,8 +435,7 @@ impl Writer<'_> {
     fn grouped(&mut self) -> Result<(), Error> {
         let query = self.query;
         for (at, target) in query.group.iter().enumerate() {
-            self.sql
-                .push_str(if at == 0 { " GROUP BY " } else { ", " });
+            self.sql.push_str(if at == 0 { " GROUP BY " } else { ", " });
             self.target(*target)?;
         }
         Ok(())
@@ -446,15 +444,15 @@ impl Writer<'_> {
     fn ordered(&mut self) -> Result<(), Error> {
         let query = self.query;
         for (at, sort) in query.sort.iter().enumerate() {
-            self.sql
-                .push_str(if at == 0 { " ORDER BY " } else { ", " });
+            self.sql.push_str(if at == 0 { " ORDER BY " } else { ", " });
             self.target(sort.target)?;
-            self.sql.push_str(match (sort.descending, sort.nulls_first) {
-                (false, false) => " ASC NULLS LAST",
-                (false, true) => " ASC NULLS FIRST",
-                (true, false) => " DESC NULLS LAST",
-                (true, true) => " DESC NULLS FIRST",
-            });
+            self.sql
+                .push_str(match (sort.descending, sort.nulls_first) {
+                    (false, false) => " ASC NULLS LAST",
+                    (false, true) => " ASC NULLS FIRST",
+                    (true, false) => " DESC NULLS LAST",
+                    (true, true) => " DESC NULLS FIRST",
+                });
         }
         Ok(())
     }

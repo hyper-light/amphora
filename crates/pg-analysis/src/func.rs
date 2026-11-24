@@ -292,10 +292,18 @@ fn body(src: &str) -> Option<Body> {
         "boolge" => |a, _| bools(a, O::is_ge),
         "texteq" | "nameeq" | "nameeqtext" | "texteqname" => |a, _| texts(a, O::is_eq),
         "textne" | "namene" | "namenetext" | "textnename" => |a, _| texts(a, O::is_ne),
-        "text_lt" | "text_pattern_lt" | "namelt" | "namelttext" | "textltname" => |a, _| texts(a, O::is_lt),
-        "text_le" | "text_pattern_le" | "namele" | "nameletext" | "textlename" => |a, _| texts(a, O::is_le),
-        "text_gt" | "text_pattern_gt" | "namegt" | "namegttext" | "textgtname" => |a, _| texts(a, O::is_gt),
-        "text_ge" | "text_pattern_ge" | "namege" | "namegetext" | "textgename" => |a, _| texts(a, O::is_ge),
+        "text_lt" | "text_pattern_lt" | "namelt" | "namelttext" | "textltname" => {
+            |a, _| texts(a, O::is_lt)
+        }
+        "text_le" | "text_pattern_le" | "namele" | "nameletext" | "textlename" => {
+            |a, _| texts(a, O::is_le)
+        }
+        "text_gt" | "text_pattern_gt" | "namegt" | "namegttext" | "textgtname" => {
+            |a, _| texts(a, O::is_gt)
+        }
+        "text_ge" | "text_pattern_ge" | "namege" | "namegetext" | "textgename" => {
+            |a, _| texts(a, O::is_ge)
+        }
         "text_starts_with" => |a, _| Ok(Value::Bool(text(a.first())?.starts_with(text(a.get(1))?))),
         "textcat" => |a, _| {
             let mut s = text(a.first())?.to_owned();

@@ -24,9 +24,7 @@ use amphora_pg_analysis::{
     output, utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
-use amphora_pg_catalog::{
-    Datum, PG_CATALOG_NAMESPACE, SearchPath, catalog_by_oid, catalog_named,
-};
+use amphora_pg_catalog::{Datum, PG_CATALOG_NAMESPACE, SearchPath, catalog_by_oid, catalog_named};
 use amphora_pg_parser::gram;
 use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree, Val};
 
@@ -256,7 +254,10 @@ impl Relations for Catalog {
             sql.ends_with(&format!("(\"{}\")", c.name.replace('"', "\"\"")))
                 || sql.ends_with(&format!("({})", c.name))
         });
-        column.and_then(|at| at.checked_add(1)).into_iter().collect()
+        column
+            .and_then(|at| at.checked_add(1))
+            .into_iter()
+            .collect()
     }
 
     fn index(&self, relation: u32, name: &str) -> bool {

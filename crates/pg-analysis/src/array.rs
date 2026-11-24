@@ -434,8 +434,7 @@ pub fn receive(
     bytes: &[u8],
     read: impl Fn(&[u8]) -> Result<(Value, usize), Error>,
 ) -> Result<(Array, usize), Error> {
-    let invalid =
-        |message: String| Error::new(sqlstate::INVALID_BINARY_REPRESENTATION, message);
+    let invalid = |message: String| Error::new(sqlstate::INVALID_BINARY_REPRESENTATION, message);
     let (count, rest) = word(bytes)?;
     if count < 0 {
         return Err(invalid(format!("invalid number of dimensions: {count}")));
@@ -724,10 +723,18 @@ mod tests {
         ] {
             let array = input(type_oid::TEXT, literal, text).unwrap();
             let key = key(&array).unwrap();
-            assert_eq!(of_key(type_oid::TEXT, &key), Some(array.clone()), "{literal}");
+            assert_eq!(
+                of_key(type_oid::TEXT, &key),
+                Some(array.clone()),
+                "{literal}"
+            );
             assert_eq!(output(&array, shown).unwrap(), literal);
             for cut in 0..key.len() {
-                assert_eq!(of_key(type_oid::TEXT, &key[..cut]), None, "{literal} at {cut}");
+                assert_eq!(
+                    of_key(type_oid::TEXT, &key[..cut]),
+                    None,
+                    "{literal} at {cut}"
+                );
             }
         }
         assert_eq!(of_key(type_oid::TEXT, &[3]), None);

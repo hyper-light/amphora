@@ -420,8 +420,7 @@ impl Analysis<'_> {
         };
         self.lateral(lateral);
         self.scopes.push(Scope::default());
-        let mut targets =
-            self.placed(Place::Subselect, |a| a.target_list(&s.target_list))?;
+        let mut targets = self.placed(Place::Subselect, |a| a.target_list(&s.target_list))?;
         for target in &mut targets {
             self.resolve_unknown(target)?;
         }
@@ -680,7 +679,12 @@ impl Analysis<'_> {
             .map(|target| target.expr)
             .collect();
         let by_key = |table: usize| {
-            let Some(oid) = self.tables.get(table).map(|t| t.oid).filter(|oid| *oid != 0) else {
+            let Some(oid) = self
+                .tables
+                .get(table)
+                .map(|t| t.oid)
+                .filter(|oid| *oid != 0)
+            else {
                 return false;
             };
             let key = self.session.relations.primary_key(oid);

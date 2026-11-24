@@ -677,6 +677,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1923 => (0x9113_5026_c13a_e4a7, top),
         // Typename: SimpleTypename opt_array_bounds
         1964 => (0xc58b_b6eb_3ec8_28bf, typename),
+        // opt_array_bounds: opt_array_bounds '[' ']'
+        1970 => (0x3fc9_fa1e_7faf_0612, unbounded),
         // opt_array_bounds: /* EMPTY */
         1972 => (0x5be7_5729_4b12_8d74, nil),
         // SimpleTypename: GenericType
@@ -1780,6 +1782,13 @@ fn typename(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     Ok(Value::Node(Some(id)))
 }
 
+/// `opt_array_bounds '[' ']'`: `lappend($1, makeInteger(-1))`.
+fn unbounded(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut bounds = r.list(1)?;
+    bounds.push(r.push(Node::Integer(-1))?);
+    Ok(Value::List(bounds))
+}
+
 /// `columnDef`. SplitColQualList keeps the Constraints and takes out a COLLATE clause; only
 /// ColConstraintElem's ported rules reach ColQualList, so every element is a Constraint.
 fn column_def(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
@@ -2438,7 +2447,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 293);
+        assert_eq!(n, 294);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of

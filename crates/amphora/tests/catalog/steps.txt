@@ -1,0 +1,235 @@
+# T-PG.12.1: what pgbench's built-in scripts ask before they start (REL_19_0 src/bin/pgbench/pgbench.c:5411,
+# GetTableInfo), as scripts/postgres-extended-answers.py reads it.
+# The start-up statements with no pgbench tables: pgbench's "could not count", and no row.
+s1: Q|select count(*) from pgbench_branches
+s1: Q|select o.n, p.partstrat, pg_catalog.count(i.inhparent) from pg_catalog.pg_class as c join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) where c.relname = 'pgbench_accounts' and o.n is not null group by 1, 2 order by 1 asc limit 1
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||t:pgbench_accounts|0 ~ DP| ~ E||0 ~ S
+# pgbench -i's tables.
+s1: Q|create table pgbench_history(tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22))
+s1: Q|create table pgbench_tellers(tid int not null,bid int,tbalance int,filler char(84)) with (fillfactor=100)
+s1: Q|create table pgbench_accounts(aid    int not null,bid int,abalance int,filler char(84)) with (fillfactor=100)
+s1: Q|create table pgbench_branches(bid int not null,bbalance int,filler char(88)) with (fillfactor=100)
+s1: Q|insert into pgbench_branches(bid,bbalance) select bid, 0 from generate_series(1, 2) as bid
+s1: Q|insert into pgbench_tellers(tid,bid,tbalance) select tid, (tid - 1) / 10 + 1, 0 from generate_series(1, 20) as tid
+s1: Q|insert into pgbench_accounts(aid,bid,abalance,filler) select aid, (aid - 1) / 5 + 1, 0, '' from generate_series(1, 10) as aid
+s1: Q|alter table pgbench_branches add primary key (bid)
+s1: Q|alter table pgbench_tellers add primary key (tid)
+s1: Q|alter table pgbench_accounts add primary key (aid)
+# The start-up statements, as pgbench sends them.
+s1: Q|select count(*) from pgbench_branches
+s1: Q|select o.n, p.partstrat, pg_catalog.count(i.inhparent) from pg_catalog.pg_class as c join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) where c.relname = 'pgbench_accounts' and o.n is not null group by 1, 2 order by 1 asc limit 1
+s1: Q|vacuum pgbench_branches
+s1: Q|vacuum pgbench_tellers
+s1: Q|truncate pgbench_history
+s1: Q|vacuum analyze pgbench_accounts
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||t:pgbench_accounts|0 ~ DP| ~ E||0 ~ S
+# The same over the extended protocol, text and binary.
+s1: P||select count(*) from pgbench_branches| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||select count(*) from pgbench_branches| ~ B|||||1 ~ E||0 ~ S
+s1: P|part|select o.n, p.partstrat, pg_catalog.count(i.inhparent) from pg_catalog.pg_class as c join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) where c.relname = $1 and o.n is not null group by 1, 2 order by 1 asc limit $2| ~ DS|part ~ S
+s1: B||part||t:pgbench_accounts,t:1| ~ DP| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,t:1|1 ~ DP| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,n| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,t:0| ~ E||0 ~ S
+s1: B||part||t:nosuch,t:1| ~ E||0 ~ S
+s1: B||part||t:pg_class,t:1| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,t:-1| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,t:x| ~ E||0 ~ S
+s1: B||part||t:pgbench_accounts,t:1| ~ E||0 ~ B||part||t:pgbench_tellers,t:5| ~ E||0 ~ S
+# The catalogs the query reads.
+s1: Q|select count(*) from pg_catalog.pg_partitioned_table
+s1: Q|select count(*) from pg_inherits
+s1: Q|select count(inhparent) from pg_inherits
+s1: Q|select partrelid, partstrat, partdefid from pg_partitioned_table
+s1: Q|select inhrelid, inhparent, inhseqno, inhdetachpending from pg_inherits
+s1: Q|select 'pg_partitioned_table'::regclass, 'pg_catalog.pg_inherits'::regclass::oid
+s1: Q|select n.nspname, c.relname, c.relkind from pg_class as c join pg_namespace as n on (n.oid = c.relnamespace) where c.relname = 'pgbench_tellers'
+s1: Q|select pg_catalog.pg_inherits.inhrelid from pg_catalog.pg_inherits
+s1: Q|select pg_inherits.nosuch from pg_inherits
+s1: Q|select inhparent from pg_partitioned_table
+# count.
+s1: Q|select count(*), count(filler), count(bid), count(1), count('a') from pgbench_branches
+s1: Q|select count(*) from pgbench_history
+s1: Q|select count(*)
+s1: Q|select count(*) + 1, 2 + count(tid) from pgbench_tellers
+s1: Q|select count(*) from pgbench_history where bid = 2 group by bid
+s1: Q|select nspname from pg_namespace where nspname = 'public'
+s1: Q|select count(*) from pgbench_tellers where bid = 2
+s1: Q|select bid, bid from pgbench_branches order by bid asc limit 1
+s1: Q|select count, bid from pgbench_tellers group by bid order by count asc limit 1
+s1: Q|select count(*), bid from pgbench_tellers group by bid order by count asc limit 1
+s1: Q|select a.bid, b.bid from pgbench_branches as a cross join pgbench_tellers as b order by bid asc limit 1
+s1: Q|select bid, count(*) from pgbench_tellers group by bid order by bid asc limit 5
+s1: Q|select bid, count(*) from pgbench_tellers group by 1 order by 1 asc limit 1
+s1: Q|select bid + 1, count(*) from pgbench_tellers group by bid + 1 order by bid + 1 asc limit 5
+s1: Q|select count(*) from pgbench_tellers group by bid order by bid asc limit 5
+s1: Q|select tid, bid, count(*) from pgbench_tellers group by tid order by tid asc limit 2
+s1: Q|select aid from pgbench_accounts order by aid asc limit 3
+s1: Q|select aid from pgbench_accounts order by 1 asc limit '2'
+s1: Q|select bid, filler from pgbench_branches order by filler asc limit 2
+s1: Q|select 'x', aid from pgbench_accounts order by 2 asc limit 1
+s1: Q|select count(*) from pgbench_tellers limit 0
+s1: Q|select aid, abalance from pgbench_accounts where abalance = 0 order by aid asc limit 1 + 1
+s1: P||select count($1) from pgbench_branches| ~ B||||t:a| ~ E||0 ~ S
+s1: P||select count($1::int) from pgbench_branches| ~ DS| ~ B||||n| ~ E||0 ~ S
+# Joins.
+s1: Q|select b.bid, count(t.tid) from pgbench_branches as b left join pgbench_tellers as t on (t.bid = b.bid) group by b.bid order by 1 asc limit 5
+s1: Q|select b.bid, t.tid from pgbench_branches as b left join pgbench_history as t on (t.bid = b.bid) order by 1 asc limit 5
+s1: Q|select b.bid, t.tid from pgbench_branches as b join pgbench_tellers as t on (t.tid = b.bid) order by t.tid asc limit 5
+s1: Q|select count(*) from pgbench_branches cross join pgbench_tellers
+s1: Q|select pgbench_branches.bid, pgbench_tellers.tid from pgbench_branches join pgbench_tellers on pgbench_tellers.tid = pgbench_branches.bid order by 1 asc limit 1
+s1: Q|select count(*) from pgbench_branches as a join pgbench_branches as b on a.bid = b.bid
+s1: Q|select count(*) from pgbench_tellers as t join generate_series(1, 3) as s on s = t.tid
+# LATERAL.
+s1: Q|select o.n from pgbench_branches as b cross join lateral (select b.bid + 1) as o(n) order by 1 asc limit 5
+s1: Q|select b.bid from pgbench_branches as b cross join lateral (select b.bid + 1) as o(n) where o.n = 3
+s1: Q|select n, count(*) from pgbench_tellers as t cross join lateral (select t.bid + 0, 'x') as o(n) group by n order by 1 asc limit 5
+s1: Q|select n, count(*) from pgbench_tellers as t cross join lateral (select t.bid - 1) as o(n) group by n order by 1 asc limit 5
+s1: Q|select b.bid, o.n from pgbench_branches as b join lateral (select b.bid + 1) as o(n) on o.n = 3
+s1: Q|select n from lateral (select 1) as o(n)
+s1: Q|select o.x, p.y from pgbench_branches as b cross join lateral (select b.bid + 1) as o(x) cross join lateral (select o.x + 1) as p(y) order by 1 asc limit 5
+s1: Q|select b.bid, s from pgbench_branches as b cross join lateral (select 'a') as o(s) order by 1 asc limit 1
+s1: Q|select count(*) from pgbench_branches as b cross join lateral (select b.bid) as o(n) left join pgbench_tellers as t on t.tid = o.n
+# current_schemas, array_position, text[].
+s1: Q|select current_schemas(true), pg_catalog.current_schemas('f')
+s1: P||select current_schemas($1)| ~ DS| ~ B||||t:f| ~ DP| ~ E||0 ~ S
+s1: P||select current_schemas($1)| ~ B||||n|1 ~ E||0 ~ S
+s1: P||select current_schemas($1)| ~ B||||t:t|1 ~ E||0 ~ S
+s1: Q|select array_position(current_schemas(true), 'public'), array_position(current_schemas(true), 'nosuch')
+s1: Q|select array_position('{a,b,c}'::text[], 'b'), array_position('{a,b,a}'::text[], 'a', 2)
+s1: Q|select array_position('[5:7]={a,b,c}'::text[], 'b'), array_position('{}'::text[], 'b'), array_position('{a,NULL}'::text[], 'b')
+s1: Q|select array_position('{1,2,3}'::int[], 2), array_position('{1,2,3}'::int8[], 3::int8)
+s1: Q|select array_position('{{a},{b}}'::text[], 'a')
+s1: Q|select array_position('{a,b}', 'b')
+s1: Q|select array_position(1, 2)
+s1: Q|select array_position('{1,2}'::int[], 'x')
+s1: Q|select array_position('{a}'::text[], 1)
+s1: P||select array_position($1, $2)|1009,25 ~ DS| ~ B||||x:7b782c4e554c4c2c797d,t:y| ~ E||0 ~ S
+s1: P||select array_position($1, $2)|1009,25 ~ B||||n,t:y| ~ E||0 ~ S
+s1: P||select array_position($1, $2)|1009,25 ~ B||||t:{x},n| ~ E||0 ~ S
+s1: P||select array_position($1, $2, $3)|1009,25,23 ~ B||||t:{x},t:x,n| ~ E||0 ~ S
+s1: P||select array_position($1::text[], $2)| ~ DS| ~ B||||t:{NULL},n| ~ E||0 ~ S
+s1: P||select $1::text[]| ~ DS| ~ B||||t:{b}|1 ~ DP| ~ E||0 ~ S
+s1: P||select $1::text[]| ~ B|||1|x:0000000100000000000000190000000200000001000000016100000001| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:00000001000000010000001900000002000000010000000161ffffffff| ~ DP| ~ E||0 ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000010000000000000019000000020000000100000001610000000162|1 ~ E||0 ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000010000000000000019000000020000000500000001610000000162| ~ E||0 ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000000000000000000019| ~ E||0 ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000070000000000000019| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:ffffffff0000000000000019| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000010000000200000019| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000010000000000000017| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:00000001000000000000001900000002000000010000000161| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:0000000100000000000000190000000100000001000000016162| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:0000000100000000000000190000000100000001000000056100| ~ S
+s1: P||select $1::text[]| ~ B|||1|x:000000010000000000000019ffffffff00000001| ~ S
+s1: P||select $1::int[]| ~ B|||1|x:00000001000000000000001700000001000000010000000300000100| ~ S
+s1: P||select $1::int[]| ~ B||||x:7b312c2d322c4e554c4c7d|1 ~ E||0 ~ S
+s1: P||select $1::int[]| ~ B||||x:7b312c787d| ~ S
+s1: Q|select '{a,b}'::text[], '{}'::text[], '{"a b","",NULL,"NULL",a\\ b,"x\"y","{","," , ab c }'::text[]
+s1: Q|select '{{a,b},{c,d}}'::text[], '[0:1][2:2]={{a},{b}}'::text[], ' { a , b } '::text[], '{{},{}}'::text[]
+s1: Q|select '{a,b}'::text[]::text, 'x'::text::text[]
+s1: Q|select '{public,a}'::name[], '{t,f}'::bool[], '{a,bc}'::"char"[], '{1,2}'::oid[], '{2026-01-02 03:04:05}'::timestamp[]
+s1: Q|select '{a,b'::text[]
+s1: Q|select 'a,b}'::text[]
+s1: Q|select '{a,b}}'::text[]
+s1: Q|select '{a,b} x'::text[]
+s1: Q|select '{a,,b}'::text[]
+s1: Q|select '{a,}'::text[]
+s1: Q|select '{"a"b}'::text[]
+s1: Q|select '{a"b"}'::text[]
+s1: Q|select '{{a},b}'::text[]
+s1: Q|select '{{a},{b,c}}'::text[]
+s1: Q|select '{a{b}}'::text[]
+s1: Q|select '{"a'::text[]
+s1: Q|select '{a\\'::text[]
+s1: Q|select ''::text[]
+s1: Q|select '[1:2]={a}'::text[]
+s1: Q|select '[1:2]{a,b}'::text[]
+s1: Q|select '[2:1]={a}'::text[]
+s1: Q|select '[a]={a}'::text[]
+s1: Q|select '[1:]={a}'::text[]
+s1: Q|select '[1={a}'::text[]
+s1: Q|select '[1:2147483647]={a}'::text[]
+s1: Q|select '[-2147483648:2147483646]={a}'::text[]
+s1: Q|select '[99999999999]={a}'::text[]
+s1: Q|select '[1][1][1][1][1][1][1]={a}'::text[]
+s1: Q|select '{{{{{{{a}}}}}}}'::text[]
+s1: Q|select '{{{{{{a}}}}}}'::text[]
+s1: Q|select '{1,x}'::int[]
+s1: Q|select '{1,99999999999}'::int[]
+s1: Q|select 1::int[]
+s1: Q|select '{a}'::nosuch[]
+s1: Q|select '{a}'::text[] + 1
+s1: Q|select 'a'::text::int[]
+# Refusals of aggregates and grouping.
+s1: Q|select bid, count(*) from pgbench_branches
+s1: Q|select pgbench_branches.bid, count(*) from pgbench_branches
+s1: Q|select bid + 1, count(*) from pgbench_branches group by bbalance
+s1: Q|select bbalance from pgbench_branches group by bid order by 1 asc limit 1
+s1: Q|select tid from pgbench_history group by bid
+s1: Q|select bid from pgbench_branches group by bid order by bbalance asc limit 1
+s1: Q|select bid from pgbench_history group by bid order by tid asc limit 1
+s1: Q|select bid from pgbench_branches where count(*) = 1
+s1: Q|select a.bid from pgbench_branches as a join pgbench_branches as b on count(*) = 1
+s1: Q|select count(count(*)) from pgbench_branches
+s1: Q|select count(*) from pgbench_branches group by count(*)
+s1: Q|select count(*) from pgbench_branches group by 1
+s1: Q|select bid from pgbench_branches order by bid asc limit count(*)
+s1: Q|select count(*) from generate_series(1, count(*)) as g
+s1: Q|select 1 from pgbench_branches as b cross join lateral (select count(b.bid)) as o(n)
+s1: Q|update pgbench_branches set bbalance = count(*)
+s1: Q|insert into pgbench_branches (bid) values (count(*))
+s1: Q|select count() from pgbench_branches
+s1: Q|select count(1, 2) from pgbench_branches
+s1: Q|select count(nosuch) from pgbench_branches
+s1: Q|select int4pl(*) from pgbench_branches
+s1: Q|select nosuch(*) from pgbench_branches
+s1: Q|select pg_backend_pid(*) from pgbench_branches
+s1: Q|select bid from pgbench_branches group by 2
+s1: Q|select bid from pgbench_branches group by 0
+s1: Q|select bid from pgbench_branches group by 1.5
+s1: Q|select bid from pgbench_branches group by 'a'
+s1: Q|select bid from pgbench_branches order by 2 asc limit 1
+s1: Q|select bid from pgbench_branches order by 'a' asc limit 1
+s1: Q|select bid from pgbench_branches order by nosuch asc limit 1
+s1: Q|select bid from pgbench_branches group by nosuch
+s1: Q|select bid from pgbench_branches order by bid asc limit -1
+s1: Q|select bid from pgbench_branches order by bid asc limit bid
+s1: Q|select bid from pgbench_branches order by bid asc limit 'x'
+s1: Q|select bid from pgbench_branches order by bid asc limit 'x'::text
+s1: Q|select bid from pgbench_branches order by bid asc limit 1 / 0
+# Refusals of names.
+s1: Q|select bid from pgbench_branches cross join pgbench_tellers
+s1: Q|select x.bid from pgbench_branches as b
+s1: Q|select pgbench_branches.bid from pgbench_branches as b
+s1: Q|select b.nosuch from pgbench_branches as b
+s1: Q|select nosuch from pgbench_branches as b
+s1: Q|select 1 from pgbench_branches as a cross join pgbench_tellers as a
+s1: Q|select 1 from pgbench_branches cross join pgbench_branches
+s1: Q|select 1 from pgbench_branches as a join pgbench_tellers as b on a.nosuch = 1
+s1: Q|select 1 from pgbench_branches as a join pgbench_tellers as b on x.bid = 1
+s1: Q|select 1 from pgbench_branches as a join pgbench_tellers as b on bid = 1
+s1: Q|select 1 from pgbench_branches as a join pgbench_tellers as b on a.bid
+s1: Q|select 1 from pgbench_branches as a join nosuch as b on a.bid = 1
+s1: Q|select 1 from pgbench_branches as a left join pgbench_tellers as b on a.bid = c.tid left join pgbench_history as c on c.bid = a.bid
+s1: Q|select 1 from lateral (select b.bid) as o(n) cross join pgbench_branches as b
+s1: Q|select 1 from pgbench_branches as a left join pgbench_tellers as t join pgbench_history as h on h.bid = a.bid on t.tid = a.bid
+s1: Q|select o.n from pgbench_branches as b cross join lateral (select b.bid) as o(n)  where n.x = 1
+s1: Q|select 1 from pgbench_branches as b cross join lateral (select bid, nosuch) as o(n)
+s1: Q|select n from pgbench_branches as b cross join lateral (select b.bid) as b(n)
+s1: Q|select 1 from lateral (select 1) as o(n) where n = 'x'
+s1: Q|select o from lateral (select 1) as o(n) where o.m = 1
+s1: Q|select int4 from pgbench_branches as b cross join lateral (select b.bid::int4, '1'::int4) as o
+s1: Q|select 1 from nosuch.pgbench_branches
+s1: Q|select nosuch.pgbench_branches.bid from pgbench_branches
+s1: Q|select public.pgbench_branches.bid from pgbench_branches as b
+s1: Q|select public.pgbench_branches.bid, pg_catalog.pgbench_branches.bid from pgbench_branches
+s1: Q|insert into pgbench_branches (bid) values (pgbench_branches.bid)
+s1: Q|insert into pgbench_branches (bid) values (bid)
+s1: Q|select array_position(array_position, 1) from pgbench_branches
+s1: Q|select current_schemas()
+s1: Q|select current_schemas(1)
+s1: Q|select current_schemas('x')
+# The tables are as they were.
+s1: Q|select bid, bbalance from pgbench_branches order by bid asc limit 5

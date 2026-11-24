@@ -328,8 +328,10 @@ impl super::Dialect for PostgresDialect {
     /// them a PostgreSQL statement may name is analysis's (section 11's unit 8).
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
         if let Some((function, types)) = pg_proc(name) {
-            return Ok((function.args.len() == arg_count && types.len() == arg_count)
-                .then(|| Func::Dialect(name.to_string())));
+            return Ok(
+                (function.args.len() == arg_count && types.len() == arg_count)
+                    .then(|| Func::Dialect(name.to_string())),
+            );
         }
         super::sqlite::resolve_builtin_function(name, arg_count)
     }
@@ -430,10 +432,10 @@ pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
         PgValue::Text(s) if oid == type_oid::BPCHAR => {
             Value::build_text(s.trim_end_matches(' ').to_string())
         }
-        PgValue::Text(s) => Value::build_text(s.clone()),
+        PgValue::Text(s) | PgValue::Unknown(s) => Value::build_text(s.clone()),
         PgValue::Char(c) => Value::build_text(char_text(*c)),
         PgValue::Array(array) => Value::Blob(array::key(array).ok_or_else(|| unstored(oid))?),
-        PgValue::Numeric(_) | PgValue::Unknown(_) => return Err(unstored(oid)),
+        PgValue::Numeric(_) => return Err(unstored(oid)),
     })
 }
 

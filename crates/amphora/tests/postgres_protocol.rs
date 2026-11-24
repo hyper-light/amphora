@@ -1369,6 +1369,25 @@ fn t_pg_11_1_pgbench_i_and_copy_answer_as_a_19_server_does() {
     assert!(compared.values().sum::<i32>() > 600, "{compared:?}");
 }
 
+/// T-PG.12.1: what pgbench's built-in scripts ask before they start (the count of its branches, its partition query,
+/// its relkind query), `count`, GROUP BY, ORDER BY, LIMIT, joins and LATERAL, `current_schemas`, `array_position`,
+/// arrays in text and in binary, and their refusals, each step's sent at once to the wire core, are answered as a
+/// PostgreSQL 19.0 server answered them, message by message.
+#[test]
+fn t_pg_12_1_the_start_up_queries_answer_as_a_19_server_does() {
+    let mut compared = std::collections::BTreeMap::new();
+    answers_as_a_19_server(
+        include_str!("catalog/steps.txt"),
+        include_str!("catalog/answers.txt"),
+        &["s1"],
+        &mut compared,
+    );
+    for tag in ['1', '2', 'C', 'D', 'E', 'T', 'Z', 't'] {
+        assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
+    }
+    assert!(compared.values().sum::<i32>() > 600, "{compared:?}");
+}
+
 /// T-PG.10.4: each message of T-PG.10.1's steps cut at each byte, a byte longer, and (but for a Parse's, whose
 /// text is the parser's own hostile input) with each byte at three others, a Sync behind it, is answered to
 /// its ReadyForQuery with at most one ErrorResponse, and the session goes on.
