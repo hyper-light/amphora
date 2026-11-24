@@ -9,7 +9,7 @@ fn b26_full_disk() {
     let disk = std::path::PathBuf::from(disk);
     let (s, last) = several_generations();
     let (mut refused, mut wrong) = (0, 0);
-    for left_free in (8u64 * 1024..).step_by(40 * 1024) {
+    for left_free in (8u64 * 1024..).step_by(12 * 1024) {
         let dir = disk.join("r");
         std::fs::create_dir_all(&dir).unwrap();
         let free = fs4::available_space(&disk).unwrap();
