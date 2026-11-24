@@ -1690,7 +1690,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn segments(&self) -> Segments {
-        *self.log.segments.lock()
+        self.log.segments.load()
     }
 
     fn segment_snapshot(&self, segment: SegmentId) -> WalSnapshot {
@@ -1711,7 +1711,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn closing_copied(&self) {
-        let _ = self.log.segments.lock().copied();
+        let _ = self.log.segments.update(Segments::copied);
     }
 
     fn iter_segment_frames(
@@ -11419,7 +11419,7 @@ pub mod test {
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
         let reopened = Database::open_file(io, copy_path, Arc::new(SqliteDialect)).unwrap();
         assert_eq!(
-            reopened.shared_wal.segments.lock().closing(),
+            reopened.shared_wal.segments.load().closing(),
             Some(SegmentId::First)
         );
         reopened
@@ -11460,7 +11460,7 @@ pub mod test {
         assert_eq!(copy.wal_total_backfilled, closing_frames);
         assert_eq!(frames(SegmentId::First), (closing_frames, closing_frames));
         assert_eq!(
-            log.segments.lock().state(SegmentId::First),
+            log.segments.load().state(SegmentId::First),
             Segment::Closing(Closing {
                 reads: 1,
                 copied: true,
@@ -11490,7 +11490,7 @@ pub mod test {
 
         assert_eq!(count_test_table(&reader), 30);
         reader.execute("commit").unwrap();
-        assert_eq!(log.segments.lock().state(SegmentId::First), Segment::Free);
+        assert_eq!(log.segments.load().state(SegmentId::First), Segment::Free);
         let current = run_checkpoint_until_done(&pager, passive);
         assert_eq!(current.closing, None);
         assert_eq!(frames(SegmentId::Second), (current_frames, current_frames));
@@ -11525,7 +11525,7 @@ pub mod test {
         during.execute("begin").unwrap();
         assert_eq!(count_test_table(&during), 30);
         held.execute("commit").unwrap();
-        assert_eq!(db.shared_wal.segments.lock().closing(), None);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
         let closing_file = dir.path().join("copy.db-wal");
         std::fs::OpenOptions::new()
             .write(true)
