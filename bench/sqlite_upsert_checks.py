@@ -12,8 +12,10 @@ at the end the rows of every table and the integrity check.
 
 Left out: which of two UNIQUE constraints a row meets first (no document says; a refusal is held as UNIQUE's), an
 expression that raises (SQLite evaluates a constant one before the statement's first row), what Amphora has no table
-function for (pragma_foreign_key_check) or lists otherwise (pragma_index_list of a WITHOUT ROWID table), a STRICT table's
-CHECK that compares TEXT with a number (Amphora refuses the table), and a generated column (production doesn't make one).
+function for (pragma_foreign_key_check, pragma_integrity_check('t')) or lists otherwise (pragma_index_list of a WITHOUT
+ROWID table), a STRICT table's CHECK that compares TEXT with a number (Amphora refuses the table), a generated column
+(production doesn't make one), and two foreign key causes of plain INSERTs: a row with no parent (refused at once, SQLite
+at the statement's end) and OR REPLACE of a parent's row on a WITHOUT ROWID table (refused, SQLite takes the new row).
 
 usage: bench/sqlite_upsert_checks.py COUNT SEED > crates/engine/tests/fixtures/upsert_checks.tsv   (SQLite 3.54.0 in Python)
 """
@@ -24,7 +26,7 @@ import sys
 
 CLAUSES = ["", "", "", "", " ON CONFLICT ABORT", " ON CONFLICT FAIL", " ON CONFLICT IGNORE", " ON CONFLICT REPLACE", " ON CONFLICT ROLLBACK"]
 FUNCTIONS = ["pragma_integrity_check", "pragma_integrity_check", "pragma_integrity_check", "pragma_quick_check", "pragma_table_info('t')",
-             "pragma_foreign_key_list('ch')", "pragma_table_xinfo('t')", "pragma_integrity_check('t')"]
+             "pragma_foreign_key_list('ch')", "pragma_table_xinfo('t')"]
 
 
 class Case:
@@ -97,12 +99,12 @@ class Case:
                               f" UPDATE OR IGNORE t SET {x} = 2 WHERE id = old.id;"] + [" DELETE FROM t WHERE id = old.id;"] * (rng.random() < 0.3))
         return f"CREATE TRIGGER g{at} {event}{of} ON t{when} BEGIN INSERT INTO lg VALUES ('{event}', {', '.join(values)});{act} END"
 
-    def value(self, col, bad=0.25):
+    def value(self, col, bad=0.25, inserted=False):
         rng = self.rng
         if col == "id":
             return rng.choice(["1", "2", "3", "'2'", "9", "95"] + ["NULL"] * (rng.random() < 0.2)) if "TEXT" not in self.key else rng.choice(["'a'", "'b'", "'c'", "'long'"])
         if col == "f":
-            return rng.choice(["1", "1", "2", "8", "NULL"])
+            return rng.choice(["1", "1", "2", "NULL"] + ["8"] * (not inserted))
         if col == "u":
             return rng.choice(["1", "2", "3", "4", "5", "NULL"])
         if rng.random() < bad:
@@ -129,8 +131,8 @@ class Case:
 
     def upsert(self):
         rng = self.rng
-        rows = ", ".join("(" + ", ".join(self.value(x, 0.08) for x in self.cols) + ")" for _ in range(rng.choice([1, 1, 2, 3])))
-        head = rng.choice(["INSERT"] * 5 + ["INSERT OR ABORT", "INSERT OR FAIL", "INSERT OR IGNORE", "INSERT OR REPLACE", "INSERT OR ROLLBACK"])
+        rows = ", ".join("(" + ", ".join(self.value(x, 0.08, True) for x in self.cols) + ")" for _ in range(rng.choice([1, 1, 2, 3])))
+        head = rng.choice(["INSERT"] * 5 + ["INSERT OR ABORT", "INSERT OR FAIL", "INSERT OR IGNORE", "INSERT OR ROLLBACK"] + ["INSERT OR REPLACE"] * (not (self.fk and self.without_rowid)))
         where = lambda: rng.choice([""] * 4 + [f" WHERE {rng.choice(['t.', 'excluded.'])}{rng.choice(self.cols)} {rng.choice(['IS NOT NULL', '> 1', '< 5'])}"])
         arms = [f" ON CONFLICT(id) DO UPDATE SET {self.sets()}{where()}", f" ON CONFLICT(u) DO UPDATE SET {self.sets()}{where()}"]
         rng.shuffle(arms)
@@ -151,7 +153,7 @@ class Case:
             return f"UPDATE{rng.choice([''] * 3 + [' OR IGNORE', ' OR FAIL', ' OR REPLACE'])} t SET " + ", ".join(f"{x} = {self.value(x, 0.4)}" for x in cols) + where
         if drawn < 0.95:
             return f"DELETE FROM t{where}"
-        return f"INSERT{rng.choice(['', ' OR IGNORE', ' OR REPLACE'])} INTO t VALUES (" + ", ".join(self.value(x) for x in self.cols) + ")"
+        return f"INSERT{rng.choice(['', ' OR IGNORE'] + [' OR REPLACE'] * (not (self.fk and self.without_rowid)))} INTO t VALUES (" + ", ".join(self.value(x, 0.25, True) for x in self.cols) + ")"
 
     def text(self):
         rng = self.rng
