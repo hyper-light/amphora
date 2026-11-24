@@ -1468,7 +1468,40 @@ green on main while real time refused.
 
 ## Runs
 
-RUNS_PLACEHOLDER
+r1896 on adacachy2, needs cpus=8 (00:28Z to 00:40Z; load (1 min) 70 to 131 on 32 cores, CPU "some" avg10 26 to 59%,
+I/O "some" 2.2 to 6.8%: a loaded host). Arms: c3ebea5d (main's product with the new tests: the red run) and
+2332e2ae (the fix, formatted), debug test binaries built in turn in the lane's one target dir (88 s, then 33 s).
+
+| check | c3ebea5d (main's product) | 2332e2ae (the fix) |
+|---|---|---|
+| focused: `database::slot::`, the new test, test 5 | 4 of 15 fail: the three slot tests (5 ms where 200 ms; `Expired` after 6 ms; the turn given up) and the new test, `stale-base refusals: [(7, "Persisted: in 617 rounds"), (5, "Replicated(...): in 540 rounds")]` | 15 of 15 pass |
+| `cargo clippy -p amphora --all-targets --locked -- -D warnings` | | exit 0 (36.6 s) |
+| `database::replicated:: replication::`, round 1 | 170 passed, 2 failed: the new test, `session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower` (63 s) | 172 passed (50 s) |
+| round 2 (arm order reversed) | 171 passed, 1 failed: the new test (60 s) | 172 passed (67 s) |
+| round 3 | 171 passed, 1 failed: the new test (67 s) | 171 passed, 1 failed: `every_falsifier_of_the_floor_holds_under_a_nemesis` (52 s) |
+
+The new test on driven time with clocks moving gives main's product the refusals real time gives it: 7 and 5 over
+96 writes, and none with the fix. The suite's one fix-arm failure is main's own flake: r1920 ran that test alone 4
+times on each arm, alternated (load 64 to 90). The fix passed 4 of 4, and main's product failed 1 of 4, "a driven
+operation was unanswered after 60000 rounds" with its leader mid-change (`changing true`). Each arm failed it once in
+7 runs. The fix arm's round 3 panic was not kept (the suite's output was filtered), so whether it is the same
+failure is not shown. `t_t1_10_r1_...` failed on main's product in round 1, as lane V11 saw it fail on main.
+
+**The ladder (r1896, after the suites; the fix's release bench, 47.8 s warm).** `ladder13.sh`: Amphora alone, V12's
+flags, 32 and 128 spread writers, both classes, 3 rounds, cell order reversed in round 2. Refusals are the
+driver's `Serialization` count by node (node 3 led every run). Load (1 min) 70 to 90, CPU "some" avg10 26 to 59%.
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 36.8, 41.4, 39.0 | 737, 844, 598 | 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 36.6, 43.2, 37.8 | 2,818, 2,228, 3,441 | 0 |
+| replicated | 32 | 0 0 0; 0 1 0; 0 0 0 | 48.0, 40.4, 46.8 | 631, 565, 582 | 0 |
+| replicated | 128 | 0 2 0; 3 1 1; 0 1 0 | 38.8, 42.8, 41.4 | 2,228, 3,572, 2,327 | 0 |
+
+Against V12's r1716 on main (9 to 41 refusals a run at 32 and 128 spread in both classes) and this lane's trace
+(24 to 31 at 32 spread): the persisted class has none left in 6 runs; the replicated class has 0 to 5 a run, its
+128-writer runs in each round. The rates are inside V12's (31.8 to 46.4 persisted, 30.4 to 38.6 replicated), one
+run a cell a round on a loaded host, so no speed is claimed either way.
 
 ## Commands
 
