@@ -73,6 +73,8 @@ class Draw:
         self.held = None
         # The names a CTE's body doesn't read by chance: its own, and those of its WITH clause it reads none of.
         self.hidden = []
+        # The CTE whose body is drawn next.
+        self.body_of = None
 
     def alias(self):
         self.aliases += 1
@@ -108,7 +110,8 @@ class Draw:
         hidden = set().union(*self.hidden) - set(ctes)
         unknown = [name for name in ("c", "d") if name not in ctes and name not in hidden]
         if drawn < 0.04 and unknown and self.take_fault("unknown"):
-            return rng.choice(unknown)
+            self.unknown = rng.choice(unknown)
+            return self.unknown
         if ctes and drawn < 0.8:
             return rng.choice(ctes)
         return rng.choice([source for source in SOURCES if source not in hidden])
@@ -153,6 +156,7 @@ class Draw:
                     "count": f"{name}(k) AS (SELECT k, v FROM {one})",
                     "twice": f"{name}(k, v) AS (SELECT 1, 1 UNION ALL SELECT x.k, y.v FROM {name} AS x JOIN {name} AS y ON x.k = y.k)",
                 }[kind]
+        self.body_of = name
         return f"{name} AS {hint}({self.select(ctes, scope, depth - 1, 'pair')})"
 
     def with_clause(self, ctes, scope, depth):
@@ -193,6 +197,7 @@ class Draw:
     def select(self, ctes, scope, depth, use, may_define=True):
         rng = self.rng
         before = ""
+        body_of, self.body_of = self.body_of, None
         if may_define and rng.random() < 0.4 and depth >= 0:
             before, ctes = self.with_clause(ctes, scope, depth)
         text, name = self.item(ctes, scope, depth, [])
@@ -225,7 +230,11 @@ class Draw:
             value = f"({self.select(ctes, inner, depth - 1, 'scalar')})"
         sql = f"{before}SELECT {first}.k AS k, {value} AS v FROM {text}{where}"
         if rng.random() < 0.1:
-            sql += f" {rng.choice(['UNION', 'UNION ALL', 'EXCEPT'])} SELECT k, v FROM {self.source(ctes)}"
+            # A UNION's arm that names the CTE whose body it is reads the CTE in SQLite, its own WITH clause's CTE of the name
+            # or not: a finding of its own (the lane's record).
+            source = self.source([name for name in ctes if name != body_of])
+            if source != body_of:
+                sql += f" {rng.choice(['UNION', 'UNION ALL', 'EXCEPT'])} SELECT k, v FROM {source}"
         return sql
 
     def subquery(self, ctes, scope, depth):
@@ -368,7 +377,7 @@ def main():
                     "later": ["circular reference"],
                     "twice": ["multiple references to recursive table"],
                     "table": ["no such table"],
-                    "unknown": ["no such table"],
+                    "unknown": [f"no such table: {getattr(draw, 'unknown', None)}"],
                     "unread": ["no such table: nosuch", "circular reference: u", "no such table: c", "no such table: d"],
                     "column": ["no such column"],
                     "count": ["table "],
