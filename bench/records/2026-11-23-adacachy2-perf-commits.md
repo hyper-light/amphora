@@ -2396,3 +2396,138 @@ Engine: `SharedLog::end_closing_reads` gives back the mark and the counts of eac
 ## Runs
 
 r1093 (main 5 rounds, macOS); r1102 (diagnosis, a83c5de2 and 32ba72e3); r1188 (8f7212ed: clippy, fmt, `db::`, suite: 197 passed, 1 failed, `v13_...`); r1192 (Linux, main: build and clippy); r1232 (Linux, e11b9211: build, clippy 0, check-production 0, image test; its first lines, the tree and the fmt result, were read from its log afterwards: fmt-fix.log is empty, no diff, and the tree is e11b9211); r1222, r1296, r1310 (macOS re-checks of the merged trees); r1319 (macOS suite, ed3760bf), r1321 (Linux, ed3760bf), r1325 (red arm).
+
+# Lane V22 (commits): a slow local read gives way to a write that needs the room, landed; a page in flight as its read ends (2026-11-24, 08:42:34Z to 09:37Z)
+
+Ada's decision (11-24): on a nearly full disk a replica's slow local read gives way: it ends with a typed error ("snapshot too old") and the write goes through. Lane V21 built it; this lane finished its tests, closed what a page in flight could do as its read ends, and landed it.
+
+## Losses first
+
+1. **No macOS run of mine started.** One was queued from 09:00Z (r1395, the engine's tests) behind other lanes' to the end of the hour. The new tests ran on Linux only; `v13_...` on macOS is listed as main's own from V21's runs, not run again.
+2. **The three rounds and the ladder ran before the last merges.** Main then moved four times in crates (lane B25 twice, A27 in the replicated queue, C10 in the engine's translate and vdbe). The landed tree (7173ca16) had the touched tests, one suite round and the gates (Checks).
+3. **No cost of the new check was measured.** A page read from the log or the file takes one lock of its connection's own, uncontended, where V21's check was a fence and a load; main had neither. No read benchmark was run; a page found in a cache or the pool takes no lock.
+4. **The ladder's load was 45 to 70 and partly this lane's own builds**, so it shows refusals and misses, no rate.
+5. **No loom or shuttle model** (below), and no torn page: the bytes a test's read finds are all another generation's or all its own; the check refuses both without looking at them.
+6. The red run of the file's page test stops at its first case (Today's page path, not shared, before the bytes); its other cases were green only. The log's was run red in each format (Today's path).
+7. **Left as V21 left it (by the code, not tested):** the early end uses what the last pass's time let the log grow by, as measured, so a burst larger than that can pass the room before the pass that frees the segment is done, and submits are refused until then.
+8. One check run (r1498) started with three build jobs on needs of two; I stopped it after about 15 s and started it again with needs of three.
+
+## `past_its_room_...`'s failure in the Linux suite: the test's own set-up, not the rule
+
+V21's rewritten test told the voter its disk is full and took "a pass says the room as it now stands" from one write's flush. A pass follows a flush only when one is asked (`Ask::copy`: a restart due, or just made) or 25 ms passed since the last (`CHECKPOINT_EVERY`). The write was neither, so when its flush came within 25 ms of the last pass the owner never learned the room, and 254 writes were taken in a room of 2,273,078 frames.
+
+Traced on a diagnostic branch (0bb3db71, never for main; r1360, adacachy2, the test alone, `--exact`, one thread; the probe prints the room and the passes counted before and after that write):
+
+| run | result | room before, after the write | passes before, after |
+|---|---|---|---|
+| as it is, 20 rounds | 9 failed (`None`), 11 passed | failed: 2,273,078, 2,273,078; passed: 2,273,078, 0 | failed: 3, 3; passed: 3, 5 |
+| a pass never due by time (60 s), 4 rounds | 4 failed | 2,273,087, 2,273,087 | 2, 2 |
+| a pass due at each flush (0 ms), 6 rounds | 6 passed | 2,273,078, 0 | 3, 5 |
+
+Every failure had no pass after the disk was told full, every pass had one, and forcing either side forces the result. So the cause is the test's, on neither main's rule nor the new one's: main's old test wrote on past 25 ms with its flushes running, so it always learned it. The fix is there: `learn_room` makes a restart due by its share, so a pass is asked as it is made, waits for the restart (the fact, not a time), then spends the share. Green 5 of 5 after (r1371), and in every suite below.
+
+## The two tests the rule changes (cited: replication.md B "What an open read keeps" and "A read gives way to a write that needs the room", C, D; store.md decision 45)
+
+- `a_local_read_holds_off_no_restart_...` (T1): the 40 writes get a room they fit in (512 frames past the file, asserted: frames under the room). Every assertion stands (the log started again under the read, the read beside it answered 1 to 40, the two views [1] and [1], a restart once more, a read after). New: a restart due by its share alone ends no read; then the disk is told it has room for 16, and the log starts again while the read is open, whose third view is refused, typed.
+- `a_follower_past_its_room_...`: two restarts under an open read, which is refused, typed (a read takes the log past no room); then its flushes held, as `past_its_room_...` holds them, until it is past its room, 4 more applied, and the disk filled. The assertions on the fence and the reopen are as they were.
+
+Red when the rule is removed (5e6b1e7c: `flush` ends no read; r1371, 2 rounds each): T1 0 of 2 ("the read's own view": a third [1]), the follower 0 of 2 ("a read took the log past its room"), `a_slow_local_read_past_the_logs_room_...` 0 of 2 ("a write refused under a slow local read"), `past_its_room_...` 2 of 2 (it holds its flushes, no read). Green with it (014d8c7b, r1371): 5 of 5 each of T1, the follower, `past_its_room_...`.
+
+## A page in flight as its read ends (engine)
+
+V21 checked a flag once a page's bytes had arrived. Reading it, then driving it, found four things that check did not cover; 1, 3 and 4 are now covered by `ReadHold::admit`, the one place a page read is taken in, and 2 by a check of the read once the pool gave a page.
+
+1. A page that passed the check was shared after it. A read ended between the check and the sharing (the pool of shared pages, or the decoded records) would have put the file's old page in the pool after the copy had forgotten it, for every later read. The page is now taken in and shared under the lock the owner ends the read under: wholly before the end, or not at all.
+2. A page found in the pool was not checked at all: between the read's lookup in the log and its lookup in the pool, the file's version may have become another's. It is checked once found.
+3. A page whose bytes arrive after its read rolled back, or in the connection's next read, met a cleared flag and was let in. A page is now checked against the read it was asked in, by number (`Asked`).
+4. A record or a chain an ended read found broken, or a short read of a cut file, was said as corruption. It is now "snapshot too old" (the log line and the typed retry).
+
+The store's databases share no pool (`Sharing::Off`, database.rs), so 1's pool half and 2 are not on the shipped path, and 3 needs a backend that completes reads later (`UnixIO` and `WindowsIO`, the two `PlatformIO`s, complete them in line). 1's other half, the records kept decoded, is on it (the log is mixed by default): a wrong record can be kept only under the generation it was read for, which no later read asks for, or for a segment that was already in use again when its header was read. I reproduced none of the four in a running server, and did not run V21's code against the tests below (they need `Asked`). By its code, V21's check would pass the log's and the file's tests (it asked after the bytes) and fail the pool's; 1 and 3 are driven at the lock (the last test), 4 by the mixed log's case.
+
+Tests (each drives the read step itself; no thread or time decides): `crates/engine/tests/read_ended.rs`, a file whose read runs the owner's part within the page's read (end the reads, copy, reset, switch, write over the frame; or end and copy over the file's page), before its bytes or once they were read:
+
+- `d45_a_log_page_in_flight_as_its_read_ends_is_never_taken_in`: both log formats, both page paths;
+- `d45_a_file_page_in_flight_as_its_read_ends_is_never_taken_in_nor_shared`: both page paths, the pages shared or not, before the bytes and after them;
+- `wal.rs`, `d45_a_shared_page_found_as_its_read_ends_is_never_taken_in`: the pool's lookup, held between the log's and its own;
+- `wal.rs`, `d45_a_page_is_taken_in_wholly_before_its_read_ends_or_not_at_all`: the owner's end on another thread waits for a page being taken in; the same page's bytes refused once the read ended, rolled back, and in the next read.
+
+The check is the place that stops it: with it removed (5170c8cb: `admit` takes no lock and refuses nothing, the pool's two checks gone; everything else as it is, the lookup's own check `find_frame` included; r1441) all four are red: the log's page answered `"new 1"`, the file's `"new"`, the pool's `"new"` (each the newer row in a read whose snapshot is the older), and the last "the segment was given back under its page" (0 reads counted, 1 expected). The mixed log's case alone was red too (b8683d65, r1573: `Mixed, Today: Ok("new 1")`, the record half of the check). Green with it: 2 and 25 passed (r1400, e46d6937; the engine's `d45_` tests), and on the merged trees 2 and 26 (fa4c28f9, r1475; 96c31ae9, r1550; one more is lane B25's).
+
+Loom: the repository names loom for the engine (`cfg(loom)` in crates/engine/Cargo.toml) and no test of it uses it. There is shuttle for a few sync types (`cfg(shuttle)`), not for this code, so no model was run. `admit` is a lock: it is sound by the lock's order, not by an ordering of atomics as V21's fence was.
+
+## Suites: main against the merge (r1441, adacachy2, one binary each, arms alternated, `--test-threads=4 database::replicated:: replication:: database::log_bound::`)
+
+Arms: `main2` is 2b713d77, `b2` is 1df45ec2 (its merge). The later merges moved main's backup, `Database::open`'s handling of a left second segment and `wal.rs`'s tests (fa4c28f9, 14f76fba), the replicated queue (6a790f28), and the engine's translate and vdbe (96c31ae9).
+
+| round | main 2b713d77 | branch 1df45ec2 |
+|---|---|---|
+| 1 | 204 passed, 1 failed (77 s, load 65): `every_falsifier_of_the_floor_holds_under_a_nemesis` ("the group calm not reached in 60000 driven rounds") | 206 passed, 0 failed (81 s, load 59) |
+| 2 | 205 passed, 0 failed (85 s, load 68) | 206 passed, 0 failed (69 s, load 58) |
+| 3 | 205 passed, 0 failed (74 s, load 59) | 206 passed, 0 failed (90 s, load 62) |
+
+Order: main, branch; branch, main; main, branch. The branch has the same tests and the new slow-read test. No test fails on the branch that main doesn't fail; `every_falsifier_...` is main's own (V18's and V20's rounds have it too). `past_its_room_...` passed all three, and m0 (V21's tree merged with main, before these tests: r1348) failed T1 and the follower alone (204 passed, 2 failed, 106 s, load 30).
+
+## The ladder (r1408, release bench of e46d6937 against main 2b713d77, cpus=8, arms alternated in each cell, the cell order reversed in round 2, 09:08:38Z to 09:13:33Z, load 45 to 70)
+
+V16's ladder (`cell13.py`), Amphora alone, 32 and 128 spread writers, both classes, 3 rounds. **No write was refused by any node in the 24 cells, on either arm.** Deadline misses (10 s) per round, 1 to 3:
+
+| class | writers | branch | main |
+|---|---|---|---|
+| persisted | 32 | 0, 0, 0 | 0, 0, 0 |
+| replicated | 32 | 0, 0, 0 | 0, 0, 0 |
+| persisted | 128 | 6, 0, 0 | 7, 31, 0 |
+| replicated | 128 | 10, 0, 0 | 23, 9, 0 |
+| commits/s, persisted 32 | | 14.6, 17.2, 16.2 | 6.4, 17.2, 12.2 |
+| commits/s, replicated 32 | | 15.6, 11.0, 10.0 | 10.4, 9.8, 11.2 |
+| commits/s, persisted 128 | | 11.0, 11.8, 8.0 | 9.0, 11.0, 15.6 |
+| commits/s, replicated 128 | | 7.6, 15.2, 15.8 | 7.6, 6.2, 13.2 |
+
+No miss is new to the change: none on either arm at 32; at 128 the branch missed in 2 of 6 cells (16), both in round 1, where main missed in both too (30), and main in 4 of 6 (70). The load was other lanes' and this lane's own builds, so no rate is compared. One cell of each arm ended with a node's connection closed as the bench stopped ("node 1 stop", "node 2 stop").
+
+## Checks
+
+- fa4c28f9 (merged with main e69221de): the seven touched tests, 3 rounds each, 21 of 21; `read_ended` 2 passed; the engine's `d45_` tests 26 passed (r1475, load 59 to 62).
+- 14f76fba (main 77f1e18f): clippy `-p amphora -p amphora-engine --all-targets` 0 (109 s), fmt 0 (r1502; its check-production was stopped by me as main moved).
+- 6a790f28 (main d16ea9d1): fmt 0; clippy 0 (93 s, amphora-engine and amphora checked); check-production 0 (10,616 left, as the ratchet holds; 62 s); the seven touched tests, 2 rounds each, 14 of 14; the replicated suite 210 passed, 0 failed (134 s, 2 threads, load 49) (r1538, r1539).
+- 96c31ae9 (main 925c73fb, lane C10's landing): fmt 0; clippy 0 (121 s); check-production 0 (10,616 left, as the ratchet holds; 161 s); the seven touched tests, 2 rounds each, 14 of 14 (T1's first round took 9 s, the rest 0 to 2 s; not traced); `read_ended` 2 passed, the `d45_` tests 26 passed (r1549, r1550). The landing's merge, 7173ca16, adds to it main's records and seven lines of an engine integration test (crates/engine/tests/oracle_findings.rs; its message says only records moved), so no check was run again before the push.
+- Soak on 6a790f28's binary: T1, the follower, `past_its_room_...`, `a_slow_local_read_past_...` and `a_restart_due_waits_for_no_read_...`, 20 rounds each, alone: 100 of 100 (r1555, load 45 to 49).
+- dfb6c62d (the branch alone, main 2b713d77): clippy 0, check-production 0 (r1446). Its count fell from 10,617 to 10,616 (one sign-losing cast fewer), so scripts/engine-ratchet.toml is lowered; e46d6937, before that and before one parameter was dropped, failed clippy (too many arguments) and check-production (the count below the ratchet) (r1404).
+- After landing, 7173ca16 (the tree as pushed, its binary the one 96c31ae9 built): the replicated suite 210 passed, 0 failed (81 s, 3 threads, load 40; r1568).
+- `python3 scripts/test_requirements.py` ok; docs/requirements.toml's T-T1.8.D1 states the rule.
+
+`v13_thirty_two_spread_writers_reach_a_group_through_any_node_once_each` fails on macOS on main's own code (V21: r1188's tree, "row 0 at member 1: Timeout"); no macOS run of mine started (below).
+
+## Runs
+
+| run | what | result |
+|---|---|---|
+| r1348 | ee7a4385 (V21's tree merged with main ef8cb085): build, the suite (2 threads); main: build | above: 204 passed, 2 failed |
+| r1360 | the probe (0bb3db71) | above |
+| r1371 | 014d8c7b: the three tests, 5 rounds each; 5e6b1e7c: the rule removed | above |
+| r1394, r1400 | d9797adf, e46d6937: the engine's tests | r1394 stopped at a rollback the tests asked of a transaction the refusal had already ended; r1400 2 and 25 passed |
+| r1403 | release bench: `--locked` refused (bench/ has no lock of its own) | not used |
+| r1408 | the ladder | above |
+| r1404, r1446, r1502, r1538 | the gates | above |
+| r1436 | 8 cores and 20 GB asked: refused (7 idle) | |
+| r1441 | 1df45ec2: build; the suites; 5170c8cb: the check removed | above |
+| r1475, r1539 | the touched tests and the suite on the merged trees | above |
+| r1498 | stopped (loss 8) | |
+| r1549, r1550, r1555, r1568 | the gates, the touched tests and the soak on the merged trees; the suite on the landed tree | above |
+| r1573 | b8683d65: the mixed log's case with the check removed | red, above |
+| r1395 | macOS, the engine's tests: queued, never started | |
+
+Branches: perf/commits-v21 (landed); diag/commits-v22-room, diag/commits-v22-red, diag/commits-v22-nocheck (probes and red arms, never for main).
+
+## Commands (adacachy2, the clone at ~/.cache/amphora-perf/commits-remote, CARGO_HOME, CARGO_TARGET_DIR and CARGO_INCREMENTAL=0 as RULES 6 has them)
+
+```
+cargo test -p amphora --lib --locked --no-run        # each arm's binary copied to ~/.cache/amphora-perf-bin/commits/v22-tests-<arm>
+v22-tests-<arm> --exact database::replicated::tests::<test> --test-threads=1 --nocapture
+v22-tests-<arm> --test-threads=4 database::replicated:: replication:: database::log_bound::
+cargo test -p amphora-engine --locked --test read_ended
+cargo test -p amphora-engine --locked --lib -- --test-threads=4 d45_
+cargo clippy -p amphora -p amphora-engine --all-targets --locked -- -D warnings; bash scripts/check-production.sh
+(cd bench && cargo build --release); python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v13/cell13.py <amphora-bench> 29490 <out> 32|128 spread persisted|replicated
+```
+
+The probe: `V22_EVERY_MS` (the pass period) and the test's `eprintln!` of its room and passes, on diag/commits-v22-room.
