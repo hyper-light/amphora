@@ -1306,3 +1306,112 @@ threads) had `every_falsifier_…` at 7 of 17.
 The coordinator said at 08:31Z that lane B24 had read pending output of other runs by mistake, r1229 and r1263 of this lane
 among them. r1229's twelve cells were all seen here and are in its folder; r1263 never answered ("did not answer in 15s") and r1277 ran its
 steps; r1277's logs were read again in the folder (clippy finished with amphora checked, 21 passed twice, ratchet 10617).
+
+## The line proved on every interleaving: two of its rules were wrong, and are put right (perf-A27)
+
+**Lane times.** First command 08:38:40Z; the hour ends 09:38:40Z. Branch `perf/cross-a27`, from origin/main 6077d42a (lane A26's
+landing). In crates/ this lane moves the line and the queue's room to `replicated/line.rs` unchanged, then changes them, and adds
+`crates/line-loom`.
+
+**Losses.**
+- A26's "first come, first served" held to the line, not to the owner: a call left the line as its place was granted, before it sent, so
+  the one behind it could send first. A26's own order test failed in 2 of this lane's 6 main rounds of the suites at load 24 to 53 and in 7 of
+  200 runs side by side at load 42, always `left: [1, 2, 4, 3]` (fixed: 0 of 200, 0 of 3 rounds).
+- A26's rule for the largest call (6c9ca0c0) kept the hole it was written to close in part: it left room for a record without entries
+  (120 bytes), but a leader's heartbeats and their answers carry a read's round (145 bytes), a read's answer an entry, and a commit
+  entries. A call past the calls' room was never answered in a group: at a leader its read's round was refused, at a follower its answer.
+  On a leaderless member a heartbeat with a round was refused, `TooLarge`. Both are red on main's rule and on 3bef6837's, green here.
+- Where the queue's room is under about twice REQUEST_MAX (64 MiB and a few KB), a call declaring REQUEST_MAX is now refused `TooLarge`
+  at once. Main admitted it alone; before A26 it was `Full` at once. It is so in a group of one as well, where no record needs the
+  room (the bounds learned at open don't know the group's members). Read from `queue_bounds`, not run.
+- With an oversized call held, an image (more than a whole command's record) is still refused and waits for it; unchanged. A second
+  record bigger than what is left beside the first waits for it to be taken, as before.
+- A call waiting for the memory budget (`Budget::take_until`, A21) does not hear its owner's end: it waits for the budget or its
+  deadline. Read from the code, not run; not changed (out of this lane's line).
+- The suites ran on 0d877f36 (before the docs, the hang guards of two joins and main's PG20 and B25 landings), not on the landed tree; the
+  landed tree had clippy, the touched tests and check-production. The suites on main: 6 rounds, the fix: 3.
+- The rate of wire records refused beside a draining line was not measured; the stress's own record source pushes as fast as it can and
+  was refused 60,000 times in 100,000 tries (its bound of 3 to 8 inputs, filled by its own records), which is no one's rate.
+- TSan sees what its instrumented build (std included) reports: no report in 3 rounds of 18 tests, none on main; it can't find a race that no run
+  reaches. It ran on x86_64 Linux. macOS on arm64: see the runs.
+
+**1. The line on every interleaving** (`crates/line-loom`, T-QB.1.19): the owner's own `line.rs`, compiled over loom. loom has no `SeqCst`
+access stronger than acquire-release, so the stand-in puts the fence C++'s mapping puts before each (Power's leading sync); the one
+fence `Line::join` states is the code's own. Every interleaving where the model ran at no preemption bound, at most three or two preemptions where that
+is not small. fix 593a8ec6's `line.rs`, r1385, r1398 (f5b4cced, e7ff0802), 4 cores:
+
+| event | property | interleavings |
+|---|---|---|
+| a place given back as a call arrives | admitted; nothing held | 1,580,791 (all) |
+| bytes given back, the place first | admitted | 50,199 (all) |
+| the bounds learned again | admitted, no other place taken | 78 (all) |
+| two in line, one place | the first admitted first, never both | 41,343 (3 preemptions) |
+| two in line, two places at once | the first *sent* first | 463,581 (3) |
+| a newcomer as a place is given back | behind the one in line | 52,929 (3) |
+| two in line, two places at once | both admitted | 1,561,525 (3) |
+| a deadline, no room | `Full` at the inputs' bound | 178 (all) |
+| a deadline beside a give-back, one behind | admitted or `Full`; the next admitted | 32,930 (2) |
+| the owner's end, two in line, then one more | each hears the reason | 5,660 (3) |
+| a wire record as a call waits | admitted at once, always | 348,533 (3) |
+| the largest call and a record | the record admitted at once, the call after | 505,834 (3) |
+| a place granted, its budget room gone, back | admitted with its charge | 8,217 (3) |
+| the same, never back | `Full`, or admitted before it went; the next admitted | 639 (2) |
+| two writes, each needing all the room | both admitted | 338 (3) |
+
+Nine broken copies of the file, each red where it must be (r1398; M1 to M10, the seventh not run: its
+parameter is in the model's constructor): no fence in `join` (deadlock), the next in line not rung (deadlock), a newcomer past those in line (`left: [2, 1]`),
+the owner's end ringing none (deadlock), any call in line taking a place (`[2, 1]`), bytes given back unrung (deadlock), a call admitted
+uncharged (`admitted uncharged`), and out of the line before it sends (`[2, 1]`). and `room_came`'s
+read at `Relaxed` (deadlock, where the bytes come back last: r1483; green in the place's test, whose later give-backs fence it).
+
+**2. ThreadSanitizer** (nightly-2026-09-05, rustup target x86_64-unknown-linux-gnutsan, std instrumented, in a private RUSTUP_HOME; a
+control program with a race reports it, rc 66): main 6077d42a, the 14 tests of `a21_`, `a26_`, `a11_` and the pressure test, rc 0, no report (r1361). The fix
+0d877f36, the same and the four `a27_`, three rounds, rc 0 each, no report (r1407). The stress (`a27_a_burst_in_line_from_every_thread_is_answered_and_holds_nothing_after`, 64 writers
+of 48 calls on a machine of 32 threads; bounds moving, wire records beside): 3,072 calls, every far deadline admitted, 360 to 376 near ones `Full`.
+
+**3. The oversized-call hole**: `a27_no_call_a_queue_takes_refuses_a_vote_or_a_heartbeat` and `a27_a_group_answers_the_largest_call_a_queue_holds_alone`
+(T-QB.1.20), r1406 on 0d877f36: red on main's rule (`MsgHeartbeat of 145 bytes refused: TooLarge`; the group's relay refused at its first such
+record) and on 3bef6837's (`MsgHeartbeat of 96 bytes refused`), green on the fix.
+
+**4. The path after a place is granted** (`a27_a_place_granted_as_the_budgets_room_went_waits_for_it_again_or_is_full`, T-QB.1.21; loom's two): the call holds
+neither place nor charge while the one behind goes before it, is admitted with its charge by the give-back's event and the owner's take, or
+is `Full` at its deadline holding nothing. Loom's M9 (admitted uncharged) is red.
+
+**5. Gates** (the tree merged with main e69221de): clippy -p amphora -p amphora-line-loom --all-targets, check-production, fmt, the requirements test, the touched tests.
+
+The suites (`database::replicated:: replication::`, two test threads an arm, cpus=2 each, FAILED only; main 04eb931a's lib test binary is the
+tree this lane began from; the fix is 0d877f36):
+
+| round | main 04eb931a | fix 0d877f36 |
+|---|---|---|
+| 1 (r1339, 08:43Z, load 24 to 50; r1410, 09:04Z, load 53) | `a26_a_call_past_…`, `every_falsifier_…` (194 passed) | none (200 passed) |
+| 2 (r1340, 08:43Z; r1411) | `every_falsifier_…` (195 passed) | none (200 passed) |
+| 3 (r1341, 08:43Z; r1411) | none (196 passed) | none (200 passed) |
+| 4 (r1411, 09:04Z, load 53) | `a26_a_call_past_…` (195 passed) | |
+| 5 (r1410, 09:07Z, load 48) | none (196 passed) | |
+| 6 (r1410, 09:09Z, load 58) | `every_falsifier_…` (195 passed) | |
+
+(The fix's three rounds ran beside main's, 09:04Z to 09:11Z, load 48 to 60; r1410 and r1411 were stopped after that to free
+cores for the gates.) `every_falsifier_…` is A25's known failure (7 of 17 rounds of main 75efff54); `a26_a_call_past_…` is the
+order defect. The order test (`a26_a_call_past_the_queues_count_waits_in_line_and_a_wire_record_does_not`), eight
+side by side, 25 times each, load 42: main 7 of 200 failed, the fix 0 of 200 (r1406).
+
+**Runs.** Scripts in bench/records/2026-11-23-adacachy2-perf-cross-a27/ (`loom_mut.sh`, `tsan.sh`, `arms2.sh`), outputs in
+`~/.cache/amphora-perf/cross-a27-out/` on adacachy2 (RULES rule 6: Linux at needs of 1 to 6 cores, runs refused at times; a macOS run placed on a
+runner I must not use was stopped before it started).
+
+| run | what | result |
+|---|---|---|
+| r1339, r1340, r1341, 08:43Z, cpus=2 each | main's suites | table |
+| r1349, 08:44Z, cpus=4 | TSan build of main 6077d42a, 104 s | rc 0 |
+| r1361, 08:50Z, cpus=4 | TSan, main's `a21_`, `a26_`, `a11_`, the pressure test | 14 passed, rc 0, no report |
+| r1375, 08:55Z | loom, the harness's first run | 14 passed |
+| r1398, 09:00Z, cpus=4 | loom on e7ff0802's line.rs, then the nine broken copies | table |
+| r1401, r1406, 09:02Z to 09:08Z, cpus=6 | the fix's lib tests, the arms | 25 passed; red 1 and 2; the order test |
+| r1407, 09:04Z, cpus=4 | TSan on 0d877f36, 3 rounds (build 151 s) | 18 passed each, rc 0, no report; 372 near-deadline `Full` of 3,072 calls |
+| r1410, r1411, 09:04Z, cpus=2 each | the suites in pairs | table |
+| r1447, 09:09Z, cpus=5 | clippy of 2b8977af (main PG20 merged) | rc 0 (48 s, engine compiled, amphora and line-loom checked); the harness under --cfg loom named dead code, fixed |
+| r1478, 09:14Z | loom with four models unbounded (the owner's end, both budget ones, the two writes) | stopped at 09:19Z, unfinished, after 5 min: the landed tree keeps three and two preemptions for them, as r1398 ran them |
+| r1483, 09:15Z, cpus=1 | M3 (`room_came` read at `Relaxed`) on `bytes_given_back_…` | red, deadlock |
+| r1499, 09:16Z, cpus=3 | 2f5c6d83 (main 77f1e18f merged: B25's backups, engine wal.rs), the landed tree but for the loom bounds above and this record | built 30 s; the touched tests 25 passed twice; clippy -p amphora -p amphora-line-loom --all-targets rc 0 (52 s, amphora-engine compiled, amphora and line-loom checked), the harness's clippy under --cfg loom rc 0; check-production rc 0 (76 s, ratchet 10617); fmt rc 0; requirements test OK |
+| r1438, 09:09Z, MacBook Pro 2, cpus=8 | macOS (arm64), 2b8977af: loom, the touched tests | not ended when this was written (09:20Z) |
