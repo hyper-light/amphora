@@ -426,12 +426,12 @@ fn t_qb_1_19_two_writes_that_need_all_the_room_are_both_admitted() {
 }
 
 /// T-QB.1.19: an owner's end reaches a call that waits for the memory budget, as it reaches those in
-/// line, and takes nothing from the budget. Do: the budget's all held by another holder, a write waits
-/// for its room; the owner ends, as the other holder gives the room back. Expect: the write refused
-/// with the owner's reason, or admitted where the room came first; nothing held after.
+/// line, and takes nothing from the budget. Do: the budget's all held by another holder, and kept, a
+/// write comes and waits for its room as the owner ends. Expect: the write refused with the owner's
+/// reason on every interleaving, nothing held after but the other's.
 #[test]
 fn t_qb_1_19_the_owners_end_reaches_a_call_that_waits_for_the_budget() {
-    every(Some(3), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let room = queue(2);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
@@ -439,18 +439,13 @@ fn t_qb_1_19_the_owners_end_reaches_a_call_that_waits_for_the_budget() {
             let room = Arc::clone(&room);
             thread::spawn(move || Room::submit_by(&room, 5, FAR).map(drop))
         };
-        let given = thread::spawn(move || drop(other));
-        let reason = Refusal::Fenced("ended".into());
-        room.line.end(&reason);
-        let answered = write.join().unwrap();
-        assert!(
-            answered == Ok(()) || answered == Err(reason),
-            "{answered:?}"
-        );
-        given.join().unwrap();
+        room.line.end(&reason());
+        assert_eq!(write.join().unwrap(), Err(reason()));
         holds_nothing(&room);
-        assert_eq!((budget.held(), budget.waiting()), (0, 0));
+        assert_eq!((budget.held(), budget.waiting()), (5, 0));
         assert_eq!(room.line.ending.waits(), 0);
+        drop(other);
+        assert_eq!(budget.held(), 0);
     });
 }
 
