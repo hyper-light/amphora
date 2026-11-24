@@ -172,20 +172,25 @@ fn pause(d: Duration) {
     }
 }
 
-/// The log beside the database at `path`.
-fn wal_path(path: &Path) -> PathBuf {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    PathBuf::from(wal)
+/// The files of the log beside the database at `path`, its two segments' (decision 45): `-wal`,
+/// then `-wal2`.
+pub(crate) fn log_paths(path: &Path) -> [PathBuf; 2] {
+    ["-wal", "-wal2"].map(|suffix| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    })
 }
 
 /// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
 /// `-wal2`.
 fn segment_path(path: &Path, segment: SegmentId) -> String {
-    match segment {
-        SegmentId::First => format!("{}-wal", path.display()),
-        SegmentId::Second => format!("{}-wal2", path.display()),
-    }
+    let [first, second] = log_paths(path);
+    let file = match segment {
+        SegmentId::First => first,
+        SegmentId::Second => second,
+    };
+    file.display().to_string()
 }
 
 /// Makes `path`, if it doesn't exist yet, an empty file that a copy-on-write file system writes in
@@ -355,7 +360,8 @@ impl Db {
     /// [`Db::open_sharing`] in a directory that exists: it makes none.
     pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
-        in_place(&wal_path(path));
+        let [first, _] = log_paths(path);
+        in_place(&first);
         Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
     }
 
@@ -610,13 +616,11 @@ impl Db {
             let _closing = self.checkpoint()?;
             let _current = self.checkpoint()?;
         }
-        if !self.db.switch_log(cut_past).map_err(fail)? {
-            return Ok(false);
+        let switch = || self.db.switch_log(cut_past).map_err(fail);
+        match &self.backup {
+            Some(hooks) => hooks.fence.restart(seq, frame, !shipped, switch),
+            None => switch(),
         }
-        if let Some(hooks) = &self.backup {
-            hooks.fence.ended(seq, frame, !shipped)?;
-        }
-        Ok(true)
     }
 
     /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
@@ -684,25 +688,35 @@ impl Db {
         self.db.wal_end()
     }
 
-    /// `len` bytes of the current segment's file of the log from `offset` (decision 45); None
-    /// when there is no such file.
-    pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_at(
-            &segment_path(&self.path, self.db.wal_segment()),
-            offset,
-            len,
-        )
+    /// `len` bytes of `segment`'s file of the log from `offset` (decision 45); None when there is
+    /// no such file. The writer may switch at any moment, so a caller that reads a generation's
+    /// frames names the segment its header was in ([`Db::log_header`]), never the one current now.
+    pub(crate) fn read_log(
+        &self,
+        segment: SegmentId,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_at(&segment_path(&self.path, segment), offset, len)
     }
 
-    /// The header the current segment's file of the log holds (decision 45): its own, or that of
-    /// the generation the file held before, until its first commit writes its own. None while the
-    /// file holds none, which is no failure: a switch makes the file, or cuts it to nothing, and
-    /// the segment's first commit writes its header; a log folded whole is emptied too.
-    pub(crate) fn log_header(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        let len = usize::try_from(LOG_HEADER_BYTES)?;
-        let wal = segment_path(&self.path, self.db.wal_segment());
+    /// The segment current now and the header its file of the log holds ([`Db::segment_header`]):
+    /// its own, or that of the generation the file held before, until its first commit writes its
+    /// own.
+    pub(crate) fn log_header(&self) -> anyhow::Result<Option<(SegmentId, Vec<u8>)>> {
+        let segment = self.db.wal_segment();
         Ok(self
-            .read_to(&wal, 0, len)?
+            .segment_header(segment)?
+            .map(|header| (segment, header)))
+    }
+
+    /// The header `segment`'s file of the log holds (decision 45). None while the file holds none,
+    /// which is no failure: a switch makes the file, or cuts it to nothing, and the segment's first
+    /// commit writes its header; a log folded whole is emptied too.
+    pub(crate) fn segment_header(&self, segment: SegmentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let len = usize::try_from(LOG_HEADER_BYTES)?;
+        Ok(self
+            .read_to(&segment_path(&self.path, segment), 0, len)?
             .filter(|header| header.len() == len))
     }
 
@@ -716,6 +730,18 @@ impl Db {
     pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(&self.path.display().to_string(), offset, len)?
             .ok_or_else(|| anyhow::anyhow!("{} is gone", self.path.display()))
+    }
+
+    /// The pages of the database now, those only its log holds yet among them: the file a restore
+    /// of it makes.
+    pub(crate) fn pages(&self) -> anyhow::Result<u64> {
+        let mut pages = None;
+        self.query("PRAGMA page_count", [], |row| {
+            pages = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        let pages = pages.ok_or_else(|| anyhow::anyhow!("PRAGMA page_count answered no row"))?;
+        Ok(u64::try_from(pages)?)
     }
 
     /// The bytes the database's file holds.

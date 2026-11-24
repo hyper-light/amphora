@@ -32,10 +32,12 @@ The retry boundary ends before `prepare_db` begins and before a SQL session's `F
 An evaluated session is never replayed, including one that fails, captures no pages or cannot
 propose. Proposed changes and bootstrap seeds retain their UnknownOutcome semantics on leadership
 loss, displacement or deadline. A stale read completion cannot turn a proposal into a new operation.
-Queue/core-read admission can still refuse work at its existing bounds; no deadline is extended.
+A call the queue has no room for waits for it in line until its deadline, never refused by the
+queue's own count ("Amendment (lane perf-A26)" of QB.1, below); no deadline is extended.
 Application admission keeps one maximum wire record's bytes free within the existing shared byte
 budget, so waiting calls alone cannot prevent replication traffic from entering the same actor.
-Already admitted wire traffic can still fill that bounded budget and cause an honest refusal.
+Already admitted wire traffic can still fill that bounded budget: a wire record past it is refused
+at once (raft sends again what it lost), and a call waits for it to drain.
 
 The implementation currently retains the engine WAL for atomic application of committed Raft
 pages. It does not yet eliminate that apply journal in favor of the Raft log alone. Transactions
@@ -2626,17 +2628,53 @@ again at each tick of the pace (`Actor::rebound`), where the queues' bytes are c
 - The command queue's bytes are the budget's room for queues. Application calls hold that room less one wire record's,
   so that calls waiting for a leader cannot block the wire record that finds one. A wire record's image is the
   budget's room for one (SB.1), held inside the command queue's bound.
-- Application calls are also counted (`Control::call_bound`): no more than the inputs the owner takes in an election
+- Application calls were also counted (`Control::call_bound`): no more than the inputs the owner takes in an election
   timeout at its learned message rate (`Drain::bound(..).messages`), at least one, and never more than the queue's
-  slots less one, so that a wire record always finds a slot. Before the intake is measured, the slots less one.
-- A call is charged its worst case (`REQUEST_MAX`, 32 MiB), while the intake's byte rate is learned mostly from small
+  slots less one, so that a wire record always finds a slot. They are not counted apart since lane perf-A11, and take any
+  of the queue's inputs but the last.
+- A call was charged its worst case (`REQUEST_MAX`, 32 MiB), while the intake's byte rate is learned mostly from small
   wire records. A byte bound learned from that rate fell to one call and refused a change of members queued beside it
   (`every_falsifier_of_the_floor_holds_under_a_nemesis`). So calls are bounded in count by the rate and in bytes by the
-  room, never in bytes by the rate. A call refused for its count is `Full` at the count bound, one refused for its
-  bytes `Full` at the calls' byte bound.
+  room, never in bytes by the rate. A call past either waits for room (lane perf-A26, below); refused at its deadline, it
+  is `Full` at the bound it is past.
 
 The local writer's queue has no election: each request it admits is charged to the budget's room for queues, refused
 `Full` at that room.
+
+**Amendment (lane perf-A26, 2026-11-24): a call waits for the command queue's room; its own counts refuse none.**
+Ada, 2026-11-23: every request's memory is charged by its real or declared size, waits wake on events and never on
+timers, and no write is refused under load. A write waits for the memory budget's room (lane perf-A21), and the
+queue's bounds then refused it at once, the budget far from full: 4,096 writers at one leader were refused 1,001 times
+(`Full` at 23 to 2,794 inputs; replicated class, main 6c54b2cb), 1,024 of them 70 times, and none at V13's 32 and 128
+spread writers (bench/records/2026-11-23-adacachy2-perf-cross.md, lane perf-A26). What each bound protects, and what
+it does now:
+- The count of inputs in the owner's channel (`Control::commands`) bounds how long a wire record waits behind what came
+  before it: at most what the owner takes in an election timeout. The memory budget gives no such bound: its room holds
+  millions of small calls, and a heartbeat behind them comes after the election it was to prevent. The bound stands, and
+  a call it has no place for waits for one: the owner taking an input from its channel is the event that makes it.
+- The calls' bytes (`Control::called`, the queue's room less a wire record's) keep room for the wire record that finds a
+  leader while calls wait for one; the budget admits writes up to its whole room. The bound stands, and so does the
+  queue's whole (`Control::admitted`); a call either has no room for waits for bytes given back. The calls' bytes, holding
+  none, take one call larger than their bound (`within`), as a window that holds nothing sends one entry (hyper-raft's
+  `Inflights::full`): a call the budget has room for never waits for room that nothing can make. Such a call leaves the
+  queue a record without entries and its envelope (`alone`), so a vote or a heartbeat enters beside it and finds a leader,
+  and an image waits for it; a call past that is refused `TooLarge` at once, as one past the budget's whole limit is.
+- The count of calls the owner holds behind its prepared write or for a leader (`Actor::waiting`, held to the inputs'
+  count) bounded nothing the bytes don't: each of those calls holds its bytes of the calls' room and of the budget, none
+  of them stands before a wire record, and the line finds the soonest deadline in O(log N). It is gone; a write taken
+  from the channel is never refused for it, nor one put back once its term moved (`Actor::requeue`).
+- A wire record, a verdict and an attestation are refused at once as before: a record refused is a lost one, which raft
+  sends again.
+
+The calls that wait stand in line (`Line`), first come, first served, holding neither a place nor a charge: charges held
+by writes the queue has no room for would take the images' and the caches' room, and the image's room is a wire record's
+bound. Only the first in line looks, rung by each event that may make room (a place or bytes given back, the bounds
+learned again), and the next is rung as it leaves, so an event wakes one thread however many wait. A call leaves the line
+with its place, at its deadline (`Full` at the bound it is past), or with the owner's reason once its owner ends. A change
+of members, a hand-off and a catch-up take a place that is free without a turn, so no line of writes holds off the group's
+own changes. A write with its place charges the budget without waiting (`Budget::take`), and where that room went
+meanwhile it gives the place back and waits for the budget again. Tested by the `a26_` tests (T-QB.1.18) and by
+`unknown_leader_application_pressure_keeps_wire_admission_available` (A11's, whose refusal at once this replaces).
 
 **A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
 budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
@@ -2698,8 +2736,8 @@ wire records queued beside them (`Control::called`).
   than the budget's room for queues holds of an input's least in memory, its own envelope (`size_of::<Envelope>()`):
   a wire record may carry no bytes, so bytes alone would not bound the count. Before anything is measured, the room's
   envelopes. Calls are counted one fewer, so a wire record always finds a place. An input's place is given back when
-  the owner takes it from the channel (`Reservation::taken`), as a bounded channel's slot was; waiting calls are held
-  to the same bound. The pump's receipts in the tests grow to the bound (`Pump::receipts`). T-QB.1.6 tests the counts.
+  the owner takes it from the channel (`Reservation::taken`), as a bounded channel's slot was; waiting calls were held
+  to the same bound until lane perf-A26, and are held by their bytes since. The pump's receipts in the tests grow to the bound (`Pump::receipts`). T-QB.1.6 tests the counts.
 - Each queued input is charged its envelope (`ENVELOPE_BYTES`, `size_of::<Envelope>()`) against the queue's bytes,
   beside what it carries (lane constants-21): memory is counted once, in the bytes, and bounded once, by them, where
   before a count of envelopes and a byte bound that left them out together allowed up to twice the room. A change of

@@ -2692,3 +2692,104 @@ fn an_element_appended_to_the_root_array_counts_in_its_header() {
         }
     }
 }
+
+/// Do: a NOT EXISTS or NOT IN whose condition is an OR, with terms on the outer table alone in its
+/// branches: an equality with another literal in each, a range in each, the same term in all; beside
+/// a join key or not, over one table or two, under a LEFT JOIN. Each as the database opens, with the
+/// parallel mode on, and with statistics.
+/// Expect: SQLite's rows. The subquery becomes an anti join, its condition a WHERE term, and the terms
+/// the planner takes out of an OR (`st IN ('open', 'closed')`, `v < 2 OR v > 8`, `st = 'open'`) were
+/// filters on the outer table: the rows no branch names, which NOT EXISTS keeps, were gone (findings
+/// pqs-b03851bb53df213f and pqs-a3981225a1b45b70, seeds 912 and 911, whose own query is the last here).
+#[test]
+fn a_not_exists_keeps_the_rows_no_branch_of_its_or_names() {
+    let either = "(o.st = 'open' AND r.kind = 1) OR (o.st = 'closed' AND r.kind = 2)";
+    let statements: &[(String, &[&str])] = &[
+        (
+            format!("SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM r WHERE {either})"),
+            &["3", "5"],
+        ),
+        (
+            format!(
+                "SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = o.k AND ({either}))"
+            ),
+            &["3", "5"],
+        ),
+        (
+            format!(
+                "SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM r JOIN r AS q ON q.id = r.id \
+                 WHERE r.k = o.k AND ({either}) AND q.v > 0)"
+            ),
+            &["3", "5"],
+        ),
+        (
+            format!("SELECT id FROM o WHERE o.k NOT IN (SELECT r.k FROM r WHERE {either})"),
+            &["3", "5"],
+        ),
+        (
+            "SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM r \
+             WHERE (o.st = 'open' AND r.kind = 1) OR (o.st = 'open' AND r.v = o.v))"
+                .into(),
+            &["2", "3", "5"],
+        ),
+        (
+            "SELECT id FROM o WHERE o.id NOT IN (SELECT r.id FROM r \
+             WHERE (o.st = 'open' AND r.kind = 1) OR (o.st = 'open' AND r.v = 6))"
+                .into(),
+            &["2", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM r \
+             WHERE (o.v < 2 AND r.kind = 1) OR (o.v > 8 AND r.v = 6))"
+                .into(),
+            &["2", "3", "5"],
+        ),
+        (
+            format!(
+                "SELECT o.id, p.id FROM o LEFT JOIN o AS p ON p.id = o.id + 1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM r WHERE {either})"
+            ),
+            &["3|4", "5|NULL"],
+        ),
+        // An EXISTS becomes a semi join, whose rows the same terms only narrow.
+        (
+            format!("SELECT id FROM o WHERE EXISTS (SELECT 1 FROM r WHERE {either})"),
+            &["1", "2", "4"],
+        ),
+        (
+            "SELECT a0.rowid FROM t0 AS a0 WHERE (NOT EXISTS (SELECT 1 FROM t0 AS s459 \
+             WHERE ((a0.c0 BETWEEN 'true' AND a0.c0) OR (a0.c0 BETWEEN 2 AND s459.c0))))"
+                .into(),
+            &["1", "2", "3", "4", "5", "7", "8", "9"],
+        ),
+    ];
+    for (setting, parallel, statistics) in [
+        ("default", false, false),
+        ("parallel", true, false),
+        ("statistics", false, true),
+        ("parallel, statistics", true, true),
+    ] {
+        let (io, conn) = open();
+        for statement in [
+            "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, st TEXT, v INT)",
+            "CREATE TABLE r(id INTEGER PRIMARY KEY, k INT, kind INT, v INT)",
+            "INSERT INTO o VALUES (1,1,'open',1),(2,2,'closed',2),(3,3,'held',3),(4,1,'open',9),(5,2,'held',NULL)",
+            "INSERT INTO r VALUES (1,1,1,5),(2,2,2,6),(3,3,1,7)",
+            "CREATE TABLE t0(c0 VARCHAR(10) COLLATE RTRIM)",
+            "INSERT INTO t0 VALUES (1e308), (NULL), ('1.5'), (' a'), ('0'), ('abc'), (1000000000000000.0), (''), (-100)",
+        ] {
+            conn.execute(statement).unwrap();
+        }
+        if parallel {
+            conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            conn.execute("ANALYZE").unwrap();
+        }
+        for (sql, expected) in statements {
+            let mut got = rows(&io, &conn, sql);
+            got.sort();
+            assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}
