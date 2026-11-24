@@ -260,6 +260,29 @@ def main():
             if odd and even and med(odd) > 0 and med(even) > 0:
                 logs.append(math.log(med(odd) / med(even)))
         w(f"| {t} | {math.exp(sum(logs) / len(logs)):.3f} | {len(logs)} |" if logs else f"| {t} | - | 0 |")
+    # ---- per round
+    w("")
+    w("### Per round: geometric mean of Amphora/best competitor in that round (competitor fixed by the overall median), by client count")
+    w("")
+    w("Round i's own pair: Amphora's ops/s over the same competitor's in the same round, so each round's ratio is taken under one machine state. "
+      "Rounds 1, 3 and 5 ran Amphora first (odd), rounds 2 and 4 ran it last (even). Cells where either answered nothing are left out of that round.")
+    w("")
+    nr = len(paths)
+    w("| clients | " + " | ".join(f"round {i} ({'first' if i % 2 else 'last'})" for i in range(1, nr + 1)) + " |")
+    w("|---" * (nr + 1) + "|")
+    import math
+    for c in sorted({c for _, c in keys}):
+        row = []
+        for i in range(nr):
+            logs = []
+            for r0, op, cc, t, sep, a, b in ratios:
+                if cc != c:
+                    continue
+                ai, bi = a["ops"][i] if i < len(a["ops"]) else None, b["ops"][i] if i < len(b["ops"]) else None
+                if ai and bi:
+                    logs.append(math.log(ai / bi))
+            row.append(f"{math.exp(sum(logs) / len(logs)):.2f}x over {len(logs)} cells" if logs else "-")
+        w(f"| {c} | " + " | ".join(row) + " |")
     # ---- gaps
     w("")
     w("## 3. The ten largest gaps (Amphora furthest behind the best competitor)")
