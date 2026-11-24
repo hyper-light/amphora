@@ -1155,3 +1155,154 @@ its place was a runner this lane may not use); the other platforms' clippy.
   trees, and `every_falsifier_of_the_floor_holds_under_a_nemesis` the same: the suite's two most frequent reds.
 - Scripts: bench/records/2026-11-23-adacachy2-perf-cross-a25/a25tally.py; the rounds' logs are on adacachy2 in
   ~/.cache/amphora-perf/cross-a25-out/suite (34 logs).
+
+## A call the owner's queue has no room for waits for it; none is refused by the queue's count (perf-A26)
+
+**Lane times.** First command 07:41:18Z; the hour ends 08:41:18Z. Branch `perf/cross-a26`, from origin/main 6c54b2cb, merged
+with 67cc7e69 (lanes D5's and C6's landings: crates/amphora outside the replicated owner, crates/engine's optimizer). In
+crates/ this lane changes `database/replicated.rs` and, under `#[cfg(test)]`, `replicated/waiting.rs`.
+
+**Losses.**
+- A write the group can't commit before its deadline still isn't committed: at 4,096 writers and about ten commits a second
+  nearly all of them end `Timeout` or `UnknownOutcome` at 10 s, on main and on the fix alike. What is gone is the refusal at
+  once (`Full`): 0 on the fix in every cell run.
+- In the replicated 4,096-writer burst the driver counted fewer commits a second on the fix in each run: 2.0, 0.6 and 4.0
+  against main's 9.6, 7.6 and 8.2 (the first pair at different loads and needs; the other two at one load). It counts only
+  writes begun after the first second, which then stand behind 4,000 others, where on main a refused writer moved to another
+  member: that explanation is read from the driver's code (`repl.rs`, `commit`), not traced. Over 20 s counted after 12 s (r1280, r1290; two rounds, needs cpus=1, the order reversed) the arms cross: main 5.6 and 4.05 commits/s, the fix 4.1 and 6.8. The other bursts go both
+  ways (the tables). No throughput is claimed, better or worse, and no performance work was done here.
+- The suites ran at one test thread an arm, not eight (adacachy2 had 0 to 4 of 32 cores idle, so runs were refused at cpus=8, 4
+  and 2), and on 181b7de6 against main 67cc7e69, not on the landed tree; the landed tree had clippy, the touched tests and
+  check-production.
+- The ladder and the bursts ran on 181b7de6's tree with the diagnostic count, not on the landed tree, under other lanes' load
+  (28 to 81); main's first ladder had cpus=8 at load 28 to 35 and the fix's cpus=2 at 75 to 81.
+- A wire record is still refused at once by the same bounds, and a follower's forward or barrier is one: its loss at a leader
+  whose queue is full reaches the follower's caller as a timeout, never as a refusal. Not counted here. While a line
+  drains, its calls refill each place as it is given back, so a wire record finds the last place and no other, as main's queue
+  under retrying callers left it; the rate of records refused beside a line was not measured.
+- `Input::Attest` (binding an application) is refused at once by the count too; it is no write and has no deadline to wait to.
+- No loom or TSan run of `Line`. Its wait is argued from the C++ order in its comments, and driven by the tests.
+- Not driven by a test: the budget's room going between a place granted and the charge taken (`submit_by` gives the place back
+  and waits for the budget again).
+- The line's depth has no metric (§10): a name is Kiln Metrics' to agree.
+
+**What QB.1 promises, and what each of its bounds protects** (replication.md, "Decision (lane constants): the queue bounds
+by drain rate"; `queue_bounds`, `ReplicaHandle::enqueue`, `Actor::receive` and `requeue` on main 6c54b2cb). Four of the
+queue's own bounds refused a write at once, after the memory budget had admitted it (A21):
+
+| bound on main | the number, from | protects | does the memory budget give it? | now |
+|---|---|---|---|---|
+| `commands < command_bound - 1` in `enqueue` | the inputs the owner takes in a learned election timeout at its learned message rate (`command_counts`), at least two | how long a wire record waits behind the inputs before it in the owner's one channel; the last place is a wire record's | no: its room holds millions of small calls ahead of a heartbeat | stays; a call waits for a place, made as the owner takes an input |
+| `called <= applications` in `enqueue` | the budget's room for queues less one wire record's bytes (about half the room) | room for the wire record that finds a leader while calls wait for one | no: it admits writes up to its whole room | stays; a call waits for bytes given back |
+| `admitted <= queued` in `enqueue` | the budget's room for queues, read each tick | the sum of calls and wire records in memory | in part: it charges the writes, not the wire records beside them | stays, a wire record refused at once as before; a call waits |
+| `waiting.len() >= command_bound` in `receive` and `requeue` | the first row's count | nothing the bytes don't: each such call holds its bytes of the calls' room and of the budget, stands before no wire record, and costs the owner O(log N) | yes, by its bytes | gone |
+
+**The defect, on main** (r1082, 07:52Z to 07:56Z, adacachy2, needs cpus=8, load 28 to 35; release `amphora-bench` of 6c54b2cb
+with a diagnostic count of every failure the driver met, by kind, branch diag/cross-a26-bench). V13's cells, one round each,
+5 s a cell, `--deadline-s 10`. Each `Full` named a count of inputs, `command_bound`, where one of the budget's or of the byte
+bounds would name bytes; the budget's own room and the writes' bytes on it were not read:
+
+| cell | writers | `Full` on main | the limit each named | commits/s | other failures |
+|---|---|---|---|---|---|
+| persisted, spread | 32 | 0 | | 20.0 | none |
+| replicated, spread | 32 | 0 | | 17.2 | none |
+| persisted, spread | 128 | 0 | | 21.0 | none |
+| replicated, spread | 128 | 0 | | 15.6 | Timeout 10, UnknownOutcome 9 |
+| replicated, the leader | 1,024 | **70** | 177 to 920 | 10.8 | Timeout 702, UnknownOutcome 160, a closed connection 58, EAGAIN 9 |
+| replicated, the leader | 4,096 | **1,001** | 23 to 2,794 | 9.6 | Timeout 3,200, UnknownOutcome 741, a closed connection 47 |
+| persisted, the leader | 4,096 | **517** | 226 to 3,423 | 8.4 | Timeout 3,029, UnknownOutcome 920, a closed connection 61 |
+
+The bench's own `refused` (by node) counts `Serialization` alone: a `Full` moved the writer to the next node unseen, so the
+ladders of A23 and V20 could not show these.
+
+**The change.** (`docs/design/replication.md`, "Amendment (lane perf-A26)" of QB.1; AC-QB.1.2, T-QB.1.18.) A write first takes its charge
+on the memory budget as A21 wrote it (waits on bytes given back, `TooLarge` at once past the whole limit, `Full` at its
+deadline), then its place in the command queue (`ReplicaHandle::place`, main's three counters). With no place it gives the
+charge back and stands in line (`Line`), first come, first served, until its deadline, holding nothing: an event wakes the
+first in line and no one else (`Reservation::taken`, as the owner takes an input; a `Reservation`'s drop, as bytes come
+back; `Actor::rebound`, as the bounds are learned again), and the next is rung as the first leaves. A call leaves the line
+with its place, at its deadline (`Full` at the bound it is past), or with its owner's reason once that owner ends. A wire
+record, a verdict and an attestation are refused at once as before. No timer and no picked number: the only wait with a
+time is each call's own deadline. The count the owner held its waiting calls to is deleted (`Actor::command_bound`).
+The calls' bytes, holding none, take one call larger than their bound (`within`; hyper-raft's `Inflights::full`), so that a
+write the budget has room for never waits for room that nothing makes. At first (3bef6837) such a call could hold the queue
+whole, a vote or a heartbeat then refused for as long as it was held; reading it again after the landing showed that (no run did). caac3f19 leaves the queue a record without entries and its envelope
+beside the largest call and refuses a larger one `TooLarge` at once (`alone`). Its test
+(`a26_the_record_that_finds_a_leader_enters_beside_the_largest_call`) was not run red: it is stated over `alone`, which
+3bef6837 has not.
+
+Not taken: holding the write's charge while it waits in line (one wait fewer). The charges of writes the queue has no room
+for would come out of the images' room, and an image's room is a wire record's bound (`queue_bounds`), so a budget full of
+waiting writes would have the replica refuse its peers' records. This is reasoned from `queue_bounds`, not run.
+
+**On the fix** (r1167, 08:09Z to 08:16Z, adacachy2, needs cpus=2, load 75 to 81; 181b7de6 with the same count, 8c86e187):
+
+| cell | writers | `Full` on the fix | commits/s | other failures |
+|---|---|---|---|---|
+| persisted, spread | 32 | 0 | 14.6 | none |
+| replicated, spread | 32 | 0 | 13.0 | none |
+| persisted, spread | 128 | 0 | 16.2 | Timeout 3, UnknownOutcome 5 |
+| replicated, spread | 128 | 0 | 12.0 | Timeout 11, UnknownOutcome 20 |
+| replicated, the leader | 1,024 | 0 | 11.2 | Timeout 658, UnknownOutcome 176, EAGAIN 63 |
+| replicated, the leader | 4,096 | 0 | 2.0 | Timeout 2,595, UnknownOutcome 1,310, EAGAIN 119 |
+| persisted, the leader | 4,096 | 0 | 3.6 | Timeout 2,815, UnknownOutcome 1,126, EAGAIN 90 |
+
+The bursts again, both arms at one load (r1229, needs cpus=2, load 62 to 75, the order reversed in round 2):
+
+| cell | round | main: `Full` (limits) | fix: `Full` | main commits/s | fix commits/s |
+|---|---|---|---|---|---|
+| replicated 1,024, the leader | 1 | 130 (68 to 899) | 0 | 6.8 | 5.2 |
+| | 2 | 267 (84 to 737) | 0 | 5.0 | 12.4 |
+| replicated 4,096, the leader | 1 | 1,087 (66 to 2,987) | 0 | 7.6 | 0.6 |
+| | 2 | 842 (109 to 2,881) | 0 | 8.2 | 4.0 |
+| persisted 4,096, the leader | 1 | 1,170 (71 to 2,457) | 0 | 0.2 | 6.2 |
+| | 2 | 165 (320 to 3,666) | 0 | 8.2 | 0.0 |
+
+`commits/s` there counts only writes a writer began after its first second (its first write began before the count and is
+never in it), so in a 5 s cell it is the second writes of the writers answered early, in line behind the first writes of
+the rest. Counted over 20 s after 12 s instead (replicated,
+4,096 writers at the leader, two rounds, load 56 to 67): main 5.6 and 4.05 commits/s with 4,664 and 4,459 `Full` in the run (limits 46 to 3,510),
+the fix 4.1 and 6.8 with none: no difference outside the two rounds' own spread.
+
+**The new test, red on main** (r1143, 08:07Z, e2b77427: main 67cc7e69 and the burst test alone): 55, 55 and 56 of 64 writes
+refused `Full` at eight inputs, the budget holding a terabyte's room. On the fix all 64 are answered and the owner holds more
+than eight at once.
+
+**The replicated suites** (`database::replicated:: replication::`, one test thread an arm, three runs side by side at
+needs cpus=1 each, load 63 to 77; FAILED only). main 67cc7e69 and the fix 181b7de6 (its 195 tests are main's 189 and the six
+`a26_`):
+
+| round (run) | main 67cc7e69 | fix 181b7de6 |
+|---|---|---|
+| 1 (r1160) | `a_local_read_open_across_an_image_install_sees_one_side_whole`, `every_falsifier_of_the_floor_holds_under_a_nemesis` (187 passed) | `every_falsifier_…` (194 passed) |
+| 2 (r1161) | none (189 passed) | none (195 passed) |
+| 3 (r1164) | `every_falsifier_…` (188 passed) | `a_local_read_open_across_an_image_install_…`, `every_falsifier_…` (193 passed) |
+
+Each failure on the fix's side is one main has in some round: no test fails on the fix's side alone. A25's count on main 75efff54 (17 rounds at eight
+threads) had `every_falsifier_…` at 7 of 17.
+
+**Runs.** Scripts in bench/records/2026-11-23-adacachy2-perf-cross-a26/, outputs in `~/.cache/amphora-perf/cross-a26-out/` on adacachy2
+(branches diag/cross-a26-bench, diag/cross-a26-bench-fix and diag/cross-a26-red hold them and the diagnostic trees).
+
+| run | what | result |
+|---|---|---|
+| r1082, 07:52Z, cpus=8 | main 6c54b2cb's release bench with the count, the cells above | built 84 s; table |
+| r1105, 07:58Z, cpus=8 | cbb215b0 (the fix on 6c54b2cb) | `a26_` 6, `a21_` 5, `a11_`, the pressure test, `admission_is_bounded_…`, `t_qb_1*`, the waiting line's: 28 passed; clippy named one cast in a test (fixed, 181b7de6) |
+| r1122, 08:02Z, cpus=4 | 181b7de6 (main 67cc7e69 merged) | clippy -p amphora --all-targets rc 0 (53 s, amphora-engine and amphora checked); check-production rc 0 (ratchet 10617) |
+| r1143, 08:05Z, cpus=2 | 181b7de6, e2b77427 (red), 67cc7e69 | built 74, 32, 31 s; the touched tests 21 passed; red 3 of 3 |
+| r1160, r1161, r1164, 08:09Z, cpus=1 each | the suites above | |
+| r1152, 08:06Z, MacBook Pro 2, cpus=8 | 181b7de6 on macOS | built 604 s; the touched tests 21 passed (the rest stopped: no time) |
+| r1163, 08:09Z, cpus=2 | 2cb219e6 (main 1fe5cc1d merged: PG19's landing) | clippy rc 0 (52 s, engine, pg crates and amphora checked), the touched tests 21 passed twice, check-production rc 0 (10617) |
+| r1167, 08:09Z, cpus=2 | 8c86e187's release bench | built 313 s; table |
+| r1229, 08:16Z, cpus=2 | the bursts, both arms twice | table |
+| r1277, 08:22Z, cpus=2 | 34c5588c (main ecaee231 merged: B24's landing), the tree of 57fa17b9 | clippy -p amphora --all-targets rc 0 (46 s; its log also took a stopped twin's lines, r1278), built 40 s, the touched tests 21 passed twice, check-production rc 0 (67 s, 10617) |
+| r1280, r1290, 08:22Z, 08:24Z, cpus=1 | the 20 s cells, both arms, the order reversed | above |
+| landed 08:27:03Z | main 3bef6837: 57fa17b9 and the merge of b5760c39 (lane C7: one engine test module, which nothing amphora builds compiles) | no re-run |
+| r1306, 08:28Z, cpus=4 | caac3f19 (3bef6837 and the largest-call fix) | built 66 s; the touched tests and the new one 22 passed twice; clippy named `bool::then_some`, so its check-production stopped there too |
+| r1312, 08:31Z, cpus=4 | d52f21ce (the lint's other spelling) | clippy named `unnecessary_lazy_evaluations`; stopped |
+| r1317, 08:33Z, cpus=4 | 6c9ca0c0 (if/else in its place; main 4931c0b1's records merged), the second landing's code before its last merge | clippy rc 0 (32 s, engine and amphora checked), built 32 s, the touched tests and the new one 22 passed twice, check-production rc 0 (66 s, 10617) |
+| r1324, 08:35Z, cpus=6 | 04eb931a (main fcbdf0c2 merged: V21's image fix in db.rs, an oracle finding in the engine's optimizer), the second landing's tree | clippy -p amphora --all-targets rc 0 (37 s, engine and amphora checked); built 59 s; the touched tests and the new one 22 passed; check-production not run again (6c9ca0c0's passed) |
+
+The coordinator said at 08:31Z that lane B24 had read pending output of other runs by mistake, r1229 and r1263 of this lane
+among them. r1229's twelve cells were all seen here and are in its folder; r1263 never answered ("did not answer in 15s") and r1277 ran its
+steps; r1277's logs were read again in the folder (clippy finished with amphora checked, 21 passed twice, ratchet 10617).
