@@ -29,7 +29,13 @@ pub struct Records<R> {
 
 impl<R: BufRead> Records<R> {
     pub fn new(input: R, format: Format) -> Self {
-        Self { input, format, line: Vec::new(), fields: Vec::new(), records: 0 }
+        Self {
+            input,
+            format,
+            line: Vec::new(),
+            fields: Vec::new(),
+            records: 0,
+        }
     }
 
     /// The next record into `fields`; false at the end of the file.
@@ -42,7 +48,8 @@ impl<R: BufRead> Records<R> {
         match self.format {
             Format::Pipe => {
                 let text = std::str::from_utf8(trim_newline(&self.line))?;
-                self.fields.extend(text.split('|').map(|f| Some(f.to_owned())));
+                self.fields
+                    .extend(text.split('|').map(|f| Some(f.to_owned())));
             }
             Format::Csv => self.csv()?,
         }
@@ -60,8 +67,14 @@ impl<R: BufRead> Records<R> {
             let Some(&byte) = self.line.get(at) else {
                 // The line ended inside quotes: the field goes on in the next.
                 anyhow::ensure!(quoted, "a CSV record ended without its newline");
-                anyhow::ensure!(self.line.len() < MAX_RECORD_BYTES, "a CSV record longer than {MAX_RECORD_BYTES} bytes");
-                anyhow::ensure!(self.input.read_until(b'\n', &mut self.line)? > 0, "the file ended inside a quoted field");
+                anyhow::ensure!(
+                    self.line.len() < MAX_RECORD_BYTES,
+                    "a CSV record longer than {MAX_RECORD_BYTES} bytes"
+                );
+                anyhow::ensure!(
+                    self.input.read_until(b'\n', &mut self.line)? > 0,
+                    "the file ended inside a quoted field"
+                );
                 continue;
             };
             at += 1;
@@ -91,7 +104,11 @@ impl<R: BufRead> Records<R> {
                         field.pop();
                     }
                     let text = String::from_utf8(std::mem::take(&mut field))?;
-                    self.fields.push(if text.is_empty() && !was_quoted { None } else { Some(text) });
+                    self.fields.push(if text.is_empty() && !was_quoted {
+                        None
+                    } else {
+                        Some(text)
+                    });
                     was_quoted = false;
                     if end {
                         return Ok(());
@@ -125,15 +142,41 @@ mod tests {
     /// Expect: each field as PostgreSQL would load it.
     #[test]
     fn csv_reads_as_copy_wrote() {
-        let rows = read(Format::Csv, "1,,\"\",\"a \\\"b\\\" \\\\ c\"\n2,\"two\nlines\",x,\n");
-        assert_eq!(rows[0], [Some("1".into()), None, Some(String::new()), Some("a \"b\" \\ c".into())]);
-        assert_eq!(rows[1], [Some("2".into()), Some("two\nlines".into()), Some("x".into()), None]);
+        let rows = read(
+            Format::Csv,
+            "1,,\"\",\"a \\\"b\\\" \\\\ c\"\n2,\"two\nlines\",x,\n",
+        );
+        assert_eq!(
+            rows[0],
+            [
+                Some("1".into()),
+                None,
+                Some(String::new()),
+                Some("a \"b\" \\ c".into())
+            ]
+        );
+        assert_eq!(
+            rows[1],
+            [
+                Some("2".into()),
+                Some("two\nlines".into()),
+                Some("x".into()),
+                None
+            ]
+        );
     }
 
     /// Do: read dbgen's rows. Expect: each field between the pipes.
     #[test]
     fn pipe_reads_as_dbgen_wrote() {
         let rows = read(Format::Pipe, "1|AFRICA|lar deposits\n");
-        assert_eq!(rows[0], [Some("1".into()), Some("AFRICA".into()), Some("lar deposits".into())]);
+        assert_eq!(
+            rows[0],
+            [
+                Some("1".into()),
+                Some("AFRICA".into()),
+                Some("lar deposits".into())
+            ]
+        );
     }
 }
