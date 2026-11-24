@@ -26,6 +26,11 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   the last connection's close, as SQLite's) are off for a backed-up writer: they skipped the wait.
   The fence follows restarts one by one (each raises the header's checkpoint sequence by one), so a
   log started again twice with no write between, its middle generation empty, stays linked whole.
+- **A segment with no header yet** (decision 45, lane B22). The store switches the log's segments once
+  a batch is committed, and a segment's header is written by its first commit. Until then, which is
+  as long as the writer is idle, the current segment's file is empty (a switch made it, or cut it),
+  or holds the header of the generation before; nothing of its generation is committed, so a round
+  ships nothing, writes its through mark and may end a base, and a shipper opens on it.
 - **Through marks.** A round with nothing new to ship, every commit stamped so far shipped, writes
   a small sealed object (`p/through/...`) saying the archive is whole through now, once that is in
   a later second than it was: a database that stops committing, or closes, restores up to the
@@ -34,7 +39,12 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   would hold the log's restarts and the store's readers back), made consistent by replaying the log
   from the first frame of the generation it began in through where the log stood when it ended, as
   PostgreSQL's base backups are made consistent by the WAL from their start. A torn page in the copy
-  is a page a checkpoint was writing, from a frame the replay writes again.
+  is a page a checkpoint was writing, from a frame the replay writes again. The file must hold every
+  frame of the generations before that one as the copy begins: a switch waits for no read (decision
+  45), so a read under way can keep the closing segment's later frames out of the file, and a base
+  begun then would lose them. So a base begins only once a pass has copied the closing segment whole:
+  the shipping thread asks for one, and where a read still holds it back the base waits for a later
+  round.
 - **No picked numbers.** Shipping has no timer: each round sends what became durable while the last
   put ran, so a segment's size and the cadence follow the observed log rate and the store's put time
   (Ada, 2026-11-21: learned as they run). A segment is split only by the store's own object size. A
@@ -333,11 +343,12 @@ PostgreSQL 17's incremental `pg_basebackup` copies only blocks its WAL summaries
 format 1 manifests still read, every chunk their own).
 
 - **Which chunks changed.** A restore replays the log from the first frame of the generation its
-  base began in, and a log only starts again once every frame is in the file. So a chunk of the
-  latest base whose pages no frame wrote in the generations from that base's beginning up to the
-  new base's is the same bytes in the file now; frames of the new base's own generation are
-  replayed over it in any case. The shipper reads each frame's page number as it ships it (the
-  frame header's first field, sqlite.org/fileformat2.html) into a bitmap a bit a page, bounded by
+  base began in, and a base begins only once the file holds every frame of the generations before
+  its own ("Bases", above). So a chunk of the latest base whose pages no frame wrote in the
+  generations from that base's beginning up to the new base's is the same bytes in the file now;
+  frames of the new base's own generation are replayed over it in any case. The shipper reads each
+  frame's page number as it ships it (the frame header's first field,
+  sqlite.org/fileformat2.html) into a bitmap a bit a page, bounded by
   the database's pages: one for the generation shipped now and one for those before it since the
   latest base began.
 - **When it may.** Only with every frame since the latest base began seen (not after the shipper

@@ -2519,7 +2519,9 @@ the places a segment is added (`crates/engine/storage/`):
   (1659-1663, 2366-2412) opens the second path beside `-wal`.
 - `crates/amphora/src/db.rs` `restart_log` and `hold_log` (505-566), the store's gate (`store.rs` 1129-1148), and the
   backup, which reads frames out of `-wal` by offset for each generation (`backup/ship.rs` 754-872): it reads the
-  segment the generation is in.
+  segment the generation is in. A segment whose header its first commit hasn't written yet
+  holds nothing to ship, and a base begins only once the closing segment is in the file, since a restore replays the
+  log from the base's own generation (backup.md, lane B22).
 
 **Sources.** SQLite's wal2 branch, `doc/wal2.md` (github.com/sqlite/sqlite, branch `wal2`): the files are
 "<database>-wal" and "<database>-wal2"; "Once the first wal file has grown large enough, writers switch to appending

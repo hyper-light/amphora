@@ -161,6 +161,8 @@ pub(crate) struct Prepared {
     foreground: Arc<Foreground>,
     counters: Arc<CheckCounters>,
     meter: Arc<DrillMeter>,
+    /// Whether a base that was to begin waits for the log's closing segment to be copied.
+    base_waits: bool,
 }
 
 /// What the shipping thread tells the check thread: rounds ended, the latest base, the log shipped
@@ -343,6 +345,7 @@ impl Prepared {
             foreground,
             counters,
             meter,
+            base_waits: false,
         })
     }
 
@@ -479,21 +482,30 @@ impl Prepared {
                 // A base begins in a generation the shipper has shipped: after a round that
                 // shipped, or once there's nothing left to (`begin_base` refuses otherwise); and
                 // just after the log starts again, so the next base copies least (T-T1.12.I4).
-                if self.shipper.base_due(None)
-                    && self.shipper.ships_current(&self.reader)
-                    && plan::base_begins_now(
+                let begins = self.base_waits
+                    || plan::base_begins_now(
                         self.shipper.base_needed(),
                         self.shipper.generation() != generation,
                         self.shipper.frames_in_generation(),
                         self.reader.log_kept_frames(),
-                    )
+                    );
+                if self.shipper.base_due(None) && self.shipper.ships_current(&self.reader) && begins
                 {
-                    *copy = Some(self.shipper.begin_base(
-                        &self.reader,
-                        blobs,
-                        &crate::memory::process(),
-                        self.archive.memory,
-                    )?);
+                    // The file must hold the closing segment first (decision 45): a pass copies
+                    // what the reads under way let it, and where one holds it back the base waits
+                    // for a later round.
+                    if !self.reader.closing_copied() {
+                        let _copied = self.reader.checkpoint()?;
+                    }
+                    self.base_waits = !self.reader.closing_copied();
+                    if !self.base_waits {
+                        *copy = Some(self.shipper.begin_base(
+                            &self.reader,
+                            blobs,
+                            &crate::memory::process(),
+                            self.archive.memory,
+                        )?);
+                    }
                 }
                 Ok((shipped, false))
             }
@@ -704,4 +716,102 @@ fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use amphora_api::blobs::SimBlobs;
+
+    use super::*;
+    use crate::backup::{SECOND_NS, restore};
+
+    fn until() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn ids(db: &Db) -> Vec<i64> {
+        let mut ids = Vec::new();
+        db.query("SELECT id FROM t ORDER BY id", [], |r| {
+            ids.push(r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            Ok(true)
+        })
+        .unwrap();
+        ids
+    }
+
+    /// Decision 45 (lane B22): a due base waits for the log's closing segment to be in the file.
+    /// Do: end a first base; write until another is due; open a read and leave it open, write 20
+    /// rows and ship them, start the log again (the read keeps those 20 out of the file), write a
+    /// row and run a round; end the read, write a row and run rounds until a base ends; restore the
+    /// last second. Expect: no base begins while the read is open, one does in the next round after
+    /// it, and the restore holds every row.
+    #[test]
+    fn d45_a_due_base_waits_for_the_closing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            chunks: ChunkGrowth::Keep,
+            check: CheckPolicy::Off,
+        };
+        let mut db = Db::open(&path).unwrap();
+        let mut prepared = Prepared::on(&mut db, &path, archive, until()).unwrap();
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+            .unwrap();
+        let put = |db: &mut Db, from: i64, rows: i64| {
+            for id in from..from + rows {
+                now.fetch_add(SECOND_NS, Ordering::SeqCst);
+                db.exec(&format!(
+                    "INSERT INTO t (id, v) VALUES ({id}, '{}')",
+                    "z".repeat(500)
+                ))
+                .unwrap();
+            }
+        };
+        let mut copy = None;
+        put(&mut db, 0, 10);
+        let mut ended = 0;
+        while ended == 0 {
+            ended += usize::from(prepared.round(&mut copy).unwrap().1);
+        }
+        let mut rows = 10;
+        while !prepared.shipper.base_due(None) {
+            put(&mut db, rows, 10);
+            rows += 10;
+            prepared.round(&mut copy).unwrap();
+            assert!(copy.is_none(), "due, it waits for the log to start again");
+        }
+
+        let slow = db.reader().unwrap();
+        slow.exec("BEGIN").unwrap();
+        let held = ids(&slow);
+        put(&mut db, rows, 20);
+        prepared.round(&mut copy).unwrap();
+        assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+        put(&mut db, rows + 20, 1);
+        prepared.round(&mut copy).unwrap();
+        assert!(copy.is_none(), "the read keeps the closing segment back");
+        assert_eq!(ids(&slow), held, "the read is under way");
+        slow.exec("COMMIT").unwrap();
+        put(&mut db, rows + 21, 1);
+        prepared.round(&mut copy).unwrap();
+        assert!(copy.is_some(), "the base that waited begins");
+        while !prepared.round(&mut copy).unwrap().1 {}
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+
+        let second = now.load(Ordering::SeqCst) / SECOND_NS - 1;
+        let target = dir.path().join("restored.db");
+        restore(blobs.as_ref(), "db", second, &target, until()).unwrap();
+        assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
+    }
 }
