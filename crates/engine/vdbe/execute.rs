@@ -22430,9 +22430,17 @@ fn morsel_rows(
         )))
     };
     // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
-    // them (the pipeline's own key order puts kinds apart).
-    let keys = data.group_by.len();
-    rows.sort_by(|a, b| a.iter().take(keys).cmp(b.iter().take(keys)));
+    // them (the pipeline's own key order puts kinds apart), each in its direction.
+    rows.sort_by(|a, b| {
+        a.iter()
+            .zip(b)
+            .zip(&data.group_order)
+            .map(|((a, b), key)| {
+                crate::types::cmp_in_column(&a.as_value_ref(), &b.as_value_ref(), key)
+            })
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut out = Vec::new();
     out.try_reserve_exact(rows.len())
         .map_err(|_| Box::new(LimboError::OutOfMemory))?;

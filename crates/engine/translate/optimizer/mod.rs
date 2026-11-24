@@ -4,9 +4,9 @@ use super::{
     plan::{
         DeletePlan, GroupBy, HashJoinType, InSeekSource, IterationDirection, JoinInfo,
         JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
-        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
-        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
-        WhereTerm, WhereTermOrigin,
+        MultiIndexScanOp, Operation, OrderTerms, Plan, Search, SeekDef, SeekKey, SelectPlan,
+        SetOperation, SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan,
+        UpdatePlan, WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -1470,7 +1470,7 @@ fn apply_select_table_plan(
         return Ok(());
     };
     let (lip_params, lip_base_rows) = (table_plan.params.clone(), table_plan.base_rows.clone());
-    plan.join_order = apply_table_access_plan(
+    let (join_order, loop_order) = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
         &mut plan.where_clause,
@@ -1478,6 +1478,8 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    plan.join_order = join_order;
+    plan.loop_order = loop_order;
     // Amphora (QT.5, T-QT.5.3): the star joins' filters, by cost, once the plan is fixed.
     let filters = lip::choose(
         resolver.star_filters(),
@@ -1924,6 +1926,7 @@ fn build_update_write_set_plan(
         },
         simple_aggregate: None,
         phantom_params: vec![],
+        loop_order: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
@@ -3027,14 +3030,15 @@ fn optimize_table_access(
         return Ok(None);
     };
 
-    Ok(Some(apply_table_access_plan(
+    let (join_order, _) = apply_table_access_plan(
         resolver,
         table_references,
         where_clause,
         order_by,
         group_by,
         plan,
-    )?))
+    )?;
+    Ok(Some(join_order))
 }
 
 /// Find the best table reads without writing them into table operations.
@@ -5252,18 +5256,17 @@ pub(crate) mod bushy_search_tests {
     }
 }
 
+/// Writes `plan` into the tables; its join order, and the ORDER BY its loops give, whose sort it
+/// took out of `order_by`.
 fn apply_table_access_plan(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<amphora_engine_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut OrderTerms,
     group_by: &mut Option<GroupBy>,
     plan: TableAccessPlan,
-) -> Result<Vec<JoinOrderMember>> {
+) -> Result<(Vec<JoinOrderMember>, OrderTerms)> {
+    let mut loop_order = Vec::new();
     let TableAccessPlan {
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
@@ -5288,7 +5291,7 @@ fn apply_table_access_plan(
                 }
             }
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
-                order_by.clear();
+                loop_order = std::mem::take(order_by);
             }
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
                 if let Some(group) = group_by.as_mut() {
@@ -5791,7 +5794,7 @@ fn apply_table_access_plan(
         }
     }
 
-    Ok(best_join_order)
+    Ok((best_join_order, loop_order))
 }
 
 /// Build a multi-index operation for the main loop or an unmatched-right read.

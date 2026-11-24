@@ -1796,3 +1796,131 @@ Kept (arm C, e23ab4b6): the filter step under `StarFilters::ByCost` keeps only t
   does not depend on crate `amphora` (`cargo tree -p amphora-engine -i amphora`: no match), so it was merged
   (d4915c23) without a re-run, under rule 6 (lane A17). Pushed to main with this record.
 - The red test (section 2) was on the arm A plus the test tree; clippy was not run on it (a throwaway).
+
+
+# Lane T22 (tpch), 2026-11-24 05:41Z to 06:41Z: q10 is slower under the cost-based filter, by the scan of lineitem; the cause is named; a fix is on a branch, not landed
+
+The hour started at 05:41:25Z (first command) and ends at 06:41:25Z (the lead's message at about 05:56Z: 06:46Z).
+
+Losses first:
+- Not merged: the fix, its test and the measure after it (parts 3 and 4). The fix is on perf/tpch-t22 (d6b08c7d, based on main ac2c429a) and is not verified: the lib built on macOS with it (r603, MacBook Pro 2: one compile error, a test's `Rates` literal without the new field, fixed), and the focused tests (r632) were still compiling or running when this record was written. No clippy, no check-production, no planner suites (`--test planner`, `records_plans`, `join_methods`, `star_filters`, `adaptive_joins`) were run.
+- The fix reaches plans only where the weights aren't pinned to a set without `scan_row`: production and unpinned tests will choose other plans, since a scan's row goes from 0.35 ns to about what the calibration times (not measured here on adacachy2). That is the fix's point, and the reason it must not land before the 22 queries and the suites are read.
+- The A/B of step 1 was cut at 16 of 20 rounds: Ada's benchmark window on adacachy2 began at about 05:56Z and every run
+  of mine there had to stop, so round 17's A process was killed. Its 16 full rounds were kept on adacachy2
+  (`~/.cache/tpch-t22/out/*.jsonl`, `ans/`), unread: the per-run milliseconds are not in this record. The per-process
+  times below are the run's own output (each process's `time`), and they hold the open and the counted run (cold pages,
+  row counters) as well as the 5 timed runs.
+- No A/B of the fix, no plans of the 22 queries under it, no answers against SQLite: adacachy2 (which holds the
+  SF1 database) was closed to this lane for the rest of the hour.
+- Every run was at load 27 to 42 on 32 cores and CPU pressure avg10 2 to 22%: B's processes ran beside A's, alternated.
+- Two of the trace's numbers are by one process each (A and B, 5 runs each on the same binary): not an A/B.
+- The trace's instrument (below) reads the statement's instruction every 200 us or more from a thread of its own; a
+  step's time is its share of the samples times the runs' median. No error bar was measured for it.
+- Not measured: B's and A's instruction counts, the effect of `adaptive` runs (`amphora` target: off).
+
+## 1. Is q10 slower under the cost-based filter? Yes (r523, adacachy2, 05:51:41Z to about 05:55:45Z; cpus=4, mem=8g)
+
+`STAGES=db` then `STAGES=ab,trace,summary ROUNDS=20 bash ~/.cache/tpch-t22/ab.sh` (copies in `~/.cache/amphora-perf/tpch-t22/` on
+adacachy and on the branch `perf/tpch-t22-scripts`): the two binaries of T21 (`amphora-bench-b0f09f9a` = A, main without a34ec88b;
+`amphora-bench-a64549cc` = B, main's fix), T21's calibration files under both keys (body b7661c2007aeb06d), T17's S set pinned
+(`S.json`, the 8 weights), one reflink copy of T11's db-sf1 per arm, q10 alone, 5 timed runs a process after the counted
+run. Odd rounds A then B, even rounds B then A.
+
+How many rounds: 20 planned, from T21's n = 6 (B against A: 1,467 to 1,157 ms, ln ratio 0.237; a pooled spread of about 0.2 in
+ln ms gives 15 independent runs a side for p 0.05 and power 0.9, fewer when paired). 16 finished.
+
+| | A (median of 16 processes) | B (median of 16 processes) | B/A per round, median (95% bootstrap; range) | B slower in | p (sign; signed rank) |
+|---|---|---|---|---|---|
+| CPU of the process, user + system, s | 5.37 (4.13 to 6.22) | 9.06 (6.88 to 11.17) | 1.77 (1.62 to 1.82; 1.42 to 1.93) | 16 of 16 | 3.1e-5; 3.1e-5 |
+| wall of the process, s | 5.84 (4.14 to 6.93) | 9.40 (6.90 to 14.26) | 1.74 (1.57 to 1.80; 1.40 to 2.06) | 16 of 16 | 3.1e-5; 3.1e-5 |
+
+The paired spread of ln(B/A) is 0.10 (CPU) and 0.12 (wall): under it the difference T21 saw (ln 1.268 = 0.237) needs 2 to 3 rounds
+at p 0.05 and power 0.9, so 16 settle it. The sign test has no smaller two-sided p at n = 16 (2/2^16).
+
+The trace below, one binary and one process a side, agrees: medians of 5 runs 1,273 ms (B: 1,908, 1,273, 1,214, 1,241, 1,314)
+and 875 ms (A: 920, 817, 833, 875, 892).
+
+## 2. The step that costs more than its price: the scan of lineitem
+
+Both plans were run by one binary (perf/tpch-t22-trace 11c74723: main ac2c429a plus a sampler of the running VDBE
+instruction, `AMPHORA_PC_TRACE=1`, and `AMPHORA_STAR_FILTERS=off` for A's plan (`off` gives A's plan exactly: SCAN orders / SEARCH lineitem
+USING INDEX / SEARCH customer by rowid / hash nation) and `bycost` for B's (SCAN lineitem with the star filter from orders, then
+orders by rowid, customer by rowid, hash nation)), S's weights pinned, 5 timed runs, the same db-sf1 reflink (`trace.sh`, run 05:54:11Z to 05:54:43Z, load 31, CPU pressure 7 to 13%). 1 page read is 1,263 ns here (T18: S's 0.35 ns row over
+`row_in_pages` 2.771e-4). Est and actual rows are T21's counted runs (identical for this db).
+
+B (1,273 ms a run):
+
+| step | est rows | actual rows | priced, page reads | priced, ms | actual, ms |
+|---|---|---|---|---|---|
+| SCAN lineitem (Next, l_returnflag decoded, tested) | 1,475,239 out | 6,001,215 read, 1,478,870 pass | 63,313.7 | 80.0 | 593.7 (Next 211.2, Column 331.9, Ne 50.6): 98.9 ns a row read |
+| the star filter from orders, checked on the 1.48M rows (key, affinity, probe) | 74,914 pass (5.08%) | 114,862 pass (7.77%) | in 41,033 (below) | | 68.7: 46 ns a probe |
+| the filter's build: orders read once, its date terms | 1,500,000 read | 1,500,000 read | in 41,033 | about 16 of it (T18's orders scan 12,605.5) | 118.2: 79 ns a row |
+| orders by rowid | 74,914 | 114,862 sought, 114,705 found | 41,033 with the filter (533,410 without) | 51.8 (673.7) | 50.5: 440 ns a seek |
+| customer by rowid | 74,914 | 114,705 | 28,295.6 | 35.7 | 112.6 with its columns (91.8 in the seek: 800 ns) |
+| materialize, hash build, hash group, sort | | 114,705 | 8,344.7 (the rest of 140,987) | 10.5 | 275.6 |
+
+A (875 ms a run):
+
+| step | est rows | actual rows | priced, page reads | priced, ms | actual, ms |
+|---|---|---|---|---|---|
+| SCAN orders (Next, o_orderdate decoded twice, tested) | 76,172 | 1,500,000 read, 57,069 pass | 12,605.5 | 15.9 | 158.0: 105 ns a row |
+| lineitem by its index (57,069 seeks, each lineitem row read by rowid) | 74,914 | 57,069 sought, about 228k rows read (4 an order, not counted), 114,705 pass | 226,958 | 286.6 | 229.8 (seeks and index 91.1; the rows read and tested 138.7) |
+| customer by rowid | 74,914 | 114,705 | 28,295.6 | 35.7 | 94.5 |
+| the rest | | | 8,344.7 | 10.5 | 347.1 |
+
+- A read by seek costs about its price (the prices are on the plan's estimated rows, the times on the run's): lineitem by its index 286.6 ms priced on 76,172 seeks (T21's estimate) against 229.8 ms for the
+  57,069 the run did; orders by rowid 50.5 ms priced 51.8; customer 1.7 to 2 times over its price.
+- A scan costs 7 to 10 times its price: lineitem 593.7 ms against 80.0 (7.4 times), orders 158.0 against 15.9 (9.9 times). B's plan over A's (1,219 to 829 ms, the medians' 398 ms) is
+  the scan of lineitem (593.7), the filter's build (118.2), its probes (68.7) and orders by rowid (50.5), less A's orders scan (158.0) and its
+  seeks of lineitem (229.8): 443 ms, less the 53 ms A's other steps take over B's.
+- The priced CPU of a scanned row: `cpu_cost_per_row` is 2.771e-4 page reads (0.35 ns: the row calibration, a loop over a page of 8-byte
+  keys), and its WHERE step 11.05 of it (3.9 ns) on the rows that pass (`cost_with_where_work`): the scan of lineitem's 63,313.7 is 1,663 for 6.0M visits,
+  4,516 for 1,475,239 steps and 57,135 for pages (derived here from the weights, not logged). The engine's loop (Next, Column, Ne) takes
+  98.9 ns on lineitem, a row of 16 columns whose eighth is read (Next 35, Column 55, Ne 8). `Work::Row` in `learned_costs.rs` says
+  "a row visited: read and tested once"; it times an iterator over an array, and nothing moves it afterwards (no scan is sampled; a seek is).
+
+The name: the planner's calibration, not the shape of the plan or the statistics. The estimates are close (lineitem 1,475,239 for 1,478,870;
+the filter's pass 5.08% for 7.77%), the prices of the reads by seek are right, and a scanned row's CPU price is 1 to 4 ns (its visit 0.35, its
+WHERE step 3.9) against 99 in the run, because the row's visit it is scaled from isn't the engine's. So B (a scan of 6.0M rows) looks like half the price of A (a scan of
+1.5M and seeks) at 140,987 against 276,204, and costs 1.46 times it.
+
+## 3. The fix (perf/tpch-t22, not landed): a scan's row timed by the statement that runs it
+
+`Work::ScanRow`: calibration opens a database in memory, makes a table of a page's keys (512 rows, as its other kinds are a page of
+keys) and a prepared `SELECT count(*) FROM scanned WHERE key = <a key that isn't there>`, and times the statement: each row is stepped to,
+decoded and tested once by the engine's loop, none goes on. The rate is measured as the other seven kinds are (rounds of samples, the median)
+and kept in the calibration file. `LearnedWeights::scan_row` is it over the row's visit; None in a set pinned without it (T17's S), and then a scan's rows
+take a row's visit as before, so every pinned run of T17 to T21 prices as it did. `cpu_cost_per_scan_row` (`cost_params.rs`) is used in the two
+places a table is read row by row: `estimate_scan_cost` (`cost.rs`), and the filter's build (`lip::build_cost`). No constant: the number is a timing.
+
+The test, `optimizer::join::tests::t22_q10_scan_rows_priced_as_measured_seek_lineitem`: q10's shape at 1/100 of SF1 (nation 25, customer 1,500, orders 15,000 with 4% in
+the date range, lineitem 60,000, 25% 'R') with ANALYZE, pinned at S's weights. With no `scan_row` the planner must scan lineitem (B); with
+`scan_row` 283 (98.9 ns at lineitem's scan over 0.35 ns) it must scan orders and seek lineitem (A). The answers are the nested loops' in both. And
+`t22_calibration_times_a_scan_of_a_page_of_keys`: calibration's statement reads each key and gives none; calibration on a moving clock has a `scan_row`.
+
+Effect on the 22 plans: not measured (adacachy2 closed). What I expect from the arithmetic, not from a run: a scan of a row is about 280 times its present
+price at pinned S, so every plan that trades a scan for seeks is re-decided; the 22 queries must be listed (`~/.cache/tpch-t21/sweep.sh`'s method) before it lands.
+
+## 4. How to finish (the next lane, when adacachy2 is free)
+
+1. Read the 16 rounds: `python3 -I ~/.cache/tpch-t22/summ22.py ~/.cache/tpch-t22` on adacachy2 (per-run milliseconds, the same test).
+2. Land or drop the fix after: a measured `scan_row` on adacachy2, S plus that in a pin file (the bench reads an optional `scan_row`), q10 as in section 1
+   (`ab.sh` with a C binary of the fix beside A and B), the 22 queries' plans and answers as T21's `sweep.sh`.
+3. Merge: clippy on amphora-engine, the join, learned-cost and filter tests, check-production.
+
+## 5. Found on the way, for other lanes (not acted on)
+
+- The same asymmetry prices the Bloom probe: 6.37 row visits, 2.2 ns, against 46 ns here in the statement's loop (`StarProbes` 32 ns, its key's column and affinity 14 ns).
+  A plan's cut by a filter is priced near free at the probes. The other 5 kinds were not looked at.
+- The per-process CPU of q10's counted run was not separated from the timed runs.
+- Two probes of q10's hash: the materialized build's MakeRecord and Insert (60.5 ms in B) are priced at a row's visit (a scan of the materialized rows), part of the 8,344.7.
+- adacachy2 was at 0 to 13 idle of 32 cores while this lane ran: 4 of 6 asks were refused or queued until the window.
+
+## 6. Checks
+
+- r523 (adacachy2, A/B): section 1. Stopped at round 17 of 20, Ada's window.
+- Trace (`trace.sh`, adacachy2, 05:54Z): section 2.
+- Build of the trace binary: adacachy2, 111 s, 11c74723 (perf/tpch-t22-trace, not for main; the sampler stores the pc in a static per instruction).
+- r569 and r583 (macOS, queued): never started; r583's tentative place was 2768d0d5 (forbidden), both stopped before they started. r585 (Mac Studio 2, by `on`): "did not answer the sync in 60s", nothing ran.
+- r603 (MacBook Pro 2, 06:15:48Z to 06:22:55Z, load 71 to 43): the lib compiled, the lib test's one error above. r630: the runner didn't answer in 15 s. r632 (MacBook Pro 2, from 06:24:58Z): `cargo test -p amphora-engine --lib -- t22_ t19_ optimizer::lip learned_costs optimizer::cost optimizer::join` at d6b08c7d, not finished at 06:37Z; its result isn't in this record.
+- `cargo fmt --all --check` on the branch: clean (local, seconds, no build).

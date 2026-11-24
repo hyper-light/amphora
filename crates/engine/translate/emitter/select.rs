@@ -1269,6 +1269,7 @@ fn build_materialized_build_input_plan(
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
+        loop_order: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
