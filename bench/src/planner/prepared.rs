@@ -35,22 +35,36 @@ pub struct Params {
 /// integer bound as an INTEGER, any other number as a REAL, a string as TEXT.
 pub fn params(text: &str, query: &str) -> anyhow::Result<Params> {
     let mut seeds = Vec::new();
-    for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-        let r: serde_json::Value = serde_json::from_str(line).map_err(|e| anyhow::anyhow!("--params line {}: {e}", n + 1))?;
+    for (n, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let r: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("--params line {}: {e}", n + 1))?;
         if r["query"].as_str() != Some(query) {
             continue;
         }
-        let seed = r["seed"].as_u64().ok_or_else(|| anyhow::anyhow!("--params line {}: no seed", n + 1))?;
-        let list = r["params"].as_array().ok_or_else(|| anyhow::anyhow!("--params line {}: no params", n + 1))?;
+        let seed = r["seed"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("--params line {}: no seed", n + 1))?;
+        let list = r["params"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("--params line {}: no params", n + 1))?;
         let mut values = Vec::with_capacity(list.len());
         for v in list {
             values.push(match v {
                 serde_json::Value::Number(x) => match x.as_i64() {
                     Some(i) => Value::from_i64(i),
-                    None => Value::from_f64(x.as_f64().ok_or_else(|| anyhow::anyhow!("--params line {}: {x} is no number", n + 1))?),
+                    None => Value::from_f64(x.as_f64().ok_or_else(|| {
+                        anyhow::anyhow!("--params line {}: {x} is no number", n + 1)
+                    })?),
                 },
                 serde_json::Value::String(s) => Value::from_text(s.clone()),
-                other => anyhow::bail!("--params line {}: {other} is neither a number nor a string", n + 1),
+                other => anyhow::bail!(
+                    "--params line {}: {other} is neither a number nor a string",
+                    n + 1
+                ),
             });
         }
         seeds.push((seed, values));
@@ -73,14 +87,33 @@ struct ModeRuns {
 
 /// Runs `sql`, prepared once for each of `modes`, with each of `params`' sets, `runs` passes over
 /// them, and returns the query's record.
-pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, modes: &[String], runs: usize, deadline: Duration) -> anyhow::Result<serde_json::Value> {
+pub fn query(
+    amphora: &mut Amphora,
+    name: &str,
+    sql: &str,
+    params: &Params,
+    modes: &[String],
+    runs: usize,
+    deadline: Duration,
+) -> anyhow::Result<serde_json::Value> {
     let mut each = Vec::with_capacity(modes.len());
     for m in modes {
         let stmt = match amphora.prepare(sql) {
             Ok(stmt) => stmt,
-            Err(e) => return Ok(serde_json::json!({ "record": "prepared", "query": name, "failed": e.to_string() })),
+            Err(e) => {
+                return Ok(
+                    serde_json::json!({ "record": "prepared", "query": name, "failed": e.to_string() }),
+                );
+            }
         };
-        each.push(ModeRuns { name: m.clone(), mode: mode(m)?, stmt, best_ms: vec![None; params.seeds.len()], answer: vec![None; params.seeds.len()], stopped: None });
+        each.push(ModeRuns {
+            name: m.clone(),
+            mode: mode(m)?,
+            stmt,
+            best_ms: vec![None; params.seeds.len()],
+            answer: vec![None; params.seeds.len()],
+            stopped: None,
+        });
     }
     for pass in 0..runs {
         for (i, (_, values)) in params.seeds.iter().enumerate() {
@@ -88,7 +121,9 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
             let turn = (pass + i) % each.len().max(1);
             let modes = each.len();
             for k in 0..modes {
-                let Some(m) = each.get_mut((k + turn) % modes) else { continue };
+                let Some(m) = each.get_mut((k + turn) % modes) else {
+                    continue;
+                };
                 if m.stopped.is_some() {
                     continue;
                 }
@@ -98,10 +133,10 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
                         if let Some(best) = m.best_ms.get_mut(i) {
                             *best = Some(best.map_or(ms, |b| b.min(ms)));
                         }
-                        if let Some(answer) = m.answer.get_mut(i) {
-                            if answer.is_none() {
-                                *answer = Some((run.rows, run.first));
-                            }
+                        if let Some(answer) = m.answer.get_mut(i)
+                            && answer.is_none()
+                        {
+                            *answer = Some((run.rows, run.first));
                         }
                     }
                     Outcome::TimedOut => m.stopped = Some("timed out".into()),
@@ -114,7 +149,10 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
     // A seed whose answers (its rows' count and first row) differ between the modes that ran it.
     let differ: Vec<u64> = (0..seeds.len())
         .filter(|&i| {
-            let answers: Vec<_> = each.iter().filter_map(|m| m.answer.get(i).cloned().flatten()).collect();
+            let answers: Vec<_> = each
+                .iter()
+                .filter_map(|m| m.answer.get(i).cloned().flatten())
+                .collect();
             answers.windows(2).any(|w| matches!(w, [a, b] if a != b))
         })
         .filter_map(|i| seeds.get(i).copied())
@@ -124,19 +162,25 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
     for m in &each {
         let finished = m.best_ms.iter().all(Option::is_some);
         let total: f64 = m.best_ms.iter().flatten().sum();
-        totals.push((m.name.clone(), finished.then_some(total)));
+        totals.push((m.name.clone(), if finished { Some(total) } else { None }));
         modes_json.insert(
             m.name.clone(),
             serde_json::json!({
                 "best_ms": m.best_ms,
-                "total_ms": finished.then_some(total),
+                "total_ms": if finished { Some(total) } else { None },
                 "custom_plans": m.stmt.metrics().custom_plans,
                 "stopped": m.stopped,
             }),
         );
     }
-    let generic = totals.iter().find(|(n, _)| n == "generic").and_then(|(_, t)| *t);
-    let auto = totals.iter().find(|(n, _)| n == "auto").and_then(|(_, t)| *t);
+    let generic = totals
+        .iter()
+        .find(|(n, _)| n == "generic")
+        .and_then(|(_, t)| *t);
+    let auto = totals
+        .iter()
+        .find(|(n, _)| n == "auto")
+        .and_then(|(_, t)| *t);
     Ok(serde_json::json!({
         "record": "prepared",
         "query": name,
@@ -166,13 +210,21 @@ mod tests {
             "\n"
         );
         let p = params(text, "q06").unwrap();
-        assert_eq!(p.seeds.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            p.seeds.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let (_, first) = &p.seeds[0];
         assert_eq!(first[0], Value::from_text("1994-01-01".to_owned()));
         assert_eq!(first[2], Value::from_f64(0.05));
         assert_eq!(first[4], Value::from_i64(24));
         let bad = r#"{"query": "q06", "seed": 1, "params": [null]}"#;
-        assert!(params(bad, "q06").unwrap_err().to_string().contains("line 1"));
+        assert!(
+            params(bad, "q06")
+                .unwrap_err()
+                .to_string()
+                .contains("line 1")
+        );
         assert!(mode("generic").is_ok() && mode("auto").is_ok() && mode("bogus").is_err());
     }
 }
