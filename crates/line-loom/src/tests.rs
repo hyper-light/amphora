@@ -277,7 +277,7 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_went_waits_for_it_again() {
         let room = queue(2);
         let held = Room::place(&room, 5, true).unwrap();
         let write = {
-            let (room, budget) = (Arc::clone(&room), Arc::clone(&budget));
+            let (room, budget) = (Arc::clone(&room), budget.clone());
             thread::spawn(move || {
                 let place = Room::submit_by(&room, 5, FAR).unwrap();
                 assert_eq!(room.charged.load(Ordering::SeqCst), 5, "admitted uncharged");
@@ -286,7 +286,7 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_went_waits_for_it_again() {
             })
         };
         let other = {
-            let budget = Arc::clone(&budget);
+            let budget = budget.clone();
             thread::spawn(move || drop(budget.take(memory::Use::Queues, 5)))
         };
         drop(held);
@@ -313,7 +313,7 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_never_comes_is_full_at_its_deadli
             thread::spawn(move || Room::submit_by(&room, 5, SOON).map(drop))
         };
         let other = {
-            let budget = Arc::clone(&budget);
+            let budget = budget.clone();
             thread::spawn(move || budget.take(memory::Use::Queues, 5).ok())
         };
         drop(held);

@@ -103,7 +103,7 @@ struct Clock {
     /// The bells that wait with a time, or have.
     waits: Mutex<Vec<Arc<Bell>>>,
     /// The memory budget's waiters, who wait with a time too.
-    budget: Mutex<Vec<Arc<memory::Budget>>>,
+    budget: Mutex<Vec<memory::Budget>>,
 }
 impl Clock {
     fn now(&self) -> u64 {
@@ -130,7 +130,7 @@ loom::lazy_static! {
         waits: Mutex::new(Vec::new()),
         budget: Mutex::new(Vec::new()),
     };
-    static ref BUDGET: Mutex<Option<Arc<memory::Budget>>> = Mutex::new(None);
+    static ref BUDGET: Mutex<Option<memory::Budget>> = Mutex::new(None);
 }
 
 /// The owner's bell (`replicated::Bell`): a ring kept until a wait takes it, or the wait's time.
@@ -178,14 +178,16 @@ mod memory {
     pub(crate) enum Use {
         Queues,
     }
-    pub(crate) struct Budget {
+    #[derive(Clone)]
+    pub(crate) struct Budget(Arc<Held>);
+    struct Held {
         /// The room left, and the waiters told each time some comes back.
         left: Mutex<u64>,
         given: Condvar,
         limit: u64,
     }
     pub(crate) struct Charge {
-        budget: Arc<Budget>,
+        budget: Budget,
         bytes: u64,
     }
     impl Charge {
@@ -195,68 +197,63 @@ mod memory {
     }
     impl Drop for Charge {
         fn drop(&mut self) {
-            *self.budget.left.lock().unwrap() += self.bytes;
-            self.budget.given.notify_all();
+            *self.budget.0.left.lock().unwrap() += self.bytes;
+            self.budget.0.given.notify_all();
         }
     }
     impl Budget {
-        pub(crate) fn of(limit: u64) -> Arc<Self> {
-            let budget = Arc::new(Self {
+        /// The process's budget from here on, of `limit` bytes.
+        pub(crate) fn of(limit: u64) -> Self {
+            let budget = Self(Arc::new(Held {
                 left: Mutex::new(limit),
                 given: Condvar::new(),
                 limit,
-            });
-            CLOCK.budget.lock().unwrap().push(Arc::clone(&budget));
-            *super::BUDGET.lock().unwrap() = Some(Arc::clone(&budget));
+            }));
+            CLOCK.budget.lock().unwrap().push(budget.clone());
+            *super::BUDGET.lock().unwrap() = Some(budget.clone());
             budget
         }
         pub(crate) fn timer(&self) {
-            let left = self.left.lock().unwrap();
-            self.given.notify_all();
+            let left = self.0.left.lock().unwrap();
+            self.0.given.notify_all();
             drop(left);
         }
         pub(crate) fn held(&self) -> u64 {
-            self.limit - *self.left.lock().unwrap()
+            self.0.limit - *self.0.left.lock().unwrap()
         }
-        pub(crate) fn take(self: &Arc<Self>, _: Use, bytes: u64) -> Result<Charge, Refusal> {
-            let mut left = self.left.lock().unwrap();
-            let Some(rest) = left.checked_sub(bytes) else {
-                return Err(Refusal::TooLarge {
-                    what: "memory for queues".into(),
-                    size: usize::try_from(bytes).unwrap(),
-                    limit: usize::try_from(*left).unwrap(),
-                });
-            };
-            *left = rest;
-            drop(left);
-            Ok(Charge {
-                budget: Arc::clone(self),
+        fn too_large(bytes: u64, limit: u64) -> Refusal {
+            Refusal::TooLarge {
+                what: "memory for queues".into(),
+                size: usize::try_from(bytes).unwrap(),
+                limit: usize::try_from(limit).unwrap(),
+            }
+        }
+        fn charge(&self, left: &mut u64, bytes: u64) -> Option<Charge> {
+            *left = left.checked_sub(bytes)?;
+            Some(Charge {
+                budget: self.clone(),
                 bytes,
             })
         }
+        pub(crate) fn take(&self, _: Use, bytes: u64) -> Result<Charge, Refusal> {
+            let mut left = self.0.left.lock().unwrap();
+            self.charge(&mut left, bytes)
+                .ok_or_else(|| Self::too_large(bytes, *left))
+        }
         pub(crate) fn take_until(
-            self: &Arc<Self>,
+            &self,
             _: Use,
             bytes: u64,
             until: Instant,
             mut waits: impl FnMut(),
         ) -> Result<Charge, Refusal> {
-            let mut left = self.left.lock().unwrap();
+            let mut left = self.0.left.lock().unwrap();
             loop {
-                if bytes > self.limit {
-                    return Err(Refusal::TooLarge {
-                        what: "memory for queues".into(),
-                        size: usize::try_from(bytes).unwrap(),
-                        limit: usize::try_from(self.limit).unwrap(),
-                    });
+                if bytes > self.0.limit {
+                    return Err(Self::too_large(bytes, self.0.limit));
                 }
-                if let Some(rest) = left.checked_sub(bytes) {
-                    *left = rest;
-                    drop(left);
-                    return Ok(Charge {
-                        budget: Arc::clone(self),
-                        bytes,
-                    });
+                if let Some(charge) = self.charge(&mut left, bytes) {
+                    return Ok(charge);
                 }
                 if Instant::now() >= until {
                     return Err(Refusal::Full {
@@ -264,11 +261,11 @@ mod memory {
                     });
                 }
                 waits();
-                left = self.given.wait(left).unwrap();
+                left = self.0.given.wait(left).unwrap();
             }
         }
     }
-    pub(crate) fn process() -> Arc<Budget> {
+    pub(crate) fn process() -> Budget {
         super::BUDGET.lock().unwrap().clone().unwrap()
     }
 }
