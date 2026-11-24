@@ -38,6 +38,7 @@ use std::borrow::Cow;
 #[amphora_engine_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
+    outer_query_refs: &[OuterQueryReference],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
@@ -47,7 +48,7 @@ pub fn translate_select(
         select,
         resolver,
         program,
-        &[],
+        outer_query_refs,
         query_destination,
         connection,
     )?;
