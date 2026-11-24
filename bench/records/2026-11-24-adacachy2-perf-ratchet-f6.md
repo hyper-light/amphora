@@ -95,7 +95,24 @@ and `pager.rs:3334`).
 
 ## Checks (adacachy2, Rust 1.99.1, CARGO_HOME/CARGO_TARGET_DIR per RULES rule 6)
 
-@@RUNS@@
+- r320: at F (50a488dc) check-production exit 0 in 56 s (10617, as the ratchet holds), then the shipping
+  build (F and main a64549cc), workspace and engine-alone passes (JSON, the tables above): load 37-56.
+- r367 at 5237f16e (F plus this record's doc edits; the engine's files as at F): check-production exit 0 in
+  66 s with the engine's lib.rs files touched, so clippy re-linted the engine ("Compiling amphora-engine" in
+  its log). Then a negative control: an `unwrap()` put in the shipping `conn_raw_api` function
+  `write_schema_version` and reverted afterwards. check-production exit 1:
+  "clippy::unwrap_used: 434, above the 433". The old gate compiles the engine without `conn_raw_api` and
+  could not see it.
+- r377 at 5237f16e: the engine's portable-logical tests,
+  `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- portable`: 28 passed, 0 failed.
+- r388 at 5237f16e: the engine's whole `mvcc::` module, the same features: 558 passed, 0 failed, 12 ignored.
+- r389 at 5237f16e: `cargo clippy --workspace --all-targets --locked -- -D warnings` (Linux): exit 0.
+- r395 at the merge 2009772f (main moved in crates/amphora, crates/api and vendored hyper-raft, not in
+  crates/engine): check-production exit 0 in 179 s, "Compiling amphora-engine" in both passes with the
+  engine's lib.rs files touched again, 10617 as the ratchet holds; the same workspace clippy: exit 0 in 61 s.
+- `cargo fmt --all --check`: exit 0 (this machine, 5237f16e and the merge).
+- macOS run r351 (portable checks) queued behind others and never started; nothing here relies on it. The
+  engine suites were run on Linux with `conn_raw_api` instead.
 
 ## Commands
 
