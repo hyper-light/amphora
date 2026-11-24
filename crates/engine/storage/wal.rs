@@ -4304,7 +4304,26 @@ impl SharedLog {
                 }
             }
             free.metadata.enabled.store(true, Ordering::Release);
+            // Its read marks are set under their exclusive locks: no read holds one of a free
+            // segment's, so each is taken at once.
+            let held = free
+                .runtime
+                .read_locks
+                .iter()
+                .take_while(|lock| lock.write())
+                .count();
+            if held < free.runtime.read_locks.len() {
+                free.runtime
+                    .read_locks
+                    .iter()
+                    .take(held)
+                    .for_each(|lock| lock.unlock());
+                return Err(LimboError::InternalError(
+                    "a read holds a mark of the log's free segment".into(),
+                ));
+            }
             free.start_after(io, header, epoch, transaction_count);
+            free.runtime.read_locks.iter().for_each(|lock| lock.unlock());
         }
         let switched = self.segments.update(|segments| segments.switch(false));
         if switched != Some(Some(to)) {
