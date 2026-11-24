@@ -1,0 +1,4 @@
+== amphora load=47.69 22:11:26
+== turso load=50.67 22:12:55
+== sqlite load=89.09 22:15:12
+records: /home/adalundhe/.cache/amphora-perf/bench-s7-run/out/round1.jsonl
