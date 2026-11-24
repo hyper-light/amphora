@@ -2556,6 +2556,7 @@ impl Program {
                     }
 
                     let (insn, _) = &insns[state.pc as usize];
+                    crate::T22_PC.store(state.pc as u32, std::sync::atomic::Ordering::Relaxed);
                     if TRACE {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }

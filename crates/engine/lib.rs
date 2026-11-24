@@ -12,6 +12,10 @@
 )]
 #![recursion_limit = "256"]
 
+/// Lane T22 (trace, not for main): the VDBE instruction running now, `u32::MAX` outside a statement; a sampler reads it.
+#[doc(hidden)]
+pub static T22_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
 pub mod alloc;
 pub mod busy;
 pub mod cdc;

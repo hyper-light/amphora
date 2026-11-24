@@ -139,6 +139,69 @@ enum Kind {
 
 // ---- Amphora ----
 
+// Lane T22 (trace, not for main): AMPHORA_PC_TRACE=1 samples the VDBE instruction running each
+// ~250 us of a timed run (a thread of its own, wall time), printing `T22 run` (the total) and one
+// line an instruction that was sampled, then the program's EXPLAIN once.
+static T22_HIST: [std::sync::atomic::AtomicU32; 8192] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 8192];
+static T22_STARTED: std::sync::Once = std::sync::Once::new();
+static T22_EXPLAINED: std::sync::Once = std::sync::Once::new();
+
+fn t22_clear() {
+    if std::env::var_os("AMPHORA_PC_TRACE").is_none() {
+        return;
+    }
+    T22_STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_micros(200));
+                let pc = amphora_engine::T22_PC.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(slot) = T22_HIST.get(pc as usize) {
+                    slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    });
+    for slot in &T22_HIST {
+        slot.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn t22_dump(conn: &Arc<amphora_engine::Connection>, sql: &str) {
+    if std::env::var_os("AMPHORA_PC_TRACE").is_none() {
+        return;
+    }
+    let total: u32 = T22_HIST
+        .iter()
+        .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
+    eprint!("T22 run total={total}");
+    for (pc, slot) in T22_HIST.iter().enumerate() {
+        let n = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            eprint!(" {pc}:{n}");
+        }
+    }
+    eprintln!();
+    T22_EXPLAINED.call_once(|| {
+        amphora_engine::T22_PC.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut stmt) = conn.prepare(format!("EXPLAIN {sql}")) {
+            loop {
+                match stmt.step() {
+                    Ok(amphora_engine::StepResult::Row) => {
+                        if let Some(row) = stmt.row() {
+                            let cols: Vec<String> = row.get_values().map(|v| v.to_string()).collect();
+                            eprintln!("T22 insn {}", cols.join("|"));
+                        }
+                    }
+                    Ok(amphora_engine::StepResult::IO) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+}
+
 pub struct Amphora {
     io: Arc<dyn amphora_engine::IO>,
     _db: Arc<amphora_engine::Database>,
@@ -191,6 +254,14 @@ impl Amphora {
         counted.set_vectorized_scans(vectorized);
         conn.set_adaptive_joins(adaptive);
         counted.set_adaptive_joins(adaptive);
+        // Lane T22 (trace): AMPHORA_STAR_FILTERS=off|always picks the star filter rule.
+        let rule = match std::env::var("AMPHORA_STAR_FILTERS").as_deref() {
+            Ok("off") => amphora_engine::StarFilters::Off,
+            Ok("always") => amphora_engine::StarFilters::Always,
+            _ => amphora_engine::StarFilters::ByCost,
+        };
+        conn.set_star_filters(rule);
+        counted.set_star_filters(rule);
         // Lane G8: AMPHORA_REAL_SUMS=exact runs the SUM-over-REAL A/B's arm (b); unset or `serial`
         // is today's. One binary for both arms, so both plan from one calibration (RULES 5e).
         let sums = match std::env::var("AMPHORA_REAL_SUMS").as_deref() {
@@ -297,6 +368,7 @@ impl Amphora {
         let prepared = Instant::now();
         let search_ms = amphora_engine::join_search_ns().saturating_sub(searched) as f64 / 1e6;
         let (mut rows, mut first) = (0u64, None);
+        t22_clear();
         let ended = self.drive(&mut stmt, Some(began + deadline), |row| {
             if rows == 0 {
                 first = Some(first_row(row.get_values().map(|v| v.to_string())));
@@ -305,6 +377,10 @@ impl Amphora {
             each(row);
         });
         let done = Instant::now();
+        if !counted {
+            t22_dump(&conn, sql);
+        }
+        amphora_engine::T22_PC.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
         conn.set_query_timeout(Duration::ZERO);
         let counts = stmt
             .row_counts()
