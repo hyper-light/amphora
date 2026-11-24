@@ -861,11 +861,61 @@ pub enum Predicate {
     NotNull {
         column: usize,
     },
+    /// `column op ?` (lane R9): a bound parameter, which only [`Predicate::bind`] turns into the
+    /// `Compare` the pipelines test, once the statement runs.
+    Parameter {
+        column: usize,
+        op: CmpOp,
+        index: NonZeroUsize,
+        /// The comparison's affinity, the serial loop's (`comparison_affinity`).
+        affinity: crate::vdbe::affinity::Affinity,
+    },
 }
 
 impl Predicate {
+    /// The term with its parameter's bound value (an unbound one NULL, as `Variable` reads it),
+    /// converted as the serial loop's comparison converts it (`Affinity::convert_for_compare`).
+    /// The column's side needs no conversion: the shape takes a parameter only against an INTEGER
+    /// column, whose stored text is text no numeric affinity converts.
+    pub(crate) fn bind(
+        &self,
+        parameters: &[Value],
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Result<Predicate, MorselError> {
+        let Predicate::Parameter {
+            column,
+            op,
+            index,
+            affinity,
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let bound = index
+            .get()
+            .checked_sub(1)
+            .and_then(|at| parameters.get(at))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let value = match affinity.convert_for_compare(&bound, digits) {
+            Some(either::Either::Left(converted)) => {
+                converted.to_owned().map_err(|_| MorselError::Alloc)?
+            }
+            Some(either::Either::Right(converted)) => converted,
+            None => bound,
+        };
+        Ok(Predicate::Compare {
+            column: *column,
+            op: *op,
+            value,
+        })
+    }
+
     pub(crate) fn holds(&self, row: &[Value]) -> Result<bool, MorselError> {
         Ok(match self {
+            Predicate::Parameter { .. } => {
+                return Err(MorselError::Corrupt("a parameter's term tested unbound"))
+            }
             Predicate::Compare {
                 column: at,
                 op,
