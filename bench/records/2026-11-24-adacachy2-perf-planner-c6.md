@@ -2,7 +2,8 @@
 
 Machines: adacachy2 (runner 00aad8da, Linux, 32 cores, load 40 to 90 all hour from other lanes: no round here is a quiet machine's),
 MacBook Pro 2 (runner e30189ea). Every run debug unless it says release, `nice -n 10`, its own `XDG_CACHE_HOME`.
-Started on main 75efff54; perf/planner-c6 landed on main 6c54b2cb, merged to it. Commands: the runs named (r...) are in kiln's output log of this hour.
+Started on main 75efff54; landed as main cc6f33d8. The last merge (322861e5) took main 997b36da: its message names 6c54b2cb and is wrong;
+what it says of the scope holds (since 9237bb9b main moved only in crates/amphora, which amphora-engine doesn't build on). Runs named (r...) are in kiln's output log.
 
 ## 1. Losses first
 
@@ -15,8 +16,11 @@ Started on main 75efff54; perf/planner-c6 landed on main 6c54b2cb, merged to it.
   test states per query (section 3). Its answers are still checked on the weights learned, twice, for all eight queries.
 - The release timing of the two plans was not measured: the release build did not finish in 25 minutes on MacBook Pro 2 at load 70
   to 90 (r818). The debug timing of the two forced plans (section 3) is indicative only.
-- Not run: the sweep before the fix on the middle and facts shards; the middle shard with ANALYZE ran to my 1,000 s limit on the
-  full version (rc 124) without an answer. Its landed (trimmed) form and the others are in section 4.
+- **Not shown: the fact shards (12,000 rows a side) and the middle shard with ANALYZE.** Each ran to my limit (1,000 s) with no answer, in the full
+  version. The landed, trimmed forms of both facts and of the middle ANALYZE shard were in r1025's `t_pl_8_13` run, cut at its 600 s (rc 124): the
+  trimmed middle shard with no statistics passed in it, the rest did not finish. They land `#[ignore]`d, so the gate does not run them. Nothing
+  wrong was seen in them, but they prove nothing yet: run them with `--ignored` (next lane's first run).
+- Not run: the sweep before the fix on the middle and facts shards.
 
 ## 2. The sweep, and the wrong answer
 
@@ -36,8 +40,8 @@ each serial and at 1, 2, 8 and 8 stated workers (Padded and, at 8, the Kept oute
 | small_any (LEFT, RIGHT, FULL), ANALYZE (14,400) | **85 wrong, 5 joins** | 0 |
 | small_any, no statistics (14,400) | 0 | 0 |
 | middle, no statistics (7,200) | not run | 0 (r967, 840 s) |
-| middle, ANALYZE (7,200) | not run | no answer: cut at 1,000 s (rc 124) |
-| facts, ANALYZE and none (300 each) | not run | no answer by the hour's end (r968) |
+| middle, ANALYZE (7,200) | not run | no answer: cut at 1,000 s (r967, rc 124) |
+| facts, ANALYZE (300) and none (300) | not run | ANALYZE: no answer, cut at 1,000 s (r968, rc 124); none: not run |
 
 The 14 joins. The first example's plan of each, the sweep's EXPLAIN, has a LEFT JOIN's table scanned as an outer loop beside a
 materialized hash build. I read the program of one (the fifth); the plans of the two FULL JOIN examples and the RIGHT JOIN one were
