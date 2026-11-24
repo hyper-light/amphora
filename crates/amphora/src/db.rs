@@ -536,6 +536,17 @@ impl Db {
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
     /// and the backup is told its log broke there (docs/design/backup.md).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(true)
+    }
+
+    /// [`Db::restart_log`]'s switch alone, copying nothing: for a writer whose passes run on
+    /// another thread. What the segment it closes still holds uncopied, the next pass copies
+    /// ([`Db::checkpoint`]): the closing segment first (decision 45).
+    pub(crate) fn switch_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(false)
+    }
+
+    fn start_log_again(&mut self, copy: bool) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
         let over = self.log_frames()? > self.log_kept;
         let (seq, frame) = self.db.wal_end();
@@ -556,8 +567,10 @@ impl Db {
         // no read under way every frame is in the file, as before. The switch needs the closing
         // segment reset, which a read still on it holds off (the writer asks again at its next
         // turn).
-        let _closing = self.checkpoint()?;
-        let _current = self.checkpoint()?;
+        if copy {
+            let _closing = self.checkpoint()?;
+            let _current = self.checkpoint()?;
+        }
         if !self.db.switch_log(cut_past).map_err(fail)? {
             return Ok(false);
         }
