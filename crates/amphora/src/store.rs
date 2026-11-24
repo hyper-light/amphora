@@ -1944,7 +1944,7 @@ mod tests {
                 "after {:?}, disk: {disk}",
                 began.elapsed()
             );
-            assert_eq!(budget.waiting(), 0);
+            assert_eq!((budget.waiting(), store.sends.ending.waits()), (0, 0));
             assert_eq!(budget.held(crate::memory::Use::Queues), 0);
             drop(other);
             let after = store.put(vec!["b".to_owned()]).err();

@@ -6517,6 +6517,7 @@ mod tests {
         ] {
             assert_eq!(held.load(Ordering::Acquire), 0, "{what}");
         }
+        assert_eq!(control.room.line.ending.waits(), 0, "waits told of the end");
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
     }
 
