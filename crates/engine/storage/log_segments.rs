@@ -136,6 +136,13 @@ impl Segments {
         self.other.map(|_| self.current.other())
     }
 
+    /// The segment a checkpoint pass copies (decision 45's rule 1): the closing one while there is
+    /// one, since every frame in it is older than the current one's, and the current one only once
+    /// the closing one is reset.
+    pub fn to_copy(&self) -> SegmentId {
+        self.closing().unwrap_or(self.current)
+    }
+
     pub fn state(&self, segment: SegmentId) -> Segment {
         if segment == self.current {
             return Segment::Current { reads: self.reads };
@@ -503,6 +510,22 @@ mod tests {
         assert_eq!(log.copied(), Some(SegmentId::First));
         assert_eq!(log.state(SegmentId::First), Segment::Free);
         assert_eq!(log.switch(false), Some(SegmentId::First));
+    }
+
+    /// Do: switch, copy the closing segment while a read counts on it, then end the read. Expect:
+    /// a checkpoint copies the current segment before any switch and after the reset, and the
+    /// closing one from the switch to its reset, copied or not (decision 45's rule 1).
+    #[test]
+    fn d45_a_checkpoint_copies_the_closing_segment_until_its_reset() {
+        let mut log = Segments::new(SegmentId::First);
+        assert_eq!(log.to_copy(), SegmentId::First);
+        let read = log.begin_read();
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        assert_eq!(log.to_copy(), SegmentId::First);
+        assert_eq!(log.copied(), None);
+        assert_eq!(log.to_copy(), SegmentId::First, "copied, not yet reset");
+        assert_eq!(log.end_read(read), Some(SegmentId::First));
+        assert_eq!(log.to_copy(), SegmentId::Second);
     }
 
     /// Do: a read begins, the writer switches, the closing segment is copied, then the read ends.
