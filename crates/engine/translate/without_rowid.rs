@@ -698,6 +698,7 @@ fn convert_image(
             start_reg: image,
             count: table.columns().len(),
             check_generated: true,
+            check_null_keys: false,
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }
@@ -829,6 +830,7 @@ pub(crate) fn validate_image(
             start_reg: image,
             count: table.columns().len(),
             check_generated: true,
+            check_null_keys: true,
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }

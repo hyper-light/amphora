@@ -554,14 +554,6 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
-
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
         // register to -1 so the trigger sees the correct value.
@@ -583,6 +575,13 @@ pub fn translate_insert(
                 dest: insertion.key_register(),
             });
             program.preassign_label_to_next_insn(skip_label);
+            // Amphora: NEW holds the row's values as its columns convert them, so a key is made an
+            // integer, and a STRICT table's values are checked and converted, before the triggers
+            // fire, as SQLite does (CV). A non-STRICT table's affinities are applied above.
+            program.emit_insn(Insn::MustBeInt {
+                reg: insertion.key_register(),
+                target_pc: None,
+            });
             Some(save_reg)
         } else {
             // Key is auto-generated, register is uninitialized. Set to -1.
@@ -592,6 +591,26 @@ pub fn translate_insert(
             });
             None
         };
+        if ctx.table.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.num_non_virtual_cols,
+                check_generated: false,
+                check_null_keys: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    ctx.table,
+                    resolver.schema(),
+                    None,
+                )?,
+            });
+        }
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            &btree_table,
+        )?;
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
             .col_mappings
@@ -678,6 +697,7 @@ pub fn translate_insert(
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
             check_generated: false,
+            check_null_keys: true,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
                 resolver.schema(),
@@ -695,6 +715,7 @@ pub fn translate_insert(
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
             check_generated: false,
+            check_null_keys: true,
             table_reference: Arc::clone(type_check_table),
         });
     }
@@ -835,6 +856,7 @@ pub fn translate_insert(
                 //TODO here we could eventually type-check only virtual columns and the stored
                 // columns that have NOT NULL REPLACE.
                 check_generated: true,
+                check_null_keys: true,
                 table_reference: type_check_table,
             });
         }
@@ -2364,23 +2386,24 @@ fn init_source_emission<'a>(
                         columns
                             .iter()
                             .map(|col_name| {
+                                // Amphora: a column declared under one of the rowid's names is
+                                // that column, of its own affinity.
                                 let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
-                                    return Ok(Affinity::Integer.aff_mask());
-                                }
-                                table
-                                    .get_column_by_name(&column_name)
-                                    .map(|(_, col)| col.affinity().aff_mask())
-                                    .ok_or_else(|| {
-                                        crate::error::LimboError::ParseError(format!(
-                                            "table {} has no column named {}",
-                                            table.get_name(),
-                                            column_name
-                                        ))
-                                    })
+                                let affinity = match table.get_column_by_name(&column_name) {
+                                    Some((_, col)) => col.affinity(),
+                                    None if ROWID_STRS
+                                        .iter()
+                                        .any(|s| s.eq_ignore_ascii_case(&column_name)) =>
+                                    {
+                                        Affinity::Integer
+                                    }
+                                    None => crate::bail_parse_error!(
+                                        "table {} has no column named {}",
+                                        table.get_name(),
+                                        column_name
+                                    ),
+                                };
+                                Ok(affinity.aff_mask())
                             })
                             .collect::<Result<String>>()?
                     };

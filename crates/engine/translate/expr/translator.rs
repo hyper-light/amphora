@@ -398,6 +398,52 @@ fn try_emit_expression_index_value_if_any(
     try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
 }
 
+/// Amphora: the left side of `lhs IN (SELECT ...)`, its fields in consecutive registers (the first and
+/// how many are returned): every field computed, then the row converted as the list's rows are, then a
+/// jump to `null` from each field that is NULL, as SQLite's `sqlite3ExprCodeIN` codes it. A NULL in one
+/// field says nothing of the others, which decide still: `(NULL, 8)` is not in `(SELECT 'eu', 7)`, and
+/// whether `(NULL, 7)` is can't be told (https://www.sqlite.org/rowvalue.html 2.1).
+///
+/// A NOT NULL column is tested too: NullRow, for an ungrouped aggregate over no rows, makes it NULL.
+pub(super) fn translate_in_subquery_lhs(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    affinity_str: &str,
+    null: BranchOffset,
+    resolver: &Resolver,
+) -> Result<(usize, usize)> {
+    let fields: Vec<&ast::Expr> = match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(exprs) => exprs.iter().map(|e| e.as_ref()).collect(),
+        expr => vec![expr],
+    };
+    let count = fields.len();
+    let start = program.alloc_registers(count);
+    for (reg, field) in (start..).zip(fields) {
+        translate_expr(program, referenced_tables, field, reg, resolver)?;
+    }
+    if affinity_str
+        .chars()
+        .map(Affinity::from_char)
+        .any(|a| a != Affinity::Blob)
+    {
+        if let Ok(count) = std::num::NonZeroUsize::try_from(count) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: start,
+                count,
+                affinities: affinity_str.to_owned(),
+            });
+        }
+    }
+    for reg in (start..).take(count) {
+        program.emit_insn(Insn::IsNull {
+            reg,
+            target_pc: null,
+        });
+    }
+    Ok((start, count))
+}
+
 #[inline(never)]
 fn translate_subquery_result_expr(
     program: &mut ProgramBuilder,
@@ -448,49 +494,19 @@ fn translate_subquery_result_expr(
                 value: 0,
                 dest: target_register,
             });
-            let lhs_columns = match unwrap_parens(lhs.as_ref().unwrap())? {
-                ast::Expr::Parenthesized(exprs) => exprs.iter().map(|e| e.as_ref()).collect(),
-                expr => vec![expr],
+            let Some(lhs) = lhs.as_deref() else {
+                crate::bail_parse_error!("IN (SELECT ...) has no left-hand side");
             };
-            let lhs_column_count = lhs_columns.len();
-            let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
-            for (i, lhs_column) in lhs_columns.iter().enumerate() {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    lhs_column,
-                    lhs_column_regs_start + i,
-                    resolver,
-                )?;
-                // If LHS is NULL, we need to check if ephemeral is empty first.
-                // - If empty: IN returns FALSE, NOT IN returns TRUE
-                // - If not empty: result is NULL (unknown)
-                // Jump to label_null_rewind which does Rewind and handles empty case.
-                //
-                // Always emit this check even for NOT NULL columns because NullRow
-                // (used in ungrouped aggregates when no rows match) overrides all
-                // column values to NULL regardless of the NOT NULL constraint.
-                program.emit_insn(Insn::IsNull {
-                    reg: lhs_column_regs_start + i,
-                    target_pc: label_null_rewind,
-                });
-            }
-
-            // Only emit Affinity instruction if there's meaningful affinity to apply
-            // (i.e., not all BLOB/NONE affinity)
-            if affinity_str
-                .chars()
-                .map(Affinity::from_char)
-                .any(|a| a != Affinity::Blob)
-            {
-                if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: lhs_column_regs_start,
-                        count,
-                        affinities: affinity_str.as_ref().clone(),
-                    });
-                }
-            }
+            // A NULL on the left: the list decides. Empty, IN is FALSE and NOT IN is TRUE; otherwise
+            // the result is NULL unless each of its rows differs in a field that is not NULL.
+            let (lhs_column_regs_start, lhs_column_count) = translate_in_subquery_lhs(
+                program,
+                referenced_tables,
+                lhs,
+                affinity_str,
+                label_null_rewind,
+                resolver,
+            )?;
 
             // For NOT IN: empty ephemeral or no all-NULL row means TRUE (include)
             // For IN: empty ephemeral or no all-NULL row means FALSE (skip)
