@@ -3629,12 +3629,14 @@ impl Database {
                 "a packed log's pages aren't shared; this database shares its pages".into(),
             ));
         }
-        self.shared_wal
-            .current()
-            .read()
-            .runtime
-            .format
-            .store(format.file_format(), Ordering::Release);
+        for segment in storage::log_segments::SegmentId::BOTH {
+            self.shared_wal
+                .segment(segment)
+                .read()
+                .runtime
+                .format
+                .store(format.file_format(), Ordering::Release);
+        }
         Ok(())
     }
 
@@ -3669,15 +3671,18 @@ impl Database {
         // Packing asked for now, or the log's generation on disk packed (recovery reads it as it
         // was written; nothing asks again after a restart of the process). A mixed log's pages
         // are shared (decision 37).
-        let packed = {
-            let shared = self.shared_wal.current().read();
-            let packed = |format| {
-                crate::storage::packed::LogFormat::of(format)
-                    == Some(crate::storage::packed::LogFormat::Packed)
-            };
-            packed(shared.runtime.format.load(Ordering::Acquire))
-                || packed(shared.metadata.wal_header.lock().file_format)
-        };
+        let packed = [Some(self.shared_wal.current()), self.shared_wal.closing()]
+            .into_iter()
+            .flatten()
+            .any(|segment| {
+                let shared = segment.read();
+                let packed = |format| {
+                    crate::storage::packed::LogFormat::of(format)
+                        == Some(crate::storage::packed::LogFormat::Packed)
+                };
+                packed(shared.runtime.format.load(Ordering::Acquire))
+                    || packed(shared.metadata.wal_header.lock().file_format)
+            });
         if packed {
             return Err(LimboError::InvalidArgument(
                 "a packed log's pages aren't shared".into(),

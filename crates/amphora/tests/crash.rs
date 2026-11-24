@@ -1220,7 +1220,7 @@ fn drill_step(
             open.restart_log().map_err(|e| format!("restart: {e:#}"))?;
         }
         Step::Checkpoint(mode) => {
-            open.query(&format!("PRAGMA wal_checkpoint({mode})"), [], |_| Ok(true))
+            open.exec(&format!("PRAGMA wal_checkpoint({mode})"))
                 .map_err(|e| format!("{mode}: {e:#}"))?;
         }
         Step::Kill => {

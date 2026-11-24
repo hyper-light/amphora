@@ -6416,7 +6416,7 @@ impl Wal for WalFile {
         if log.mark() != Mark::InFile || log.current_id() != SegmentId::First {
             return Ok(false);
         }
-        for segment in [SegmentId::First, SegmentId::Second] {
+        for segment in SegmentId::BOTH {
             let file = log.segment(segment).read().runtime.file.clone();
             let Some(file) = file else { continue };
             if file.size()? > 0 {
@@ -8813,9 +8813,10 @@ impl WalFile {
                         .runtime
                         .file
                         .clone();
-                    // Nothing to cut in a segment never switched to, nor in one cut already.
-                    let file =
-                        file.filter(|file| last || file.size().map_or(true, |size| size > 0));
+                    // Nothing to cut in a segment never switched to. One that reads as empty is cut
+                    // and synced as any other: a switch's own cut of it was not synced, whether this
+                    // process made it or one that was killed, so a power cut would bring its older
+                    // frames back once the other file is cut (lane B30).
                     let Some(file) = file else {
                         result.cut = Self::after_cut(segment, last);
                         continue;
