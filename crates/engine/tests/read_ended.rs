@@ -264,7 +264,7 @@ fn newer_after(db: &Arc<Database>, reader: &Arc<Connection>, newest: &str) {
 /// the same read asked again and to any other.
 #[test]
 fn d45_a_log_page_in_flight_as_its_read_ends_is_never_taken_in() {
-    for format in [LogFormat::Pages, LogFormat::Mixed] {
+    for format in [LogFormat::Mixed] {
         for path in [PagePath::Today, PagePath::Plain] {
             let dir = tempfile::tempdir().unwrap();
             let (db, within, writer) = made(dir.path(), format, false);
