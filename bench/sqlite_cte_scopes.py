@@ -68,7 +68,10 @@ class Draw:
         self.bad = False
         # Whether the statement may hold a fault, which it then holds once: SQLite and Amphora meet several in orders of
         # their own.
-        self.fault = self.rng.random() < 0.3
+        self.fault = self.rng.random() < 0.4
+        self.held = None
+        # The names a CTE's body doesn't read by chance: its own, and those of its WITH clause it reads none of.
+        self.hidden = []
 
     def alias(self):
         self.aliases += 1
@@ -101,12 +104,18 @@ class Draw:
     def source(self, ctes):
         rng = self.rng
         drawn = rng.random()
-        if drawn < 0.04 and self.take_fault():
-            return rng.choice(["c", "d"] if not ctes else [name for name in NAMES if name not in ctes] or ["c"])
-        return rng.choice(ctes) if ctes and drawn < 0.8 else rng.choice(SOURCES)
+        hidden = set().union(*self.hidden) - set(ctes)
+        unknown = [name for name in ("c", "d") if name not in ctes and name not in hidden]
+        if drawn < 0.04 and unknown and self.take_fault("unknown"):
+            return rng.choice(unknown)
+        if ctes and drawn < 0.8:
+            return rng.choice(ctes)
+        return rng.choice([source for source in SOURCES if source not in hidden])
 
-    def take_fault(self):
+    def take_fault(self, kind):
         taken, self.fault = self.fault, False
+        if taken:
+            self.held = kind
         return taken
 
     def cte(self, name, ctes, scope, depth):
@@ -133,14 +142,16 @@ class Draw:
             return f"{name} AS {hint}(SELECT k, v FROM {one} ORDER BY k, v LIMIT {rng.choice([1, 2, 3])})"
         if drawn < 0.68:
             return f"{name} AS {hint}(SELECT x.k, y.v FROM {one} AS x {rng.choice(['JOIN', 'LEFT JOIN'])} {one if rng.random() < 0.6 else two} AS y ON x.k = y.k)"
-        if drawn < 0.74 and self.take_fault():
-            return rng.choice([
-                f"{name} AS (SELECT k, v FROM {name})",
-                f"{name} AS (SELECT k, v FROM nosuch)",
-                f"{name} AS (SELECT nosuch AS k, v FROM t)",
-                f"{name}(k) AS (SELECT k, v FROM {one})",
-                f"{name}(k, v) AS (SELECT 1, 1 UNION ALL SELECT x.k, y.v FROM {name} AS x JOIN {name} AS y ON x.k = y.k)",
-            ])
+        if drawn < 0.76:
+            kind = rng.choice(["own", "table", "column", "count", "twice"])
+            if self.take_fault(kind):
+                return {
+                    "own": f"{name} AS (SELECT k, v FROM {name})",
+                    "table": f"{name} AS (SELECT k, v FROM nosuch)",
+                    "column": f"{name} AS (SELECT nosuch AS k, v FROM t)",
+                    "count": f"{name}(k) AS (SELECT k, v FROM {one})",
+                    "twice": f"{name}(k, v) AS (SELECT 1, 1 UNION ALL SELECT x.k, y.v FROM {name} AS x JOIN {name} AS y ON x.k = y.k)",
+                }[kind]
         return f"{name} AS {hint}({self.select(ctes, scope, depth - 1, 'pair')})"
 
     def with_clause(self, ctes, scope, depth):
@@ -150,14 +161,15 @@ class Draw:
         around = [name for name in ctes if name not in names]
         parts = []
         for at, name in enumerate(names):
-            later = rng.random() < 0.15 and self.take_fault()
+            later = names[at + 1:] and rng.random() < 0.25 and self.take_fault("later")
             reads = around + names[:at] + (names[at + 1:] if later else [])
-            # A CTE's own name in its body is its own, or the table's: a body reads none of the name around it.
+            self.hidden.append(set(names) - set(reads))
             parts.append(self.cte(name, reads, scope, depth))
+            self.hidden.pop()
         if rng.random() < 0.35:
             # One that nothing reads, most often, whose body would be an error.
             parts.append(f"u AS (SELECT k, v FROM {'bad' if self.bad else rng.choice(['nosuch', 'u', 'c', 'd'])})")
-            if rng.random() < 0.1 and self.take_fault():
+            if rng.random() < 0.1 and self.take_fault("unread"):
                 names = names + ["u"]
         rng.shuffle(parts)
         recursive = "RECURSIVE " if rng.random() < 0.3 else ""
@@ -346,9 +358,20 @@ def main():
             answer = ask(conn, sql, write)
             if answer is None or len(answer) > 900 or "\n" in answer:
                 continue
-            # At most one statement in five that SQLite refuses.
+            # At most one statement in five that SQLite refuses, each for the fault it was drawn with alone.
             if answer.startswith("error:"):
-                if (refused + 1) * 5 > count:
+                expected = {
+                    "own": ["circular reference"],
+                    "later": ["circular reference"],
+                    "twice": ["multiple references to recursive table"],
+                    "table": ["no such table"],
+                    "unknown": ["no such table"],
+                    "unread": ["no such table: nosuch", "circular reference: u", "no such table: c", "no such table: d"],
+                    "column": ["no such column"],
+                    "count": ["table "],
+                }.get(draw.held, [])
+                asked = sql in FOUND or any(answer.startswith(f"error: {text}") for text in expected)
+                if not asked or (refused + 1) * 5 > count:
                     continue
                 refused += 1
             print(f"{'w' if write else 'q'}\t{sql}\t{answer}")

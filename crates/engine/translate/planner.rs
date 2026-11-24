@@ -199,13 +199,28 @@ impl RecursiveRefCounter<'_> {
         let Some(with) = with else {
             return;
         };
+        let base = scope.len();
+        // Each of their names is visible in every body, where it refers to the nested CTE (its own
+        // included) rather than the recursive table.
         for cte in &with.ctes {
-            let name = normalize_ident(cte.tbl_name.as_str());
-            // The CTE's own name is visible inside its body, where it refers
-            // to the nested CTE itself rather than the recursive table.
-            scope.push((name, 0));
-            let weight = self.count_select(&cte.select, scope);
-            scope.last_mut().expect("scope entry pushed above").1 = weight;
+            scope.push((normalize_ident(cte.tbl_name.as_str()), 0));
+        }
+        // A body's weight rests on those of the CTEs it reads, which may stand after it: one pass
+        // more for each link of the longest chain of them.
+        for _ in &with.ctes {
+            let mut settled = true;
+            for (offset, cte) in with.ctes.iter().enumerate() {
+                let at = base.saturating_add(offset);
+                let before = scope.get_mut(at).map(|(_, weight)| std::mem::take(weight));
+                let weight = self.count_select(&cte.select, scope);
+                settled &= before == Some(weight);
+                if let Some(entry) = scope.get_mut(at) {
+                    entry.1 = weight;
+                }
+            }
+            if settled {
+                break;
+            }
         }
     }
 
@@ -1452,9 +1467,7 @@ fn prepare_recursive_cte_plan(
         ast::CompoundOperator::UnionAll => true,
         ast::CompoundOperator::Union => false,
         ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
-            crate::bail_parse_error!(
-                "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
-            );
+            crate::bail_parse_error!("circular reference: {}", cte_name);
         }
     };
     for compound in select
