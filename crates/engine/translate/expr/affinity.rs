@@ -90,6 +90,14 @@ pub(crate) fn get_expr_affinity(
         }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
+        // A trigger's new.c and old.c have no affinity, but the rowid, which is an INTEGER
+        // (https://www.sqlite.org/forum/forumpost/819f2d6627).
+        ast::Expr::TriggerRegister(_, ast::TriggerColumn::Rowid) => Affinity::Integer,
+        ast::Expr::Variable(variable)
+            if variable.trigger_column == Some(ast::TriggerColumn::Rowid) =>
+        {
+            Affinity::Integer
+        }
         ast::Expr::Register(reg) => {
             // During UPDATE expression index evaluation, column references are
             // rewritten to Expr::Register. Look up the original column affinity

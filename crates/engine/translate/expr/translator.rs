@@ -322,6 +322,9 @@ fn translate_expr_by_kind(
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
         ast::Expr::Register(_) => translate_register_expr(program, expr, target_register, resolver),
+        ast::Expr::TriggerRegister(register, column) => {
+            translate_trigger_register_expr(program, *register, column, target_register)
+        }
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -1207,6 +1210,11 @@ fn arguments_collation(
                 None => None,
             };
             return Ok(Some(declared.unwrap_or(CollationSeq::Binary)));
+        }
+        if let Some(column) = crate::translate::collate::trigger_column(operand) {
+            if let Some(collation) = crate::translate::collate::trigger_column_collseq(column)? {
+                return Ok(Some(collation));
+            }
         }
     }
     Ok(None)
@@ -3694,10 +3702,41 @@ fn translate_variable_expr(
     let ast::Expr::Variable(variable) = expr else {
         unreachable!("translate_variable_expr expects Expr::Variable");
     };
+    if let Some(column) = &variable.trigger_column {
+        set_trigger_column_collation(program, column)?;
+    }
     let index = program.register_variable(variable);
     program.emit_insn(Insn::Variable {
         index,
         dest: target_register,
+    });
+    Ok(target_register)
+}
+
+/// A trigger's `new.c` or `old.c` compares by its column's collation, as a column read of it does
+/// (translate_column_expr).
+fn set_trigger_column_collation(
+    program: &mut ProgramBuilder,
+    column: &ast::TriggerColumn,
+) -> Result<()> {
+    if let Some(collation) = crate::translate::collate::trigger_column_collseq(column)? {
+        program.set_collation(Some((collation, false)));
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn translate_trigger_register_expr(
+    program: &mut ProgramBuilder,
+    register: usize,
+    column: &ast::TriggerColumn,
+    target_register: usize,
+) -> Result<usize> {
+    set_trigger_column_collation(program, column)?;
+    program.emit_insn(Insn::Copy {
+        src_reg: register,
+        dst_reg: target_register,
+        extra_amount: 0,
     });
     Ok(target_register)
 }

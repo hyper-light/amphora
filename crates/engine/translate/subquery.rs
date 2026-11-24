@@ -617,7 +617,7 @@ pub fn plan_subqueries_from_returning(
 
 /// Plan subqueries in a trigger WHEN clause expression.
 /// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// NEW/OLD references should already be rewritten to Expr::TriggerRegister before calling this.
 #[amphora_engine_macros::trace_stack]
 pub fn plan_subqueries_from_trigger_when_clause(
     program: &mut ProgramBuilder,

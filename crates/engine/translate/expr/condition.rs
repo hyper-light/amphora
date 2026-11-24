@@ -557,7 +557,7 @@ fn translate_leaf_condition_expr(
             )?;
             emit_cond_jump(program, condition_metadata, between_result_reg);
         }
-        ast::Expr::Variable(_) => {
+        ast::Expr::Variable(_) | ast::Expr::TriggerRegister(..) => {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
