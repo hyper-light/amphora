@@ -2345,6 +2345,13 @@ No A/B of the ladder against main was run, and the load was other lanes', so no 
 | r710, r813, r842 | macOS | none ran |
 | r963, r969 | stopped by me: a red run begun before the tree moved; the ladder started on a stale release binary (its seven cells are not used) | |
 
+## After landing (adacachy2)
+
+- The landed tree's build (1e4b65b3), one suite round (`--test-threads=2 database::replicated:: replication::`, load 37): **188 passed, 0 failed** (111 s; r1042).
+- `Db::restart_log` was restructured (its copying path unchanged), so its integration files ran on main 6c54b2cb: `store` 17 passed, `files` 3 passed, 0 failed (r1045, load 43 to 48).
+  `backup` failed once in its first whole-file run (r1043, load 48): `t_t1_12_x2_cross_group_cut_across_skewed_clocks`, last second seen 1, not 2 (a test of archived wall-clock seconds). It passed alone 3 of 3, and the whole file
+  passed 3 of 3 on the landed tree and 3 of 3 on main 135ed91c, alternated (24 passed each, r1048, load 30 to 39). Not traced: one failure in four whole-file runs on the landed tree, none in three on main.
+
 ## Landing
 
 Branch perf/commits-v20: a83c5de2 (the tests, red), 32ba72e3 (the change), f09699b9 (docs). Merged with main 60993be4 (9efdff4d), b53a29b1 (1e4b65b3, checked as above) and
