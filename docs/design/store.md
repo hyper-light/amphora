@@ -2582,9 +2582,16 @@ SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a
   because both files are empty and synced before it (`Wal::may_unmark`). A crash before it is durable leaves 3 (refused);
   after, the log's frame or the file says 2 and every commit is in the file. A commit of page 1 without the mark puts the
   database back where an opened one is (`Mark::Absent`), so a connection that comes meanwhile marks it again before any
-  switch. A close that can't fold (Busy three times) leaves 3. `Db` makes no clean close as it is dropped: its files stay
-  marked as the process ends. `Db::close` is one, and a restore ends in it, so SQLite reads a restored file too. VACUUM
-  INTO's file says 2 and 2, as before.
+  switch. A close that can't fold (Busy three times) leaves 3. `Db::close` is one, and a restore ends in it, so SQLite reads a
+  restored file too. `Db` makes none as it is dropped. VACUUM INTO's file says 2 and 2, as before.
+- *An orderly end closes cleanly (the coordinator, 2026-11-24, on lane B29's question; lane B30).* A store ends once its
+  last handle is let go: what was handed over committed and flushed, its readers and its checkpointer gone, and then its
+  engine closed (`store::Engine::close`, a database's `Db::close`), as SQLite's last connection does. `Store::close` and
+  `Database::close` let a handle go and wait for that, so that a process that stops knows it is done before it exits. A
+  process that is killed, before that or in it, leaves the files as they stand: refused, or closed whole (tests/crash.rs
+  cuts the power at each change). Not closed cleanly, so refused too: a store whose flush failed (decision 9: the log's
+  frames may not be what the disk holds) or whose engine's upkeep did, and a database backed up, whose log starts again
+  only once shipped (`Db::back_up`).
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other

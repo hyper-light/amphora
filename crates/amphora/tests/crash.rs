@@ -600,6 +600,10 @@ impl Engine for Events {
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
+
+    fn close(self) -> anyhow::Result<()> {
+        self.db.close()
+    }
 }
 
 /// The WAL's checksum (SQLite's format: words little-endian under magic 0x377f0682).
@@ -699,6 +703,8 @@ struct Seen {
     refused: usize,
     /// The images plain SQLite refuses, of those the cut left.
     sqlite_refused: usize,
+    /// The store ended in order before the cut.
+    closed: usize,
 }
 
 /// Whether plain SQLite reads the files a cut left, whole. None: it refuses them (docs/design/store.md,
@@ -848,18 +854,30 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         });
     }
     let counted = store.counters();
-    drop(store);
+    let log_cuts = disk
+        .files
+        .lock()
+        .unwrap()
+        .get(&format!("{PATH}-wal"))
+        .map_or(0, |f| f.held.lock().unwrap().cuts);
+    // Half the stores end in order before the power goes, if it hasn't; the others as it does.
+    let whole = if seed.is_multiple_of(2) {
+        let closed = store.close(soon());
+        let whole = !disk.crashed();
+        if whole {
+            closed.map_err(|e| format!("close: {e:#}"))?;
+        }
+        whole
+    } else {
+        drop(store);
+        false
+    };
     let mut seen = Seen {
         cut_midway: disk.crashed(),
         changes: disk.changes.load(Ordering::SeqCst),
         checkpoints: counted.checkpoints,
         restarts: counted.restarts,
-        log_cuts: disk
-            .files
-            .lock()
-            .unwrap()
-            .get(&format!("{PATH}-wal"))
-            .map_or(0, |f| f.held.lock().unwrap().cuts),
+        log_cuts,
         ..Seen::default()
     };
 
@@ -923,6 +941,13 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         return Err(format!("{n} rows of batch {batch}, which was never sent"));
     }
     let sqlite = plain_sqlite(&image, PATH).map_err(|e| format!("{e}{}", account()))?;
+    if whole && sqlite.is_none() {
+        return Err(format!(
+            "SQLite refuses a store that ended in order{}",
+            account()
+        ));
+    }
+    seen.closed += usize::from(whole);
     seen.sqlite_refused += usize::from(sqlite.is_none());
     Ok(seen)
 }
@@ -985,7 +1010,7 @@ fn run_seeds<S: Send>(n: u64, from: u64, one: impl Fn(u64) -> Result<S, String> 
 fn seeds(n: u64, from: u64) {
     let (mut midway, mut acknowledged, mut refused) = (0u64, 0usize, 0usize);
     let (mut checkpoints, mut restarts, mut log_cuts) = (0u64, 0u64, 0u64);
-    let mut sqlite_refused = 0usize;
+    let (mut sqlite_refused, mut closed) = (0usize, 0usize);
     // What whole workloads changed, to draw crash points from.
     let mut whole: Vec<u64> = Vec::new();
     for seen in run_seeds(n, from, one_seed) {
@@ -999,11 +1024,13 @@ fn seeds(n: u64, from: u64) {
         restarts += seen.restarts;
         log_cuts += seen.log_cuts;
         sqlite_refused += seen.sqlite_refused;
+        closed += seen.closed;
     }
     eprintln!(
         "{n} seeds: cut midway in {midway}; {checkpoints} checkpoints, {restarts} restarts of the log \
          and {log_cuts} cuts of its file before a cut; {acknowledged} batches acknowledged, \
-         {refused} refused; plain SQLite refuses {sqlite_refused} of the images"
+         {refused} refused; plain SQLite refuses {sqlite_refused} of the images; {closed} stores \
+         ended in order"
     );
     assert!(sqlite_refused > 0, "no image plain SQLite refuses");
     whole.sort_unstable();

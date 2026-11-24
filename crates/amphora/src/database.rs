@@ -2172,6 +2172,29 @@ impl Database {
         Ok(database)
     }
 
+    /// Lets this handle go and waits, until `until` at most, for the owner's orderly end: every other
+    /// handle in the process gone, what was written durable, and the file closed cleanly, so that
+    /// plain SQLite reads it (docs/design/store.md, decision 45). An owner whose last handle is let
+    /// go without it ends the same way, unwaited for. Refused [`Refusal::Timeout`] past `until`, and
+    /// why the file wasn't closed cleanly: it then stays as a kill leaves it, recovered as it is
+    /// opened. A client of another process's owner closes nothing.
+    pub fn close(self, until: Instant) -> Result<(), Refusal> {
+        let end = match &self.shared.writer {
+            Writer::Local(store) => Some(store.ending()),
+            Writer::Client(_) | Writer::Replicated { .. } => None,
+        };
+        drop(self);
+        let Some(end) = end else {
+            return Ok(());
+        };
+        end.wait(until)
+            .map_err(|error| match error.downcast_ref::<store::Refused>() {
+                Some(store::Refused::Timeout) => Refusal::Timeout,
+                Some(refused) => refused.ended(),
+                None => unavailable(format!("{error:#}")),
+            })
+    }
+
     /// This database's handle over `cluster`'s groups (lane split-merge-18, T-T1.9.R20): its
     /// namespaces' scans, changes and heads read every group, each revision in the order of its
     /// commit stamp, the hybrid logical clock the cross-group steps carry
@@ -3642,6 +3665,11 @@ impl Engine for Local {
     type Reader = Db;
     fn key(_: &Command) -> &str {
         "database"
+    }
+    /// The database closed cleanly: plain SQLite then reads its file (docs/design/store.md,
+    /// decision 45).
+    fn close(self) -> anyhow::Result<()> {
+        self.db.close()
     }
     /// None of its own: a command is charged at its admission ([`Admission`]), what it carries
     /// and what its answer can hold, until it is answered, its time in the writer's queue within.

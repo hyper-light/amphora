@@ -122,6 +122,16 @@ pub trait Engine: Send + 'static {
         Ok(Upkept::default())
     }
 
+    /// Its end: every handle of its store dropped, everything committed durable and no reader of its
+    /// store left. An engine on a database closes it cleanly ([`crate::db::Db::close`]). Never asked
+    /// after a failed flush or a failed upkeep, nor of a process that is killed.
+    fn close(self) -> anyhow::Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+
     /// The holding its database keeps with its rows, as [`Engine::keep_holding`] last kept it
     /// (None: it keeps none yet): what a group in groups answers from (CP-T1.9;
     /// docs/design/reshard.md, "A group's holding"). By default an engine keeps no holding, and
@@ -517,6 +527,9 @@ struct Sends {
     claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
+    /// The writer is done, its engine let go: how that ended.
+    closed: Mutex<Option<Result<(), String>>>,
+    closing: Condvar,
 }
 
 /// The flushes begun ([`flusher`]): a flush's target is made durable only once it and every flush
@@ -583,6 +596,8 @@ impl Default for Sends {
             claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
+            closed: Mutex::default(),
+            closing: Condvar::new(),
         }
     }
 }
@@ -811,6 +826,56 @@ impl Sends {
             self.done.notify_all();
         }
         self.ending.end(&Refused::Stopped.ended());
+    }
+
+    /// Waits for the writer's last commit, its `commits`th, to be durable: whether it is, not if a
+    /// flush failed. Each flush that ends wakes it, as it does a batch's sender.
+    fn all_durable(&self, commits: u64) -> bool {
+        let mut durable = locked(&self.durable);
+        loop {
+            if self.disk_failed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if durable.commits >= commits || self.durable_as_committed.load(Ordering::Relaxed) {
+                return true;
+            }
+            durable = self
+                .flushed
+                .wait(durable)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// The writer is done: how its engine's close ended, told to whoever waits ([`Store::close`]).
+    fn close(&self, ended: Result<(), String>) {
+        if let Err(error) = &ended {
+            tracing::warn!(target: "amphora.store", event = "unclosed", %error, "the store ended without a clean close; it recovers when it is opened");
+        }
+        *locked(&self.closed) = Some(ended);
+        self.closing.notify_all();
+    }
+
+    fn wait_closed(&self, until: Instant) -> anyhow::Result<()> {
+        let mut closed = locked(&self.closed);
+        loop {
+            match &*closed {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(_)) if self.disk_failed.load(Ordering::SeqCst) => {
+                    return Err(Refused::Disk.into());
+                }
+                Some(Err(error)) => return Err(anyhow::anyhow!("{error}")),
+                None => {}
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refused::Timeout.into());
+            }
+            closed = self
+                .closing
+                .wait_timeout(closed, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 
     /// A flush failed: whoever waits for a commit or a flush is told.
@@ -1251,6 +1316,15 @@ impl<R: Send + 'static> Readers<R> {
     }
 }
 
+/// How a store ends ([`Store::close`]), holding no handle to it.
+pub(crate) struct End(Arc<Sends>);
+
+impl End {
+    pub(crate) fn wait(&self, until: Instant) -> anyhow::Result<()> {
+        self.0.wait_closed(until)
+    }
+}
+
 /// A handle to a store: cheap to clone, usable from any thread. Its writer's queue counts nothing:
 /// its batches are bounded by their charge ([`Engine::row_bytes`]), its jobs by their callers, each
 /// waiting for its own.
@@ -1329,6 +1403,22 @@ impl<E: Engine> Store<E> {
     #[must_use]
     pub fn counters(&self) -> Counters {
         self.meter.counters()
+    }
+
+    /// Lets this handle go and waits, until `until` at most, for the store's orderly end: its other
+    /// handles gone too, everything handed over committed and flushed, and its engine closed
+    /// ([`Engine::close`]). A store let go without it ends the same way, unwaited for. Refused
+    /// [`Refused::Timeout`] past `until` (it ends on its own once its last handle goes),
+    /// [`Refused::Disk`] after a failed flush, and why its engine couldn't be closed otherwise.
+    pub fn close(self, until: Instant) -> anyhow::Result<()> {
+        let end = self.ending();
+        drop(self);
+        end.wait(until)
+    }
+
+    /// What says how the store ends, holding no handle to it.
+    pub(crate) fn ending(&self) -> End {
+        End(Arc::clone(&self.sends))
     }
 
     /// Rows to be committed with the next batch. Never waits: with no room for their charge they
@@ -1734,6 +1824,14 @@ fn writer<E: Engine>(
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
                 readers.release();
                 sends.stop();
+                let closed = if sends.all_durable(commits) {
+                    engine.close().map_err(|e| format!("{e:#}"))
+                } else {
+                    // After a failed flush the log's frames may not be what the disk holds
+                    // (docs/design/store.md, decision 9): the files are left as a kill leaves them.
+                    Err(Refused::Disk.to_string())
+                };
+                sends.close(closed);
                 return;
             }
         }
@@ -1755,6 +1853,7 @@ fn writer<E: Engine>(
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
                 readers.release();
                 sends.stop();
+                sends.close(Err(format!("the engine's upkeep failed: {e:#}")));
                 return;
             }
         }
