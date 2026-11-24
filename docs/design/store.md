@@ -2433,6 +2433,14 @@ before any frame of the current one.
   Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
   that against today's twice-the-bound.
 
+**A replica's owner (the coordinator, 2026-11-24; lane V20).** The restart a replica's owner makes is this switch and
+waits for no local read (replication.md, "A replica's database log bounded by what it measures", B and D, which had it
+wait until no read was out and held reads for it). It calls the switch alone (`Db::switch_log`), never
+`Db::restart_log`, which copies on its caller's thread: the copy and the file's flush are the owner's flushing thread's
+passes', one asked as each switch is made. An open read keeps the segment it began on, to its end (its caller's deadline
+at most); the closed segment lives until it is copied whole and no read counts on it (the bound above). The log's peak
+disk is the two segments, each within the replica's room (replication.md, C and D).
+
 **On disk (revised 2026-11-23, Ada: "There are no 'older databases' besides any ones you've created for test.
 Amphora is not even released. This is not a concern.").** The two segments replace the one log outright. There is no
 upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
@@ -2511,7 +2519,9 @@ the places a segment is added (`crates/engine/storage/`):
   (1659-1663, 2366-2412) opens the second path beside `-wal`.
 - `crates/amphora/src/db.rs` `restart_log` and `hold_log` (505-566), the store's gate (`store.rs` 1129-1148), and the
   backup, which reads frames out of `-wal` by offset for each generation (`backup/ship.rs` 754-872): it reads the
-  segment the generation is in.
+  segment the generation is in. A segment whose header its first commit hasn't written yet
+  holds nothing to ship, and a base begins only once the closing segment is in the file, since a restore replays the
+  log from the base's own generation (backup.md, lane B22).
 
 **Sources.** SQLite's wal2 branch, `doc/wal2.md` (github.com/sqlite/sqlite, branch `wal2`): the files are
 "<database>-wal" and "<database>-wal2"; "Once the first wal file has grown large enough, writers switch to appending

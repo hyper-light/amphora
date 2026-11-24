@@ -536,6 +536,17 @@ impl Db {
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
     /// and the backup is told its log broke there (docs/design/backup.md).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(true)
+    }
+
+    /// [`Db::restart_log`]'s switch alone, copying nothing: for a writer whose passes run on
+    /// another thread. What the segment it closes still holds uncopied, the next pass copies
+    /// ([`Db::checkpoint`]): the closing segment first (decision 45).
+    pub(crate) fn switch_log(&mut self) -> anyhow::Result<bool> {
+        self.start_log_again(false)
+    }
+
+    fn start_log_again(&mut self, copy: bool) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
         let over = self.log_frames()? > self.log_kept;
         let (seq, frame) = self.db.wal_end();
@@ -556,8 +567,10 @@ impl Db {
         // no read under way every frame is in the file, as before. The switch needs the closing
         // segment reset, which a read still on it holds off (the writer asks again at its next
         // turn).
-        let _closing = self.checkpoint()?;
-        let _current = self.checkpoint()?;
+        if copy {
+            let _closing = self.checkpoint()?;
+            let _current = self.checkpoint()?;
+        }
         if !self.db.switch_log(cut_past).map_err(fail)? {
             return Ok(false);
         }
@@ -626,6 +639,24 @@ impl Db {
         )
     }
 
+    /// The header the current segment's file of the log holds (decision 45): its own, or that of
+    /// the generation the file held before, until its first commit writes its own. None while the
+    /// file holds none, which is no failure: a switch makes the file, or cuts it to nothing, and
+    /// the segment's first commit writes its header; a log folded whole is emptied too.
+    pub(crate) fn log_header(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let len = usize::try_from(LOG_HEADER_BYTES)?;
+        let wal = segment_path(&self.path, self.db.wal_segment());
+        Ok(self
+            .read_to(&wal, 0, len)?
+            .filter(|header| header.len() == len))
+    }
+
+    /// Whether the file holds every frame committed before the log's current segment (decision
+    /// 45): what a copy of the file needs before it begins in the current generation.
+    pub(crate) fn closing_copied(&self) -> bool {
+        self.db.wal_closing_copied()
+    }
+
     /// `len` bytes of the database's file from `offset`.
     pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(&self.path.display().to_string(), offset, len)?
@@ -641,7 +672,21 @@ impl Db {
         file.size().map_err(fail)
     }
 
+    /// `len` bytes of `path` from `offset`; None when there is no such file, and refused when it
+    /// holds fewer.
     fn read_at(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let bytes = self.read_to(path, offset, len)?;
+        if let Some(bytes) = &bytes
+            && bytes.len() != len
+        {
+            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
+        }
+        Ok(bytes)
+    }
+
+    /// What `path` holds of the `len` bytes from `offset`, fewer past its end; None when there is
+    /// no such file.
+    fn read_to(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
         let file = match self.io.open_file(path, OpenFlags::NoLock, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -672,9 +717,6 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("a read's lock was poisoned"))?
             .take()
             .ok_or_else(|| anyhow::anyhow!("reading {path} failed"))?;
-        if bytes.len() != len {
-            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
-        }
         Ok(Some(bytes))
     }
 
