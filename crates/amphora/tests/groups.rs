@@ -148,6 +148,10 @@ impl Engine for Events {
         &row.key
     }
 
+    fn row_bytes(row: &Row) -> usize {
+        std::mem::size_of::<Row>().saturating_add(row.key.capacity())
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         let head = self.head + 1;
         let pinned = self.pinned;
