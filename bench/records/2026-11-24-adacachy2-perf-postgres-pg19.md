@@ -14,10 +14,11 @@ Hour: 2026-11-24T07:18:16Z to 08:18:16Z (from the lane's first command). Branch 
   again from the shorter one.
 - `ROLLBACK` is not in the parser's rules (its tree has `BEGIN` and `COMMIT` alone), so the failing block ends
   by `END`, which rolls back, and no test asks for `ROLLBACK`.
-- Isolation: an explicit transaction is the engine's own, which reads one snapshot for its whole life. READ
-  COMMITTED (a snapshot per statement, section 8) is unit 14's and the waits of unit 14 and 15 aren't built,
-  so a second session that updates a row the first has changed waits for nothing: it is `40001`. The two
-  sessions of T-PG.9.1 don't write one row at once.
+- Isolation is the engine's own transaction, not tested against a server beyond the two sessions of T-PG.9.1 (which
+  don't write one row at once): a transaction that reads before it writes keeps the engine's snapshot for its
+  whole life, where READ COMMITTED takes one for each statement (section 8's unit 14), and a write that meets
+  another's is refused as `40001` by the executor's mapping, where 19 waits and goes on (units 14 and 15). Both
+  from reading the code, no run.
 - A function over a column is found by its name on every call (`Func::Dialect`), which section 4 says
   `Func::Pg(ProcOid)` is to replace. Functions that read the session's `TimeZone` or `search_path` over a
   column are refused `0A000`.
@@ -70,8 +71,8 @@ start. The branch was squashed before the push: the code's tree, 13b176bf's, is 
 | Run | Tree | Command | Result |
 |---|---|---|---|
 | r1072, 07:49Z, cpus=8 | 4240fffb | `cargo test -p amphora --test postgres_protocol t_pg_9_1` | The red run: FAILED on one statement, `aid > 1` (the server answers two rows, here `0A000`), the other 41 agreeing. `aid > 1` was then dropped. |
-| r1081, 07:52Z, cpus=8, load 21.4 31.3 43.1 | b1718a16 | `cargo test -p amphora-pg-analysis`, `-p amphora --test postgres_protocol --test postgres_listener`, `-p amphora-engine --lib -- dialect:: vtab alter` | 2, 3 and 5 passed; 13 and 5 passed; 35 passed, 3,195 filtered out (clippy's run in the same command failed on two lints in lower.rs's tests) |
-| r1098, 07:58Z, cpus=2, load 22.6 29.0 38.9 | 2bc49000, main 67cc7e69 merged | clippy failed on the same two lints; `cargo test -p amphora-pg-analysis -p amphora-pg-catalog` and `-p amphora --test postgres_protocol --test postgres_listener` | 2, 3, 5 passed and 2, 5 passed (pg-catalog); 13 and 5 passed |
+| r1081, 07:52Z, cpus=8, load 21.4 31.3 43.1 | b1718a16 | `cargo test -p amphora-pg-analysis`, `-p amphora --test postgres_protocol --test postgres_listener`, `-p amphora-engine --lib -- dialect:: vtab alter` | 2, 3 and 5 passed; 13 and 5 passed; 35 passed, 3,195 filtered out (clippy in the same command failed on two lints in lower.rs's tests) |
+| r1098, 07:58Z, cpus=2, load 22.6 29.0 38.9 | 2bc49000, main 67cc7e69 merged | clippy failed on two lints in lower.rs's tests (others, where r1081's were mended); `cargo test -p amphora-pg-analysis -p amphora-pg-catalog` and `-p amphora --test postgres_protocol --test postgres_listener` | 2, 3, 5 passed and 2, 5 passed (pg-catalog); 13 and 5 passed |
 | same | same | `bash scripts/check-production.sh` | exit 0. The log shows `Compiling amphora-engine`, `Checking amphora-engine-parser`, `Checking amphora-pg-analysis`, `Checking amphora`. `engine-ratchet: 10617 left in the engine's production code across 17 lints, as the ratchet holds` |
 | r1120, 08:02Z, cpus=4, load 63.1 49.0 44.9 | eba20acc | `cargo clippy -p amphora-pg-analysis -p amphora-pg-catalog -p amphora-engine -p amphora --all-targets --locked -- -D warnings` | Failed on six lints, all in postgres_protocol.rs's new tests (mended in 13b176bf). pg-analysis, engine and amphora were checked: `Checking amphora-engine`, `Checking amphora-pg-analysis` |
 | r1127, 08:02Z, cpus=1 | eba20acc | the control: a container of the lane's own, the 19.0 server, the same list and `scripts/postgres-tpcb-answers.py` | exit 0: 151 lines, one differs from the committed answers, the CURRENT_TIMESTAMP's value |
