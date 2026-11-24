@@ -20,12 +20,14 @@ pub mod coerce;
 pub mod datetime;
 pub mod expr;
 pub mod func;
+pub mod lower;
 pub mod resolve;
 pub mod stmt;
 pub mod tz;
 
 pub use expr::{Expr, ExprId, ExprKind, Exprs, Form};
-pub use func::{Value, eval, input, output};
+pub use func::{Value, call, eval, input, output};
+pub use lower::{Field, Lowered, lower};
 pub use stmt::{Query, Target, analyze};
 
 use amphora_pg_catalog::{SearchPath, data::type_oid, type_by_oid};
@@ -139,6 +141,9 @@ pub struct Session<'a> {
     pub relations: &'a dyn Relations,
     /// The `TimeZone` setting.
     pub time_zone: &'a datetime::TimeZone,
+    /// When the statement's transaction began, as microseconds from 2000-01-01 UTC
+    /// (`GetCurrentTransactionStartTimestamp`, CURRENT_TIMESTAMP's value): none where no transaction runs.
+    pub now: Option<i64>,
 }
 
 /// `format_type_be` (src/backend/utils/adt/format_type.c): a type's name as messages show it.

@@ -1715,4 +1715,6 @@ tests = [
   { id = "T-PG.8.4", text = "amphora-pg-analysis tests/statements.rs t_pg_8_4_a_regclass_parameter_resolves_a_table — passes when pgbench's relkind query takes $1 as a regclass and its text resolves a table" },
   { id = "T-PG.8.5", text = "amphora-pg-analysis tests/statements.rs t_pg_8_5_a_time_zone_19_does_not_have_is_refused — passes when a TimeZone that names no zone is 22023" },
   { id = "T-PG.8.6", text = "amphora-pg-analysis tests/statements.rs t_pg_8_6_a_deep_expression_takes_no_stack — passes when 100,000 operators in a row and 1,500 in each other are analyzed and computed" },
+  { id = "T-PG.9.1", text = "amphora tests/postgres_protocol.rs t_pg_9_1_tpcb_statements_answer_as_a_19_server_does — passes when pgbench's TPC-B statements, run through two sessions of the wire core on the engine, answer message for message as a PostgreSQL 19.0 server did (tests/tpcb/answers.txt, taken by scripts/postgres-tpcb-answers.py): RowDescription types, DataRow text, command tags, SQLSTATEs and transaction states; a CURRENT_TIMESTAMP by its shape" },
+  { id = "T-PG.9.2", text = "amphora-pg-analysis src/lower.rs t_pg_9_2_* — passes when TPC-B's account update lowers to the engine's update with int4pl over the column and its key compared by the engine, a constant is computed once and bound, and 22012 is refused as 19 refuses it" },
 ]

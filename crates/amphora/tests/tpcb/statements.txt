@@ -1,0 +1,41 @@
+s1|INSERT INTO pgbench_branches (bid, bbalance, filler) VALUES (1, 0, $$branch one$$)
+s1|INSERT INTO pgbench_branches (bid, bbalance, filler) VALUES (2, 100, $$branch two$$)
+s1|INSERT INTO pgbench_tellers (tid, bid, tbalance, filler) VALUES (1, 1, 0, $$teller$$)
+s1|INSERT INTO pgbench_tellers (tid, bid, tbalance, filler) VALUES (2, 2, 0, $$teller$$)
+s1|INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (1, 1, 0, $$$$)
+s1|INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (2, 1, 2147483640, $$$$)
+s1|INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (3, 2, -7, $$$$)
+s1|SELECT 1
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 3
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 100 WHERE aid = 1
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|UPDATE pgbench_tellers SET tbalance = tbalance + 100 WHERE tid = 1
+s1|UPDATE pgbench_branches SET bbalance = bbalance + 100 WHERE bid = 1
+s1|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 1, 1, 100, CURRENT_TIMESTAMP)
+s1|END
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s2|SELECT tid, bid, aid, delta, mtime FROM pgbench_history
+s2|BEGIN
+s2|UPDATE pgbench_accounts SET abalance = abalance + -100 WHERE aid = 3
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 3
+s2|UPDATE pgbench_tellers SET tbalance = tbalance + -100 WHERE tid = 2
+s2|UPDATE pgbench_branches SET bbalance = bbalance + -100 WHERE bid = 2
+s2|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (2, 2, 3, -100, CURRENT_TIMESTAMP)
+s2|END
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 3
+s1|SELECT bbalance FROM pgbench_branches WHERE bid = 1
+s1|SELECT tid, bid, aid, delta FROM pgbench_history
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 100 WHERE aid = 2
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 2
+s1|END
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance - 100 WHERE aid = 1
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|END
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|SELECT 2147483647 + 1
+s1|SELECT abalance, 1 + 2 FROM pgbench_accounts WHERE aid = 3
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 100

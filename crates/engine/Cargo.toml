@@ -155,6 +155,7 @@ bytemuck = "1.23.1"
 aes-gcm = { version = "0.10.3" }
 aes = { version = "0.8.4" }
 amphora-engine-parser = { workspace = true }
+amphora-pg-analysis = { path = "../pg-analysis" }
 amphora-pg-catalog = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
