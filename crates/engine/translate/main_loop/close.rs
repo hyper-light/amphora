@@ -378,7 +378,8 @@ fn emit_unmatched_right_rows(
         // Keep the key as cursor metadata for EXPLAIN. The override selects
         // this new cursor when the main read has the same key.
         let key = CursorKey::index(main_table.internal_id, index.clone());
-        let cursor_id = program.alloc_cursor_index(Some(key.clone()), &index)?;
+        let cursor_id =
+            program.alloc_cursor_index(Some(key.clone()), &main_table.index_of_cursor(&index)?)?;
         cursor_overrides.push((key, cursor_id));
         unmatched_index_cursors.push((index, cursor_id));
     }
