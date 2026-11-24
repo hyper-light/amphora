@@ -8,8 +8,8 @@
   plan).
 - **check-production was not run on Linux.** adacachy2 was Ada's benchmark window. On macOS the
   engine's counts are the same on main and here, lint by lint.
-- **The shapes probe was cut short by the hour**: 329 of its 393 statements were judged on the fixed
-  tree (planned by cost), 393 on main's code. A larger table (`C1_SCALE`) and a file were not run.
+- **A larger table and a file were not run.** The probe takes both (`C1_SCALE`, `C1_FILE`); the hour
+  went to the wrong answer below. Its 393 statements ran at t_qt_6_35's sizes, in memory.
 - **A wrong answer on main, found and fixed (T-QT.6.36), in two places a user reaches:**
   - A COLUMNAR table's column copy, with no parallel mode: `GROUP BY s ORDER BY s DESC` (and NULLS
     LAST, NULLS FIRST) came out ascending.
@@ -48,7 +48,7 @@ places, and the groups are sorted by it as the serial sorter compares keys (`cmp
 | Check (Mac Studio d1323898, macOS arm64, dev profile) | main fab12d7e | with the fix |
 |---|---|---|
 | `t_qt_6_36` (new; the test alone, commit 3f76bfaa) | FAILED, 2.51 s: "SELECT d.c, count(*), min(f.b) FROM f LEFT JOIN d ON f.a = d.a GROUP BY d.c ORDER BY d.c NULLS LAST on 1 cores, ByCost, Padded: the order" | passes, 20.58 s |
-| shapes probe: 393 join statements (and the nine of t_qt_6_35), 2 join methods, 2 outer orientations, 3 searched-link settings, stated 1, 3 and 8 cores and measured costs at 1 and 4, each answer judged in row order by SQLite 3.51.0 | 20,696 answers of 393 statements: workers 7,930, 1,020 wrong (all the same rows in another order); serial loop 12,766, 0 wrong | 10,183 answers of 329 statements: workers 3,880, 0 wrong; serial loop 6,303, 0 wrong |
+| shapes probe: 393 join statements (and the nine of t_qt_6_35), 2 join methods, 2 outer orientations, 3 searched-link settings, stated 1, 3 and 8 cores and measured costs at 1 and 4, each answer judged in row order by SQLite 3.51.0 | 20,696 answers of 393 statements: workers 7,930, 1,020 wrong (all the same rows in another order); serial loop 12,766, 0 wrong | 17,911 answers of 393 statements (every one planned by cost, some under HashJoinsOnly): workers 6,760, 0 wrong; serial loop 11,151, 0 wrong |
 | `t_qt_6_36_a_copys_groups_come_out_in_the_order_stated` (new; main's execute.rs put back for the red) | FAILED: `SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s DESC` gave NULL, k0, k1, k10, ... from the copy and k9, k8, k7, ... from the rows | passes, 0.63 s, and the copy answered |
 | `translate::` and `versioned::columns` suites (8 threads, 107 s) | `t_pl_8_13` red with the same message (85 s) | 335 passed, 1 failed (`t_pl_8_13`, main's own) |
 | `morsel` suite (`--skip t_qt_6_18`, 6 threads) | `t_qt_6_35` red | 48 passed, 1 failed (`t_qt_6_35`, main's own), 4 ignored, 31.5 s |
@@ -75,7 +75,20 @@ places, and the groups are sorted by it as the serial sorter compares keys (`cmp
 - **Answers.** At the test's shape every one of the 9 statements, under 5 join-method settings, 2 outer
   orientations, 3 searched-link settings and 1, 2, 3, 4 and 8 stated cores, equals SQLite 3.54.0's:
   1,350 parallel and 45 serial answers, 0 wrong (adacachy2, before the window).
-- **For the planner's lane.** The design as written doesn't promise a hash join for these statements
-  without statistics (executor.md's "at least one of them a hash join"; the limit above), while
-  T-QT.6.35 asks for a link in each. Either the test runs ANALYZE first, the statistics the planner's
-  costs rest on, with its assertions unchanged, or the limit reads its own estimate's certainty.
+- **What the test should say.** The design takes an inner join only with a hash join in it
+  (executor.md, lane qs6-10) and doesn't promise the planner makes one without statistics, while
+  T-QT.6.35 asks for a link in each statement. Run on 7bfaf2ac, assertions unchanged:
+  - ANALYZE before the statements: still red, at statement 2 (by cost it takes nested loops then).
+  - ANALYZE and `HashJoinsOnly`: passes, 2.71 s, all 9 statements at every core count. That is what
+    776d28b2 and 232a8f7e did for T-QT.6.29 to 6.32 (`HashJoinsOnly`), with the statistics the limit
+    above needs. Not landed: the coordinator's to decide.
+  - The planner's choice isn't the test's to change. The limit refusing the cheaper plan on a fallback
+    estimate (400,000 rows guessed for 1,000) is the planner's lane's question.
+
+## Suites after the landing (7bfaf2ac, the landed code)
+
+`--test hash_group_by` 5 passed, `--test join_methods` 4 passed (1 ignored), `--test nested_loops` 7
+passed, `--test planner` 13 passed and 1 failed
+(`a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages`, planner.rs:182: "800 pages",
+a scan by the index where the test expects the table's), which fails on fab12d7e too, before this
+landing. `--test top_n` did not run: cargo stopped at planner's failure.
