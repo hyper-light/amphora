@@ -2696,7 +2696,10 @@ mod tests {
         let locked = |b: &mut Txn, d: &mut Descender, key: &[u8]| {
             t.lock(&v.pool, d, &v.clock, b, key, seen).unwrap()
         };
-        assert_eq!(locked(&mut b, &mut d, b"k"), Locked::Moved { removed: false });
+        assert_eq!(
+            locked(&mut b, &mut d, b"k"),
+            Locked::Moved { removed: false }
+        );
         let read = |snap: &Snapshot, d: &mut Descender, key: &[u8]| {
             t.get(&v.pool, d, &v.clock, snap, key).unwrap()
         };
@@ -2713,9 +2716,13 @@ mod tests {
             t.put(&v.pool, &mut d, &v.clock, &mut other, b"k", b"2"),
             Err(LimboError::RowTaken(Some(id))) if id == b.id
         ));
-        assert_eq!(locked(&mut b, &mut d, b"l"), Locked::Moved { removed: false });
+        assert_eq!(
+            locked(&mut b, &mut d, b"l"),
+            Locked::Moved { removed: false }
+        );
         let before = b.savepoint();
-        t.put(&v.pool, &mut d, &v.clock, &mut b, b"l", b"3").unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"l", b"3")
+            .unwrap();
         v.rollback_to(&mut b, before, &mut d).unwrap();
         assert_eq!(read(&b.newest(), &mut d, b"l").unwrap(), b"1");
         v.commit(b, &mut d).unwrap();

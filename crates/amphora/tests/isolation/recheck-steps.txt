@@ -344,6 +344,39 @@ s2|rollback
 s1|commit
 s2|update q set v = v + 2 where id = 1
 s2|reset lock_timeout
+# a statement refused partway leaves no row changed or locked, in a block before its ROLLBACK too
+s1|create table r(id int not null, v int)
+s1|insert into r(id, v) values (1, 10)
+s1|insert into r(id, v) values (2, 20)
+s1|insert into r(id, v) values (3, 30)
+s1|begin
+s1|update r set v = v + 1 where id = 3
+s2|set lock_timeout = '50ms'
+s2~update r set v = v + 100 where id >= 1
+s3|update r set v = v + 1 where id = 1
+s2|begin
+s2|update r set v = v + 1 where id = 2
+s2~update r set v = v + 100 where id >= 1
+s3|update r set v = v + 1 where id = 1
+s3|update r set v = v + 1 where id = 2
+s2|rollback
+s1|commit
+s2|reset lock_timeout
+s1|select v from r where id = 1
+s1|select v from r where id = 2
+s1|select v from r where id = 3
+# a statement refused after it followed one row: the block's earlier change of another stays until its end
+s1|begin
+s1|update r set v = 2147483647 where id = 2
+s2|begin
+s2|update r set v = v + 5 where id = 3
+s2>update r set v = v + 1 where id >= 1
+s1|commit
+s2<
+s2|rollback
+s1|select v from r where id = 1
+s1|select v from r where id = 2
+s1|select v from r where id = 3
 # the settings
 s1|show lock_timeout
 s1|show deadlock_timeout

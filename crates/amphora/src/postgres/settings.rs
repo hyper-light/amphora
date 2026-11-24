@@ -80,7 +80,12 @@ impl Settings {
     }
 
     /// These with `name` as `value` has it, none for what 19 boots with.
-    pub fn with(mut self, name: &str, value: Option<&str>, superuser: bool) -> Result<Self, PgError> {
+    pub fn with(
+        mut self,
+        name: &str,
+        value: Option<&str>,
+        superuser: bool,
+    ) -> Result<Self, PgError> {
         let setting = Self::known(name)?;
         if setting.superuser && !superuser {
             return Err(PgError::error(
@@ -237,6 +242,10 @@ mod tests {
         );
         let set = set("lock_timeout", false).unwrap();
         assert_eq!(set.wait_limits().lock, Some(Duration::from_secs(5)));
-        assert!(Settings::default().with("deadlock_timeout", Some("5s"), true).is_ok());
+        assert!(
+            Settings::default()
+                .with("deadlock_timeout", Some("5s"), true)
+                .is_ok()
+        );
     }
 }

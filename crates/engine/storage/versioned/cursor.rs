@@ -31,8 +31,8 @@
 
 use super::blink::{Comparator, Descender, Leaf};
 use super::durable::Database;
-use super::overflow;
 use super::durable::RowLock;
+use super::overflow;
 use super::version::{Snapshot, Txn, VTree};
 use crate::error::LimboError;
 #[cfg(any(test, injected_yields))]

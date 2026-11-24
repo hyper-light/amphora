@@ -945,9 +945,7 @@ impl Session {
 
     /// [`Statements::check_deadlock`].
     pub fn check_deadlock(&mut self) -> bool {
-        self.statements
-            .as_mut()
-            .is_some_and(|s| s.check_deadlock())
+        self.statements.as_mut().is_some_and(|s| s.check_deadlock())
     }
 
     /// [`Statements::lock_timed_out`].
