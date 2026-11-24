@@ -193,8 +193,9 @@ fn in_place(_path: &Path) {}
 pub(crate) type Pages = Vec<(u32, Vec<u8>)>;
 
 /// What a traced preparation read (`Db::prepare_traced`): its read set, `None` past its bound,
-/// and page 1 as it stood at the session's base.
+/// page 1 as it stood at the session's base and the lock vote to publish at apply, if any.
 pub(crate) struct Traced {
+    pub(crate) lock: Option<crate::xgroup::TxnId>,
     pub(crate) reads: Option<Vec<u32>>,
     pub(crate) page_one: Vec<u8>,
 }
@@ -213,6 +214,8 @@ pub struct Db {
     log_kept: u64,
     /// What a backup asks of this database's writer ([`Db::back_up`]); readers have none.
     backup: Option<Arc<crate::backup::Hooks>>,
+    /// The one cross-group lock step in this writer transaction, cleared on commit or rollback.
+    lock: Option<crate::xgroup::TxnId>,
 }
 
 /// What a reader's opener and the flusher keep of their database: the engine's handles, then the
@@ -273,6 +276,7 @@ impl Db {
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
             backup: None,
+            lock: None,
         })
     }
 
@@ -367,6 +371,7 @@ impl Db {
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
             backup: None,
+            lock: None,
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
@@ -415,6 +420,7 @@ impl Db {
             fenced: Arc::clone(&self.fenced),
             log_kept: self.log_kept,
             backup: None,
+            lock: None,
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -445,6 +451,7 @@ impl Db {
                 fenced: Arc::clone(&fenced),
                 log_kept,
                 backup: None,
+                lock: None,
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -622,6 +629,22 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    /// The lock step whose publication clock the writer must record with its pages (T-T1.9.R30).
+    pub(crate) fn locking(&mut self, txn: crate::xgroup::TxnId) -> anyhow::Result<()> {
+        if !self.conn.get_auto_commit() {
+            anyhow::ensure!(
+                self.lock.is_none_or(|old| old == txn),
+                "two cross-group lock steps in one writer transaction"
+            );
+            self.lock = Some(txn);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_lock(&self) -> Option<crate::xgroup::TxnId> {
+        self.lock
     }
 
     /// The log's generation and its last committed frame.
@@ -1117,6 +1140,7 @@ impl Db {
         f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
     ) -> anyhow::Result<(R, Pages, Traced)> {
         self.exec("BEGIN IMMEDIATE")?;
+        self.lock = None;
         let pager = self.conn.get_pager();
         let result = self.page_one().and_then(|page_one| {
             pager.record_access(bound).map_err(fail)?;
@@ -1124,8 +1148,17 @@ impl Db {
             let access = pager.take_access().map_err(fail)?;
             let pages = pager.transaction_image(max_bytes).map_err(fail)?;
             let reads = (!access.overflowed()).then(|| access.read().collect());
-            Ok((answer, pages, Traced { reads, page_one }))
+            Ok((
+                answer,
+                pages,
+                Traced {
+                    reads,
+                    page_one,
+                    lock: self.lock,
+                },
+            ))
         });
+        self.lock = None;
         pager.end_access();
         // A prepared transaction never leaves an engine commit marker, even when capture fails.
         self.exec("ROLLBACK")?;
@@ -1355,7 +1388,22 @@ impl Db {
         // checkpoint/coordinator changes cannot invalidate a deferred snapshot mid-closure;
         // an FnOnce session cannot be replayed after an upgrade fails.
         self.query("BEGIN IMMEDIATE", [], |_| Ok(true))?;
-        let done = f(self).and_then(|v| self.query("COMMIT", [], |_| Ok(true)).map(|()| v));
+        self.lock = None;
+        let result = f(self);
+        let lock = self.lock.take();
+        let done = result.and_then(|v| {
+            if let (Some(txn), Some(hooks)) = (lock, self.stamps()) {
+                hooks.marks.publish_lock(|at| {
+                    crate::xgroup::sql::keep_lock_stamp(self, txn, at)?;
+                    // publish_lock holds the clock through COMMIT and records this WAL end itself.
+                    self.conn.prepare_execute_batch("COMMIT").map_err(fail)?;
+                    Ok(self.log_end())
+                })?;
+            } else {
+                self.query("COMMIT", [], |_| Ok(true))?;
+            }
+            Ok(v)
+        });
         if done.is_err() && !self.conn.get_auto_commit() {
             // What the failure already says is what the caller hears; a rollback that fails too
             // leaves the connection to refuse the next transaction, which says so.

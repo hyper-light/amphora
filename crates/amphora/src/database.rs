@@ -2684,11 +2684,41 @@ impl Database {
         }
     }
 
+    /// The stamp the lock step published, read locally after `call_internal` has waited for
+    /// that step's apply (T-T1.9.R30). A fenced coordinator can lose its locks to recovery
+    /// before this read; it cannot give a successful vote for a stamp it no longer knows.
+    pub(crate) fn lock_reply_clock(
+        &self,
+        txn: crate::xgroup::TxnId,
+        until: Instant,
+    ) -> Result<Option<u64>, Refusal> {
+        use crate::xgroup::{Tablet, sql::SqlTablet};
+        let database = self.resolve(until)?;
+        let read = move |db: &mut Db| {
+            let _deadline = db.deadline(until);
+            SqlTablet::new(db)
+                .lock_stamp(txn)?
+                .ok_or_else(|| Refusal::UnknownOutcome.into())
+        };
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.read_local(until, read).map(Some),
+            Writer::Local(_) if database.stamps().is_none() => Ok(None),
+            Writer::Local(store) => store
+                .read_committed(until, read, move |engine| read(&mut engine.db))
+                .map(Some)
+                .map_err(|e| refused(&e)),
+            Writer::Client(_) => Err(api::invalid(
+                "cross-group step",
+                "lock state belongs to the group's owner",
+            )),
+        }
+    }
+
     /// This group's clock on the one cross-group clock (lane split-merge-21, T-T1.9.R28; Ada's
     /// decision of 2026-11-22), microseconds since the Unix epoch: a replicated group's closed
     /// time, a backed-up group's writer clock (`Marks::latest_micros`, which
     /// stamps the rows reads across groups place); none for a group that
-    /// keeps neither. What a lock reply carries for the coordinator to choose the commit stamp.
+    /// keeps neither. Lock votes use the clock recorded at publication (`lock_reply_clock`).
     pub fn cross_clock(&self, until: Instant) -> Result<Option<u64>, Refusal> {
         let database = self.resolve(until)?;
         if let Writer::Replicated { client, .. } = &database.shared.writer {

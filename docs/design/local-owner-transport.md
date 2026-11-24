@@ -179,6 +179,8 @@ across a drain. Each side says the versions it speaks and both use the newest on
   with `Stepped`, as version 8 did. At 8 both `Step.carried` and `Stepped.latest` carry the backup
   clock's nanoseconds. At 9 the stamps are microseconds. Each side speaking 9 converts at the
   version-8 boundary, rounding an incoming nanosecond stamp up so its clock covers it (T-T1.12.X2).
+  `Step::Lock` is version 8's and sent only at 9, as what it locks is finished by version 9's steps
+  (xgroup.md, "Over the transport").
 - What a version-8 peer can't say is missing, not guessed: a step a version-8 node answers adds no
   closed time to a transaction's token (xgroup.md, "Reading its own writes across groups"), so
   reading one's own writes in that node's groups holds once it speaks 9.
@@ -186,7 +188,9 @@ across a drain. Each side says the versions it speaks and both use the newest on
 `VERSION_MIN`, 8, is a format value: every version-8 message keeps its shape, and nothing newer is
 sent at 8. The tests: `a_version_8_client_and_a_version_9_owner_exchange_what_both_know`,
 `a_version_9_client_and_a_version_8_owner_exchange_what_both_know`,
-`a_version_9_greeting_agrees_on_9_and_binds_it`, `negotiated_versions_take_the_newest_both_speak`.
+`a_version_9_greeting_agrees_on_9_and_binds_it`, `negotiated_versions_take_the_newest_both_speak`,
+`t_t1_9_r30_a_participant_too_old_to_finish_is_refused_before_any_lock`,
+`t_t1_9_r30_the_transports_frames_keep_their_wire_numbers`.
 Falsified by: a version-8 peer refused by a version-9 one, a variant sent on a connection that
 agreed on a version without it, or a greeting with its `Speaks` cut off that authenticates.
 
