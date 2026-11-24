@@ -50,13 +50,10 @@ for p in sorted(glob.glob(os.path.join(src, "round[0-9]*.jsonl"))) + [os.path.jo
 PY
   cp "$L/bench-cargo-lock.diff" "$W/$S/" 2>/dev/null
   tail -5 "$L/build.log" >"$W/$S/build.log.tail"
-  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py verdict.py finish.sh "$W/$S/")
   git -C "$SRC" fetch -q origin perf/bench-s7b
-  git -C "$SRC" show FETCH_HEAD:$S/record-head.md >"$W/$S/record-head.txt" 2>/dev/null || { echo "no record head at FETCH_HEAD"; exit 1; }
-  git -C "$SRC" show FETCH_HEAD:$S/record-tail.md >"$W/$S/record-tail.txt" 2>/dev/null || { echo "no record tail at FETCH_HEAD"; exit 1; }
-  # The record: the head (verdict, how it ran), sections 2 and 3 of TABLES.md as the script wrote them, the tail.
-  { cat "$W/$S/record-head.txt"; echo; awk '/^## 2\. /{p=1} /^## 4\. /{p=0} p' "$O/TABLES.md"; echo; cat "$W/$S/record-tail.txt"; } >"$W/$S.md"
-  rm -f "$W/$S/record-head.txt" "$W/$S/record-tail.txt"
+  for f in record-head.md record-tail.md load-template.md judgment.md record_assemble.py; do git -C "$SRC" show FETCH_HEAD:$S/$f >"$L/scripts/$f" || { echo "no $f at FETCH_HEAD"; exit 1; }; done
+  python3 -I "$L/scripts/record_assemble.py" "$O" "$L/scripts" "$(date -u +%FT%TZ)" "$W/$S.md" || exit 1
+  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py verdict.py record_assemble.py finish.sh "$W/$S/")
   git -C "$W" add -- "$S" "$S.md" && git -C "$W" diff --cached --quiet && { echo "nothing to commit"; exit 0; }
   git -C "$W" commit -q -m "$msg
 
