@@ -2982,6 +2982,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        let watched = hyper_durable::V16_WATCH.load(Ordering::Relaxed) == self.replica.id();
+        if watched {
+            eprintln!("V16 step id={} paused={paused} input={} paused_inputs={} at={:?}", self.replica.id(), input.is_some(), self.paused_inputs.len(), at.saturating_duration_since(self.started));
+        }
         if input.is_some() {
             // Work came to the command queue: its busy time begins (`Drain::came`).
             self.intake.came(self.now()?);
@@ -3092,6 +3096,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         #[cfg(test)]
         if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
             locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
+        }
+        if watched {
+            eprintln!("V16 drove id={} more={} messages={:?}", self.replica.id(), driven.more, output.messages.iter().map(|m| (m.msg_type, m.from, m.to)).collect::<Vec<_>>());
         }
         self.release(output)?;
         // Inputs a pause kept are taken at once, one a step.
@@ -4915,7 +4922,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         let context = self.read_context()?;
-        self.replica.read(context).map_err(raft_error)
+        let read = self.replica.read(context).map_err(raft_error);
+        hyper_durable::V16_WATCH.store(self.replica.id(), Ordering::Relaxed);
+        eprintln!("V16 close id={} read={read:?} has_ready={} msgs={:?} in_flight={} at={:?}", self.replica.id(), self.replica.core().has_ready(), self.replica.core().raft.v16_msgs(), self.replica.in_flight(), self.at.saturating_duration_since(self.started));
+        read
     }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
         if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {

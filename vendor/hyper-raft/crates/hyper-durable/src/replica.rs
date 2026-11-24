@@ -1611,6 +1611,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.guarded(|r| {
             r.drive_applied = 0;
             r.driven_at = now;
+            let watched = crate::V16_WATCH.load(std::sync::atomic::Ordering::Relaxed) == r.id();
+            if watched {
+                eprintln!("V16 drive-begin id={} has_ready={} msgs={:?} in_flight={} depth={} has_slot={} room={} stall={} writes={:?}", r.id(), r.node.has_ready(), r.node.raft.v16_msgs(), r.node.in_flight(), r.depth, r.has_slot(), r.node.store().log.room(), r.stall.is_some(), r.writes.iter().map(|w| (w.kind, w.state.clone(), w.messages.len())).collect::<Vec<_>>());
+            }
             r.take_answers(now, out)?;
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
@@ -1628,6 +1632,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             r.release_reads(out);
             r.keep();
             r.settle();
+            if watched {
+                eprintln!("V16 drive-end id={} out_messages={:?} has_ready={} msgs={:?} in_flight={} writes={:?}", r.id(), out.messages.iter().map(|m| (m.msg_type, m.to)).collect::<Vec<_>>(), r.node.has_ready(), r.node.raft.v16_msgs(), r.node.in_flight(), r.writes.iter().map(|w| (w.kind, w.state.clone(), w.messages.len())).collect::<Vec<_>>());
+            }
             let (end, payload) = (r.log_end(), r.unstable_payload());
             if let Some(patience) = r.patience.as_mut() {
                 patience.settled(now, end, payload);
@@ -1762,6 +1769,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             return self.tell_durable_commit();
         };
+        if crate::V16_WATCH.load(std::sync::atomic::Ordering::Relaxed) == self.id() {
+            eprintln!("V16 durable id={} number={number} emits={:?}", self.id(), write.messages.iter().map(|m| (m.msg_type, m.to)).collect::<Vec<_>>());
+        }
         self.emit(write.messages, out);
         let persisted = self.node.on_persist(number);
         let mut light = self.must(persisted)?;
@@ -2052,6 +2062,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.writes_made.fenced = self.writes_made.fenced.saturating_add(1);
             return self.commit_write(now, waker);
         }
+        if crate::V16_WATCH.load(std::sync::atomic::Ordering::Relaxed) == self.id() {
+            eprintln!("V16 take_ready id={} due={due}", self.id());
+        }
         if !due {
             return Ok(());
         }
@@ -2073,6 +2086,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         let number = ready.number();
         let messages = ready.take_persisted_messages();
+        if crate::V16_WATCH.load(std::sync::atomic::Ordering::Relaxed) == self.id() {
+            eprintln!("V16 take_ready id={} number={number} persisted={:?} out_now={}", self.id(), messages.iter().map(|m| (m.msg_type, m.to)).collect::<Vec<_>>(), out.messages.len());
+        }
         let range = ready.committed_range();
         let carries = {
             let persist = self.node.to_persist();

@@ -35,6 +35,8 @@
 //! records what each needs.
 
 mod budget;
+/// Lane V16's diagnostic: the member id whose drive is traced (0: none).
+pub static V16_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 mod compaction;
 mod held;
 mod hyperlog;

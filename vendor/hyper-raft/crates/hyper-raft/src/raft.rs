@@ -1557,6 +1557,10 @@ impl<S: Storage> Raft<S> {
     pub fn id(&self) -> NodeId {
         self.id
     }
+    /// Lane V16's diagnostic: the messages that wait, by kind and receiver.
+    pub fn v16_msgs(&self) -> Vec<(MessageType, u64)> {
+        self.msgs.as_slice().iter().map(|m| (m.msg_type, m.to)).collect()
+    }
     /// This member's term.
     pub fn term(&self) -> u64 {
         self.term
