@@ -10,6 +10,7 @@ resolver = "3"
 amphora-engine-ext = { path = "crates/engine-ext" }
 amphora-engine-macros = { path = "crates/engine-macros" }
 amphora-engine-parser = { path = "crates/engine-parser" }
+amphora-pg-catalog = { path = "crates/pg-catalog" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"
