@@ -1,0 +1,21 @@
+oracles: the features they never made are generated, and a REAL's digits are no finding
+
+The generator (synth.rs) makes compounds, WITH and WITH RECURSIVE, derived tables, window functions,
+USING and NATURAL joins, row values, UPSERT, views, triggers, STRICT and WITHOUT ROWID tables, each so
+that its answer is certain, and a cut that would leave it uncertain is no case (Sel::certain). The
+reducer cuts arms, CTEs, sources and window calls. The summary counts checks by feature, is written as
+the run goes, and keeps one example of each refusal. An error met before is not cut down again, and a
+panic in a setup is named by its text. A query past 4,000,000 of SQLite's instructions is left.
+
+The differential check compares texts with each REAL in floatingpoint.html 1.3.1's digits on both sides
+(digits.rs): SQLite 3.54.0's 17 digits of a double whose 15 convert back are the same text, alone, inside
+another text or against other digits; any other difference stays one. A value a REAL's text is inside (a
+length, hex, JSONB) may be what SQLite gives with its texts at 15 digits.
+
+Amphora is opened with WITHOUT ROWID tables on, as production opens it (crates/amphora/src/db.rs).
+
+Tests (Linux, adacachy2, the oracles' module on the engine): 11 passed, 0 failed, among them that the
+generator makes each feature and that each other digits difference stays one. Bench clippy 0. G2 step 3;
+AC-T1.1.1, AC-T1.8.6; docs/research/oracles.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
