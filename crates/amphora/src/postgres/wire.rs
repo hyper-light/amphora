@@ -67,13 +67,15 @@ impl Severity {
     }
 }
 
-/// What an ErrorResponse carries: severity, SQLSTATE, message and an optional detail.
+/// What an ErrorResponse carries: severity, SQLSTATE, message, an optional detail, and the character
+/// of the Query it points at (1-based).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgError {
     pub severity: Severity,
     pub code: SqlState,
     pub message: String,
     pub detail: Option<String>,
+    pub position: Option<usize>,
 }
 
 impl PgError {
@@ -83,6 +85,7 @@ impl PgError {
             code,
             message: message.into(),
             detail: None,
+            position: None,
         }
     }
 
@@ -92,12 +95,19 @@ impl PgError {
             code,
             message: message.into(),
             detail: None,
+            position: None,
         }
     }
 
     #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_position(mut self, position: Option<usize>) -> Self {
+        self.position = position;
         self
     }
 
@@ -298,8 +308,9 @@ pub fn put_cstr(out: &mut Vec<u8>, text: &[u8]) {
     out.push(0);
 }
 
-/// ErrorResponse with the fields PostgreSQL sends a client: S, V, C, M and D when there is one
-/// (`doc/src/sgml/protocol.sgml`, "Error and Notice Message Fields").
+/// ErrorResponse with the fields PostgreSQL sends a client: S, V, C, M, and D and P when there is one
+/// (`doc/src/sgml/protocol.sgml`, "Error and Notice Message Fields"), in its order
+/// (`src/backend/utils/error/elog.c`, `send_message_to_frontend`).
 pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError> {
     message(out, b'E', |out| {
         for (field, value) in [
@@ -314,6 +325,10 @@ pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError>
         if let Some(detail) = &error.detail {
             out.push(b'D');
             put_cstr(out, detail.as_bytes());
+        }
+        if let Some(position) = error.position {
+            out.push(b'P');
+            put_cstr(out, position.to_string().as_bytes());
         }
         out.push(0);
     })

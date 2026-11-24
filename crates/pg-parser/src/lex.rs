@@ -749,6 +749,16 @@ fn udeescape(input: &[u8], s: &[u8], escape: u8, position: usize) -> Result<Vec<
     Ok(out)
 }
 
+/// The bytes of the token `input` starts with: where the scanner stops after it, all of them when it
+/// refuses.
+pub(crate) fn token_len(input: &[u8]) -> usize {
+    let mut core = Core::new(input);
+    match core.next() {
+        Ok(Some(_)) => core.pos,
+        Ok(None) | Err(_) => input.len(),
+    }
+}
+
 /// parser.c's `base_yylex`: scan.l's tokens with the _LA lookaheads and U&'' / U&"" decoding.
 pub struct Lexer<'a> {
     core: Core<'a>,

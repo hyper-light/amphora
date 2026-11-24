@@ -173,7 +173,36 @@ pub(super) fn read_segment(
 /// requests; with no room for a part it's refused, typed ([`Unrestorable::PastRoom`]), before it
 /// makes the file. A chunk whose sum fails is refused after its parts are written: the restored
 /// file is a failed restore's.
+///
+/// An archive short of the frames its keys say is refused, typed ([`Unrestorable::Short`]), and the
+/// files made are removed: they would open as a whole database (AC-T1.12.4).
 pub fn restore_within(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    second: u64,
+    path: &Path,
+    pace: &mut dyn Pace,
+    memory: &Arc<Memory>,
+    until: Instant,
+) -> anyhow::Result<Restored> {
+    let refused = match make(blobs, prefix, second, path, pace, memory, until) {
+        Err(e) if matches!(e.downcast_ref(), Some(Unrestorable::Short { .. })) => e,
+        restored => return restored,
+    };
+    let [log_path, second_path] = log_paths(path);
+    for file in [path, &log_path, &second_path] {
+        match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(refused.context(format!("{} is left: {e}", file.display())));
+            }
+            _ => {}
+        }
+    }
+    Err(refused)
+}
+
+/// [`restore_within`]'s restore, its files left as it ends.
+fn make(
     blobs: &dyn Blobs,
     prefix: &str,
     second: u64,
@@ -297,6 +326,11 @@ pub fn restore_within(
     let mut index = 0usize;
     while let Some(first) = plan.segments.get(index) {
         let generation = segments.get(*first).map_or(0, |s| s.generation);
+        let short = |archived: u64, replayed: u64| Unrestorable::Short {
+            generation,
+            archived,
+            replayed,
+        };
         // The first generation's log is new (checked above); each later one takes the place of the
         // log the fold before it emptied but left (a truncating checkpoint keeps its file).
         let mut log = std::fs::OpenOptions::new()
@@ -323,7 +357,7 @@ pub fn restore_within(
                 key.last
             };
             if key.first > written.saturating_add(1) {
-                anyhow::bail!("segment {name} doesn't follow frame {written}");
+                return Err(short(end, written).into());
             }
             // Its frames' bytes that are in the log already, from the segment before, which this
             // one begins within (a send retried, [`plan::cover`]), and those up to the cut.
@@ -389,7 +423,8 @@ pub fn restore_within(
                 anyhow::bail!("segment {name} doesn't follow frame {written}");
             }
             if head.frames < upto {
-                anyhow::bail!("segment {name} holds fewer frames than it says");
+                let held = head.frames.checked_div(FRAME_BYTES).unwrap_or(0);
+                return Err(short(end, begins.saturating_sub(1).saturating_add(held)).into());
             }
             if !header_written {
                 log.write_all(&head.header)?;
@@ -403,13 +438,13 @@ pub fn restore_within(
         }
         log.sync_all()?;
         drop(log);
-        replay(path, written, super::check::step_bytes(blobs), pace)?;
+        let replayed = replay(path, written, super::check::step_bytes(blobs), pace)?;
+        if replayed != written {
+            return Err(short(written, replayed).into());
+        }
         if generation == plan.cut.0 {
             if written != plan.cut.1 {
-                anyhow::bail!(
-                    "the archive's log ends at frame {written}, before the cut at {}",
-                    plan.cut.1
-                );
+                return Err(short(plan.cut.1, written).into());
             }
             break;
         }
@@ -427,8 +462,17 @@ pub fn restore_within(
 /// Paced, in parts of as many frames as one of the store's objects holds (`step` bytes, the size a
 /// restore's other steps move), each part a step made durable as it ends, so a paced check pauses
 /// inside the replay (T-T1.12.C8); the last fold empties the log.
-fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<()> {
+///
+/// The frames it replayed: fewer than `frames`, none folded, where the log isn't what the archive
+/// says. The engine's recovery keeps the frames that follow one another from the log's header (their
+/// salts and running sums), up to their last commit, and drops the rest as a crash's tail; a
+/// segment's own sum says its bytes are those sent, not that they are its generation's.
+fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<u64> {
     let mut db = Db::open(path)?;
+    let (_, replayed) = db.log_end();
+    if replayed != frames {
+        return Ok(replayed);
+    }
     if pace.paced() {
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
         let per_step = step.checked_div(FRAME_BYTES).unwrap_or(0).max(1);
@@ -447,7 +491,8 @@ fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::R
     }
     db.fold_log()?;
     drop(db);
-    pace.done(None, 0)
+    pace.done(None, 0)?;
+    Ok(replayed)
 }
 
 /// Deletes what a retention of `retention_ns` lets go at `now_ns` ([`plan::expired`]): how many
