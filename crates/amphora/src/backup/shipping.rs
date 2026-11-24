@@ -583,8 +583,7 @@ impl Checker {
         let mut log_headroom = 0u64;
         for segment in log_paths(&self.source) {
             restore = restore.saturating_add(file_len(&segment)?);
-            log_headroom = log_headroom
-                .saturating_add(self.reader.log_kept_frames().saturating_mul(FRAME_BYTES));
+            log_headroom = self.reader.log_kept_frames().saturating_mul(FRAME_BYTES);
         }
         Ok(Budget {
             free: fs4::available_space(disk)?,
