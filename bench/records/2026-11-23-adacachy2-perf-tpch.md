@@ -1432,3 +1432,118 @@ the misprice from those and fix it.
 - Bench clippy (`cargo clippy --release --bin amphora-bench -- -D warnings`): 163 errors, none on a line this
   change touched (in planner/: `engines.rs:227`, `mod.rs:109, 294, 501, 535, 550, 639, 688`, all older; elsewhere
   `blink.rs`, `cc.rs`, `cluster.rs` and more). The bench crate is not clippy-clean on main.
+
+# Lane T18 (tpch), 2026-11-24 01:59Z to 02:55Z: T17 landed; q03's misprice named (the star filter's cut is never priced); not fixed
+
+Losses first:
+- The deliverable is not done. Step 1 is: the misprice is named from data. Not done: the fix in the cost model, its
+  test, five settled runs, a fix merged.
+- adacachy2 refused 5 of 8 asks for room (0 to 4 of 32 cores idle), and kiln's link to its server dropped twice
+  (02:00Z and 02:19Z), the second time while the instruments' checks were being asked for.
+- The traced runs ran at load 50 to 61 on 32 cores (CPU pressure avg10 9 to 31%). The seek times include any wait for
+  a CPU: T15's `run_delay` subtraction is not applied to them. S ran first after the build: its counted run (50,249 ms)
+  and run 0 (29,308 ms) read a cold cache, and only its runs 1 to 4 are warm.
+- The hash join's real time is inferred by subtraction, not measured: there is no per-operator time.
+- The seek trace reads the clock twice a seek, which adds to each seek's time. How much was not measured.
+
+## 1. The landing (9dfd4cf4 on main, 02:08Z)
+
+perf/tpch-t17 merged with main (a3f1c56d). r6 at a3f1c56d, in a fresh worktree (`~/.cache/tpch-ab/t18`), so every engine
+source was new to cargo: `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` clean (the log compiles
+amphora-engine, 50 s); in bench/, `cargo test --release --bin amphora-bench -- planner::tests` 3 of 3, the log compiling
+amphora-engine. Main then moved only in amphora-pg-catalog, scripts and vendor. Nothing here depends on that crate
+(`cargo tree -p amphora-engine -i amphora-pg-catalog` finds no path, and no manifest but its own names it), so it was
+merged again (9dfd4cf4) and pushed without a new run.
+
+## 2. The instruments (11bd3c7c, perf/tpch-t18)
+
+- `amphora::join_search`, "T18: a read weighed against a hash join": at `join_lhs_and_rhs`'s choice, the right table's
+  read and its cost, the hash join's cost, the left side's cost and rows. Every alternative the search weighs for a
+  step is logged, not only the cheapest whole plan for each last table.
+- `amphora::seek_time` (`AMPHORA_SEEK_TRACE=1` in the bench), "T18: a cursor's seeks this run": every seek (SeekGE, LE,
+  GT, LT and SeekRowid) timed while the target is on, summed by cursor and written at Halt beside the learned row
+  visit's nanoseconds. Nothing is learned from it.
+
+## 3. The trace (r53, adacachy2, 02:14:49Z to 02:16:24Z)
+
+`SHA=11bd3c7c JOBS=4 bash ~/.cache/tpch-t18/trace.sh` (local copies of it and `summ.py` in `~/.cache/amphora-perf/tpch-t18/`):
+release build 149 s; q03 at SF1, target `amphora` (one thread), T11's `db-sf1`, pinned at T17's S set, then F's, one
+process each (the counted run, then 5 runs). Every prepare used its pinned set, and every run of a set chose its plan.
+Answers: S and F each 1 of 1 compared against T17's S-1, 0 differ.
+
+The costs (in page reads), from each process's first prepare. Each step is logged; the sums are the two plans' steps.
+
+| step | at S's weights | at F's weights |
+|---|---|---|
+| orders, scanned | 12,605.5 | 12,526.3 |
+| customer by rowid, 707,520 seeks (F's plan) | 251,802.2 | 4,665.4 |
+| customer by hash join, orders built (S's plan) | 126,367.5 | 95,945.3 |
+| lineitem by index, 141,331 in (both plans) | 368,009.0 | 71,814.5 |
+| F's plan, whole | 632,416.7 (sum) | 89,006.2 (logged) |
+| S's plan, whole | 506,982.0 (logged) | 180,286.1 (sum) |
+
+The seeks, timed (the median over the process's 6 statements; the row visit is the calibration's 0.35 ns):
+
+| cursor | plan, the order its keys arrive in | ns a seek | range | in row visits |
+|---|---|---|---|---|
+| customer, by rowid | F, orders' `o_custkey` (random) | 1,146.5 | 986 to 1,255 | 3,276 |
+| lineitem's index | F, orders' own order, the index's | 757.2 | 715 to 1,059 | 2,163 |
+| lineitem's index | S, customer's hash order (random), warm runs 1 to 4 | 1,605.5 | 1,540 to 1,631 | 4,587 |
+| lineitem's index | S, the counted run and run 0 (cold) | 50,934 | 44,370 to 57,498 | 145,526 |
+
+Times: F's runs 0 to 4, median 864 ms (809 to 1,006). S's warm runs 1 to 4, median 1,871 ms (1,840 to 1,906).
+
+## 4. The misprice
+
+- At S's weights, F's plan is priced 1.25 times S's. The whole gap is the customer step: 707,520 rowid seeks at 0.353
+  page reads each (249,779, 99.2% of the step) against the hash join's 126,368.
+- The row estimate is the cause. The run seeks customer 147,665 times, not 707,520: orders' loop gave 147,665 rows in F
+  against the 727,305 the same scan gave S's hash build, so 4 in 5 are dropped before customer. What drops them is
+  inferred, not traced (no star-filter count reaches the bench's record): the star filter (`lip.rs`, built from
+  customer's `c_mktsegment` rows, checked at orders' scan) is the only thing in F's plan that can. `lip::choose` picks
+  it after the join search, from the finished order, so the search never prices it. With the seeks counted on the rows that pass, F's
+  step is 52,553 at S's weights (the run's 147,665) or 50,299 (the planner's own pass, customer's rows per input
+  0.1998), and F's plan 433,168 or 430,913, below S's 506,982: F is chosen at S's weights. The step is scaled by the
+  seeks: their CPU is 99.2% of it.
+- The seek weight is not the cause. A real seek costs more than S's weight says, not less. Customer's rowid seek took
+  1,146 ns, or 3,276 row visits, against S's 1,274 (446 ns) and F's 16.88 (5.9 ns). At the measured weight, with
+  nothing else changed, F's step would be 642,170: F priced higher still. F's set priced a seek 130 to 270 times below
+  every warm seek timed, so F's plan was chosen under it for a wrong reason.
+- A seek's order matters: lineitem's index takes 757 ns a seek in key order and 1,606 ns at random (2.1 times), and
+  50,934 ns cold. A cold seek reads its pages inside the seek, and the learned seek weight times a sampled seek whole,
+  so it also holds page reads that the model prices apart (`file_reads`). That is a second misprice, in the seek
+  weight; it is not what decides this choice.
+- Both corrected (the run's 147,665 seeks at the measured seek), F's step is 134,026 against the hash join's 126,368, near
+  a tie. The hash join's price is then what decides. S's runs take 1,007 ms more than F's (medians), while the model
+  prices S's hash join at 126,368 page reads, 160 ms at 1,263 ns a read (`row_in_pages` and the row's 0.35 ns). Inferred
+  by subtraction, not measured: the hash join (727,305 rows built, customer scanned to probe it) is priced several
+  times below its time.
+
+## 5. Next, in order
+
+1. The fix: the join search prices the star filter the run will use. When a right table can give a filter to a fact
+   table the left side reads whole (`lip::choose`'s conditions: plain inner joins, rowid tables, an equality key, terms
+   of the dimension's own), price its reads on the rows that pass (its rows per input, with the filter's false
+   positives), plus the filter's build (one read of the dimension) and a lookup a fact row. `lip::choose` keeps the
+   filters the search priced.
+2. Test: at S's weights (pinned), on a q03-shaped schema with statistics, the planner chooses `SCAN orders / customer by
+   rowid / lineitem by index`.
+3. Five runs of q03 on one connection settle on it in the trace, answers identical; then merge.
+4. Apart: the hash join's price against its time, per operator; the seek weight's samples that hold page reads.
+
+## 6. Checks
+
+- r6 (a3f1c56d), the landing: section 1.
+- r53 (11bd3c7c): release build 149 s. The instruments read true in the real run: customer's seeks (147,665) are
+  orders' rows, and lineitem's (147,126) are customer's, in every statement of F. They have no test of their own.
+- r7 (090dabbd, this branch merged with main 6d76681c, which moved in `crates/engine`): `cargo clippy -p amphora-engine
+  --all-targets --locked -- -D warnings` clean (the log checks amphora-engine, 41 s); `cargo test -p amphora-engine
+  --lib --locked -- optimizer::join learned_costs` 69 of 69; in bench/, `cargo test --release --bin amphora-bench --
+  planner::tests` 3 of 3, the log compiling amphora-engine.
+- r62, the same checks queued on macOS, was lost in kiln's restart at about 02:18Z.
+- r29 (090dabbd), in bench/: `cargo clippy --release --bin amphora-bench -- -D warnings` gives 163 findings, the count
+  T17 recorded on main, none on the lines this lane changed (`planner/mod.rs` 573 to 577); the log checks amphora-engine.
+- r34 (f8a5e57d, merged again after main moved in `crates/engine/storage` and the bench): the same as r7, clippy clean
+  (the log checks amphora-engine, 41 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).
+- r50 (4f6725d4, merged again after main moved in `crates/engine` (database.rs, wal.rs) and `crates/amphora`): clippy
+  clean (the log checks amphora-engine, 34 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).

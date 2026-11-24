@@ -954,3 +954,74 @@ successor's first run on main.
 
 **Notes, one line each.** `Db::read_log` reads `-wal` by path, so the backup will need the current segment's file once
 the switch exists (above). Main's `store` test has 14 tests since lane A18 (15 at B16's merge).
+
+## perf-B18 (2026-11-24, 01:53-02:53Z, two kiln restarts mid-hour)
+
+**Losses first.** The switch is built and the store's restart no longer waits for any read, but the brief's
+condition 1 is only partly met. *Not deleted:* `begin_restart`, `end_restart` and `try_restart_log_for_write` on both
+backends, `WalFile::restart_log` and `unlock_after_restart`. Those restarts in place stay for a log that never switched;
+once a log has its second segment's file they refuse (the checkpoint answers Busy, the writer's restart before a write
+restarts nothing), because a restart in place would take the current segment's sequence two past the other segment's
+header, a pair `Segments::recover` refuses as corrupt, and a truncate would leave the other segment's copied frames to
+be read as the log. Turning those two triggers into switches needs the writer's read guard moved to the new segment
+inside `begin_write_tx` (the trigger before a write) and TRUNCATE's meaning restated for two files (the checkpoint's):
+the next lane's. *Not built:* the multi-process backend's switch: `Database::switch_log` refuses a multi-process log
+with an error (its shared memory doesn't publish a switch). No A/B ran (rule 0). The engine's `storage::` and
+`vdbe::vacuum` suites on the final code: see the checks below.
+
+**Built** (perf/pagepath-d45).
+1. *The switch* (`SharedLog::switch`, wal.rs; `Database::switch_log`, database.rs). With the log's write lock held and
+   the other segment free: the current segment's file is flushed (so every frame of a closing segment is durable), the
+   free segment gets its file (`-wal2` made at the first switch, from the path recovery passes in), is cut to nothing
+   if longer than the caller's bound (decision 31, kept at each segment's reuse), takes the closing header's format with
+   its sequence one past and new salts (`restart_wal_header`), the epoch and transaction count carried on, its read
+   marks set under their exclusive locks, and is then published (`Segments::switch`, then `second_current`). It waits
+   for no read: a read live at the switch keeps reading the closing segment.
+2. *The store's trigger.* `Db::restart_log` copies what the reads let two passes copy (the closing segment, then the
+   current one: with no read under way every frame is in the file, as before), then switches; false while a read
+   still counts on the segment the last switch closed. `Readers::restart_if_asked` no longer takes the gate or every
+   slot; the gate is deleted (nothing took it for writing).
+3. *The backup and the flusher follow the current segment's file* (`segment_path` in db.rs): `Db::read_log`,
+   `Db::log_frames` and `Db::flusher` read or flush `-wal` or `-wal2`, whichever is current.
+4. *Fixes the switch needed.* A passive pass over the closing segment is not bounded by the current segment's
+   flushes (its frames were all flushed before the switch). `read_frame` reads a frame that a commit's records hold
+   from its own segment's header and records, not the current segment's (before this the store, files and backup
+   tests read zeros after a switch: "Checksum mismatch on page 1: expected 0").
+5. *Tests.* `d45_a_reader_that_never_finishes_holds_up_no_restart_and_no_commit` (store test): a read transaction left
+   open, the writer restarts (switches) and commits 50 rows past it; a new reader reads 60 rows, the open read still
+   10. `d45_a_backup_after_a_switch_holds_the_writes_made_after_it` (backup test): ship, base, switch, 20 rows, ship;
+   the restore of the last second holds all 40. The files test's restart case is restated for two segments (the cut
+   comes when a segment is switched to again).
+
+**Checks** (adacachy2, `~/.cache/amphora-perf/pagepath-b18/check.sh`, B17's with logs named b18 and an
+`it:<test>:<filter>` step for amphora's integration tests; needs `linux/amd64,cpus=8,mem=24g` unless named).
+- Main's pass set, r5 on 5bc8d61e (load 13-55): `storage:: vdbe::vacuum` passed 736, failed 1
+  (`cb4_ab_both_rebuy_policies_at_the_extremes`, main's own), ignored 14, in 275 s; the store test passed 16.
+- r31 on 76880856 (the switch, first cut): clippy failed on one unused import (`RwLock`, the gate's); `d45_` passed
+  20; the store test passed 16.
+- r57 on c73eb843: clippy exit 0 in 50 s; the new store test failed: the switch set the free segment's read marks
+  without their locks ("must hold exclusive lock"). Fixed in 808c8a83.
+- r76 on 808c8a83: clippy exit 0 in 39 s; the store test failed 2 of 17, the files test's restart case and both backup
+  tests failed, each "Checksum mismatch on page N: expected 0": `read_frame` read a closing segment's record frames
+  from the current segment. Fixed in 4741b54e.
+- r8 on 4741b54e (load 21-57): the store test passed 17 (the new one and `the_log_stays_bounded_under_writes_and_reads_
+  that_never_pause` among them); the files test passed 3, ignored 1 (`what_cutting_the_log_costs_its_writer`, a timing
+  check); `t_t1_12_i1_incremental_bases_keep_unchanged_chunks` (two restarts, two bases, restores) passed; the new
+  backup test failed for want of a base ("no base precedes second 1040"), fixed in d15b4a09; the workspace clippy exit
+  0 in 55 s; `d45_` passed 20. Stopped before the engine suite to test the merge with main instead.
+- r32 on b4662671 (this branch with main merged, lane Q5's read path in wal.rs among it; load 45-57): the store test
+  passed 17; `d45_a_backup_after_a_switch_holds_the_writes_made_after_it` passed; the files test passed 3, ignored 1;
+  the workspace clippy exit 0 in 42 s; `d45_` passed 20. Main then moved only outside crates/ (lane V15's records),
+  merged as 929355dd and pushed to main as a5ae048c without a new run. After the push (rule 5b), on the same
+  b4662671: `storage:: vdbe::vacuum` passed 738, failed 1 (`cb4_ab_both_rebuy_policies_at_the_extremes`, main's own, as
+  in r5) and ignored 14, in 261 s; `scripts/check-production.sh` exit 0 in 60 s ("10903 left in the engine's
+  production code across 17 lints, as the ratchet holds").
+
+**Notes, one line each.**
+- The switch carries the epoch over unbumped, and a pass that finds the closing segment copied at its start resets it
+  with no Finalize (so no epoch bump): check that no cached page's frame tag from one segment can pass for the other's.
+- `-wal2` is made by the engine at the first switch without the no-copy-on-write flag `Db::open_made` gives `-wal`.
+- `files.rs`'s ignored timing check `what_cutting_the_log_costs_its_writer` still asserts the one-file cut; it needs
+  restating for two segments before it is run again.
+- The store's checkpointer decides a pass by the current segment's uncopied frames (`Db::uncopied`): a closing
+  segment's frames wait until the current segment passes its bound, so the log can hold up to about twice its bound.
