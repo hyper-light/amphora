@@ -41,8 +41,9 @@ for step in "$@"; do
       timeout 900 nice -n 10 "$(bin "$name")" $filter > "$O/test-$name.log" 2>&1; rc=$?
       echo "== test $name $filter rc=$rc $(( $(date +%s) - s ))s"; grep -E "test result|panicked|answers differ|FAILED|failed$" "$O/test-$name.log" | head -12 ;;
     sweeps)  # the two sweeps' tests, reading their fixtures from files
+      rm -f "$D"/c13_sweep-* "$D"/c18_sweep-*
       sed -e 's#include_str!("fixtures/on_ctes.tsv")#Box::leak(std::fs::read_to_string(std::env::var("C18_FIXTURE").unwrap()).unwrap().into_boxed_str())#' crates/engine/tests/outer_join_subqueries.rs > crates/engine/tests/c13_sweep.rs
-      sed -e 's#include_str!("fixtures/cte_scopes.tsv")#Box::leak(std::fs::read_to_string(std::env::var("C18_FIXTURE").unwrap()).unwrap().into_boxed_str()) as \&str#' crates/engine/tests/cte_scopes.rs > crates/engine/tests/c18_sweep.rs
+      sed -e 's#include_str!("fixtures/cte_scopes.tsv")#(Box::leak(std::fs::read_to_string(std::env::var("C18_FIXTURE").unwrap()).unwrap().into_boxed_str()) as \&str)#' crates/engine/tests/cte_scopes.rs > crates/engine/tests/c18_sweep.rs
       timeout 900 nice -n 10 cargo test -p amphora-engine --locked --features simulator --test c13_sweep --test c18_sweep --no-run 2>&1 | grep -E "^(error|warning)|Executable|Finished" -A 8 | head -40
       rc=${PIPESTATUS[0]}; echo "== sweeps built rc=$rc in $(( $(date +%s) - s ))s"; [ "$rc" = 0 ] || exit 4 ;;
     wides13:*|wides18:*)  # wides13:COUNT:SEED SEED ... each in a process of its own
