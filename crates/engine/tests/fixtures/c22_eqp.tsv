@@ -1,0 +1,80 @@
+db	drawn 332
+sql	CREATE TABLE t(b TEXT, k INT, a INT NOT NULL ON CONFLICT REPLACE DEFAULT 6, c INT UNIQUE ON CONFLICT FAIL, PRIMARY KEY (a DESC, k)) WITHOUT ROWID
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)
+sql	CREATE TABLE lg(ev, x, y, z)
+sql	CREATE INDEX tp ON t(b) WHERE a > 2
+sql	CREATE UNIQUE INDEX tub ON t(b) WHERE b > 'x'
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)
+sql	INSERT OR IGNORE INTO t VALUES ('z', 2, 1, 5)
+sql	INSERT OR IGNORE INTO t VALUES ('x', 2, 2, 4)
+sql	INSERT OR IGNORE INTO t VALUES (7, 3, 3, 2)
+sql	INSERT OR IGNORE INTO t VALUES (7, 3, 4, 6)
+sql	CREATE TRIGGER g0 AFTER DELETE ON t WHEN old.a > 2 BEGIN INSERT INTO lg VALUES ('AD0', old.b, old.c, old.a); DELETE FROM t WHERE c = old.a AND k <> old.k; UPDATE OR ABORT u SET n = old.k WHERE k = old.c; END
+sql	CREATE TRIGGER g1 BEFORE UPDATE OF b ON t BEGIN INSERT INTO lg VALUES ('BU1', old.c, old.c, old.b); END
+sql	CREATE TRIGGER g2 AFTER DELETE ON t BEGIN INSERT INTO lg VALUES ('AD2', old.c, old.b, old.k); UPDATE t SET b = 'w' WHERE c = old.a; END
+sql	CREATE TRIGGER g3 AFTER UPDATE OF b ON t WHEN old.b IS NOT NULL BEGIN INSERT INTO lg VALUES ('AU3', old.c, new.k, old.c); DELETE FROM u WHERE k = old.k; END
+q	INSERT OR IGNORE INTO t(k, a, b, c) SELECT k, n, 'x', n + 1 FROM u	x
+q	DELETE FROM lg	x
+q	INSERT INTO t(k, a, b, c) SELECT k, n, 'x', n + 1 FROM u	x
+q	DELETE FROM lg	x
+# DELETE FROM t => SQLite ['SCAN t USING INDEX sqlite_autoindex_t_1']
+q	EXPLAIN QUERY PLAN DELETE FROM t	x
+q	DELETE FROM lg	x
+q	INSERT OR ABORT INTO t VALUES (7, 1, '5', NULL), ('y', 3, 1, 2), ('z', 2, NULL, 5)	x
+q	DELETE FROM lg	x
+q	INSERT INTO t VALUES ('y', 1, 60, 6)	x
+q	DELETE FROM lg	x
+q	PRAGMA integrity_check	x
+db	drawn 343
+sql	CREATE TABLE t(k TEXT PRIMARY KEY, a INT NOT NULL CHECK (a < 50), b TEXT, c INT UNIQUE ON CONFLICT FAIL)
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE) WITHOUT ROWID
+sql	CREATE TABLE lg(ev, x, y, z)
+sql	CREATE INDEX tca ON t(c, a)
+sql	CREATE INDEX te ON t(a + c)
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)
+sql	INSERT OR IGNORE INTO t VALUES ('d', 60, NULL, 4)
+sql	INSERT OR IGNORE INTO t VALUES ('a', 60, 7, 6)
+sql	INSERT OR IGNORE INTO t VALUES ('B', '5', NULL, 6)
+sql	INSERT OR IGNORE INTO t VALUES ('b', '5', 'x', 4)
+sql	CREATE TRIGGER g0 BEFORE DELETE ON t WHEN EXISTS (SELECT 1 FROM u WHERE u.n = old.k) BEGIN INSERT INTO lg VALUES ('BD0', old.b, old.k, old.c); INSERT INTO lg SELECT 'n', count(*), max(c), NULL FROM t; END
+q	BEGIN	x
+# UPDATE OR IGNORE t SET k = 'c' WHERE +c > 3 RETURNING k, a, b, c => SQLite ['SCAN t']
+q	EXPLAIN QUERY PLAN UPDATE OR IGNORE t SET k = 'c' WHERE +c > 3 RETURNING k, a, b, c	x
+q	DELETE FROM lg	x
+q	INSERT OR ABORT INTO t VALUES ('d', NULL, 'x', 2)	x
+q	DELETE FROM lg	x
+# UPDATE OR ABORT t SET k = 'B' WHERE +b IS NOT NULL RETURNING k, a, b, c => SQLite ['SCAN t']
+q	EXPLAIN QUERY PLAN UPDATE OR ABORT t SET k = 'B' WHERE +b IS NOT NULL RETURNING k, a, b, c	x
+q	DELETE FROM lg	x
+q	INSERT INTO t VALUES ('b', 1, 'y', 2)	x
+q	DELETE FROM lg	x
+q	INSERT INTO t VALUES ('B', 60, 'z', 1), ('d', 2, 'z', 5), ('e', NULL, NULL, 6)	x
+q	DELETE FROM lg	x
+q	COMMIT	x
+q	PRAGMA integrity_check	x
+db	drawn 399
+sql	CREATE TABLE t(k TEXT COLLATE NOCASE PRIMARY KEY, a INT NOT NULL ON CONFLICT IGNORE, b TEXT, c INT UNIQUE) WITHOUT ROWID
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE) WITHOUT ROWID
+sql	CREATE TABLE lg(ev, x, y, z)
+sql	CREATE INDEX te ON t(a + c)
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)
+sql	INSERT OR IGNORE INTO t VALUES ('e', NULL, 'x', 3)
+sql	INSERT OR IGNORE INTO t VALUES ('e', NULL, 7, 5)
+sql	INSERT OR IGNORE INTO t VALUES ('a', 2, NULL, 5)
+sql	INSERT OR IGNORE INTO t VALUES ('c', 60, 'z', 4)
+sql	INSERT OR IGNORE INTO t VALUES ('d', 4, 7, 6)
+sql	CREATE TRIGGER g0 AFTER DELETE ON t WHEN old.c IN (SELECT k FROM u) OR old.c = 'x' BEGIN INSERT INTO lg VALUES ('AD0', old.c, old.a, old.k); UPDATE OR ABORT u SET n = 2 WHERE k = old.c; INSERT INTO u VALUES (old.c, 3) ON CONFLICT(k) DO UPDATE SET n = excluded.n + 10; END
+sql	CREATE TRIGGER g1 AFTER DELETE ON t BEGIN INSERT INTO lg VALUES ('AD1', old.a, old.c, old.c); INSERT INTO lg SELECT 'n', count(*), max(c), NULL FROM t; DELETE FROM u WHERE k = old.c; END
+q	INSERT INTO t VALUES ('b', 4, NULL, 2), ('e', 60, 7, 3) ON CONFLICT(c) DO NOTHING	x
+q	DELETE FROM lg	x
+# DELETE FROM t => SQLite ['SCAN t USING INDEX te']
+q	EXPLAIN QUERY PLAN DELETE FROM t	x
+q	DELETE FROM lg	x
+q	INSERT OR ROLLBACK INTO t(k, a, b, c) SELECT k, n, 'x', n + 1 FROM u	x
+q	DELETE FROM lg	x
+q	INSERT OR ABORT INTO t VALUES ('a', 60, 7, 1), ('e', 2, 'x', NULL)	x
+q	DELETE FROM lg	x
+# UPDATE t SET b = 'q' WHERE k = 'c' => SQLite ['SEARCH t USING PRIMARY KEY (k=?)']
+q	EXPLAIN QUERY PLAN UPDATE t SET b = 'q' WHERE k = 'c'	x
+q	DELETE FROM lg	x
+q	PRAGMA integrity_check	x
