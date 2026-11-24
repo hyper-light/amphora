@@ -5062,6 +5062,222 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// Lane C3's probe, not for main: `facts`, analyzed or not.
+        fn c3_facts(analyze: bool) -> (Arc<Database>, Arc<crate::Connection>) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in C3_DATA {
+                conn.execute(sql).unwrap();
+            }
+            if analyze {
+                conn.execute("ANALYZE").unwrap();
+            }
+            (db, conn)
+        }
+
+        const C3_DATA: [&str; 8] = [
+            "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
+            "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
+            "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)",
+            "CREATE TABLE f2(id INTEGER PRIMARY KEY, d2 INT, k INT)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+             INSERT INTO d1 SELECT x, x % 25 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+             INSERT INTO d2 SELECT x, x % 25 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
+             INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
+             INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
+        ];
+
+        /// The eight queries of `t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`, in
+        /// its order.
+        fn c3_queries() -> Vec<String> {
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let mut out = Vec::new();
+            for (on_extra, above) in [
+                ("", ""),
+                (" AND s.cat <> 11 AND s.cat <> 17", ""),
+                ("", " AND s.id IS NULL"),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            ] {
+                for (from, filter) in [
+                    (
+                        format!(
+                            "FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12{on_extra} \
+                             JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
+                             JOIN d2 ON f2.d2 = d2.id"
+                        ),
+                        "WHERE d1.cat < 3 AND d2.id = 7",
+                    ),
+                    (
+                        format!(
+                            "FROM d2 LEFT JOIN d1 s ON s.id = d2.id * 6{on_extra} \
+                             JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
+                             JOIN d1 ON f1.d1 = d1.id"
+                        ),
+                        "WHERE d2.cat < 3 AND d1.id = 3",
+                    ),
+                ] {
+                    out.push(format!("{select} {from} {filter}{above}"));
+                }
+            }
+            out
+        }
+
+        /// The answers of every query under every setting, and the plans' shapes; nothing asserted.
+        #[test]
+        fn c3_probe_answers() {
+            use crate::vdbe::morsel::ParallelMode;
+            let dir = std::env::var("C3_DIR").ok();
+            let mut dump = String::new();
+            for analyze in [true, false] {
+                let (_db, conn) = c3_facts(analyze);
+                for (n, sql) in c3_queries().iter().enumerate() {
+                    let mut run = |setting: &str| {
+                        BUSHY_PLANS.with(|plans| plans.set(0));
+                        LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                        let answer = rows(&conn, sql);
+                        let bushy = BUSHY_PLANS.with(Cell::get);
+                        let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
+                        let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                        eprintln!(
+                            "C3A|analyzed={analyze}|q{n}|{setting}|bushy={bushy}|in_runs={in_runs}|{answer:?}|{plan:?}"
+                        );
+                        dump.push_str(&format!(
+                            "{analyze}\t{n}\t{setting}\t{bushy}\t{in_runs}\t{}\n",
+                            answer.join(";")
+                        ));
+                    };
+                    conn.set_join_methods(JoinMethods::ByCost);
+                    run("by_cost_first");
+                    run("by_cost_second");
+                    conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                    run("left_join_probes");
+                    conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                    conn.set_adaptive_joins(true);
+                    run("adaptive");
+                    conn.set_adaptive_joins(false);
+                    for cores in [1, 2, 8] {
+                        conn.set_parallel_mode(ParallelMode::On);
+                        conn.set_parallel_cores(std::num::NonZeroUsize::new(cores));
+                        run(&format!("parallel_{cores}"));
+                    }
+                    conn.set_parallel_mode(ParallelMode::Off);
+                    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+                    run("hash_only");
+                    conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+                    run("merge_only");
+                    conn.set_join_methods(JoinMethods::ByCostWithMerge);
+                    run("by_cost_with_merge");
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                    run("nested_loops");
+                    conn.set_join_methods(JoinMethods::ByCost);
+                }
+            }
+            if let Some(dir) = dir {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(format!("{dir}/data.sql"), C3_DATA.join(";\n") + ";\n").unwrap();
+                std::fs::write(
+                    format!("{dir}/queries.tsv"),
+                    c3_queries()
+                        .iter()
+                        .enumerate()
+                        .map(|(n, sql)| format!("{n}\t{sql}\n"))
+                        .collect::<String>(),
+                )
+                .unwrap();
+                std::fs::write(format!("{dir}/answers.tsv"), dump).unwrap();
+            }
+        }
+
+        /// Every whole plan the search weighed for the first query and its mirror, at the weights
+        /// after `facts()` and again after the query has run, with the weights themselves
+        /// (`RUST_LOG=amphora::join_search=debug`).
+        #[test_log::test]
+        fn c3_probe_weighed() {
+            let (db, conn) = c3_facts(true);
+            for (n, sql) in c3_queries().iter().enumerate().take(2) {
+                for round in ["before", "after"] {
+                    eprintln!("C3W|q{n}|{round}|weights={:?}", db.learned_costs.weights());
+                    let (plan, cost) = plan_and_cost(&conn, sql);
+                    eprintln!("C3W|q{n}|{round}|cost={cost}|{plan:?}");
+                    if round == "before" {
+                        let answer = rows(&conn, sql);
+                        eprintln!("C3W|q{n}|ran|{answer:?}");
+                    }
+                }
+            }
+        }
+
+        /// The plan with the LEFT JOIN in the run and its mirror, each forced, timed and counted.
+        #[test]
+        fn c3_probe_forced() {
+            use super::super::bushy_test_hook::{APPLIED, PIN, PIN_HASH_JOINS, SPLIT};
+            let (db, conn) = c3_facts(true);
+            conn.set_row_counters(true);
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let left = "LEFT JOIN d2 s ON s.id = d1.id * 12";
+            let filter = "WHERE d1.cat < 3 AND d2.id = 7";
+            let a = format!(
+                "{select} FROM d2 JOIN d1 {left} JOIN f1 ON f1.d1 = d1.id \
+                 JOIN f2 ON f2.k = f1.k AND f2.d2 = d2.id {filter}"
+            );
+            let b = format!(
+                "{select} FROM d1 {left} JOIN d2 JOIN f2 ON f2.d2 = d2.id \
+                 JOIN f1 ON f1.d1 = d1.id AND f2.k = f1.k {filter}"
+            );
+            let searched = c3_queries()[0].clone();
+            for (name, sql, pin, split) in [
+                ("left join in the run: d2 ((d1 s f1) f2)", &a, true, 1usize),
+                ("its mirror: d1 s ((d2 f2) f1)", &b, true, 2usize),
+                ("the search's own", &searched, false, 0usize),
+            ] {
+                PIN.with(|p| p.set(pin));
+                PIN_HASH_JOINS.with(|p| p.set(0));
+                SPLIT.with(|s| s.set(if pin { Some(split) } else { None }));
+                let mut times = Vec::new();
+                let mut counts = Vec::new();
+                let mut answer = Vec::new();
+                APPLIED.with(|applied| applied.set(0));
+                LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                for _ in 0..15 {
+                    let mut stmt = conn.prepare(sql.as_str()).unwrap();
+                    let began = std::time::Instant::now();
+                    let got = stmt.run_collect_rows().unwrap();
+                    times.push(began.elapsed().as_micros());
+                    counts = stmt.row_counts();
+                    answer = got
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|value| value.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .collect();
+                }
+                let applied = APPLIED.with(Cell::get);
+                let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                let cost = LAST_JOIN_COST.with(Cell::get);
+                PIN.with(|p| p.set(false));
+                SPLIT.with(|s| s.set(None));
+                times.sort();
+                eprintln!(
+                    "C3F|{name}|applied={applied} in_runs={in_runs}|cost={cost}|us median {} min {} max {}|{answer:?}|{plan:?}",
+                    times[times.len() / 2],
+                    times[0],
+                    times[times.len() - 1]
+                );
+                for count in &counts {
+                    eprintln!("C3F|{name}|{count:?}");
+                }
+                eprintln!("C3F|{name}|weights={:?}", db.learned_costs.weights());
+            }
+        }
+
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
         /// LEFT JOINs after the core and inside it, with semi and anti joins, and (lane pl8-20) a
         /// LEFT JOIN of the second fact on the first fact and the outer dimension, followed by an
