@@ -72,6 +72,10 @@ pub(super) struct SessionMeter {
     waited: AtomicU64,
     wait_nanos: AtomicU64,
     redirects: AtomicU64,
+    /// The token reads that have begun to wait, counted and told under the closed time's lock:
+    /// what a test waits for to know its read waits ([`Client::session_waits`]).
+    #[cfg(test)]
+    begun: AtomicU64,
 }
 
 /// A replica's token reads: those served at once, those that waited and the nanoseconds they
@@ -190,10 +194,35 @@ impl Client {
             if now >= bound {
                 return Ok(Wait::Redirect);
             }
+            #[cfg(test)]
+            if !waited {
+                shared.sessions.begun.fetch_add(1, Ordering::Relaxed);
+                shared.moved.notify_all();
+            }
             waited = true;
             point = shared
                 .moved
                 .wait_timeout(point, bound.min(until).saturating_duration_since(now))
+                .map_err(|_| unavailable("the closed time's lock was poisoned"))?
+                .0;
+        }
+    }
+    /// The token reads on this replica that have begun to wait, once one has or at `until`, woken
+    /// by the read itself: what a test waits for before it lets the replica catch up, as a read
+    /// whose thread starts late would find its token applied and wait for nothing.
+    #[cfg(test)]
+    pub(in crate::database) fn session_waits(&self, until: Instant) -> Result<u64, Refusal> {
+        let shared = &self.handle.shared;
+        let mut point = locked(&shared.closed)?;
+        loop {
+            let begun = shared.sessions.begun.load(Ordering::Relaxed);
+            let left = until.saturating_duration_since(Instant::now());
+            if begun > 0 || left.is_zero() {
+                return Ok(begun);
+            }
+            point = shared
+                .moved
+                .wait_timeout(point, left)
                 .map_err(|_| unavailable("the closed time's lock was poisoned"))?
                 .0;
         }
