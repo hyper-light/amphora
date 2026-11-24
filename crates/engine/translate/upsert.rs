@@ -480,11 +480,10 @@ pub(crate) struct DoUpdateSubqueries {
     sets: RowSubqueries,
 }
 
+/// Each subquery beside whether it reads the row to insert, which is another at each conflict.
 #[derive(Default)]
 struct RowSubqueries {
-    planned: Vec<NonFromClauseSubquery>,
-    /// Whether one reads the row to insert: what ran once is then another at each conflict.
-    reads_excluded: bool,
+    planned: Vec<(NonFromClauseSubquery, bool)>,
 }
 
 impl DoUpdateSubqueries {
@@ -532,38 +531,43 @@ impl DoUpdateSubqueries {
         // The target's alias takes its name's place, and the name `excluded` if it is that.
         let shadowed = target.identifier == EXCLUDED;
         let mut tables = TableReferences::new(vec![target], scope.outer_query_refs().to_vec());
-        for (exprs, planned) in [
+        for (exprs, RowSubqueries { planned }) in [
             (
-                predicate
-                    .iter_mut()
-                    .map(|expr| expr.as_mut())
-                    .collect::<Vec<_>>(),
+                predicate.iter_mut().collect::<Vec<_>>(),
                 &mut subqueries.predicate,
             ),
             (
-                sets.iter_mut().map(|set| set.expr.as_mut()).collect(),
+                sets.iter_mut().map(|set| &mut set.expr).collect(),
                 &mut subqueries.sets,
             ),
         ] {
-            let mut exprs = exprs;
-            if !shadowed {
-                for expr in exprs.iter_mut() {
-                    walk_expr_mut(expr, &mut |node| {
-                        if let Some(select) = subquery_of(node) {
-                            rewrite_excluded(select, &excluded, &mut planned.reads_excluded)?;
-                        }
-                        Ok(WalkControl::Continue)
-                    })?;
-                }
+            for expr in exprs {
+                walk_expr_mut(expr, &mut |node| {
+                    if subquery_of(node).is_none() {
+                        return Ok(WalkControl::Continue);
+                    }
+                    let mut reads_excluded = false;
+                    if !shadowed {
+                        walk_expr_mut(node, &mut |node| {
+                            if let Some(select) = subquery_of(node) {
+                                rewrite_excluded(select, &excluded, &mut reads_excluded)?;
+                            }
+                            Ok(WalkControl::Continue)
+                        })?;
+                    }
+                    let mut found = Vec::new();
+                    plan_subqueries_from_row_writes(
+                        program,
+                        &mut found,
+                        &mut tables,
+                        &mut [node],
+                        resolver,
+                        connection,
+                    )?;
+                    planned.extend(found.into_iter().map(|subquery| (subquery, reads_excluded)));
+                    Ok(WalkControl::SkipChildren)
+                })?;
             }
-            plan_subqueries_from_row_writes(
-                program,
-                &mut planned.planned,
-                &mut tables,
-                &mut exprs,
-                resolver,
-                connection,
-            )?;
         }
         for set in sets.iter_mut() {
             let mut value = set.expr.as_ref();
@@ -623,25 +627,26 @@ impl RowSubqueries {
         let (Some(target), false) = (target, self.planned.is_empty()) else {
             return read(program);
         };
-        let end = program.allocate_label();
-        if self.reads_excluded {
-            program.emit_insn(Insn::ResetOnce { region_end: end });
-        }
         // The cursor stands on the conflicting row.
         let row = [(CursorKey::table(target), ctx.cursor_id)];
-        let result = program.with_cursor_overrides(&row, |program| {
-            super::without_rowid::emit_write_subqueries(
-                program,
-                resolver,
-                &mut self.planned,
-                false,
-                ctx.database_id,
-                &ctx.table.name,
-            )?;
+        program.with_cursor_overrides(&row, |program| {
+            for (subquery, reads_excluded) in &mut self.planned {
+                let end = program.allocate_label();
+                if *reads_excluded {
+                    program.emit_insn(Insn::ResetOnce { region_end: end });
+                }
+                super::without_rowid::emit_write_subqueries(
+                    program,
+                    resolver,
+                    std::slice::from_mut(subquery),
+                    false,
+                    ctx.database_id,
+                    &ctx.table.name,
+                )?;
+                program.preassign_label_to_next_insn(end);
+            }
             read(program)
-        })?;
-        program.preassign_label_to_next_insn(end);
-        Ok(result)
+        })
     }
 }
 
