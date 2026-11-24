@@ -5,7 +5,7 @@
 //!   group commit, no row waiting for a timer. A batch is charged its rows' bytes
 //!   ([`Engine::row_bytes`]) to the memory budget's room for queues (MB.1) until its commit ends:
 //!   past that room it is refused ([`Refused::Full`]) rather than queued; [`Store::put_wait`] waits
-//!   for this store's commits to free room instead, woken by each.
+//!   for room instead, until its deadline, woken by each charge given back anywhere in the budget.
 //! - **Durable beside the writer.** A commit doesn't wait for the disk: a flusher thread flushes
 //!   what was committed, over and over, and a write is durable once a flush that began after its
 //!   commit ends ([`Store::durable`] waits for that, by the [`Ticket`] its batch was handed with).
@@ -28,6 +28,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::memory::Charge;
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
@@ -405,7 +406,7 @@ type Job<E> = Box<dyn FnOnce(&mut E) + Send>;
 enum Msg<E: Engine> {
     /// Rows, the keys they are of, what becomes of them, and their charge (none: they charge
     /// nothing, [`Engine::row_bytes`]).
-    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>, Option<Queued>),
+    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>, Option<Charge>),
     /// Run on the engine, between commits (what was sent before it is committed first).
     Run(Job<E>),
 }
@@ -487,11 +488,6 @@ struct Sends {
     stopping: AtomicBool,
     /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
     disk_failed: AtomicBool,
-    /// The bytes of this store's batches charged to the memory budget's room for queues whose
-    /// commits haven't ended ([`Queued`]). A sender looks for room and waits under its lock, and a
-    /// batch's bytes are given back under it before its waiters are woken, so no wakeup is lost
-    /// between a sender's look and its wait.
-    room: (Mutex<u64>, Condvar),
     claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
@@ -543,25 +539,6 @@ struct Counts {
 /// Shards of the keys' counts.
 const SHARDS: u64 = 64;
 
-/// A batch's bytes charged to the memory budget's room for queues (MB.1): given back when it
-/// drops (its commit ended, or it was let go), under the room's lock, and then the senders waiting
-/// for room are woken.
-struct Queued {
-    sends: Arc<Sends>,
-    budget: Arc<crate::memory::Budget>,
-    bytes: u64,
-}
-
-impl Drop for Queued {
-    fn drop(&mut self) {
-        let mut queued = locked(&self.sends.room.0);
-        self.budget.give(crate::memory::Use::Queues, self.bytes);
-        *queued = queued.saturating_sub(self.bytes);
-        drop(queued);
-        self.sends.room.1.notify_all();
-    }
-}
-
 impl Default for Sends {
     fn default() -> Self {
         Self {
@@ -576,7 +553,6 @@ impl Default for Sends {
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
-            room: (Mutex::new(0), Condvar::new()),
             claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
@@ -1384,10 +1360,10 @@ impl<E: Engine> Store<E> {
     }
 
     /// Charges `rows`' bytes ([`Engine::row_bytes`]) to the memory budget's room for queues
-    /// (MB.1), waiting until `until` (none: not at all) for this store's commits to give back room.
-    /// Refused [`Refused::Full`] past `until`, or at once while nothing of this store's holds a
-    /// charge: no commit of its would wake the wait then.
-    fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Queued>, Refused> {
+    /// (MB.1) until their commit ends, waiting until `until` (none: not at all) for room given back
+    /// anywhere in the budget ([`crate::memory::Budget::take_until`]). Refused [`Refused::Full`]
+    /// past `until`.
+    fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Charge>, Refused> {
         let bytes = rows.iter().fold(0u64, |n, row| {
             n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
         });
@@ -1395,31 +1371,13 @@ impl<E: Engine> Store<E> {
             return Ok(None);
         }
         let budget = crate::memory::process();
-        let mut queued = locked(&self.sends.room.0);
-        loop {
-            if budget.hold(crate::memory::Use::Queues, bytes).is_ok() {
-                *queued = queued.saturating_add(bytes);
-                return Ok(Some(Queued {
-                    sends: Arc::clone(&self.sends),
-                    budget,
-                    bytes,
-                }));
-            }
-            let left = until.map_or(Duration::ZERO, |u| {
-                u.saturating_duration_since(Instant::now())
-            });
-            if left.is_zero() || *queued == 0 {
-                return Err(Refused::Full);
-            }
-            self.meter.waited_for_room();
-            queued = self
-                .sends
-                .room
-                .1
-                .wait_timeout(queued, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let queues = crate::memory::Use::Queues;
+        match until {
+            None => budget.take(queues, bytes),
+            Some(until) => budget.take_until(queues, bytes, until, || self.meter.waited_for_room()),
         }
+        .map(Some)
+        .map_err(|_| Refused::Full)
     }
 
     /// Run `f` on a reader, on this thread, once the writes of `key` (of every key: None) handed
@@ -1563,7 +1521,7 @@ struct Batch {
     end: usize,
     keys: Vec<String>,
     fate: Arc<Fate>,
-    _queued: Option<Queued>,
+    _queued: Option<Charge>,
 }
 
 /// The writer: rows are committed as soon as nothing else waits in the queue (or at the commit's
@@ -1805,6 +1763,55 @@ mod tests {
         store.sync(far).unwrap();
         assert_eq!(*kept.lock().unwrap(), vec!["a".to_owned(), "c".to_owned()]);
         assert!(store.counters().room_waits >= 1);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1: a sender waiting for room is woken by a charge given back
+    /// anywhere in the memory budget, not only by its own store's commits. Do: with room for one
+    /// row, hold store A's writer in a job and queue a row on A; on store B, which holds no charge,
+    /// wait with a row until a deadline an hour off; then let A's writer go. Expect: B's wait
+    /// counted, B's row taken once A's commit gives its charge back, none refused, all given back.
+    #[test]
+    fn mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back() {
+        let one = std::mem::size_of::<String>() + 1;
+        let fed = Fed::new(Some(u64::try_from(one).unwrap()), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let (kept_a, kept_b) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let a = Store::start(Kept(Arc::clone(&kept_a)), Config::default()).unwrap();
+        let b = Store::start(Kept(Arc::clone(&kept_b)), Config::default()).unwrap();
+        let far = Instant::now() + Duration::from_secs(3600);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let busy = a.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(far, move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let first = a.put(vec!["a".to_owned()]).unwrap();
+        let (waiting, on_waiter) = (b.clone(), Arc::clone(&budget));
+        let waiter = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+            waiting.put_wait(vec!["b".to_owned()], far)
+        });
+        while b.counters().room_waits == 0 && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        let second = waiter.join().unwrap().unwrap();
+        job.join().unwrap().unwrap();
+        a.durable(&first, far).unwrap();
+        b.durable(&second, far).unwrap();
+        assert_eq!(*kept_a.lock().unwrap(), vec!["a".to_owned()]);
+        assert_eq!(*kept_b.lock().unwrap(), vec!["b".to_owned()]);
+        assert_eq!(b.counters().room_waits, 1);
+        assert_eq!(a.counters().dropped + b.counters().dropped, 0);
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
     }
 }

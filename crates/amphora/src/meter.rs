@@ -91,7 +91,7 @@ pub struct Meter {
     flush_us: AtomicU64,
     /// Batches refused: the memory budget's room for queues had no room for them.
     dropped: AtomicU64,
-    /// Times a batch's sender waited for its store's commits to give back room.
+    /// Times a batch's sender waited for the memory budget to give back room.
     room_waits: AtomicU64,
     /// Batches whose commit failed, each refused to its sender.
     failed: AtomicU64,
@@ -124,7 +124,7 @@ pub struct Counters {
     pub flushes: u64,
     pub flush_ms: u64,
     pub dropped: u64,
-    /// Times a batch's sender waited for its store's commits to give back room.
+    /// Times a batch's sender waited for the memory budget to give back room.
     pub room_waits: u64,
     pub failed: u64,
     pub checkpoints: u64,
@@ -197,7 +197,7 @@ impl Meter {
             .saturating_add(1)
     }
 
-    /// A batch's sender waits for its store's commits to give back room.
+    /// A batch's sender waits for the memory budget to give back room.
     pub fn waited_for_room(&self) {
         self.room_waits.fetch_add(1, Ordering::Relaxed);
     }
