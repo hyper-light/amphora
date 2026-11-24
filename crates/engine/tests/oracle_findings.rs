@@ -2886,6 +2886,8 @@ fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
                 "CREATE TABLE l(x INT, y INT)",
                 "INSERT INTO l VALUES (2, 5), (3, 7)",
                 "CREATE TABLE e(x INT)",
+                "CREATE TABLE r0(x INT)",
+                "CREATE TABLE l0(x INT, y INT)",
                 "CREATE TABLE d(id INTEGER PRIMARY KEY, k INT)",
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 400) INSERT INTO d SELECT x, x % 80 FROM n",
                 "CREATE INDEX d_k ON d(k)",
@@ -2917,7 +2919,7 @@ fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
                 ),
                 // Nothing is put in the inner list or looked up in it: the table was emptied with no panic.
                 (
-                    "SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE (SELECT count(*) FROM e WHERE e.x IN (SELECT s.x FROM e AS s WHERE b.x <= s.x)) = 0".into(),
+                    "SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE (SELECT count(*) FROM r0 WHERE r0.x IN (SELECT l0.y FROM l0 WHERE b.x <= l0.x)) = 0".into(),
                     &["1|NULL", "2|NULL", "NULL|1", "NULL|2"],
                 ),
                 // The unmatched rows are found by the list the WHERE clause tests each of them against.
