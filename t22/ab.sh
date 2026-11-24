@@ -19,7 +19,7 @@ if has db; then
   cp "$T21/S.json" "$P" || exit 1
   for a in A B; do [ -d "$L/db-$a" ] || cp -a --reflink=always "$T11/db-sf1" "$L/db-$a" || exit 1; done
   git -C "$R" fetch -q origin main || exit 1
-  mkdir -p "$L/q" && git -C "$R" archive "$B" bench/planner/tpch/queries | tar x -C "$L/q" || exit 1
+  mkdir -p "$L/q" && git -C "$R" archive "$B" bench/planner/tpch | tar x -C "$L/q" || exit 1
   cmp "$Q/q10.sql" "$L/q10.sql" || exit 1
   for a in A B; do sha256sum "$BIN/amphora-bench-$(sha_of $a)" | cut -c1-16; done
 fi
@@ -32,7 +32,7 @@ if has ab; then
     for arm in $order; do
       echo "=== $arm r$i $(date -u +%H:%M:%SZ) $(state)"
       { time b "$arm" --runs 5 --timeout-s 120 --count-timeout-s 120 --pin-weights "$P" --answers "$L/ans/$arm-r$i" --out "$L/out/$arm-r$i.jsonl" 2> "$L/out/$arm-r$i.log"; } 2>&1
-      echo "rc=$? $(state)"
+      rc=$?; echo "rc=$rc $(state)"; [ $rc = 0 ] || { tail -3 "$L/out/$arm-r$i.log"; exit 1; }
     done
   done
 fi
