@@ -51,7 +51,9 @@ PY
   cp "$L/bench-cargo-lock.diff" "$W/$S/" 2>/dev/null
   tail -5 "$L/build.log" >"$W/$S/build.log.tail"
   (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py finish.sh "$W/$S/")
-  git -C "$W" add -- "$S" && git -C "$W" diff --cached --quiet && { echo "nothing to commit"; exit 0; }
+  git -C "$SRC" fetch -q origin perf/bench-s7b
+  git -C "$SRC" show FETCH_HEAD:$S.md >"$W/$S.md" 2>/dev/null || { echo "no record file at FETCH_HEAD:$S.md"; exit 1; }
+  git -C "$W" add -- "$S" "$S.md" && git -C "$W" diff --cached --quiet && { echo "nothing to commit"; exit 0; }
   git -C "$W" commit -q -m "$msg
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" || exit 1
