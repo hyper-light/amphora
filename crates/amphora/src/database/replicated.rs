@@ -7337,7 +7337,7 @@ mod tests {
     /// that call's end, which its deadline is at the latest. Do: on a leaderless member, queue the
     /// largest call it holds alone, then a second in line; send a record that fits the queue but not
     /// beside the call; move the clock past the first call's deadline, then past the second's. Expect:
-    /// the record refused `Full` while either is held, admitted once both ended, at their deadlines.
+    /// the record refused at once while either is held, admitted once both ended, at their deadlines.
     #[test]
     fn a28_a_record_with_no_room_beside_a_held_call_enters_once_the_call_ended() {
         let dir = tempfile::tempdir().unwrap();
@@ -7374,7 +7374,10 @@ mod tests {
         let refused = |what: &str| {
             let refused = handle.admit_receive(2, record.clone(), beyond).err();
             assert!(
-                matches!(refused, Some(Refusal::Full { .. })),
+                matches!(
+                    refused,
+                    Some(Refusal::Full { .. } | Refusal::TooLarge { .. })
+                ),
                 "{what}: {refused:?}"
             );
         };

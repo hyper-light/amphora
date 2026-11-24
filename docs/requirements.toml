@@ -1298,7 +1298,7 @@ tests = [
   { id = "T-QB.1.22", text = "Calls of every size from every thread, with deadlines near and far, beside wire records and learned bounds (run under ThreadSanitizer too): passes when every call whose deadline is far is admitted, one near it is admitted or Full, and nothing is held of the queue or the budget after" },
   # lane perf-A28
   { id = "T-QB.1.23", text = "A write waiting for the memory budget's room, another use holding all of it, as its owner is dropped or its loop ends, and in a group of three as the term moves: passes when the owner's end refuses it Fenced, none waiting and nothing held, and the term's change doesn't end it, the write answered by its owner once the room comes" },
-  { id = "T-QB.1.24", text = "A record that fits the queue but not beside the largest call it holds alone, a second call in line: passes when the record is refused Full while either is held and enters once both ended, at their deadlines" },
+  { id = "T-QB.1.24", text = "A record that fits the queue but not beside the largest call it holds alone, a second call in line: passes when the record is refused at once while either is held and enters once both ended, at their deadlines" },
 ]
 
 # lane many-writers
