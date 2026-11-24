@@ -202,6 +202,12 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // The planner keeps an entry for each occurrence of a call it takes for nondeterministic (one
+    // over date(x), say), but an outer layer reads equal calls of this window from one column of
+    // this layer, as SQLite does (selectWindowRewriteExprCb compares a call with those already in
+    // the sublist). The call is computed once, by the entry that column reads.
+    current_window.functions.retain(|f| f.rewritten.is_some());
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
@@ -532,9 +538,10 @@ fn window_function_uses_subtypes(window_func: &AccumulatorFunc) -> bool {
 /// path, including evaluating scalar calls separately for step and inverse.
 fn rewrite_late_window_arg(
     arg: &mut Expr,
-    aggregates: &mut [Aggregate],
+    aggregates: &mut Vec<Aggregate>,
     ctx: &mut WindowSubqueryContext,
 ) -> Result<()> {
+    resolve_window_and_aggregate_functions(arg, ctx.resolver, aggregates, None, &mut [])?;
     walk_expr_mut(arg, &mut |node| {
         if matches!(
             node,
