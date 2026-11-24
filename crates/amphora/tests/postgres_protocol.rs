@@ -98,7 +98,7 @@ fn drive(
         assert!(step.consumed <= held.len(), "consumed only what was held");
         held.drain(..step.consumed);
         match step.next {
-            Next::Continue => {}
+            Next::Continue | Next::Flush => {}
             Next::Need(total) => {
                 assert!(total > held.len(), "a Need asks for more than is held");
                 assert!(

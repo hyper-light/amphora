@@ -17,6 +17,7 @@ use crate::sync::{Arc, Mutex};
 use crate::{Connection, LimboError, Numeric, Value};
 use amphora_engine_parser::ast;
 use amphora_pg_analysis::datetime::TimeZone;
+use amphora_pg_analysis::func::{char_text, text_char};
 use amphora_pg_analysis::{lower, Column, Relations, Session, Value as PgValue};
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Proc, SearchPath};
@@ -423,7 +424,8 @@ pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
             Value::build_text(s.trim_end_matches(' ').to_string())
         }
         PgValue::Text(s) => Value::build_text(s.clone()),
-        PgValue::Char(_) | PgValue::Numeric(_) | PgValue::Unknown(_) => return Err(unstored(oid)),
+        PgValue::Char(c) => Value::build_text(char_text(*c)),
+        PgValue::Numeric(_) | PgValue::Unknown(_) => return Err(unstored(oid)),
     })
 }
 
@@ -451,9 +453,10 @@ pub fn from_engine(oid: u32, value: &Value) -> crate::Result<Option<PgValue>> {
         type_oid::TIMESTAMP | type_oid::TIMESTAMPTZ => {
             PgValue::Timestamp(integer.ok_or_else(corrupt)?)
         }
-        type_oid::TEXT | type_oid::VARCHAR | type_oid::BPCHAR => {
+        type_oid::TEXT | type_oid::VARCHAR | type_oid::BPCHAR | type_oid::NAME => {
             PgValue::Text(text.ok_or_else(corrupt)?.to_string())
         }
+        type_oid::CHAR => PgValue::Char(text_char(text.ok_or_else(corrupt)?)),
         _ => return Err(unstored(oid)),
     }))
 }
