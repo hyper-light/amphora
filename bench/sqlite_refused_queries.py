@@ -12,7 +12,7 @@ A compound's values are distinct under every collation, so that the order is one
 arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere), no query has two of lag, lead,
 first_value, last_value and nth_value (CO), and no `SELECT *` is over two windows (it has a column too few). No view is
 DISTINCT or grouped: each of its columns counts, and which rows reach it is the push-down's. No CTE holds such a column:
-Amphora evaluates it still.
+Amphora evaluates it still. No subquery groups by its outer row's column (refused).
 """
 import random
 import sqlite3
@@ -156,7 +156,7 @@ def derived(rng):
         f"SELECT j FROM {src} JOIN o ON v.{c} = o.j", f"SELECT v.id FROM {src} RIGHT JOIN o ON o.id = v.id", f"SELECT o.id, v.{c} FROM o FULL JOIN {src} ON v.id = o.id", f"SELECT x.id FROM doc AS x, {src} WHERE x.id = v.id AND v.{c} IS NOT NULL",
         f"SELECT v.id, (SELECT max(o.j) FROM o WHERE o.id = v.{c}) FROM {src}", f"SELECT v.id FROM {src} WHERE EXISTS (SELECT 1 FROM o WHERE o.j = v.{c})",
         f"SELECT v.id FROM {src} WHERE v.id IN (SELECT o.j FROM o WHERE o.id IS NOT v.{c})", f"SELECT (SELECT (SELECT v.{c}) FROM o WHERE o.id = v.id) FROM {src}", f"SELECT v.id, (SELECT count(*) FROM o WHERE o.j IN (SELECT v.{d})) FROM {src}",
-        f"SELECT (SELECT sum(o.j) FROM o GROUP BY o.j = v.{c} ORDER BY 1 LIMIT 1), v.{d} FROM {src}", f"SELECT x.id FROM {src} JOIN doc AS x ON x.id = v.id AND EXISTS (SELECT 1 FROM o WHERE o.j = v.{c} OR o.id = v.{d})",
+        f"SELECT x.id FROM {src} JOIN doc AS x ON x.id = v.id AND EXISTS (SELECT 1 FROM o WHERE o.j = v.{c} OR o.id = v.{d})",
         f"SELECT * FROM o WHERE j = (SELECT max(v.id) FROM {src} WHERE v.{c} IS NOT (SELECT v.{d}))", f"SELECT count(*) FILTER (WHERE v.{c} IS NOT NULL), sum(v.{d} IS NULL) FROM {src}", f"SELECT max(v.id) OVER (PARTITION BY (SELECT v.{c})) FROM {src}",
         f"SELECT {c} FROM {src} LIMIT 2", f"SELECT id FROM {src} GROUP BY id HAVING max({c}) IS NOT NULL", f"SELECT CASE WHEN {c} IS NULL THEN {d} ELSE id END FROM {src}", f"SELECT rowid FROM o WHERE j NOT IN (SELECT {c} FROM {src} WHERE {c} IS NOT NULL)",
     ]
