@@ -115,7 +115,8 @@ pub struct Clock {
 
 /// Which open transaction each waiting one waits for, and who is woken when one ends
 /// (docs/design/postgres.md section 8): a wait is a `Waker`'s word, never a timer. Bounded by the
-/// transactions that wait, each once; a wait that would close a ring of them is refused.
+/// transactions that wait, each once. A ring of them is found by the one whose deadline to look for
+/// it passes first ([`Clock::deadlock`]).
 #[derive(Default)]
 struct Waits {
     on: FxHashMap<u64, u64>,
@@ -329,6 +330,12 @@ pub struct Txn {
     charged: u64,
     read_bytes: u64,
     rules: Rules,
+    /// Where its running statement reads, kept open while the statement's changes are made against
+    /// later commits ([`Clock::follow`]): `start` is then the newest it follows.
+    reading: Option<Ts>,
+    /// The rows it locked at a version its statement's snapshot doesn't see ([`VTree::lock`]): one
+    /// that its statement then left as it was is put back as it was, unchanged, at its commit.
+    locked: Vec<(u64, Vec<u8>)>,
 }
 
 /// How a transaction is isolated where it is not the database's default (docs/design/postgres.md
@@ -342,6 +349,18 @@ pub struct Rules {
     /// Whether a row of another's keeps its statement waiting (`RowTaken`) rather than refusing
     /// its transaction (`WriteWriteConflict`).
     pub waits: bool,
+    /// Whether its statement goes on with the newest version of a row that a commit since the
+    /// statement's snapshot changed (READ COMMITTED's, rechecked: [`VTree::lock`]), rather than
+    /// being refused it.
+    pub follows: bool,
+}
+
+/// What [`VTree::lock`] took: the version its statement's snapshot saw, or a later one, which may
+/// have removed the row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Locked {
+    Held,
+    Moved { removed: bool },
 }
 
 /// How a database validates a commit (decision 5). Each one is the floor, snapshot isolation with
@@ -539,6 +558,15 @@ impl Txn {
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            start: self.reading.unwrap_or(self.start),
+            own: Some(self.id),
+        }
+    }
+
+    /// What its changes are made against: its snapshot, or the commits its statement followed
+    /// ([`Clock::follow`]).
+    pub fn newest(&self) -> Snapshot {
+        Snapshot {
             start: self.start,
             own: Some(self.id),
         }
@@ -704,6 +732,8 @@ impl Clock {
             charged: 0,
             read_bytes: 0,
             rules: Rules::default(),
+            reading: None,
+            locked: Vec::new(),
         })
     }
 
@@ -712,27 +742,58 @@ impl Clock {
     /// snapshots' lock, so a collection sees the old one or the new, never neither.
     pub fn renew(&self, txn: &mut Txn) -> Result<()> {
         let mut open = self.open.lock();
+        if let Some(reading) = txn.reading.take() {
+            count_out(&mut open.all, reading);
+            count_out(&mut open.txns, reading);
+        }
+        self.start_now(&mut open, txn).map(|_| ())
+    }
+
+    /// `txn.start` moved to every commit published now, `open` locked: the start it moved from, its
+    /// counts given back.
+    fn start_now(&self, open: &mut Open, txn: &mut Txn) -> Result<Ts> {
         let start = self.visible.load(Ordering::Acquire);
-        if start == txn.start {
-            return Ok(());
+        let was = txn.start;
+        if start == was {
+            return Ok(was);
         }
         count_in(&mut open.all, start)?;
         if let Err(e) = count_in(&mut open.txns, start) {
             count_out(&mut open.all, start);
             return Err(e);
         }
-        count_out(&mut open.all, txn.start);
-        count_out(&mut open.txns, txn.start);
+        count_out(&mut open.all, was);
+        count_out(&mut open.txns, was);
         txn.start = start;
-        Ok(())
+        Ok(was)
+    }
+
+    /// `txn`'s changes made against every commit published now, its running statement still reading
+    /// where it began: 19's EvalPlanQual changes the newest version of a row and scans the rest at
+    /// the statement's snapshot (docs/design/postgres.md section 8). The snapshot stays open, so no
+    /// version it sees is collected, until the next statement's ([`Clock::renew`]) or the end.
+    fn follow(&self, txn: &mut Txn) -> Result<()> {
+        // A commit is seen by its state before its timestamp is published, both under this lock:
+        // once it is free, what `take` found is published.
+        drop(self.publish.lock());
+        let mut open = self.open.lock();
+        if txn.reading.is_none() {
+            let reading = txn.start;
+            count_in(&mut open.all, reading)?;
+            if let Err(e) = count_in(&mut open.txns, reading) {
+                count_out(&mut open.all, reading);
+                return Err(e);
+            }
+            txn.reading = Some(reading);
+        }
+        self.start_now(&mut open, txn).map(|_| ())
     }
 
     /// Registers `wake` to be called once transaction `holder` ends, for `waiter` (its transaction,
     /// none when its statement ran in one of its own, already ended): `false` when `holder` has
     /// ended, and nothing is registered. Registered under the waits' lock while `holder`'s state is
     /// read, and `holder`'s end removes its state before it takes that lock ([`Clock::forget`]), so
-    /// no end is missed. A wait that would close a ring of waits is refused (`Deadlock`),
-    /// registering nothing.
+    /// no end is missed.
     pub fn wait_for(&self, waiter: Option<u64>, holder: u64, wake: &Waker) -> Result<bool> {
         let states = self.states(holder)?;
         let mut waits = self.waits.lock();
@@ -745,18 +806,6 @@ impl Clock {
             return Ok(false);
         }
         if let Some(waiter) = waiter {
-            // Each transaction waits for one other, so the ring is a path.
-            let mut at = holder;
-            for _ in 0..=waits.on.len() {
-                if at == waiter {
-                    held();
-                    return Err(LimboError::Deadlock);
-                }
-                match waits.on.get(&at) {
-                    Some(&next) => at = next,
-                    None => break,
-                }
-            }
             waits.on.insert(waiter, holder);
         }
         let told = waits.told.entry(holder).or_default();
@@ -767,6 +816,45 @@ impl Clock {
             told.push((waiter, wake.clone()));
         }
         Ok(true)
+    }
+
+    /// The ring of waits `waiter`'s wait closes, each with the transaction it waits for, `waiter`
+    /// first; none when it closes none. 19's `DeadLockCheck` (deadlock.c), which the session whose
+    /// `deadlock_timeout` passed runs: it is the one refused.
+    pub fn deadlock(&self, waiter: u64) -> Vec<(u64, u64)> {
+        let waits = self.waits.lock();
+        // Each transaction waits for one other, so a ring is a path back to the first.
+        let mut ring = Vec::new();
+        let mut at = waiter;
+        for _ in 0..waits.on.len() {
+            let Some(&next) = waits.on.get(&at) else {
+                return Vec::new();
+            };
+            ring.push((at, next));
+            if next == waiter {
+                return ring;
+            }
+            at = next;
+        }
+        Vec::new()
+    }
+
+    /// `waiter` waits no more, its holder not ended: its wait was refused or given up.
+    pub fn stop_waiting(&self, waiter: u64) {
+        let mut waits = self.waits.lock();
+        let Some(holder) = waits.on.remove(&waiter) else {
+            return;
+        };
+        if let Some(told) = waits.told.get_mut(&holder) {
+            let before = told.len();
+            told.retain(|(by, _)| *by != Some(waiter));
+            let gone = before.saturating_sub(told.len());
+            if told.is_empty() {
+                waits.told.remove(&holder);
+            }
+            self.waiting
+                .fetch_sub(u64::try_from(gone).unwrap_or(0), Ordering::SeqCst);
+        }
     }
 
     fn resolve(&self, writer: u64) -> Result<Writer> {
@@ -827,8 +915,10 @@ impl Clock {
         self.states(txn.id)?.lock().remove(&txn.id);
         {
             let mut open = self.open.lock();
-            count_out(&mut open.all, txn.start);
-            count_out(&mut open.txns, txn.start);
+            for start in std::iter::once(txn.start).chain(txn.reading) {
+                count_out(&mut open.all, start);
+                count_out(&mut open.txns, start);
+            }
         }
         // After its commit is published: one who finds it no longer writing finds its commit.
         let mut woken = Vec::new();
@@ -1292,6 +1382,59 @@ impl VTree {
         Ok(before)
     }
 
+    /// `txn` takes the row under `key` before its statement, which found it at `seen` (its
+    /// snapshot's start), changes it, so that no other transaction changes it in between: refused as
+    /// [`VTree::put`]'s is, but for a commit since `seen` that the transaction follows
+    /// ([`Rules::follows`]), whose version the row then is, [`Locked::Moved`], to be judged again.
+    /// 19's `table_tuple_lock` of the last version (`ExecUpdate`, REL_19_0
+    /// src/backend/executor/nodeModifyTable.c:2661).
+    pub fn lock(
+        &self,
+        pool: &Pool,
+        d: &mut Descender,
+        clock: &Clock,
+        txn: &mut Txn,
+        key: &[u8],
+        seen: Ts,
+    ) -> Result<Locked> {
+        let mut take = |txn: &mut Txn| {
+            self.tree.modify(pool, d, key, |cell| {
+                let mut heads = self.heads(key)?.lock();
+                let newest = match heads.get(key) {
+                    Some(head) => match clock.resolve(head.writer)? {
+                        Writer::Committed(ts) => ts,
+                        Writer::Open(_) | Writer::Aborted => 0,
+                    },
+                    None => 0,
+                };
+                let Some(removed) = cell.map(|c| c.flags.removed) else {
+                    return Err(LimboError::InternalError(
+                        "versioned storage: a row locked that is in no leaf".into(),
+                    ));
+                };
+                self.take(clock, txn, key, cell, &mut heads)?;
+                let change = Change::Mark(Flags {
+                    versioned: true,
+                    removed,
+                });
+                Ok((change, (newest, removed)))
+            })
+        };
+        let taken = match take(txn) {
+            Err(LimboError::RowTaken(None)) if txn.rules.follows => {
+                clock.follow(txn)?;
+                take(txn)
+            }
+            taken => taken,
+        };
+        let (newest, removed) = taken?;
+        if newest <= seen {
+            return Ok(Locked::Held);
+        }
+        txn.locked.push((self.id, key.to_vec()));
+        Ok(Locked::Moved { removed })
+    }
+
     /// `txn` puts `value` under `key`: the row it saw there before, if any.
     pub fn put(
         &self,
@@ -1341,7 +1484,7 @@ impl VTree {
     ) -> Result<Option<Vec<u8>>> {
         self.tree.modify(pool, d, key, |cell| {
             let mut heads = self.heads(key)?.lock();
-            let seen = Self::visible(clock, &txn.snapshot(), cell, heads.get(key))?;
+            let seen = Self::visible(clock, &txn.newest(), cell, heads.get(key))?;
             if seen.is_none() {
                 // Nothing to remove, unless the cell is another's change, which conflicts.
                 if let Some(head) = heads.get(key) {
@@ -1467,28 +1610,33 @@ impl VTree {
     }
 
     /// Puts `value` (none: removed) back in place as `txn`'s version of the row under `key`, which
-    /// it holds: a rollback to a savepoint after which it changed the row again.
+    /// it holds: a rollback to a savepoint after which it changed the row again. With none given, the
+    /// version it locked ([`VTree::lock`]) and had not changed.
     fn reset_own(
         &self,
         pool: &Pool,
         d: &mut Descender,
         txn: &Txn,
         key: &[u8],
-        value: Option<&[u8]>,
+        value: Option<Option<&[u8]>>,
     ) -> Result<()> {
-        if let Some(v) = value {
+        if let Some(Some(v)) = value {
             Tree::check_row(key, v)?;
         }
         self.tree.modify(pool, d, key, |cell| {
             let heads = self.heads(key)?.lock();
-            if heads.get(key).is_none_or(|h| h.writer != txn.id) {
+            let Some(head) = heads.get(key).filter(|h| h.writer == txn.id) else {
                 return Err(LimboError::InternalError(
                     "versioned storage: a savepoint's row its transaction doesn't hold".into(),
                 ));
-            }
+            };
+            let value = match value {
+                Some(value) => value.map(<[u8]>::to_vec),
+                None => head.older.first().and_then(|o| o.value.clone()),
+            };
             let change = match (value, cell) {
                 (Some(v), _) => Change::Put(
-                    v.to_vec(),
+                    v,
                     Flags {
                         versioned: true,
                         removed: false,
@@ -1827,6 +1975,10 @@ impl Versioned {
         d: &mut Descender,
         log: impl FnOnce(Ts, &[Op]) -> Result<()>,
     ) -> Result<Ts> {
+        if let Err(e) = self.put_back_unwritten(&mut txn, d) {
+            self.abort(txn, d)?;
+            return Err(e);
+        }
         let reads = std::mem::take(&mut txn.reads);
         // The reads' charge moves to the kept commit, or is released here.
         let read_bytes = std::mem::take(&mut txn.read_bytes);
@@ -1888,6 +2040,36 @@ impl Versioned {
         }
         self.clock.forget(&txn)?;
         Ok(ts)
+    }
+
+    /// The rows `txn` locked and left as they were ([`VTree::lock`]) are no change of its: put back,
+    /// so that no snapshot older than its commit takes one for changed (19's row locks are none).
+    fn put_back_unwritten(&self, txn: &mut Txn, d: &mut Descender) -> Result<()> {
+        if txn.locked.is_empty() {
+            return Ok(());
+        }
+        let written: FxHashSet<Row<'_>> = txn
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Put { tree, key, .. } | Op::Remove { tree, key } => {
+                    Some((*tree, key.as_slice()))
+                }
+                Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => None,
+            })
+            .collect();
+        let mut back: FxHashSet<(u64, Vec<u8>)> = FxHashSet::default();
+        for (tree, key) in std::mem::take(&mut txn.locked) {
+            if !written.contains(&(tree, key.as_slice())) {
+                back.insert((tree, key));
+            }
+        }
+        for (tree, key) in &back {
+            self.tree(*tree)?
+                .restore(&self.pool, d, &self.clock, txn, key)?;
+        }
+        txn.changed.retain(|row| !back.contains(row));
+        Ok(())
     }
 
     /// Finishes an unchanged transaction at its snapshot when validation needs no read history
@@ -2195,8 +2377,9 @@ impl Versioned {
                 Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => continue,
             };
         }
-        // Rows changed before the savepoint and after it, each once, with that value.
-        let mut again: Vec<(Row<'_>, Option<&[u8]>)> = Vec::new();
+        // Rows taken before the savepoint and changed after it, each once, with that value: none for
+        // one it had locked and not changed.
+        let mut again: Vec<(Row<'_>, Option<Option<&[u8]>>)> = Vec::new();
         let mut seen: FxHashSet<Row<'_>> = FxHashSet::default();
         for op in later {
             let row = match op {
@@ -2206,12 +2389,14 @@ impl Versioned {
             if fresh_rows.contains(&row) || !seen.insert(row) {
                 continue;
             }
-            let value = then.get(&row).copied().ok_or_else(|| {
-                LimboError::InternalError(
+            let value = then.get(&row).copied();
+            let locked = || txn.locked.iter().any(|(t, k)| (*t, k.as_slice()) == row);
+            if value.is_none() && !locked() {
+                return Err(LimboError::InternalError(
                     "versioned storage: a row changed before a savepoint with no change of it"
                         .into(),
-                )
-            })?;
+                ));
+            }
             again.push((row, value));
         }
         for ((tree, key), then) in &again {
@@ -2403,6 +2588,7 @@ mod tests {
         let waits = Rules {
             validation: Some(Validation::Snapshot),
             waits: true,
+            follows: false,
         };
         let mut a = v.clock.begin().unwrap();
         let mut b = v.clock.begin().unwrap();
@@ -2443,38 +2629,111 @@ mod tests {
         assert_eq!(told_b.times(), 1);
     }
 
-    /// Do: a wait for `b` of `a`, then one for `a` of `b`. Expect: the second refused `Deadlock`, one
-    /// that names no transaction of its own never refused, and each end tells who waits
-    /// (T-PG.14.2).
+    /// Do: waits of `a` for `b`, of `b` for `c` and of `d` for `a`, then one of `c` for `a`, and last `c`'s given
+    /// up. Expect: no ring until `c`'s wait closes one, then the same ring found from each of its three,
+    /// the asker first, and from `d`, which waits for it, none; none once `c` waits no more, and `a` told by
+    /// `b`'s end alone (T-PG.15.2).
     #[test]
-    fn t_pg_14_2_a_wait_that_closes_a_ring_is_refused() {
+    fn t_pg_15_2_a_ring_of_waits_is_found_from_each_of_its_own() {
         let v = db();
-        let mut d = Descender::new();
-        let a = v.clock.begin().unwrap();
-        let b = v.clock.begin().unwrap();
-        let c = v.clock.begin().unwrap();
+        let mut descender = Descender::new();
+        let [a, b, c, d] = std::array::from_fn(|_| v.clock.begin().unwrap());
         let (told_a, waker_a) = told();
-        let (told_b, waker_b) = told();
-        let (told_c, waker_c) = told();
+        let (_, waker) = told();
         assert!(v.clock.wait_for(Some(a.id), b.id, &waker_a).unwrap());
-        assert!(matches!(
-            v.clock.wait_for(Some(b.id), a.id, &waker_b),
-            Err(LimboError::Deadlock)
-        ));
-        assert!(v.clock.wait_for(Some(c.id), a.id, &waker_c).unwrap());
-        assert!(v.clock.wait_for(None, a.id, &waker_b).unwrap());
-        assert!(matches!(
-            v.clock.wait_for(Some(b.id), c.id, &waker_b),
-            Err(LimboError::Deadlock)
-        ));
-        v.abort(a, &mut d).unwrap();
-        assert_eq!((told_b.times(), told_c.times()), (1, 1));
-        assert!(v.clock.wait_for(Some(b.id), c.id, &waker_b).unwrap());
-        assert_eq!(told_a.times(), 0);
-        v.abort(c, &mut d).unwrap();
-        assert_eq!((told_a.times(), told_b.times()), (0, 2));
-        v.abort(b, &mut d).unwrap();
+        assert!(v.clock.wait_for(Some(b.id), c.id, &waker).unwrap());
+        assert!(v.clock.wait_for(Some(d.id), a.id, &waker).unwrap());
+        for id in [a.id, b.id, c.id, d.id] {
+            assert!(v.clock.deadlock(id).is_empty());
+        }
+        assert!(v.clock.wait_for(Some(c.id), a.id, &waker).unwrap());
+        let ring = [(a.id, b.id), (b.id, c.id), (c.id, a.id)];
+        for at in 0..3 {
+            let mut from = ring;
+            from.rotate_left(at);
+            assert_eq!(v.clock.deadlock(from[0].0), from);
+        }
+        assert!(v.clock.deadlock(d.id).is_empty());
+        v.clock.stop_waiting(c.id);
+        assert!(v.clock.deadlock(a.id).is_empty());
+        v.abort(b, &mut descender).unwrap();
         assert_eq!(told_a.times(), 1);
+        for txn in [a, c, d] {
+            v.abort(txn, &mut descender).unwrap();
+        }
+        assert_eq!(v.clock.waiting.load(Ordering::SeqCst), 0);
+    }
+
+    /// Do: `b` locks a row (`Rules::follows`) that a commit since its snapshot changed, and leaves it as it
+    /// is; locks another and puts a value to it, rolls back to before the put, and commits. Expect: the
+    /// lock given the newest version and held against another writer until `b` ends, the rows `b` left
+    /// unchanged by its commit (a snapshot before it changes them still), and the rest of `b`'s reads at
+    /// its own snapshot (T-PG.15.1).
+    #[test]
+    fn t_pg_15_1_a_row_locked_at_a_later_version_and_left_is_no_change() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let follows = Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+            follows: true,
+        };
+        let mut first = v.clock.begin().unwrap();
+        for key in [b"k", b"l", b"m"] {
+            t.put(&v.pool, &mut d, &v.clock, &mut first, key, b"0")
+                .unwrap();
+        }
+        v.commit(first, &mut d).unwrap();
+        let mut b = v.clock.begin().unwrap();
+        b.isolate(follows);
+        let seen = b.snapshot().start;
+        let mut a = v.clock.begin().unwrap();
+        for key in [b"k", b"l", b"m"] {
+            t.put(&v.pool, &mut d, &v.clock, &mut a, key, b"1").unwrap();
+        }
+        v.commit(a, &mut d).unwrap();
+        let locked = |b: &mut Txn, d: &mut Descender, key: &[u8]| {
+            t.lock(&v.pool, d, &v.clock, b, key, seen).unwrap()
+        };
+        assert_eq!(
+            locked(&mut b, &mut d, b"k"),
+            Locked::Moved { removed: false }
+        );
+        let read = |snap: &Snapshot, d: &mut Descender, key: &[u8]| {
+            t.get(&v.pool, d, &v.clock, snap, key).unwrap()
+        };
+        // Its own row is its newest version; the rest of its statement reads where it began.
+        assert_eq!(read(&b.newest(), &mut d, b"k").unwrap(), b"1");
+        assert_eq!(read(&b.snapshot(), &mut d, b"m").unwrap(), b"0");
+        let mut other = v.clock.begin().unwrap();
+        other.isolate(Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+            follows: false,
+        });
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut other, b"k", b"2"),
+            Err(LimboError::RowTaken(Some(id))) if id == b.id
+        ));
+        assert_eq!(
+            locked(&mut b, &mut d, b"l"),
+            Locked::Moved { removed: false }
+        );
+        let before = b.savepoint();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"l", b"3")
+            .unwrap();
+        v.rollback_to(&mut b, before, &mut d).unwrap();
+        assert_eq!(read(&b.newest(), &mut d, b"l").unwrap(), b"1");
+        v.commit(b, &mut d).unwrap();
+        for key in [b"k", b"l"] {
+            assert_eq!(read(&other.snapshot(), &mut d, key).unwrap(), b"1");
+            t.put(&v.pool, &mut d, &v.clock, &mut other, key, b"2")
+                .unwrap();
+        }
+        v.commit(other, &mut d).unwrap();
+        v.collect(&mut d).unwrap();
+        assert_eq!(v.versioned_rows(), 0);
     }
 
     /// Do: two open transactions change the same row; then one commits and a transaction begun
