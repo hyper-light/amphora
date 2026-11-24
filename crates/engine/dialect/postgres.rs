@@ -601,4 +601,46 @@ mod tests {
         conn.execute("CREATE TABLE kept (a int4)").unwrap();
         assert_eq!(oid(&conn, "kept"), undone + 1);
     }
+
+    /// T-PG.7.10: under MVCC the counter comes back from the log's recovery and from a checkpoint
+    /// of the header to its page: after a dropped table and a reopen, each way, a new table takes
+    /// the OID after the dropped one's.
+    #[test]
+    fn t_pg_7_10_the_counter_survives_mvcc_recovery_and_checkpoint() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's MVCC store, its log and its checkpoint",
+        ) {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mvcc.db");
+        let path = path.to_str().unwrap();
+        let dropped = {
+            let (_db, conn) = open(path);
+            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            conn.execute("CREATE TABLE gone (a int4)").unwrap();
+            let dropped = oid(&conn, "gone");
+            conn.execute("DROP TABLE gone").unwrap();
+            conn.close().unwrap();
+            dropped
+        };
+        let recovered = {
+            let (_db, conn) = open(path);
+            conn.execute("CREATE TABLE recovered (a int4)").unwrap();
+            let recovered = oid(&conn, "recovered");
+            conn.execute("DROP TABLE recovered").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+            recovered
+        };
+        assert_eq!(recovered, dropped + 1, "after the log's recovery");
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE checkpointed (a int4)").unwrap();
+        assert_eq!(
+            oid(&conn, "checkpointed"),
+            recovered + 1,
+            "after a checkpoint of the header"
+        );
+    }
 }
