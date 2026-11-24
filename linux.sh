@@ -47,6 +47,13 @@ for step in "$@"; do
       echo "panics: $(grep -ac '^    Amphora PANIC' "$O/wide-$seed.log")"
       grep -a "^    Amphora PANIC" "$O/wide-$seed.log" | sort | uniq -c | sort -rn | head -5
       python3 "$HOME/.cache/amphora-perf/dml-c14-diag-remote/classify.py" "$O/wide-$seed.log" ${CLASS_MAX:-14} ;;
+    red:*)  # red:COUNT:SEED   every test of c14_dml by name, on this tree
+      IFS=: read -r _ count seed <<< "$step"
+      python3 "$HOME/.cache/amphora-perf/dml-c14-diag-remote/sqlite_dml_rows.py" "$count" "$seed" > "$O/red-$seed.tsv" || exit 9
+      C14_FIXTURE=$O/red-$seed.tsv timeout 420 nice -n 10 "$(bin c14_dml)" --test-threads=${JOBS:-8} > "$O/red-$seed.log" 2>&1; rc=$?
+      echo "== red $count $seed rc=$rc $(( $(date +%s) - s ))s"
+      grep -aE "^test .* (ok|FAILED)$|^test result" "$O/red-$seed.log" | sort -u
+      grep -aE "SQLite .*|^[0-9]+ runs" "$O/red-$seed.log" | grep -aE "^(default|parallel|statistics):|runs" | cut -c1-260 | head -20 ;;
     clippy)
       timeout 1500 nice -n 10 cargo clippy -p amphora-engine --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
       echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine|^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;
