@@ -1,0 +1,393 @@
+# eval-plan-qual: wx1 wx2 c1 c2 read
+s1|create table accounts(accountid text not null, balance int not null)
+s1|alter table accounts add primary key (accountid)
+s1|insert into accounts(accountid, balance) values ('checking', 600)
+s1|insert into accounts(accountid, balance) values ('savings', 600)
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = balance - 200 where accountid = 'checking'
+s2>update accounts set balance = balance + 450 where accountid = 'checking'
+s1|commit
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+s3|select * from accounts where accountid = 'savings'
+# eval-plan-qual: wy1 wy2 c1 c2 read
+s1|update accounts set balance = 600 where accountid = 'checking'
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = balance + 500 where accountid = 'checking'
+s2>update accounts set balance = balance + 1000 where accountid = 'checking' and balance < 1000
+s1|commit
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+# eval-plan-qual: wx1 wx2 r1 c2 read
+s1|update accounts set balance = 600 where accountid = 'checking'
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = balance - 200 where accountid = 'checking'
+s2>update accounts set balance = balance + 450 where accountid = 'checking'
+s1|rollback
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+# eval-plan-qual: wy1 wy2 r1 c2 read
+s1|update accounts set balance = 600 where accountid = 'checking'
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = balance + 500 where accountid = 'checking'
+s2>update accounts set balance = balance + 1000 where accountid = 'checking' and balance < 1000
+s1|rollback
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+# eval-plan-qual: tocds1 wx2 c1 c2 read (tocds1 with wx2, the key it is found by changed)
+s1|update accounts set balance = 600 where accountid = 'checking'
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set accountid = 'cds' where accountid = 'checking'
+s2>update accounts set balance = balance + 450 where accountid = 'checking'
+s1|commit
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+s3|select * from accounts where accountid = 'cds'
+# eval-plan-qual: tocds1 tocds1 c1 c2 read (the key's index entry is the newest version's)
+s1|update accounts set accountid = 'checking' where accountid = 'cds'
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = 700 where accountid = 'checking'
+s2>update accounts set accountid = 'cds' where accountid = 'checking'
+s1|commit
+s2<
+s2|commit
+s3|select * from accounts where accountid = 'checking'
+s3|select * from accounts where accountid = 'cds'
+s1|update accounts set accountid = 'checking' where accountid = 'cds'
+s3|select * from accounts where accountid = 'checking'
+# eval-plan-qual: writep3a writep3b c1 c2 (one table for the spec's three)
+s1|create table p(id int not null, a int, b int, c int)
+s1|insert into p(id, a, b, c) values (1, 0, 1, 0)
+s1|insert into p(id, a, b, c) values (2, 0, 2, 1)
+s1|insert into p(id, a, b, c) values (3, 1, 1, 0)
+s1|insert into p(id, a, b, c) values (4, 1, 2, 0)
+s1|insert into p(id, a, b, c) values (5, 2, 3, 0)
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update p set b = 0 - b where c = 0
+s2>update p set b = 0 - b where c = 0
+s1|commit
+s2<
+s2|commit
+s3|select b from p where id = 1
+s3|select b from p where id = 2
+s3|select b from p where id = 5
+# eval-plan-qual: writep4a writep4b c1 c2 readp
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update p set c = 4 where c = 0
+s2>update p set b = -4 where c = 0
+s1|commit
+s2<
+s2|commit
+s3|select b, c from p where id = 1
+s3|select b, c from p where id = 4
+# eval-plan-qual: simplepartupdate conditionalpartupdate c1 c2 read_part (no partitions)
+s1|create table parttbl(a int, b int, c int)
+s1|insert into parttbl(a, b, c) values (1, 1, 1)
+s1|insert into parttbl(a, b, c) values (2, 2, 2)
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update parttbl set b = b + 10
+s2>update parttbl set c = 0 - c where b < 10
+s1|commit
+s2<
+s2|commit
+s3|select * from parttbl where a = 1
+s3|select * from parttbl where a = 2
+# rows changed before the wait are kept: another session waits for one of them
+s1|create table q(id int not null, v int)
+s1|insert into q(id, v) values (1, 10)
+s1|insert into q(id, v) values (2, 20)
+s1|insert into q(id, v) values (3, 30)
+s1|begin
+s1|update q set v = v + 1 where id = 2
+s2>update q set v = v + 100
+s3>update q set v = v + 1000 where id = 1
+s1|commit
+s2<
+s3<
+s1|select v from q where id = 1
+s1|select v from q where id = 2
+s1|select v from q where id = 3
+# a row that matches only from the commit on is not changed
+s1|update q set v = 10 where id = 1
+s1|update q set v = 20 where id = 2
+s1|update q set v = 10 where id = 3
+s1|begin
+s1|update q set v = 11 where id = 1
+s1|update q set v = 10 where id = 2
+s2>update q set v = v + 100 where v >= 10 and v < 20
+s1|commit
+s2<
+s1|select v from q where id = 1
+s1|select v from q where id = 2
+s1|select v from q where id = 3
+# a statement waits twice, for two holders
+s1|update q set v = 10 where id = 1
+s1|update q set v = 20 where id = 2
+s1|update q set v = 30 where id = 3
+s1|begin
+s1|update q set v = v + 1 where id = 1
+s3|begin
+s3|update q set v = v + 1 where id = 3
+s2>update q set v = v + 100
+s1|commit
+s2+
+s3|rollback
+s2<
+s1|select v from q where id = 1
+s1|select v from q where id = 2
+s1|select v from q where id = 3
+# a row that failed the recheck stays locked, and is no change of its locker's
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = 5 where id = 1
+s2|begin
+s2>update q set v = v + 100 where v = 10
+s1|commit
+s2<
+s3|begin isolation level repeatable read
+s3|select v from q where id = 1
+s1>update q set v = v + 7 where id = 1
+s2|commit
+s1<
+s3|update q set v = v + 1 where id = 1
+s3|rollback
+s1|select v from q where id = 1
+# a lock alone refuses no repeatable read update
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = 5 where id = 1
+s2|begin
+s2>update q set v = v + 100 where v = 10
+s1|commit
+s2<
+s3|begin isolation level repeatable read
+s3|select v from q where id = 1
+s3>update q set v = v + 1 where id = 1
+s2|commit
+s3<
+s3|commit
+s1|select v from q where id = 1
+# a lock alone, then the row changed by its locker, then the statement refused: what was before
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = 5 where id = 1
+s2|begin
+s2>update q set v = v + 100 where v = 10
+s1|commit
+s2<
+s2|update q set v = v + 1 where id = 1
+s2|select v from q where id = 1
+s2|commit
+s1|select v from q where id = 1
+# an error ends its transaction at once, and the waiter goes on
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = v + 1 where id = 1
+s2>update q set v = v + 100 where id = 1
+s1|select 1 / 0
+s2<
+s1|rollback
+s1|select v from q where id = 1
+# the newest version's value is refused as the statement's own
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = 2147483647 where id = 1
+s2|begin
+s2>update q set v = v + 100 where id = 1
+s1|commit
+s2<
+s2|rollback
+s1|select v from q where id = 1
+# a chain of two commits is followed to its end
+s1|update q set v = 10 where id = 1
+s1|begin
+s1|update q set v = v + 1 where id = 1
+s1|update q set v = v + 1 where id = 1
+s2>update q set v = v + 100 where id = 1
+s1|commit
+s2<
+s1|select v from q where id = 1
+# repeatable read refuses a multi-row update at the row changed
+s1|begin isolation level repeatable read
+s1|select v from q where id = 2
+s2|update q set v = v + 1 where id = 2
+s1|update q set v = v + 100
+s1|rollback
+s1|select v from q where id = 1
+# deadlock-simple, by rows: two sessions, the second's check finds it
+s1|update q set v = 10 where id = 1
+s1|update q set v = 20 where id = 2
+s1|begin
+s1|set deadlock_timeout = '100s'
+s2|begin
+s2|set deadlock_timeout = '10ms'
+s1|update q set v = v + 1 where id = 1
+s2|update q set v = v + 2 where id = 2
+s1>update q set v = v + 1 where id = 2
+s2!update q set v = v + 2 where id = 1
+s1<
+s2|select v from q where id = 1
+s2|rollback
+s1|commit
+s1|select v from q where id = 1
+s1|select v from q where id = 2
+# the first waiter's check, not yet due as the ring closed, finds it
+s1|begin
+s1|set deadlock_timeout = '2s'
+s2|begin
+s2|set deadlock_timeout = '100s'
+s1|update q set v = v + 1 where id = 1
+s2|update q set v = v + 2 where id = 2
+s1>update q set v = v + 1 where id = 2
+s2>update q set v = v + 2 where id = 1
+s1!
+s2<
+s1|commit
+s2|commit
+s1|select v from q where id = 1
+s1|select v from q where id = 2
+# deadlock-hard, by rows: eight sessions, the last's check finds it
+s1|create table dh(id int not null, v int)
+s1|insert into dh(id, v) values (1, 0)
+s1|insert into dh(id, v) values (2, 0)
+s1|insert into dh(id, v) values (3, 0)
+s1|insert into dh(id, v) values (4, 0)
+s1|insert into dh(id, v) values (5, 0)
+s1|insert into dh(id, v) values (6, 0)
+s1|insert into dh(id, v) values (7, 0)
+s1|insert into dh(id, v) values (8, 0)
+s1|begin
+s1|set deadlock_timeout = '100s'
+s2|begin
+s2|set deadlock_timeout = '100s'
+s3|begin
+s3|set deadlock_timeout = '100s'
+s4|begin
+s4|set deadlock_timeout = '100s'
+s5|begin
+s5|set deadlock_timeout = '100s'
+s6|begin
+s6|set deadlock_timeout = '100s'
+s7|begin
+s7|set deadlock_timeout = '100s'
+s8|begin
+s8|set deadlock_timeout = '10ms'
+s1|update dh set v = v + 1 where id = 1
+s2|update dh set v = v + 2 where id = 2
+s3|update dh set v = v + 3 where id = 3
+s4|update dh set v = v + 4 where id = 4
+s5|update dh set v = v + 5 where id = 5
+s6|update dh set v = v + 6 where id = 6
+s7|update dh set v = v + 7 where id = 7
+s8|update dh set v = v + 8 where id = 8
+s1>update dh set v = v + 1 where id = 2
+s2>update dh set v = v + 2 where id = 3
+s3>update dh set v = v + 3 where id = 4
+s4>update dh set v = v + 4 where id = 5
+s5>update dh set v = v + 5 where id = 6
+s6>update dh set v = v + 6 where id = 7
+s7>update dh set v = v + 7 where id = 8
+s8!update dh set v = v + 8 where id = 1
+s7<
+s8|commit
+s7|commit
+s6<
+s6|commit
+s5<
+s5|commit
+s4<
+s4|commit
+s3<
+s3|commit
+s2<
+s2|commit
+s1<
+s1|commit
+s1|select v from dh where id = 1
+s1|select v from dh where id = 2
+s1|select v from dh where id = 8
+# a wait that closes no ring is not refused by the check
+s1|begin
+s1|set deadlock_timeout = '10ms'
+s2|begin
+s2|set deadlock_timeout = '10ms'
+s1|update q set v = v + 1 where id = 1
+s2>update q set v = v + 2 where id = 1
+s1|commit
+s2<
+s2|commit
+# lock_timeout
+s1|begin
+s1|update q set v = v + 1 where id = 1
+s2|set lock_timeout = '50ms'
+s2~update q set v = v + 2 where id = 1
+s2|show lock_timeout
+s2|begin
+s2|update q set v = v + 2 where id = 2
+s2~update q set v = v + 2 where id = 1
+s2|select 1
+s2|rollback
+s1|commit
+s2|update q set v = v + 2 where id = 1
+s2|reset lock_timeout
+# the settings
+s1|show lock_timeout
+s1|show deadlock_timeout
+s1|set lock_timeout = 10
+s1|show lock_timeout
+s1|set lock_timeout to '1min'
+s1|show lock_timeout
+s1|set lock_timeout = '1500 ms'
+s1|show lock_timeout
+s1|set lock_timeout = '1.5s'
+s1|show lock_timeout
+s1|set lock_timeout = '3600s'
+s1|show lock_timeout
+s1|set lock_timeout = '2d'
+s1|show lock_timeout
+s1|set lock_timeout = '1ms'
+s1|show lock_timeout
+s1|set lock_timeout = 1.5
+s1|show lock_timeout
+s1|set lock_timeout = 'abc'
+s1|set lock_timeout = '10 furlongs'
+s1|set lock_timeout = -1
+s1|set lock_timeout = '9999999999'
+s1|set deadlock_timeout = 0
+s1|show lock_timeout
+s1|set lock_timeout to default
+s1|show lock_timeout
+s1|begin
+s1|set lock_timeout = '7s'
+s1|show lock_timeout
+s1|rollback
+s1|show lock_timeout
+s1|begin
+s1|set lock_timeout = '8s'
+s1|set local lock_timeout = '9s'
+s1|show lock_timeout
+s1|commit
+s1|show lock_timeout
+s1|set local lock_timeout = '3s'
+s1|show lock_timeout
+s1|reset lock_timeout
+s1|show lock_timeout
+s1|begin
+s1|set lock_timeout = '4s'
+s1|select 1 / 0
+s1|rollback
+s1|show lock_timeout

@@ -2588,6 +2588,7 @@ mod tests {
         let waits = Rules {
             validation: Some(Validation::Snapshot),
             waits: true,
+            follows: false,
         };
         let mut a = v.clock.begin().unwrap();
         let mut b = v.clock.begin().unwrap();
@@ -2628,38 +2629,104 @@ mod tests {
         assert_eq!(told_b.times(), 1);
     }
 
-    /// Do: a wait for `b` of `a`, then one for `a` of `b`. Expect: the second refused `Deadlock`, one
-    /// that names no transaction of its own never refused, and each end tells who waits
-    /// (T-PG.14.2).
+    /// Do: waits of `a` for `b`, of `b` for `c` and of `d` for `a`, then one of `c` for `a`, and last `c`'s given
+    /// up. Expect: no ring until `c`'s wait closes one, then the same ring found from each of its three,
+    /// the asker first, and from `d`, which waits for it, none; none once `c` waits no more, and `a` told by
+    /// `b`'s end alone (T-PG.15.2).
     #[test]
-    fn t_pg_14_2_a_wait_that_closes_a_ring_is_refused() {
+    fn t_pg_15_2_a_ring_of_waits_is_found_from_each_of_its_own() {
         let v = db();
-        let mut d = Descender::new();
-        let a = v.clock.begin().unwrap();
-        let b = v.clock.begin().unwrap();
-        let c = v.clock.begin().unwrap();
+        let mut descender = Descender::new();
+        let [a, b, c, d] = std::array::from_fn(|_| v.clock.begin().unwrap());
         let (told_a, waker_a) = told();
-        let (told_b, waker_b) = told();
-        let (told_c, waker_c) = told();
+        let (_, waker) = told();
         assert!(v.clock.wait_for(Some(a.id), b.id, &waker_a).unwrap());
-        assert!(matches!(
-            v.clock.wait_for(Some(b.id), a.id, &waker_b),
-            Err(LimboError::Deadlock)
-        ));
-        assert!(v.clock.wait_for(Some(c.id), a.id, &waker_c).unwrap());
-        assert!(v.clock.wait_for(None, a.id, &waker_b).unwrap());
-        assert!(matches!(
-            v.clock.wait_for(Some(b.id), c.id, &waker_b),
-            Err(LimboError::Deadlock)
-        ));
-        v.abort(a, &mut d).unwrap();
-        assert_eq!((told_b.times(), told_c.times()), (1, 1));
-        assert!(v.clock.wait_for(Some(b.id), c.id, &waker_b).unwrap());
-        assert_eq!(told_a.times(), 0);
-        v.abort(c, &mut d).unwrap();
-        assert_eq!((told_a.times(), told_b.times()), (0, 2));
-        v.abort(b, &mut d).unwrap();
+        assert!(v.clock.wait_for(Some(b.id), c.id, &waker).unwrap());
+        assert!(v.clock.wait_for(Some(d.id), a.id, &waker).unwrap());
+        for id in [a.id, b.id, c.id, d.id] {
+            assert!(v.clock.deadlock(id).is_empty());
+        }
+        assert!(v.clock.wait_for(Some(c.id), a.id, &waker).unwrap());
+        let ring = [(a.id, b.id), (b.id, c.id), (c.id, a.id)];
+        for at in 0..3 {
+            let mut from = ring;
+            from.rotate_left(at);
+            assert_eq!(v.clock.deadlock(from[0].0), from);
+        }
+        assert!(v.clock.deadlock(d.id).is_empty());
+        v.clock.stop_waiting(c.id);
+        assert!(v.clock.deadlock(a.id).is_empty());
+        v.abort(b, &mut descender).unwrap();
         assert_eq!(told_a.times(), 1);
+        for txn in [a, c, d] {
+            v.abort(txn, &mut descender).unwrap();
+        }
+        assert_eq!(v.clock.waiting.load(Ordering::SeqCst), 0);
+    }
+
+    /// Do: `b` locks a row (`Rules::follows`) that a commit since its snapshot changed, and leaves it as it
+    /// is; locks another and puts a value to it, rolls back to before the put, and commits. Expect: the
+    /// lock given the newest version and held against another writer until `b` ends, the rows `b` left
+    /// unchanged by its commit (a snapshot before it changes them still), and the rest of `b`'s reads at
+    /// its own snapshot (T-PG.15.1).
+    #[test]
+    fn t_pg_15_1_a_row_locked_at_a_later_version_and_left_is_no_change() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let follows = Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+            follows: true,
+        };
+        let mut first = v.clock.begin().unwrap();
+        for key in [b"k", b"l", b"m"] {
+            t.put(&v.pool, &mut d, &v.clock, &mut first, key, b"0")
+                .unwrap();
+        }
+        v.commit(first, &mut d).unwrap();
+        let mut b = v.clock.begin().unwrap();
+        b.isolate(follows);
+        let seen = b.snapshot().start;
+        let mut a = v.clock.begin().unwrap();
+        for key in [b"k", b"l", b"m"] {
+            t.put(&v.pool, &mut d, &v.clock, &mut a, key, b"1").unwrap();
+        }
+        v.commit(a, &mut d).unwrap();
+        let locked = |b: &mut Txn, d: &mut Descender, key: &[u8]| {
+            t.lock(&v.pool, d, &v.clock, b, key, seen).unwrap()
+        };
+        assert_eq!(locked(&mut b, &mut d, b"k"), Locked::Moved { removed: false });
+        let read = |snap: &Snapshot, d: &mut Descender, key: &[u8]| {
+            t.get(&v.pool, d, &v.clock, snap, key).unwrap()
+        };
+        // Its own row is its newest version; the rest of its statement reads where it began.
+        assert_eq!(read(&b.newest(), &mut d, b"k").unwrap(), b"1");
+        assert_eq!(read(&b.snapshot(), &mut d, b"m").unwrap(), b"0");
+        let mut other = v.clock.begin().unwrap();
+        other.isolate(Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+            follows: false,
+        });
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut other, b"k", b"2"),
+            Err(LimboError::RowTaken(Some(id))) if id == b.id
+        ));
+        assert_eq!(locked(&mut b, &mut d, b"l"), Locked::Moved { removed: false });
+        let before = b.savepoint();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"l", b"3").unwrap();
+        v.rollback_to(&mut b, before, &mut d).unwrap();
+        assert_eq!(read(&b.newest(), &mut d, b"l").unwrap(), b"1");
+        v.commit(b, &mut d).unwrap();
+        for key in [b"k", b"l"] {
+            assert_eq!(read(&other.snapshot(), &mut d, key).unwrap(), b"1");
+            t.put(&v.pool, &mut d, &v.clock, &mut other, key, b"2")
+                .unwrap();
+        }
+        v.commit(other, &mut d).unwrap();
+        v.collect(&mut d).unwrap();
+        assert_eq!(v.versioned_rows(), 0);
     }
 
     /// Do: two open transactions change the same row; then one commits and a transaction begun

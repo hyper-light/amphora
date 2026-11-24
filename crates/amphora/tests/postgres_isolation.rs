@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use amphora::postgres::execute::{Database, Executor};
+use amphora::postgres::execute::{Database, Executor, SessionRole};
 use amphora::postgres::session::{Flow, Statements, TxStatus};
 
 /// Counts the wakes of a session's wait.
@@ -71,15 +71,18 @@ fn sessions(dir: &tempfile::TempDir) -> BTreeMap<String, Session> {
         amphora_engine::storage::versioned::memory::machine(),
     )
     .unwrap();
-    ["s1", "s2"]
-        .into_iter()
-        .map(|name| {
+    let role = SessionRole {
+        name: "ada",
+        superuser: true,
+    };
+    (1..=8)
+        .map(|n| {
             let session = Session {
-                executor: database.session("ada", "UTC").unwrap(),
+                executor: database.session(role, "UTC", 1000 + n).unwrap(),
                 woken: Arc::new(Woken::default()),
                 answered: Vec::new(),
             };
-            (name.to_owned(), session)
+            (format!("s{n}"), session)
         })
         .collect()
 }
@@ -89,28 +92,72 @@ fn sessions(dir: &tempfile::TempDir) -> BTreeMap<String, Session> {
 /// given no answer until the other session's transaction ends, whose end alone wakes it.
 #[test]
 fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
+    let compared = interleave(
+        include_str!("isolation/steps.txt"),
+        include_str!("isolation/answers.txt"),
+    );
+    assert!(compared.waited >= 5, "{compared:?}");
+    assert!(compared.messages > 100, "{compared:?}");
+}
+
+/// T-PG.15.1: the interleavings of `recheck-steps.txt` (19's eval-plan-qual, deadlock-simple and
+/// deadlock-hard specs within the statements Amphora has, and more of their kind) are answered as a
+/// 19.0 server answered them: a row the holder committed a later version of is judged again and
+/// changed, or passed by and kept locked, on that version alone, and a statement keeps what it changed
+/// before it waited; the session whose deadlock check finds a ring is refused, whichever closed it, and
+/// one whose `lock_timeout` passes. The deadlines are 19's: here the test says when one passes.
+#[test]
+fn t_pg_15_1_a_row_is_rechecked_and_a_ring_refused_as_a_19_server_does() {
+    let compared = interleave(
+        include_str!("isolation/recheck-steps.txt"),
+        include_str!("isolation/recheck-answers.txt"),
+    );
+    assert!(compared.waited >= 30, "{compared:?}");
+    assert!(compared.deadlocks >= 3, "{compared:?}");
+    assert!(compared.timeouts >= 2, "{compared:?}");
+    assert!(compared.messages > 300, "{compared:?}");
+}
+
+/// What an interleaving's comparison saw, so that a list that tests nothing fails.
+#[derive(Debug, Default)]
+struct Compared {
+    waited: usize,
+    deadlocks: usize,
+    timeouts: usize,
+    messages: usize,
+}
+
+/// Runs `steps`, each answered as `answers` has it.
+fn interleave(steps: &str, answers: &str) -> Compared {
     let dir = tempfile::tempdir().unwrap();
     let mut sessions = sessions(&dir);
-    let answers = tpcb::answers(include_str!("isolation/answers.txt"));
-    let steps: Vec<&str> = include_str!("isolation/steps.txt")
+    let answers = tpcb::answers(answers);
+    let steps: Vec<&str> = steps
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .collect();
     assert_eq!(answers.len(), steps.len());
-    let mut waited = 0;
-    let mut compared = 0;
+    let mut compared = Compared::default();
     for ((step, sql, theirs), line) in answers.iter().zip(&steps) {
-        let (name, kind) = if let Some(name) = step.strip_suffix('>') {
-            (name, Kind::Waits)
-        } else if let Some(name) = step.strip_suffix('<') {
-            (name, Kind::Ends)
-        } else {
-            (step.as_str(), Kind::Runs)
+        let (name, kind) = step.split_at(2);
+        let kind = match (kind, sql.as_str()) {
+            ("", _) => Kind::Runs,
+            (">", _) => Kind::Waits,
+            ("<", _) => Kind::Ends,
+            ("+", _) => Kind::WaitsOn,
+            ("!", "-") => Kind::Deadlocks { sent: false },
+            ("!", _) => Kind::Deadlocks { sent: true },
+            ("~", _) => Kind::TimesOut,
+            _ => panic!("{step}"),
         };
         let expected = match kind {
             Kind::Runs => format!("{name}|{sql}"),
             Kind::Waits => format!("{name}>{sql}"),
             Kind::Ends => format!("{name}<"),
+            Kind::WaitsOn => format!("{name}+"),
+            Kind::Deadlocks { sent: true } => format!("{name}!{sql}"),
+            Kind::Deadlocks { sent: false } => format!("{name}!"),
+            Kind::TimesOut => format!("{name}~{sql}"),
         };
         assert_eq!(*line, expected);
         let session = sessions.get_mut(name).unwrap();
@@ -121,32 +168,39 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
                 assert_eq!(flow, Flow::Done, "{line}");
             }
             Kind::Waits => {
-                let flow = session.executor.simple_query(sql, &mut out).unwrap();
+                session.stops(sql, line);
+                // Its check finds no ring while the wait closes none.
+                compared.waited += 1;
+                continue;
+            }
+            Kind::WaitsOn => {
+                let flow = session.goes_on(&mut out, line);
                 assert_eq!(flow, Flow::Waiting, "{line}");
                 session.answered = out;
-                let waker = Waker::from(Arc::clone(&session.woken));
-                let mut context = Context::from_waker(&waker);
-                assert_eq!(
-                    session.executor.poll_wait(&mut context),
-                    Poll::Pending,
-                    "{line}"
-                );
-                assert_eq!(session.woken.0.swap(0, Ordering::SeqCst), 0, "{line}");
-                waited += 1;
+                session.registers(line);
+                compared.waited += 1;
                 continue;
             }
             Kind::Ends => {
-                assert!(
-                    session.woken.0.swap(0, Ordering::SeqCst) > 0,
-                    "{line}: the end of the transaction it waits for wakes it"
-                );
-                let waker = Waker::noop();
-                let mut context = Context::from_waker(waker);
-                assert_eq!(
-                    session.executor.poll_wait(&mut context),
-                    Poll::Ready(()),
-                    "{line}"
-                );
+                let flow = session.goes_on(&mut out, line);
+                assert_eq!(flow, Flow::Done, "{line}");
+            }
+            Kind::Deadlocks { sent } => {
+                if sent {
+                    session.stops(sql, line);
+                }
+                assert!(session.executor.check_deadlock(), "{line}");
+                compared.deadlocks += 1;
+                out = std::mem::take(&mut session.answered);
+                let flow = session.executor.resume(&mut out).unwrap();
+                assert_eq!(flow, Flow::Done, "{line}");
+            }
+            Kind::TimesOut => {
+                session.stops(sql, line);
+                assert!(!session.executor.check_deadlock(), "{line}");
+                assert!(session.executor.wait_limits().lock.is_some(), "{line}");
+                session.executor.lock_timed_out();
+                compared.timeouts += 1;
                 out = std::mem::take(&mut session.answered);
                 let flow = session.executor.resume(&mut out).unwrap();
                 assert_eq!(flow, Flow::Done, "{line}");
@@ -156,19 +210,107 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
         let (z, body) = theirs.pop().unwrap();
         assert_eq!((z, body[0]), (b'Z', status(&session.executor)), "{line}");
         let ours = messages(&out);
-        let (got, want) = (tpcb::told(sql, &ours), tpcb::told(sql, &theirs));
-        assert_eq!(got, want, "{line}");
-        compared += want.len();
+        assert_eq!(told(sql, &ours), told(sql, &theirs), "{line}");
+        compared.messages += theirs.len();
     }
-    assert!(waited >= 5, "statements waited: {waited}");
-    assert!(compared > 100, "messages compared: {compared}");
+    compared
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl Session {
+    /// Sends a statement that waits.
+    fn stops(&mut self, sql: &str, line: &str) {
+        let mut out = Vec::new();
+        let flow = self.executor.simple_query(sql, &mut out).unwrap();
+        assert_eq!(flow, Flow::Waiting, "{line}");
+        self.answered = out;
+        self.registers(line);
+    }
+
+    /// The wait is registered when the session polls it, as the listener does.
+    fn registers(&mut self, line: &str) {
+        let waker = Waker::from(Arc::clone(&self.woken));
+        let mut context = Context::from_waker(&waker);
+        let polled = self.executor.poll_wait(&mut context);
+        assert_eq!(polled, Poll::Pending, "{line}");
+        assert_eq!(self.woken.0.swap(0, Ordering::SeqCst), 0, "{line}");
+    }
+
+    /// Goes on once its holder has ended.
+    fn goes_on(&mut self, out: &mut Vec<u8>, line: &str) -> Flow {
+        assert!(
+            self.woken.0.swap(0, Ordering::SeqCst) > 0,
+            "{line}: the end of the transaction it waits for wakes it"
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        let polled = self.executor.poll_wait(&mut context);
+        assert_eq!(polled, Poll::Ready(()), "{line}");
+        *out = std::mem::take(&mut self.answered);
+        self.executor.resume(out).unwrap()
+    }
+}
+
+/// Messages as a comparison reads them: a refusal's severity, SQLSTATE, message, detail, hint and
+/// position, the numbers of the detail's processes and transactions by their first place in it (19's
+/// CONTEXT names a ctid, which Amphora's rows don't have).
+fn told(sql: &str, messages: &[(u8, Vec<u8>)]) -> Vec<String> {
+    messages
+        .iter()
+        .zip(tpcb::told(sql, messages))
+        .map(|((kind, body), told)| {
+            let field = |tag: u8| {
+                body.split(|b| *b == 0)
+                    .find(|f| f.first() == Some(&tag))
+                    .map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+            };
+            match kind {
+                b'E' => format!(
+                    "{told} detail {:?} hint {:?}",
+                    field(b'D').map(|detail| numbered(&detail)),
+                    field(b'H')
+                ),
+                _ => told,
+            }
+        })
+        .collect()
+}
+
+/// `text` with each number as its place among the distinct numbers in it.
+fn numbered(text: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut made = String::new();
+    let mut number = String::new();
+    for c in text.chars().chain(std::iter::once('\n')) {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        if !number.is_empty() {
+            let at = seen.iter().position(|n| *n == number).unwrap_or_else(|| {
+                seen.push(number.clone());
+                seen.len() - 1
+            });
+            made.push_str(&format!("#{at}"));
+            number.clear();
+        }
+        made.push(c);
+    }
+    made
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Runs,
     Waits,
+    /// Its wait ends by its holder's end.
     Ends,
+    /// Woken by its holder's end, it waits for another.
+    WaitsOn,
+    /// Its wait ends by its deadlock check, as it is `sent` or after.
+    Deadlocks {
+        sent: bool,
+    },
+    /// Its wait ends by its `lock_timeout`.
+    TimesOut,
 }
 
 /// T-PG.14.1: a transaction that changes the catalog is validated in full at any level: one that
@@ -202,71 +344,4 @@ fn t_pg_14_1_an_index_built_beside_a_commit_is_refused_at_any_level() {
     );
     let out = run("s2", "select v from t where id = 2");
     assert!(out.windows(2).any(|w| w == b"20"), "{out:?}");
-}
-
-/// T-PG.14.2: two sessions that wait for each other are not left to wait: the one whose wait would
-/// close the ring is refused `40P01` at once (19 refuses one of the two once `deadlock_timeout`
-/// passes: which one is section 11's unit 15), and its rollback lets the other go on.
-#[test]
-fn t_pg_14_2_two_sessions_waiting_for_each_other_are_refused_40p01() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut sessions = sessions(&dir);
-    let mut run = |name: &str, sql: &str| {
-        let mut out = Vec::new();
-        let session = sessions.get_mut(name).unwrap();
-        (session.executor.simple_query(sql, &mut out).unwrap(), out)
-    };
-    for sql in [
-        "create table t(id int not null, v int)",
-        "insert into t(id, v) values (1, 10)",
-        "insert into t(id, v) values (2, 20)",
-        "begin",
-        "update t set v = v + 1 where id = 1",
-    ] {
-        let (flow, _) = run("s1", sql);
-        assert_eq!(flow, Flow::Done, "{sql}");
-    }
-    for sql in ["begin", "update t set v = v + 1 where id = 2"] {
-        let (flow, _) = run("s2", sql);
-        assert_eq!(flow, Flow::Done, "{sql}");
-    }
-    let (flow, _) = run("s1", "update t set v = v + 1 where id = 2");
-    assert_eq!(flow, Flow::Waiting);
-    // The wait is registered when the session polls it, as the listener does: the wait graph then names it.
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    let session = sessions.get_mut("s1").unwrap();
-    assert_eq!(session.executor.poll_wait(&mut context), Poll::Pending);
-    let session = sessions.get_mut("s2").unwrap();
-    let mut out = Vec::new();
-    let flow = session
-        .executor
-        .simple_query("update t set v = v + 1 where id = 1", &mut out)
-        .unwrap();
-    assert_eq!(flow, Flow::Waiting);
-    assert_eq!(
-        session.executor.poll_wait(&mut context),
-        Poll::Ready(()),
-        "a wait that closes a ring of waits is over at once"
-    );
-    let mut answer = Vec::new();
-    assert_eq!(session.executor.resume(&mut answer).unwrap(), Flow::Done);
-    assert!(answer.starts_with(b"E"), "{answer:?}");
-    assert!(
-        answer.windows(5).any(|w| w == b"40P01"),
-        "the refusal's SQLSTATE: {answer:?}"
-    );
-    let (flow, _) = {
-        let mut out = Vec::new();
-        (
-            session.executor.simple_query("rollback", &mut out).unwrap(),
-            out,
-        )
-    };
-    assert_eq!(flow, Flow::Done);
-    let session = sessions.get_mut("s1").unwrap();
-    assert_eq!(session.executor.poll_wait(&mut context), Poll::Ready(()));
-    let mut out = Vec::new();
-    assert_eq!(session.executor.resume(&mut out).unwrap(), Flow::Done);
-    assert_eq!(out[0], b'C', "{out:?}");
 }
