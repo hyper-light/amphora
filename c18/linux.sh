@@ -32,7 +32,7 @@ for step in "$@"; do
     build:*)
       tests=""; IFS=, read -ra names <<< "${step#build:}"; for n in "${names[@]}"; do tests="$tests --test $n"; done
       timeout 900 nice -n 10 cargo test -p amphora-engine --locked --features simulator $tests --no-run 2>&1 | grep -E "^(error|warning)|Executable|Finished" -A 8 | head -80
-      echo "== built in $(( $(date +%s) - s ))s" ;;
+      rc=${PIPESTATUS[0]}; echo "== built rc=$rc in $(( $(date +%s) - s ))s"; [ "$rc" = 0 ] || { echo "== BUILD FAILED, nothing run"; exit 4; } ;;
     sql:*)
       C18_SQL=$O/${step#sql:} timeout 300 "$(bin c18_sql)" --nocapture 2>"$O/sql.err" | cut -c1-900
       grep -E "panicked|required" "$O/sql.err" | sort | uniq -c | head ;;
