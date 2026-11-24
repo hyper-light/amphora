@@ -6,8 +6,7 @@ use amphora_pg_catalog::Kind;
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_parser::tree::{Node, NodeId, SelectStmt, Tree};
 
-use crate::coerce::Context;
-use crate::expr::{Analysis, ExprId, ExprKind, Exprs, Form, Table};
+use crate::expr::{Analysis, Cast, ExprId, ExprKind, Exprs, Table};
 use crate::{Error, Session, format_type, sqlstate};
 
 /// What a statement does.
@@ -143,14 +142,7 @@ impl Analysis<'_> {
         // resolveTargetListUnknowns (parse_target.c:288).
         for target in &mut targets {
             if self.exprs.get(target.expr)?.type_oid == type_oid::UNKNOWN {
-                target.expr = self.coerce_type(
-                    target.expr,
-                    type_oid::TEXT,
-                    -1,
-                    Context::Implicit,
-                    Form::ImplicitCast,
-                    -1,
-                )?;
+                target.expr = self.coerce_type(target.expr, Cast::implicit(type_oid::TEXT))?;
             }
         }
         Ok((Command::Select, targets, filter))
@@ -380,14 +372,8 @@ impl Analysis<'_> {
             .ok_or_else(|| Error::unsupported("this column"))?;
         let e = self.exprs.get(expr)?;
         let (type_oid, location) = (e.type_oid, e.location);
-        let cast = self.coerce_to_target(
-            expr,
-            column.type_oid,
-            column.typmod,
-            Context::Assignment,
-            Form::ImplicitCast,
-            -1,
-        )?;
+        let cast = Cast::assignment(column.type_oid, column.typmod);
+        let cast = self.coerce_to_target(expr, cast)?;
         let expr = cast.ok_or_else(|| {
             Error::new(
                 sqlstate::DATATYPE_MISMATCH,

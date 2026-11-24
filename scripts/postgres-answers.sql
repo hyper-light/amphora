@@ -1,6 +1,6 @@
 -- PostgreSQL 19's answers for crates/pg-analysis/tests (docs/design/postgres.md section 11's unit 8),
--- run by scripts/postgres-answers.sh on a 19 server. Writes /tmp/operators.txt, /tmp/casts.txt and
--- /tmp/statements.txt there, the last from /tmp/statements.in.
+-- run by scripts/postgres-answers.sh on a 19 server. Writes /tmp/operators.txt, /tmp/casts.txt,
+-- /tmp/functions.txt and /tmp/statements.out there, the last from /tmp/statements.in.
 \set ON_ERROR_STOP 1
 set client_min_messages = error;
 drop schema if exists sw cascade;
@@ -81,6 +81,37 @@ begin
   end loop;
 end $$;
 \copy (select s || ' ' || t || ' ' || e || ' ' || a || ' ' || i from sw.casts order by s collate "C", t collate "C") to '/tmp/casts.txt'
+
+-- Each function of one argument of the unit's types, by name, and of two where several of one name take
+-- two: the function's OID (`coercion` for a cast written as a call), or the SQLSTATE where none is chosen.
+create table sw.functions (f text, l text, r text, a text);
+do $$
+declare
+  p record; l text; r text; a text; lt text; rt text; node text;
+  ts text[] := array['int4', 'int8', 'text', 'bpchar', '"char"', 'timestamp', 'timestamptz', 'regclass', 'unknown'];
+begin
+  for p in select proname, bool_or(n > 1 and pronargs = 2) as two, bool_or(pronargs - pronargdefaults <= 1 and pronargs >= 1) as one
+      from (select *, count(*) over (partition by proname, pronargs) as n from pg_proc where pronamespace = 11 and proname !~ '^RI_') x group by 1 order by 1 loop
+    foreach l in array (case when p.one or p.two then ts else '{}' end) loop
+      lt := case when l = 'unknown' then 'NULL' else 'NULL::' || l end;
+      foreach r in array (case when p.one and p.two then array['-'] || ts when p.two then ts else array['-'] end) loop
+        rt := case when r = '-' then '' when r = 'unknown' then ', NULL' else ', NULL::' || r end;
+        begin
+          execute format('create temp view v as select pg_catalog.%I(%s%s) as x', p.proname, lt, rt);
+          select substring(ev_action from ':targetList \(\{TARGETENTRY :expr (\{[A-Z]+ [^{]*)') into node
+            from pg_rewrite where ev_class = 'v'::regclass;
+          drop view v;
+          a := coalesce((regexp_match(node, '^\{(?:FUNCEXPR :funcid|AGGREF :aggfnoid|WINDOWFUNC :winfnoid) (\d+)'))[1], 'coercion');
+        exception when others then
+          get stacked diagnostics a = returned_sqlstate;
+        end;
+        insert into sw.functions values (p.proname, l, r, a);
+      end loop;
+    end loop;
+  end loop;
+end $$;
+\copy (select f || ' ' || l || ' ' || r || ' ' || a from sw.functions where a <> '42883' order by f collate "C", l collate "C", r collate "C") to '/tmp/functions.txt'
+select 'functions asked', count(*), count(*) filter (where a <> '42883') from sw.functions;
 
 -- Each statement under its TimeZone: PREPARE's SQLSTATE, or its parameters' and columns' types (with
 -- their type modifiers where it has no parameters), then its value: what it selects or stores.

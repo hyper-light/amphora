@@ -1,4 +1,4 @@
-//! T-PG.8.1: an operator or a cast means what PostgreSQL 19.0 says it means, for every operator
+//! T-PG.8.1: an operator, cast or function means what PostgreSQL 19.0 says it means, for every operator
 //! name in its catalog and every pair of the unit's types. The answers are the server's (the
 //! postgres:19 image, `PostgreSQL 19.0 (Debian 19.0-1.pgdg13+1)`, run by scripts/postgres-answers.sh).
 #![allow(
@@ -12,12 +12,13 @@
 use std::collections::BTreeMap;
 
 use amphora_pg_analysis::coerce::{self, Context, Path};
-use amphora_pg_analysis::resolve::{self, Name};
-use amphora_pg_catalog::data::{PG_OPERATOR, TYPES};
+use amphora_pg_analysis::resolve::{self, Call, Name};
+use amphora_pg_catalog::data::{PG_OPERATOR, PG_PROC, TYPES};
 use amphora_pg_catalog::{PG_CATALOG_NAMESPACE, SearchPath, type_named};
 
 const OPERATORS: &str = include_str!("operators.txt");
 const CASTS: &str = include_str!("casts.txt");
+const FUNCTIONS: &str = include_str!("functions.txt");
 
 const UNIT: &[&str] = &[
     "int4",
@@ -80,6 +81,70 @@ fn t_pg_8_1_each_operator_resolves_as_19_resolves_it() {
     }
     assert_eq!(wrong, Vec::<String>::new(), "{} of {asked}", wrong.len());
     assert_eq!((asked, answered), (5697, answers.len()));
+}
+
+/// T-PG.8.1, functions: 19's function for each name and its one or two arguments' types (`coercion` for a
+/// cast written as a call), or its SQLSTATE. A call the answers don't list is `42883`, and one that 19
+/// refuses only once it has chosen the function (an aggregate with no OVER, a polymorphic argument of no
+/// known type) is one it chose a function for.
+#[test]
+fn t_pg_8_1_each_function_resolves_as_19_resolves_it() {
+    let answers: BTreeMap<(&str, &str, &str), &str> = FUNCTIONS
+        .lines()
+        .map(|line| {
+            let f: Vec<&str> = line.split(' ').collect();
+            ((f[0], f[1], f[2]), f[3])
+        })
+        .collect();
+    let path = SearchPath::new(&[], "", None, |_| None);
+    let mut wrong = Vec::new();
+    let (mut asked, mut answered) = (0, 0);
+    let mut names: Vec<&str> = PG_PROC.iter().map(|p| p.name).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let procs = || PG_PROC.iter().filter(|p| p.name == name);
+        let two = procs().filter(|p| p.args.len() == 2).count() > 1;
+        let one = procs().any(|p| !p.args.is_empty() && p.args.len() - p.defaults <= 1);
+        let mut seconds: Vec<&str> = if one || !two { vec!["-"] } else { vec![] };
+        seconds.extend(if two { UNIT } else { &[] });
+        let firsts: &[&str] = if one || two { UNIT } else { &[] };
+        for first in firsts {
+            for second in &seconds {
+                asked += 1;
+                let answer = answers.get(&(name, *first, *second)).copied();
+                answered += usize::from(answer.is_some());
+                let mut args = vec![type_oid(first)];
+                args.extend((*second != "-").then(|| type_oid(second)));
+                let call = resolve::function(
+                    &path,
+                    |_| None,
+                    &Name {
+                        schema: None,
+                        name: name.to_owned(),
+                    },
+                    &args,
+                    true,
+                );
+                let got = match call {
+                    Ok(Call::Function { function, .. }) => function.oid.to_string(),
+                    Ok(Call::Coercion(_)) => "coercion".to_owned(),
+                    Err(e) => e.sqlstate.to_owned(),
+                };
+                let chosen = !matches!(got.as_str(), "42883" | "42725");
+                let right = match answer {
+                    None => got == "42883",
+                    Some("0A000" | "42804" | "42809" | "42P16") => chosen,
+                    Some(answer) => got == answer,
+                };
+                if !right {
+                    wrong.push(format!("{name}({first}, {second}): {got}, 19: {answer:?}"));
+                }
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new(), "{} of {asked}", wrong.len());
+    assert_eq!((asked, answered), (14382, answers.len()));
 }
 
 /// T-PG.8.1, casts: how each of the unit's types becomes another, as an explicit cast (19's node: `F`

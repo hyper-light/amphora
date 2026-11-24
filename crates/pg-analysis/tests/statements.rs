@@ -130,3 +130,33 @@ fn t_pg_8_4_a_regclass_parameter_resolves_a_table() {
         assert_eq!(output(type_oid::OID, &table, session).unwrap(), "16384");
     });
 }
+
+/// T-PG.8.5: a `TimeZone` that names no zone, or an offset past what 19 takes, is `22023`
+/// (`check_timezone`, src/backend/commands/variable.c), and the POSIX and INTERVAL forms that 19 takes
+/// refuse `0A000`.
+#[test]
+fn t_pg_8_5_a_time_zone_19_does_not_have_is_refused() {
+    for setting in ["Nowhere/None", "", "168", "-200"] {
+        let e = tz::time_zone(setting).unwrap_err();
+        assert_eq!(e.sqlstate, sqlstate::INVALID_PARAMETER_VALUE, "{setting}");
+    }
+    for setting in ["<+03>-3", "INTERVAL '-08:00'"] {
+        let e = tz::time_zone(setting).unwrap_err();
+        assert_eq!(e.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED, "{setting}");
+    }
+}
+
+/// T-PG.8.6: an expression as deep as the grammar reads is analyzed and computed with no recursion
+/// (CLAUDE.md section 11): a test thread's stack would not hold 9,000 levels of one.
+#[test]
+fn t_pg_8_6_a_deep_expression_takes_no_stack() {
+    let utc = tz::time_zone("UTC").unwrap();
+    common::session(&utc, |session| {
+        let sql = format!("SELECT 0{}", " + 1".repeat(100_000));
+        let query = common::prepare(&sql, &[], session).unwrap();
+        assert_eq!(value(&query, "", session), Ok("100000".to_owned()));
+        let sql = format!("SELECT {}1{}", "(1 + ".repeat(1_500), ")".repeat(1_500));
+        let query = common::prepare(&sql, &[], session).unwrap();
+        assert_eq!(value(&query, "", session), Ok("1501".to_owned()));
+    });
+}
