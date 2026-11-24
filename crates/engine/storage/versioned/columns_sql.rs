@@ -689,17 +689,27 @@ impl Rows for At<'_> {
 }
 
 /// A SQL table's rows: record payloads, an INTEGER PRIMARY KEY's column (stored as NULL) read
-/// from the row's key, as the executor's scan hook reads it.
-struct SqlRows {
+/// from the row's key, as the executor's scan hook reads it; an INTEGER in a column of REAL
+/// affinity read as a REAL, as the serial loop's `RealAffinity` makes it (lane R10). Both come
+/// from the table's schema, so the blocks a copy caches decode alike for every statement.
+struct SqlRows<'a> {
     rowid_alias: Option<usize>,
+    reals: &'a [usize],
 }
 
-impl Decode for SqlRows {
+impl Decode for SqlRows<'_> {
     fn decode(&self, key: &[u8], row: &[u8], out: &mut Vec<Cell>) -> Result<()> {
         Records.decode(key, row, out)?;
         if let Some(at) = self.rowid_alias {
             if let Some(cell) = out.get_mut(at) {
                 *cell = Cell::Int(key_rowid(key)?);
+            }
+        }
+        for at in self.reals {
+            if let Some(cell) = out.get_mut(*at) {
+                if let Cell::Int(i) = *cell {
+                    *cell = Cell::Real(i as f64);
+                }
             }
         }
         Ok(())
@@ -712,6 +722,7 @@ impl Decode for SqlRows {
 struct OnCores<'a> {
     cache: &'a Cache,
     mode: ParallelMode,
+    sums: crate::RealSums,
     costs: &'a Mutex<Option<MachineCosts>>,
     budget: &'a MemoryBudget,
     declined: std::cell::Cell<bool>,
@@ -736,6 +747,15 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
         if let Some(kind) = sums_text(q, &granules) {
             self.declined.set(true);
             return Err(morsel(MorselError::Unsupported { kind }));
+        }
+        // A REAL to sum (lane R10): the copy's sum is exact and rounded once, `RealSums::Exact`'s
+        // answer. Under the others the sum is SQLite's compensated one in row order, which the
+        // serial loop takes, as the morsels' workers hand it back (`no_real_outputs`).
+        if self.sums != crate::RealSums::Exact && sums_real(q, &granules) {
+            self.declined.set(true);
+            return Err(morsel(MorselError::Unsupported {
+                kind: "a REAL to sum outside RealSums::Exact",
+            }));
         }
         let built = granules
             .iter()
@@ -785,6 +805,25 @@ fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
                         Cell::Blob(_) => Some("BLOB"),
                         _ => None,
                     }),
+                })
+        })
+}
+
+/// Whether a column `q` sums holds a REAL in any granule.
+fn sums_real(q: &Query, granules: &[Placed]) -> bool {
+    q.aggs
+        .iter()
+        .filter_map(|a| match a {
+            Agg::Sum(c) => Some(*c),
+            _ => None,
+        })
+        .any(|c| {
+            granules
+                .iter()
+                .any(|p| match p.granule.columns.get(c).map(|v| &v.data) {
+                    Some(Data::Real(_)) => true,
+                    Some(Data::Mixed(cells)) => cells.iter().any(|v| matches!(v, Cell::Real(_))),
+                    _ => false,
                 })
         })
 }
@@ -997,12 +1036,14 @@ fn read(
             let scan = OnCores {
                 cache: &copy.cache,
                 mode: connection.parallel_mode(),
+                sums: connection.real_sums(),
                 costs: &connection.morsel_costs,
                 budget: &budget,
                 declined: std::cell::Cell::new(false),
             };
             let dec = SqlRows {
                 rowid_alias: data.rowid_alias,
+                reals: &data.reals,
             };
             match columns_path::aggregate_on_copy(
                 &copy.columns,
@@ -1475,8 +1516,15 @@ mod tests {
         }
         let after = copies(&on).counts();
         let runs = u64::try_from(params.len() * 3).unwrap();
-        assert_eq!(after.handed - before.handed, runs, "every run handed to the copies");
-        assert_eq!(after.skipped_body, before.skipped_body, "none skipped as body");
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
         assert_eq!(
             bound(&on, &Value::build_text("500")),
             bound(&on, &Value::from_i64(500)),
@@ -1484,6 +1532,371 @@ mod tests {
         );
         eprintln!(
             "== r9 v >= ?: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
+    }
+
+    /// Lane R10: REAL columns through the copies, with SQLite's answers. Do: a table with an
+    /// INTEGER column `q` holding stray REALs (2.5, f64::MAX twice, -0.0) and a REAL column `p`
+    /// holding whole-number REALs (stored as integers), halves, -0.0, both f64::MAX, the least
+    /// subnormal, 2^53 + 1 and i64's ends as integers (read as their nearest doubles), a text and
+    /// NULL; declared `COLUMNAR` and not, and on the pager's storage; each statement bound as
+    /// `bench/sqlite_answers_r10.py` binds it, one worker and then the
+    /// workers the switch picks, three runs each, under `RealSums::Serial`. Expect: every answer
+    /// bit for bit the one that script printed from SQLite 3.54.0, on both tables; the statements
+    /// handed to the copies, none skipped as `body`, and the copy reading some.
+    #[test]
+    fn r10_real_columns_reach_the_copies_with_sqlites_answers() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        // The pager's storage, whose scan hook reads the rows on morsels (`TableSource`).
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let paged_db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let paged = paged_db.connect(ConnectOpts::new()).unwrap();
+        for (c, declared) in [(&on, true), (&off, false), (&paged, false)] {
+            create(
+                c,
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, q INTEGER, p REAL)",
+                declared,
+            );
+            c.execute("INSERT INTO r SELECT value, value % 10, (value % 50) * 0.5 - 5.0 FROM generate_series(1, 600)")
+                .unwrap();
+            c.execute("INSERT INTO r VALUES (601, 7, -0.0), (602, 7, 1.7976931348623157e308), (603, 7, -1.7976931348623157e308), \
+                 (604, 7, 4.9406564584124654e-324), (605, 7, 9007199254740993), (606, 7, 9223372036854775807), \
+                 (607, 2.5, 1.0), (608, 1.7976931348623157e308, 2.0), (609, 1.7976931348623157e308, 3.0), \
+                 (610, NULL, NULL), (611, -9223372036854775808, -9223372036854775808), (612, 7, 'abc'), (613, -0.0, 4.0)")
+                .unwrap();
+        }
+        let sql = [
+            "SELECT COUNT(*) FROM r WHERE p < ?",
+            "SELECT COUNT(*) FROM r WHERE p >= ?",
+            "SELECT COUNT(*) FROM r WHERE p = ?",
+            "SELECT COUNT(*) FROM r WHERE ? <> p",
+            "SELECT COUNT(*) FROM r WHERE q = ? AND p < ?",
+            "SELECT SUM(q), COUNT(q), MIN(q), MAX(q) FROM r WHERE p > ?",
+            "SELECT SUM(q), COUNT(*) FROM r WHERE p < ?",
+        ];
+        let sqlite: Vec<(usize, Vec<Value>, &str)> = vec![
+            (0, vec![Value::from_i64(500)], "i608"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i608",
+            ),
+            (0, vec![Value::from_i64(0)], "i122"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i122",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i122",
+            ),
+            (0, vec![Value::from_i64(-5)], "i2"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i610",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i0",
+            ),
+            (0, vec![Value::from_i64(9007199254740992)], "i608"),
+            (0, vec![Value::from_i64(9007199254740993)], "i609"),
+            (0, vec![Value::from_i64(9223372036854775807)], "i609"),
+            (0, vec![Value::from_i64(i64::MIN)], "i1"),
+            (0, vec![Value::build_text("500")], "i608"),
+            (0, vec![Value::build_text("1e400")], "i611"),
+            (0, vec![Value::build_text("-0.0")], "i122"),
+            (0, vec![Value::build_text("abc")], "i611"),
+            (0, vec![Value::Null], "i0"),
+            (0, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i135",
+            ),
+            (1, vec![Value::from_i64(500)], "i4"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i4",
+            ),
+            (1, vec![Value::from_i64(0)], "i490"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i490",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i490",
+            ),
+            (1, vec![Value::from_i64(-5)], "i610"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i2",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i612",
+            ),
+            (1, vec![Value::from_i64(9007199254740992)], "i4"),
+            (1, vec![Value::from_i64(9007199254740993)], "i3"),
+            (1, vec![Value::from_i64(9223372036854775807)], "i3"),
+            (1, vec![Value::from_i64(i64::MIN)], "i611"),
+            (1, vec![Value::build_text("500")], "i4"),
+            (1, vec![Value::build_text("1e400")], "i1"),
+            (1, vec![Value::build_text("-0.0")], "i490"),
+            (1, vec![Value::build_text("abc")], "i1"),
+            (1, vec![Value::Null], "i0"),
+            (1, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i477",
+            ),
+            (2, vec![Value::from_i64(500)], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i0",
+            ),
+            (2, vec![Value::from_i64(0)], "i13"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i13",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i13",
+            ),
+            (2, vec![Value::from_i64(-5)], "i12"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i1",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i1",
+            ),
+            (2, vec![Value::from_i64(9007199254740992)], "i1"),
+            (2, vec![Value::from_i64(9007199254740993)], "i0"),
+            (2, vec![Value::from_i64(9223372036854775807)], "i0"),
+            (2, vec![Value::from_i64(i64::MIN)], "i1"),
+            (2, vec![Value::build_text("500")], "i0"),
+            (2, vec![Value::build_text("1e400")], "i0"),
+            (2, vec![Value::build_text("-0.0")], "i13"),
+            (2, vec![Value::build_text("abc")], "i1"),
+            (2, vec![Value::Null], "i0"),
+            (2, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i1",
+            ),
+            (3, vec![Value::from_i64(500)], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i612",
+            ),
+            (3, vec![Value::from_i64(0)], "i599"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i599",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i599",
+            ),
+            (3, vec![Value::from_i64(-5)], "i600"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i611",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i611",
+            ),
+            (3, vec![Value::from_i64(9007199254740992)], "i611"),
+            (3, vec![Value::from_i64(9007199254740993)], "i612"),
+            (3, vec![Value::from_i64(9223372036854775807)], "i612"),
+            (3, vec![Value::from_i64(i64::MIN)], "i611"),
+            (3, vec![Value::build_text("500")], "i612"),
+            (3, vec![Value::build_text("1e400")], "i612"),
+            (3, vec![Value::build_text("-0.0")], "i599"),
+            (3, vec![Value::build_text("abc")], "i611"),
+            (3, vec![Value::Null], "i0"),
+            (3, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i611",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(7),
+                    Value::from_f64(f64::from_bits(0x407f400000000000)),
+                ],
+                "i63",
+            ),
+            (4, vec![Value::from_i64(7), Value::from_i64(0)], "i13"),
+            (
+                4,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_i64(2),
+                ],
+                "i1",
+            ),
+            (
+                4,
+                vec![Value::from_i64(7), Value::build_text("1e400")],
+                "i66",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(0),
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                ],
+                "i12",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0xc000000000000000))],
+                "r7ff0000000000000,i526,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "r7ff0000000000000,i464,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "r7ff0000000000000,i439,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4004000000000000))],
+                "r7fefffffffffffff,i414,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4008000000000000))],
+                "i1936,i401,i0,i9",
+            ),
+            (5, vec![Value::Null], "n,i0,n,n"),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff0000000000000))],
+                "i-9223372036854775235,i148",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "rc3dfffffffffffff,i161",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0xc010000000000000))],
+                "i-9223372036854775789,i26",
+            ),
+        ];
+        let cell = |v: &Value| match v {
+            Value::Null => "n".to_string(),
+            Value::Numeric(Numeric::Integer(i)) => format!("i{i}"),
+            Value::Numeric(Numeric::Float(f)) => format!("r{:016x}", f64::from(*f).to_bits()),
+            Value::Text(t) => format!("t{}", t.as_str()),
+            Value::Blob(b) => format!("b{b:?}"),
+        };
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<String> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().map(cell).collect::<Vec<_>>().join(","));
+                Ok(())
+            })
+            .unwrap();
+            out.join(";")
+        };
+        for text in sql {
+            let hooked = rows(&on, &format!("EXPLAIN {text}")).iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            assert!(
+                hooked,
+                "{text}: the statement's program holds the copies' hook"
+            );
+        }
+        let before = copies(&on).counts();
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            on.set_parallel_mode(mode);
+            off.set_parallel_mode(mode);
+            paged.set_parallel_mode(mode);
+            for (at, params, answer) in &sqlite {
+                let text = sql[*at];
+                assert_eq!(
+                    bound(&paged, text, params),
+                    *answer,
+                    "the pager's storage, {mode:?}: {text} {params:?}"
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        bound(&on, text, params),
+                        *answer,
+                        "declared, {mode:?}: {text} {params:?}"
+                    );
+                    assert_eq!(
+                        bound(&off, text, params),
+                        *answer,
+                        "not declared, {mode:?}: {text} {params:?}"
+                    );
+                }
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(sqlite.len() * 3 * 2).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert!(after.copy > before.copy, "the copy read some");
+        eprintln!(
+            "== r10: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
             after.handed - before.handed,
             after.copy - before.copy,
             after.rows - before.rows,
