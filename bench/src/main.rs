@@ -13,7 +13,9 @@
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
 // Tests may unwrap, assert and index (CLAUDE.md §1): clippy reads the workspace's clippy.toml here.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects))]
+// Command-line tools: printing results and reading arguments is their job, so clippy.toml's disallowed macros and methods are lifted for them.
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 mod blink;
 mod cc;
