@@ -18,17 +18,27 @@ use amphora_pg_oracle::{Oracle, Verdict, split};
 use amphora_pg_parser::gram;
 
 mod common;
-use common::REFUSED_IN_ACTIONS;
+use common::{REFUSED_IN_ACTIONS, TREES_EQUAL};
 
 fn category(oracle: &Verdict, rust: &Result<(), gram::Refusal>) -> Option<String> {
     match (oracle, rust) {
         (Verdict::Tree(_), Ok(())) => None,
         (Verdict::Tree(_), Err(e)) => Some(format!("19 accepts, refused {}", e.sqlstate)),
-        (Verdict::Refused { sqlstate, message, .. }, Ok(())) => {
+        (
+            Verdict::Refused {
+                sqlstate, message, ..
+            },
+            Ok(()),
+        ) => {
             let head: String = message.chars().take(40).collect();
             Some(format!("19 refuses {sqlstate} ({head}), accepted"))
         }
-        (Verdict::Refused { sqlstate, cursor, .. }, Err(e)) => {
+        (
+            Verdict::Refused {
+                sqlstate, cursor, ..
+            },
+            Err(e),
+        ) => {
             if sqlstate != e.sqlstate {
                 Some(format!("19 refuses {sqlstate}, refused {}", e.sqlstate))
             } else if usize::try_from(*cursor).unwrap() != e.cursor {
@@ -65,7 +75,8 @@ fn t_pg_5_2_grammar_matches_19_on_the_regression_corpus() {
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
         .collect();
     files.sort();
-    let (mut total, mut skipped, mut matched, mut in_actions) = (0usize, 0usize, 0usize, 0usize);
+    let (mut total, mut skipped, mut matched, mut in_actions, mut trees) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut kinds: BTreeMap<String, (usize, String)> = BTreeMap::new();
     for file in &files {
         let script = std::fs::read(file).unwrap();
@@ -76,7 +87,19 @@ fn t_pg_5_2_grammar_matches_19_on_the_regression_corpus() {
             }
             total += 1;
             let verdict = oracle.parse(sql).unwrap();
-            let mine = gram::accepts(sql);
+            let parsed = gram::parse_tree(sql);
+            if let (Verdict::Tree(text), Ok(gram::Parsed::Tree { tree, statements })) =
+                (&verdict, &parsed)
+            {
+                assert_eq!(
+                    &tree.to_text(statements).unwrap(),
+                    text,
+                    "{} #{i}",
+                    file.display()
+                );
+                trees += 1;
+            }
+            let mine = parsed.map(|_| ());
             if matches!((&verdict, &mine), (Verdict::Refused { .. }, Ok(()))) {
                 in_actions += 1;
             }
@@ -102,7 +125,7 @@ fn t_pg_5_2_grammar_matches_19_on_the_regression_corpus() {
         }
     }
     println!(
-        "statements {total} (skipped {skipped} not UTF-8 or with NUL), verdict and cursor match {matched} of {total}, {in_actions} refused in an action"
+        "statements {total} (skipped {skipped} not UTF-8 or with NUL), verdict and cursor match {matched} of {total}, {in_actions} refused in an action, {trees} parse to 19's tree"
     );
     let mut by_count: Vec<_> = kinds.into_iter().collect();
     by_count.sort_by_key(|k| std::cmp::Reverse(k.1.0));
@@ -113,6 +136,10 @@ fn t_pg_5_2_grammar_matches_19_on_the_regression_corpus() {
         matched + in_actions,
         total,
         "every statement accepted or refused as 19 does, where 19 does, but those refused in actions"
+    );
+    assert!(
+        trees >= TREES_EQUAL,
+        "{trees} statements parse to 19's tree, fewer than {TREES_EQUAL}"
     );
     assert!(
         in_actions <= REFUSED_IN_ACTIONS,

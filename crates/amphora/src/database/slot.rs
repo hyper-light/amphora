@@ -227,15 +227,26 @@ impl<T> Slots<T> {
         if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
             gap.from = None;
         }
-        let ended = if self
-            .holding
-            .as_ref()
-            .is_some_and(|holding| holding.member == member)
+        let ended = self.released(member, at);
+        Taken {
+            step: Some(message),
+            ended,
+            unmeasured: None,
+        }
+    }
+
+    /// `member`'s barrier at `at` for work that writes nothing: a read, or the end of a write that
+    /// forwarded nothing (CP-T1.8, lane V11). It asks for no slot and steps now. A slot `member`
+    /// holds ends released, and its older barrier still waiting steps, its operation over (its
+    /// owner makes one at a time, and its link delivers in order, as `read` takes it). A queue
+    /// entry a refusal left waits for the member's next write.
+    pub(super) fn pass(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
+        if let Some(position) = self.waiting.iter().position(|(m, _)| *m == member)
+            && let Some(older) = self.waiting.remove(position)
         {
-            self.end(at, SlotEnd::Released)
-        } else {
-            None
-        };
+            self.ready.push_back(older);
+        }
+        let ended = self.released(member, at);
         Taken {
             step: Some(message),
             ended,
@@ -467,6 +478,21 @@ impl<T> Slots<T> {
         Ok(())
     }
 
+    /// Ends `member`'s slot released at `at`, if it holds it: its work was no write.
+    fn released(&mut self, member: u64, at: Instant) -> Option<Ended> {
+        if !self
+            .holding
+            .as_ref()
+            .is_some_and(|holding| holding.member == member)
+        {
+            return None;
+        }
+        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
+            gap.from = None;
+        }
+        self.end(at, SlotEnd::Released)
+    }
+
     fn end(&mut self, at: Instant, how: SlotEnd) -> Option<Ended> {
         if let Some(read) = self.read.take() {
             self.ready.push_back(read);
@@ -545,6 +571,46 @@ mod tests {
         assert_eq!(slots.start(t, 1, 1, false), None);
         assert_eq!(slots.read(3, t, "other").step, Some("other"));
         assert_eq!(slots.forward(3, t, "write").step, Some("write"));
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V11): a barrier for work that writes nothing asks for no slot. Do:
+    /// member 3 holds a slot and member 2's write barrier waits; then read barriers from member
+    /// 2, from member 4 (queued by a refusal), and from member 3. Expect: each steps at once;
+    /// member 2's older barrier steps with its read, and no slot begins for member 2; member 3's
+    /// ends its slot released; member 4 stays queued, its next write's barrier waiting.
+    #[test]
+    fn a_read_barrier_asks_for_no_slot_and_ends_its_members_own() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(3);
+        waits(&mut slots, 3, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(3));
+        assert_eq!(drained(&mut slots), vec![(3, "barrier")]);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        let read = slots.pass(2, t + MS, "read");
+        assert_eq!(read.step, Some("read"));
+        assert!(read.ended.is_none());
+        assert_eq!(drained(&mut slots), vec![(2, "barrier")]);
+        slots.refused(4);
+        assert_eq!(slots.pass(4, t + MS, "four").step, Some("four"));
+        assert!(slots.holds(), "another member's read ended member 3's slot");
+        let own = slots.pass(3, t + 2 * MS, "end");
+        assert_eq!(own.step, Some("end"));
+        assert_eq!(
+            own.ended,
+            Some(Ended {
+                member: 3,
+                how: SlotEnd::Released,
+                held: 2 * MS
+            })
+        );
+        waits(&mut slots, 4, t + 3 * MS);
+        assert_eq!(
+            slots.start(t + 3 * MS, 1, 1, false).map(|(m, _)| m),
+            Some(4),
+            "a slot began for member 2's read"
+        );
     }
 
     /// T-T1.8.W4: do refuse members 2 and 3 and take both barriers; expect one slot each, in the

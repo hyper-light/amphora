@@ -23,6 +23,7 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
+use crate::storage::log_segments::{ReadSpan, Segments, SlotReads};
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
@@ -38,7 +39,7 @@ use std::ptr::NonNull;
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 2;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
@@ -588,6 +589,34 @@ struct SharedWalCoordinationMapHeader {
     backfill_proof_crc32c: AtomicU32,
     writer_owner: AtomicU64,
     checkpoint_owner: AtomicU64,
+    /// Decision 45: the log's two segments and every process's reads on each
+    /// ([`Segments::pack`]), so a checkpointer sees the reads of other processes.
+    segments: AtomicU64,
+    /// The other segment's header, beside the current one's above, written and
+    /// read under `snapshot_seq` like it ([`SharedSegmentHeader`]).
+    other_max_frame: AtomicU64,
+    other_nbackfills: AtomicU64,
+    other_checkpoint_seq: AtomicU32,
+    other_page_size: AtomicU32,
+    other_salt_1: AtomicU32,
+    other_salt_2: AtomicU32,
+    other_checksum_1: AtomicU32,
+    other_checksum_2: AtomicU32,
+}
+
+/// One segment's header as the shared memory carries it for the segment that is
+/// not current (decision 45): its log header, its last commit frame and what of
+/// it is copied into the database file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SharedSegmentHeader {
+    pub max_frame: u64,
+    pub nbackfills: u64,
+    pub checkpoint_seq: u32,
+    pub page_size: u32,
+    pub salt_1: u32,
+    pub salt_2: u32,
+    pub checksum_1: u32,
+    pub checksum_2: u32,
 }
 
 #[repr(C)]
@@ -1233,6 +1262,99 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// The log's segments, with the reads every live process counts on each: the
+    /// slots of readers proven dead are reclaimed first, so a crash leaks no read.
+    pub(crate) fn segments(&self) -> Segments {
+        self.reclaim_stale_reader_slots();
+        let reads = self
+            .reader_reads()
+            .iter()
+            .map(|word| SlotReads(word.load(Ordering::Acquire)))
+            .fold(SlotReads::default(), SlotReads::plus);
+        Segments::unpack(self.header().segments.load(Ordering::Acquire)).with_reads(reads)
+    }
+
+    /// Count a read begun with `span` on `slot`, the reader slot that guards it,
+    /// where every process sees it. False when a count of the slot is at the most
+    /// its bits hold: the read is refused and tried again.
+    pub(crate) fn count_read(&self, slot: SharedReaderSlot, span: &ReadSpan) -> bool {
+        self.slot_reads(slot.slot_index as usize).is_some_and(|word| {
+            word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                SlotReads(reads).with(span).map(|reads| reads.0)
+            })
+            .is_ok()
+        })
+    }
+
+    /// The read [`Self::count_read`] counted on `slot` with `span` is done.
+    pub(crate) fn uncount_read(&self, slot: SharedReaderSlot, span: &ReadSpan) {
+        if let Some(word) = self.slot_reads(slot.slot_index as usize) {
+            let _ = word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                Some(SlotReads(reads).without(span).0)
+            });
+        }
+    }
+
+    /// Publish which segment is current and the other's state, as this process
+    /// recovered them at open. Reads are counted in the reader slots, not here.
+    pub(crate) fn seed_segments(&self, recovered: Segments) {
+        self.header()
+            .segments
+            .store(recovered.pack(), Ordering::Release);
+    }
+
+    /// The header of the segment that is not current.
+    pub(crate) fn other_segment(&self) -> SharedSegmentHeader {
+        let header = self.header();
+        loop {
+            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+            if seq_before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let other = SharedSegmentHeader {
+                max_frame: header.other_max_frame.load(Ordering::Acquire),
+                nbackfills: header.other_nbackfills.load(Ordering::Acquire),
+                checkpoint_seq: header.other_checkpoint_seq.load(Ordering::Acquire),
+                page_size: header.other_page_size.load(Ordering::Acquire),
+                salt_1: header.other_salt_1.load(Ordering::Acquire),
+                salt_2: header.other_salt_2.load(Ordering::Acquire),
+                checksum_1: header.other_checksum_1.load(Ordering::Acquire),
+                checksum_2: header.other_checksum_2.load(Ordering::Acquire),
+            };
+            if seq_before == header.snapshot_seq.load(Ordering::Acquire) {
+                return other;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Replace the header of the segment that is not current.
+    pub(crate) fn install_other_segment(&self, other: SharedSegmentHeader) {
+        self.with_snapshot_write(|header| {
+            header
+                .other_max_frame
+                .store(other.max_frame, Ordering::Release);
+            header
+                .other_nbackfills
+                .store(other.nbackfills, Ordering::Release);
+            header
+                .other_checkpoint_seq
+                .store(other.checkpoint_seq, Ordering::Release);
+            header
+                .other_page_size
+                .store(other.page_size, Ordering::Release);
+            header.other_salt_1.store(other.salt_1, Ordering::Release);
+            header.other_salt_2.store(other.salt_2, Ordering::Release);
+            header
+                .other_checksum_1
+                .store(other.checksum_1, Ordering::Release);
+            header
+                .other_checksum_2
+                .store(other.checksum_2, Ordering::Release);
+        });
+    }
+
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
         self.open_mode
     }
@@ -1331,6 +1453,7 @@ impl MappedSharedWalCoordination {
                 Ok(true) => {
                     self.reader_frames()[slot_index as usize]
                         .store(UNUSED_READER_FRAME, Ordering::Release);
+                    self.forget_slot_reads(slot_index as usize);
                     self.reader_owners()[slot_index as usize]
                         .store(UNOWNED_LOCK, Ordering::Release);
                     let word_idx = (slot_index >> 6) as usize;
@@ -1679,6 +1802,7 @@ impl MappedSharedWalCoordination {
                 return false;
             }
             self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+            self.forget_slot_reads(slot_index as usize);
             let word_idx = (slot_index >> 6) as usize;
             let bit = slot_index & 63;
             self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
@@ -1700,6 +1824,7 @@ impl MappedSharedWalCoordination {
             return false;
         }
         self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+        self.forget_slot_reads(slot_index as usize);
         let word_idx = (slot_index >> 6) as usize;
         let bit = slot_index & 63;
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
@@ -1947,6 +2072,7 @@ impl MappedSharedWalCoordination {
                 return false;
             }
             self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+            self.forget_slot_reads(slot_index as usize);
             self.reader_owners()[slot_index as usize].store(UNOWNED_LOCK, Ordering::Release);
             let word_idx = (slot_index >> 6) as usize;
             let bit = slot_index & 63;
@@ -2286,6 +2412,7 @@ impl MappedSharedWalCoordination {
                     Ok(true) => {
                         self.reader_frames()[slot_index]
                             .store(UNUSED_READER_FRAME, Ordering::Release);
+                        self.forget_slot_reads(slot_index);
                         self.reader_owners()[slot_index].store(UNOWNED_LOCK, Ordering::Release);
                         let word_idx = slot_index >> 6;
                         let bit = slot_index & 63;
@@ -2550,10 +2677,10 @@ impl MappedSharedWalCoordination {
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
         let reader_bitmap_words = (reader_slot_count / 64) as usize;
-        // Layout after header: reader_bitmap | reader_frames | reader_owners
-        // Only 3 arrays are currently used; the remaining 2 are reserved space
-        // for future per-reader arrays (e.g. backfill proof bitmaps) and must
-        // not be removed without a coordinated file format version bump.
+        // Layout after header: reader_bitmap | reader_frames | reader_owners |
+        // reserved (reader_bitmap's size) | reader_reads. The reserved array is
+        // space for a future per-reader bitmap and must not be removed without a
+        // coordinated file format version bump.
         let raw_len = size_of::<SharedWalCoordinationMapHeader>()
             + reader_bitmap_words * size_of::<AtomicU64>()
             + reader_slot_count as usize * size_of::<AtomicU64>()
@@ -2624,6 +2751,35 @@ impl MappedSharedWalCoordination {
                 .cast::<AtomicU64>()
         };
         unsafe { std::slice::from_raw_parts(ptr, header.reader_slot_count as usize) }
+    }
+
+    /// Each reader slot's reads by segment ([`SlotReads`]), the fifth array.
+    fn reader_reads(&self) -> &[AtomicU64] {
+        let header = self.header();
+        let bitmap_words = header.reader_bitmap_word_count as usize;
+        let slots = header.reader_slot_count as usize;
+        let ptr = unsafe {
+            self.base_ptr
+                .as_ptr()
+                .add(size_of::<SharedWalCoordinationMapHeader>())
+                .cast::<AtomicU64>()
+                .add(bitmap_words)
+                .add(slots)
+                .add(slots)
+                .add(bitmap_words)
+        };
+        unsafe { std::slice::from_raw_parts(ptr, slots) }
+    }
+
+    fn slot_reads(&self, slot_index: usize) -> Option<&AtomicU64> {
+        self.reader_reads().get(slot_index)
+    }
+
+    /// A slot freed from a reader that is gone: the reads it counted hold no segment.
+    fn forget_slot_reads(&self, slot_index: usize) {
+        if let Some(word) = self.slot_reads(slot_index) {
+            word.store(0, Ordering::Release);
+        }
     }
 
     /// Map one frame-index block on demand.
@@ -2903,6 +3059,8 @@ impl MappedSharedWalCoordination {
             std::ptr::addr_of_mut!((*header).writer_owner).write(AtomicU64::new(UNOWNED_LOCK));
             std::ptr::addr_of_mut!((*header).checkpoint_owner).write(AtomicU64::new(UNOWNED_LOCK));
         }
+        self.header().segments.store(0, Ordering::Release);
+        self.install_other_segment(SharedSegmentHeader::default());
         // A freshly truncated file-backed mapping is already zero-filled. Avoid
         // touching the full reserved region here, because large sparse `.tshm`
         // files can SIGBUS on tmpfs/quota-constrained test environments if we
@@ -2915,6 +3073,9 @@ impl MappedSharedWalCoordination {
         }
         for owner in self.reader_owners() {
             owner.store(UNOWNED_LOCK, Ordering::Release);
+        }
+        for reads in self.reader_reads() {
+            reads.store(0, Ordering::Release);
         }
     }
 
@@ -4359,5 +4520,92 @@ mod tests {
             mapped.find_frame(7, 0, boundary + 3, None),
             Some(boundary + 3)
         );
+    }
+
+    /// Do: count a read on both segments through one mapping of a shared memory file, look from
+    /// a second mapping of the same file, then end the read. Expect: the second mapping sees the
+    /// read on each segment while it is under way, and none once it has ended.
+    #[test]
+    fn d45_two_mappings_of_one_file_see_each_others_reads() {
+        use crate::storage::log_segments::{Closing, Segment, SegmentId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let reading = create_mapping(&path);
+        let looking = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        reading.seed_segments(log);
+        let span = log.begin_read();
+        let slot = reading
+            .register_reader(reading.owner_record(), 5)
+            .unwrap();
+        assert!(reading.count_read(slot, &span));
+        let closing = |reads| {
+            Segment::Closing(Closing {
+                reads,
+                copied: false,
+                shipped: true,
+            })
+        };
+
+        let seen = looking.segments();
+        assert_eq!(seen.current(), SegmentId::Second);
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 1 });
+        assert_eq!(seen.state(SegmentId::First), closing(1));
+
+        reading.uncount_read(slot, &span);
+        reading.unregister_reader(slot);
+        let seen = looking.segments();
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 0 });
+        assert_eq!(seen.state(SegmentId::First), closing(0));
+        assert_eq!(log.end_read(span), None);
+    }
+
+    /// Do: leave a read counted on the closing segment in a reader slot whose owner has died, as
+    /// a process that crashed mid-read leaves it, beside a live read on both segments in another
+    /// slot. Expect: counting the reads reclaims the dead slot and drops its read; the live read
+    /// still counts, and once it ends no read is left on either segment.
+    #[test]
+    fn d45_a_dead_readers_slot_is_reclaimed_and_its_read_stops_counting() {
+        use crate::storage::log_segments::{Closing, Segment, SegmentId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        let dead_span = log.begin_read();
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        mapped.seed_segments(log);
+        let dead_owner = SharedOwnerRecord::new(exited_child_pid(), 43);
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(17, Ordering::Release);
+        mapped.reader_owners()[0].store(dead_owner.raw(), Ordering::Release);
+        mapped.reader_reads()[0].store(
+            SlotReads::default().with(&dead_span).unwrap().0,
+            Ordering::Release,
+        );
+        let live_span = log.begin_read();
+        let live = mapped.register_reader(mapped.owner_record(), 5).unwrap();
+        assert_ne!(live.slot_index, 0);
+        assert!(mapped.count_read(live, &live_span));
+        let closing = |reads| {
+            Segment::Closing(Closing {
+                reads,
+                copied: false,
+                shipped: true,
+            })
+        };
+
+        let seen = mapped.segments();
+        assert_eq!(mapped.reader_owner(0), None, "the dead reader's slot is reclaimed");
+        assert_eq!(seen.state(SegmentId::First), closing(1), "the dead read stops counting");
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 1 });
+
+        mapped.uncount_read(live, &live_span);
+        mapped.unregister_reader(live);
+        let seen = mapped.segments();
+        assert_eq!(seen.state(SegmentId::First), closing(0));
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 0 });
+        assert_eq!(log.end_read(live_span), None);
+        assert_eq!(log.end_read(dead_span), None);
     }
 }

@@ -84,9 +84,14 @@ const MOVE_Z: f64 = 2.734_368_786_533_176;
 /// 12(2), 1941): a load that slows the work multiplies its times, so a logarithm's spread is the
 /// same at any level, and a successive difference stays small across a slow drift. The difference
 /// into a batch that moved the rate is a change in the work, not its noise, and is left out.
+///
+/// Lane T13 (PL.13, the versioned cost snapshot): the connection's page-miss share is judged by the
+/// same test, its batches the pager's windows of fetches (`Pager::page_miss_ratio`), on the share
+/// itself rather than its logarithm (a share of 0 has none).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Batches {
-    /// The last batch mean's logarithm; None before the first batch closed.
+pub(crate) struct Batches {
+    /// The last batch mean, on the scale judged (a rate's logarithm); None before the first batch
+    /// closed.
     last: Option<f64>,
     /// How many successive differences `squares` sums the squares of.
     differences: f64,
@@ -94,14 +99,14 @@ struct Batches {
 }
 
 impl Batches {
-    /// Whether a batch whose mean's logarithm is `seen` replaces `standing`, the rate standing
-    /// (nanoseconds a unit); and the batch counted. The first batch observed replaces the rate
+    /// Whether a batch whose mean is `seen` replaces `standing`, the value standing, both on one
+    /// scale (a rate's logarithm); and the batch counted. The first batch observed replaces the rate
     /// calibration measured or the open anchored: those are timed on other work than the
     /// database's operators, so there is no spread to weigh the two against. A later one replaces
     /// it only past the spread between batches (`refutes`).
-    fn judge(&mut self, standing: Option<f64>, seen: f64) -> bool {
+    pub(crate) fn judge(&mut self, standing: Option<f64>, seen: f64) -> bool {
         let moves = match (standing, self.last) {
-            (Some(standing), Some(_)) => self.refutes(standing.ln(), seen),
+            (Some(standing), Some(_)) => self.refutes(standing, seen),
             _ => true,
         };
         if let (Some(last), false) = (self.last, moves) {
@@ -112,7 +117,18 @@ impl Batches {
         moves
     }
 
-    /// Whether `seen` sits from `standing` (logarithms) past the spread between batches. The
+    /// The spread between batch means (the root mean square successive difference), None before a
+    /// difference was counted: the noise a later batch is judged by.
+    pub(crate) fn spread(&self) -> Option<f64> {
+        let spread = (self.squares / self.differences).sqrt();
+        if self.differences >= 1.0 && spread.is_finite() {
+            Some(spread)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `seen` sits from `standing` (one scale) past the spread between batches. The
     /// difference of two batch means has twice a batch's variance, and the mean square successive
     /// difference estimates twice it as well, so the gap is weighed against the root of the mean
     /// square successive difference itself: their ratio is Student's t with as many degrees of
@@ -313,7 +329,7 @@ impl Rate {
             return;
         };
         self.current = Span::default();
-        if self.batches.judge(self.standing, mean.ln()) {
+        if self.batches.judge(self.standing.map(f64::ln), mean.ln()) {
             self.standing = Some(mean);
         }
     }
@@ -331,7 +347,7 @@ impl Rate {
             return;
         }
         self.current = Span::default();
-        if self.batches.judge(self.standing, median.ln()) {
+        if self.batches.judge(self.standing.map(f64::ln), median.ln()) {
             self.standing = Some(median);
         }
     }

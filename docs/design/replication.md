@@ -2013,6 +2013,16 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   is that close: it ends nothing and asks for nothing, and it steps. A slot ends once (lane P14). A member sends its
   close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
   leader, which gave none, would take the close as an ask (lane P14's trace, the same stuck state).
+- *Which barriers ask* (CP-T1.8, lanes V8 and V11). Since lane V8 a follower's write asks for its slot from its
+  first try: the leader queues every write's barrier (`Slots::ask`), not only a refused member's, so the base it
+  prepares on is current when its write appends. A read never asks (lane V11): work that writes nothing (a
+  Records get, scan, changes, head or import progress, and `Database::query`, which a replicated database runs
+  with its writing statements refused, as a local one does) marks its barrier's context with one byte past the
+  request identity (`READ_BARRIER`), and the leader steps a marked barrier at once (`Slots::pass`), ending a
+  slot its member holds `released`. So a follower's read never waits behind another member's slot, nor holds
+  the leader's writes for its own round trip. The second barrier a write that forwarded nothing sends is marked
+  too. A leader before this echoes the byte unread and takes the barrier as a write's, as it did; a read's
+  context is never an entry's, since a read never proposes.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the

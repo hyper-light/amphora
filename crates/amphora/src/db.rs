@@ -1318,6 +1318,18 @@ impl Db {
         Ok(value)
     }
 
+    /// `f` with every statement that writes refused (the engine's `query_only`), in the
+    /// transaction under way: a replicated query's session (`Database::query`).
+    pub(crate) fn query_only<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.conn.set_query_only(true);
+        let done = f(self);
+        self.conn.set_query_only(false);
+        done
+    }
+
     /// `f` on each of `batches`, in order, in one transaction ([`Db::transaction`]) that ends
     /// before a batch its cache might not hold: once the pages written so far, and as many again
     /// as the last batch wrote, pass what the cache holds before it spills written pages into the

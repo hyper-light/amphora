@@ -555,16 +555,28 @@ struct WorkerResult<T> {
 }
 
 /// A REAL sum kept exact until its one rounding: the non-overlapping partials of Shewchuk's
-/// "Adaptive Precision Floating-Point Arithmetic" (1997), as Python's `math.fsum` keeps them. The
-/// sum of a set of doubles is then one number whatever the order they arrive in, so a parallel
-/// sum equals the serial one. Finite partials never overlap, so there are at most as many as the
-/// double's exponent range over its precision (2098 / 53, about 40): the bound is the format's.
-#[derive(Clone, Debug, Default)]
+/// "Adaptive Precision Floating-Point Arithmetic" (1997), as Python's `math.fsum` keeps them, and
+/// a count of [`CARRY_UNIT`]s the partials hand on (lane R4). The sum of a set of doubles is then
+/// one number whatever the order they arrive in, so a parallel sum equals the serial one, even
+/// where a running sum passes the double's range and comes back. Finite partials never overlap,
+/// so there are at most as many as the double's exponent range over its precision (2098 / 53,
+/// about 40): the bound is the format's.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExactSum {
+    /// Each below [`CARRY_UNIT`], so together below twice it.
     partials: Vec<f64>,
-    /// The sum of the non-finite inputs, and of a sum that left the double's range.
+    /// The sum's multiple of [`CARRY_UNIT`] the partials don't hold.
+    carry: i64,
+    /// The sum of the non-finite inputs.
     special: Option<f64>,
 }
+
+/// 2^1021, the unit of [`ExactSum`]'s carry. An input below it, a partial below it and the
+/// partials' sum below twice it add to less than 2^1023, so no step of the two-sum overflows: a
+/// finite binary64 is below 2^1024 (IEEE 754-2019, table 3.5: emax 1023).
+const CARRY_UNIT: f64 = f64::from_bits(0x7FC0_0000_0000_0000);
+/// 2^-1021, a normal double, so scaling by it is exact down to the subnormals.
+const CARRY_UNIT_INVERSE: f64 = f64::from_bits(0x0020_0000_0000_0000);
 
 impl ExactSum {
     pub fn add(&mut self, value: f64) -> Result<(), MorselError> {
@@ -572,7 +584,7 @@ impl ExactSum {
             self.special = Some(self.special.map_or(value, |special| special + value));
             return Ok(());
         }
-        let mut x = value;
+        let mut x = self.carry_out(value)?;
         let mut kept = 0usize;
         let count = self.partials.len();
         for j in 0..count {
@@ -593,20 +605,40 @@ impl ExactSum {
             x = high;
         }
         self.partials.truncate(kept);
-        if !x.is_finite() {
-            // The exact sum left the double's range: it rounds to this infinity.
-            self.special = Some(self.special.map_or(x, |special| special + x));
-            return Ok(());
-        }
+        let x = self.carry_out(x)?;
         self.partials.try_reserve(1)?;
         self.partials.push(x);
         Ok(())
+    }
+
+    /// Moves `value`'s whole [`CARRY_UNIT`]s into the carry and returns the rest, below one. Each
+    /// step is exact: it changes only the bits from the unit's up. A finite double holds at most
+    /// seven units.
+    fn carry_out(&mut self, mut value: f64) -> Result<f64, MorselError> {
+        let overflow = || MorselError::Overflow {
+            what: "an exact sum's carry",
+        };
+        while value >= CARRY_UNIT {
+            value -= CARRY_UNIT;
+            self.carry = self.carry.checked_add(1).ok_or_else(overflow)?;
+        }
+        while value <= -CARRY_UNIT {
+            value += CARRY_UNIT;
+            self.carry = self.carry.checked_sub(1).ok_or_else(overflow)?;
+        }
+        Ok(value)
     }
 
     pub fn merge(&mut self, other: &ExactSum) -> Result<(), MorselError> {
         for partial in &other.partials {
             self.add(*partial)?;
         }
+        self.carry = self
+            .carry
+            .checked_add(other.carry)
+            .ok_or(MorselError::Overflow {
+                what: "an exact sum's carry",
+            })?;
         if let Some(special) = other.special {
             self.add(special)?;
         }
@@ -614,16 +646,23 @@ impl ExactSum {
     }
 
     /// The sum as a payload slot's bytes (lane G8, the serial loop under `RealSums::Exact`): a tag
-    /// for `special` (0 none, 1 plus infinity, 2 minus infinity), then each partial's bits. A NaN
-    /// special has none: the caller keeps it as SQLite's NULL.
+    /// for `special` (0 none, 1 plus infinity, 2 minus infinity), the carry's eight bytes, then
+    /// each partial's bits. A NaN special has none: the caller keeps it as SQLite's NULL.
     pub(crate) fn write_to(&self, out: &mut crate::alloc::Vec<u8>) -> Result<(), MorselError> {
         out.clear();
-        out.try_reserve_exact(self.partials.len().saturating_mul(8).saturating_add(1))?;
+        out.try_reserve_exact(
+            self.partials
+                .len()
+                .saturating_add(1)
+                .saturating_mul(8)
+                .saturating_add(1),
+        )?;
         out.push(match self.special {
             Some(special) if special > 0.0 => 1,
             Some(_) => 2,
             None => 0,
         });
+        out.extend_from_slice(&self.carry.to_le_bytes());
         for partial in &self.partials {
             out.extend_from_slice(&partial.to_bits().to_le_bytes());
         }
@@ -641,6 +680,10 @@ impl ExactSum {
             2 => Some(f64::NEG_INFINITY),
             _ => return Err(MorselError::Corrupt("an exact sum's tag")),
         };
+        let (carry, rest) = rest
+            .split_first_chunk::<8>()
+            .ok_or(MorselError::Corrupt("an exact sum's carry"))?;
+        let carry = i64::from_le_bytes(*carry);
         let mut partials = Vec::new();
         partials.try_reserve_exact(rest.len() / 8)?;
         for chunk in rest.chunks(8) {
@@ -649,7 +692,11 @@ impl ExactSum {
                 .map_err(|_| MorselError::Corrupt("an exact sum's partial"))?;
             partials.push(f64::from_bits(u64::from_le_bytes(bits)));
         }
-        Ok(ExactSum { partials, special })
+        Ok(ExactSum {
+            partials,
+            carry,
+            special,
+        })
     }
 
     /// Whether the sum met both infinities: SQLite's sum is then NULL.
@@ -657,38 +704,70 @@ impl ExactSum {
         self.special.is_some_and(f64::is_nan)
     }
 
-    /// The exact sum rounded once to the nearest double, ties to even (`math.fsum`'s last step).
+    /// The exact sum of the finite inputs rounded once to the nearest double, ties to even; with
+    /// non-finite inputs, their sum. The finite inputs' exact sum is a real number however far
+    /// past the double's range, so it never turns an infinite input into NaN (lane R5).
     pub fn value(&self) -> f64 {
         if let Some(special) = self.special {
             return special;
         }
-        let mut rest = self.partials.iter().rev();
-        let Some(mut high) = rest.next().copied() else {
-            return 0.0;
-        };
-        let mut low = 0.0;
-        let mut below = None;
-        while let Some(y) = rest.next().copied() {
-            let x = high;
-            high = x + y;
-            let rounded = high - x;
-            low = y - rounded;
-            if low != 0.0 {
-                below = rest.next().copied();
-                break;
+        let partials = self.partials.iter().rev().copied();
+        match i8::try_from(self.carry) {
+            Ok(0) => round_once(partials),
+            // The carry's units are the largest partial (the others are below one), and the sum
+            // is below 2^1023, so no step of the rounding overflows.
+            Ok(units @ -2..=2) => {
+                round_once(std::iter::once(f64::from(units) * CARRY_UNIT).chain(partials))
             }
-        }
-        if let Some(next) = below {
-            if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
-                let y = low * 2.0;
-                let x = high + y;
-                if y == x - high {
-                    high = x;
-                }
+            // The sum is at least one unit: rounded at 2^-1021 its size, where no step overflows,
+            // then scaled back, which is exact or past the range an infinity. A partial below 1
+            // there counts only by its sign (it settles a tie), so one that would vanish keeps it.
+            Ok(units @ -9..=9) => {
+                let scaled = partials.map(|partial| {
+                    let scaled = partial * CARRY_UNIT_INVERSE;
+                    if scaled == 0.0 && partial != 0.0 {
+                        f64::from_bits(1).copysign(partial)
+                    } else {
+                        scaled
+                    }
+                });
+                round_once(std::iter::once(f64::from(units)).chain(scaled)) * CARRY_UNIT
             }
+            // At least (10 - 2) units, 2^1024: past the range.
+            _ if self.carry < 0 => f64::NEG_INFINITY,
+            _ => f64::INFINITY,
         }
-        high
     }
+}
+
+/// Non-overlapping partials, largest first, rounded once to the nearest double, ties to even
+/// (`math.fsum`'s last step).
+fn round_once(mut rest: impl Iterator<Item = f64>) -> f64 {
+    let Some(mut high) = rest.next() else {
+        return 0.0;
+    };
+    let mut low = 0.0;
+    let mut below = None;
+    while let Some(y) = rest.next() {
+        let x = high;
+        high = x + y;
+        let rounded = high - x;
+        low = y - rounded;
+        if low != 0.0 {
+            below = rest.next();
+            break;
+        }
+    }
+    if let Some(next) = below {
+        if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
+            let y = low * 2.0;
+            let x = high + y;
+            if y == x - high {
+                high = x;
+            }
+        }
+    }
+    high
 }
 
 /// A value as a grouping or join key: SQLite's numeric equality (an integral REAL equals its
@@ -1990,6 +2069,68 @@ mod tests {
         special.add(f64::INFINITY).unwrap();
         special.add(1.0).unwrap();
         assert_eq!(special.value(), f64::INFINITY);
+    }
+
+    /// Lane R4: a sum stays exact past the double's range. Do: R1's bigpairs (+1e308 +1e308
+    /// -1e308 -1e308 an order, a short order's +1e308s unmatched), a running sum that overflows
+    /// and comes back, and sums at the range's edge (a tie, and a tie a tiny term breaks), each
+    /// cut in two at every place, merged both ways, and through the payload's bytes. Expect the
+    /// exact sum rounded once: +inf for bigpairs (SQLite's too), never NULL.
+    #[test]
+    fn r4_exact_sum_stays_exact_past_the_range() {
+        let max = f64::MAX;
+        let half_ulp = 2f64.powi(970);
+        let tiny = f64::from_bits(1);
+        let cases: [(&str, &[f64], f64); 7] = [
+            (
+                "bigpairs",
+                &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308],
+                f64::INFINITY,
+            ),
+            (
+                "overflow and back",
+                &[1e308, 1e308, -1e308, -1e308, 1.5],
+                1.5,
+            ),
+            (
+                "down and back",
+                &[-max, -max, -max, max, max, max, -0.25],
+                -0.25,
+            ),
+            ("max again", &[max, max, -max], max),
+            ("the tie past max", &[max, half_ulp], f64::INFINITY),
+            ("a tiny term breaks the tie", &[max, half_ulp, -tiny], max),
+            (
+                "an infinity beside an overflow the other way",
+                &[f64::INFINITY, -1e308, -1e308],
+                f64::INFINITY,
+            ),
+        ];
+        for (name, terms, expected) in cases {
+            for cut in 0..=terms.len() {
+                let (left, right) = terms.split_at(cut);
+                let mut a = ExactSum::default();
+                left.iter().for_each(|t| a.add(*t).unwrap());
+                let mut b = ExactSum::default();
+                right.iter().rev().for_each(|t| b.add(*t).unwrap());
+                let mut ab = a.clone();
+                ab.merge(&b).unwrap();
+                let mut ba = b.clone();
+                ba.merge(&a).unwrap();
+                let mut bytes = crate::alloc::Vec::new();
+                ab.write_to(&mut bytes).unwrap();
+                let read = ExactSum::read_from(&bytes).unwrap();
+                for (way, sum) in [("a+b", &ab), ("b+a", &ba), ("bytes", &read)] {
+                    assert!(!sum.is_nan(), "{name}, cut at {cut}, {way}");
+                    assert_eq!(
+                        sum.value().to_bits(),
+                        expected.to_bits(),
+                        "{name}, cut at {cut}, {way}: {}",
+                        sum.value()
+                    );
+                }
+            }
+        }
     }
 
     /// T-QT.6.4: a statement whose workers together pass its memory budget is refused with the typed

@@ -58,7 +58,7 @@ held_peak() {
   done
 }
 # A run cut short takes its sampler with it.
-trap 'kill "${sampler:-}" 2>/dev/null || true' EXIT
+trap 'kill "${sampler:-}" 2>/dev/null || true; rm -f -- "${report:-}"' EXIT
 for t in ${targets//,/ }; do
   e=$(engine "$t")
   if [[ -n "$e" ]]; then
@@ -70,7 +70,10 @@ for t in ${targets//,/ }; do
     sampler=$!
   fi
   load=$(cut -d' ' -f1 /proc/loadavg)
-  out=$("$bin" --target "$t" --dir "$data/$t" "$@" | tail -1)
+  # The report goes through a file: with each read's answers in it (src/suite.rs) it passes Linux's
+  # 128 KiB limit on one argument (MAX_ARG_STRLEN), and python3 couldn't be started with it.
+  report=$(mktemp -p "$data")
+  "$bin" --target "$t" --dir "$data/$t" "$@" | tail -1 >"$report"
   load_after=$(cut -d' ' -f1 /proc/loadavg)
   # Where this target's engine ran (Ada's fair comparisons, 2026-11-21: one client and one platform
   # for every system compared, said in each record): in the driver's process or as a local server
@@ -99,9 +102,10 @@ for t in ${targets//,/ }; do
       SERVER_MEM_PEAK="$peak" SERVER_MEM_STATS="$stats" SERVER_MEM_HELD="$(cat "$held")" SERVER_SETTINGS="$(bash "servers/$e.sh" settings 2>/dev/null || true)")
     rm -f -- "${held:?}"
   fi
-  env "${server[@]}" python3 - "$out" <<PY
+  env "${server[@]}" python3 - "$report" <<PY
 import json, os, re, sys
-report = json.loads(sys.argv[1])
+with open(sys.argv[1]) as f:
+    report = json.load(f)
 record = {
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "host": "$host", "cpu": "$cpu", "cores": $cores,
     "disk": "$disk", "fs": "$fs", "kernel": "$kernel", "commit": "$commit", "dirty_files": $dirty,
@@ -133,6 +137,7 @@ if env.get("SERVER_CONTAINER"):
     })
 print(json.dumps(record))
 PY
+  rm -f -- "${report:?}"
   # A server left running loads the machine under every target after it (an idle CedarDB,
   # ClickHouse or MySQL took half a core to two-thirds of one each): stopped once its record is
   # made, unless AMPHORA_BENCH_KEEP=1.

@@ -1089,3 +1089,51 @@ traced the same way if they fail.
     # r1591: built f5239515 and 5174b409 in turn (one target dir), each run 6 times alternated:
     v10-diag-<sha> --exact database::replicated::tests::writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held --nocapture
     # logs ~/.cache/amphora-perf/commits-v10-logs/diag-a-213229; the patch: ~/.cache/amphora-perf/commits-v10-scripts/diag_a.py (on adacachy)
+
+# Lane V11 (commits) on adacachy2: part 2, a read's barrier asks for no write slot (2026-11-23, 22:03Z to 22:58Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, never refusing writes under load. This
+lane's deliverable: V9's part 2, merged to main. A replicated `Database::query` refuses writing statements, and a
+read's barrier never asks for a write slot.
+
+## Losses first
+
+1. **No red run of the new test.** Its doc says lane V8's rule held member 2's reads behind member 3's slot; that
+   is read from the code (V9's trace), not run. Branch `diag/commits-v11-red` (168dc72d, the leader asking a slot
+   for every barrier again) is pushed for that run and was not run.
+2. **The suite ran on ad4c0922, not the final head.** The head adds the review's bootstrap fix (f05b2c05) and
+   main's merges (engine, store flush W3). Clippy and the focused tests ran on each merged tree (below).
+3. **Mixed versions, not handled (the design's, noted):** an old leader takes a new follower's marked read
+   barrier as a write's and holds a slot for it, and the new follower's read sends no second barrier, so that
+   slot ends by its length. The leader's own reads still wait while any slot is held (`slot_deferred`).
+
+## The change (ad4c0922, f05b2c05)
+
+V9's design, as written. `Operation::Query` runs a replicated query past its barrier with `Db::query_only`.
+`Operation::writes` classifies each operation; work that writes nothing marks its barrier's context with
+`READ_BARRIER`, one byte past the 32-byte identity. The leader's `MsgReadIndex` arm steps a marked barrier at once
+(`Slots::pass`); an unmarked one asks as V8 made it. The second barrier after a write that forwarded nothing is
+marked; a read sends none. Review (one subagent, source only) found one bug: at the source-leader, a read submitted
+while a bootstrap is pending proposed the seed with its marked context; f05b2c05 truncates it to the identity.
+
+## Runs
+
+| run | tree | what | result |
+|---|---|---|---|
+| r1619 | main 98bd0fa9 vs eb365f3d | `suites.sh 6` | 98bd0fa9: 2 failures in 6 rounds (`seed_and_delta_hold_through_an_election_at_each_step` r1, `session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower` r6); eb365f3d: 0 |
+| r1658 | ad4c0922 | focused tests | 21 of 21 |
+| r1660 | ad4c0922 vs eb365f3d | `suites.sh 6` | ad4c0922: 0 failures in 6 rounds (171 passed); eb365f3d: 0 (167 passed); 35 to 57 s a round, load 21 to 77 |
+| r1661 | 3d9c41b9 (merged main) | clippy, focused tests | clean; 21 of 21 |
+| r1670 | df199602 (merged main) | clippy, focused tests | clean; 21 of 21 |
+
+Focused tests: `database::slot::`, the two new tests, and every test named `slot`.
+
+## Commands
+
+    # kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote at the SHA, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    ~/.cache/commits-v10/suites.sh 6 <sha> eb365f3d       # r1619, r1660
+    cargo clippy -p amphora --all-targets --locked -- -D warnings
+    cargo test -p amphora --lib --locked --no-run
+    v9-tests-<sha> --test-threads=8 database::slot:: a_follower_read_completes_while_another_member_holds_the_write_slot \
+      a_replicated_query_that_writes_is_refused_and_writes_nothing slot
