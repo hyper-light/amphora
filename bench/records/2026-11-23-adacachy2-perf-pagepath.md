@@ -1555,7 +1555,7 @@ on adacachy2 in `~/.cache/amphora-perf/pagepath-b25/`.
 | 2, a base under way as the log breaks | rounds as the shipping thread runs them (`a_base_begun_before_the_log_broke_is_begun_again`), and `end_base` itself (`a_base_begun_before_a_break_is_refused_its_end`) | the last commit's second refused ("no base precedes second 1072"), no base begun; `end_base` Ok, no base needed | begun again in the same round; `end_base` refuses it |
 | 2, an archive holding one | a base's manifest begun before a break and ended in the generation after it, opened again (`a_shipper_opened_on_a_base_begun_before_a_break_begins_another`) | "no base precedes second 1073" | a base begins; the second restores |
 | 3, a process that ended between a switch and the next round | 45 rows shipped whole, the writer switches, 5 rows, the files as they stand opened (`d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment`) | 11 of 11 seconds after the opening refused, none wrong | 11 of 11 restore, no base ended |
-| 3, its other case | the switch forced with 25 rows unshipped (`d45_a_shipper_opened_after_a_forced_switch_is_past_a_break`) | as green: a gap | refused to the next base's end, then whole; none wrong |
+| 3, its other case | the switch forced with 25 rows unshipped (`d45_a_shipper_opened_after_a_forced_switch_is_past_a_break`) | not run on main's code, where every opening after a switch was a gap | refused to the next base's end, then whole; none wrong |
 | 4, a generation force-ended under a send | B24's scenario with no base after (`d45_a_generation_ended_by_force_is_whole_once_its_send_ships_it`) | 86 seconds refused (1091 to 1176) | 0 refused, every second with its rows |
 | 5, a checkpoint pass over a new database where a `-wal2` is left (289 frames of a removed database) | (`d45_a_new_databases_checkpoint_copies_no_log_segment_left_at_its_path`, engine `d45_open_discards_a_second_segment_beside_a_database_with_no_pages`) | the new database holds the removed one's tables (`removed`, `t`); the engine opens on the second segment | it is empty; the segment's file is gone |
 
@@ -1584,9 +1584,11 @@ main 2b713d77), e69221de (the fixes, tests and docs); then 77f1e18f at 09:12:48Z
 | r1397 | 46e2480f (writes the old archives), 3e028a02 (main's code, every scenario test), 84cfb3d6 | `cpus=5,mem=16g`, 32 to 36, 09:00Z to 09:04Z | as the table above says: 47 and 47 seconds short with no error on main's code, none with the fix; on main's code 8 of the 12 of tests/backup.rs's run fail (the other 4: note 5's three and a test of lane B22's), 3 of 3 of `backup::`'s and 1 of 1 of the engine's |
 | r1409 | 84cfb3d6, whose tree (e07ca62f) is e69221de's, landed | `cpus=8,mem=20g`, 34 to 79, 09:04Z to 09:09Z | all ten steps exit 0: fmt; `backup::` 45 passed; tests/backup.rs 40 passed, 0 failed, 1 ignored (the benchmark) in 54 s, the drill among them; tests/store.rs 17; the power cut 1 (its 200 seeds); engine `d45_` 24; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 63 s ("Checking amphora-engine"); check-production 64 s ("Compiling amphora-engine" twice, "10617 left ... as the ratchet holds") |
 | r1442 | 77f1e18f, main itself | `cpus=8,mem=20g`, 44 to 71, 09:09Z to 09:19Z | tests/backup.rs 41 passed, 0 failed, 1 ignored in 30 s; clippy `-p amphora --all-targets --locked -D warnings` 0; the mutants below |
+| r1535 | 9b0a2ad7, main itself with lane A27 landed on top | `cpus=2,mem=8g`, 51 to 55, 09:21Z to 09:23Z | `backup::` 45 passed; tests/backup.rs 41 passed, 0 failed, 1 ignored in 53 s (clippy, check-production and tests/store.rs not run again) |
 
-`cargo fmt --all --check` 0 on each tree pushed. Refused for room: `cpus=8` at 08:36Z and 09:00Z, `cpus=6` at 09:19Z (3, 5 and 3 of 32 cores idle). The engine's
-`storage:: vdbe::` suites were not run: the engine changes are the open's second segment and one reader of the log's state, whose suites are `d45_`.
+`cargo fmt --all --check` 0 on each tree pushed. Refused for room: `cpus=8` at 08:36Z and 09:00Z, `cpus=6` at 09:19Z (3, 5 and 3 of 32 cores idle). Of the engine's
+other suites only `storage::wal::` and `storage::log_segments::` were run (r1521, 77f1e18f, `cpus=3,mem=12g`, load 52 to 57, 09:20Z to
+09:21Z: 129 passed, 0 failed, 1 ignored): the engine changes are the open's second segment and one reader of the log's state.
 
 **Each part of the fix is red when taken out** (r1442, on 77f1e18f, `mutants.py`; `--lib backup::` and the new tests of tests/backup.rs).
 
