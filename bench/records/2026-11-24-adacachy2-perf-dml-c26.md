@@ -14,7 +14,8 @@ Goal G2 step 3; AC-T1.1.1, AC-T1.8.6; CLAUDE.md 1, 4, 11. Nothing was timed.
 - **`PRAGMA defer_foreign_keys`** and the order several child tables' actions run in (`resolved_fks_referencing` goes through a hash map; SQLite's newest first) were not looked at.
 - **A multi-row UPDATE of a table with several UNIQUE keys and no trigger, foreign key or REPLACE** goes in the order of the index Amphora picks, SQLite in its own (C17's 343). One drawn database in 250 met it without foreign keys.
 - Cost, not measured: a DELETE of several rows of a table with a foreign key, or that one references, now keeps its rowids first (SQLite does); a parent's removal scans every child that references it, not the first, and under CASCADE too.
-- The engine's library tests were not run. Nor macOS, the corpus, the gate.
+- Run only after the landing, on main 6683e18d: the library's `translate::`, `trigger`, `upsert`, `without_rowid`, `conflict`, `statement_lifecycle`, `foreign`, `fk`, `vdbe::execute` and `native_extension` tests, 451 passed, 22 ignored (r2261). Not run: the rest of the library,
+  macOS, the corpus, the gate.
 
 ## 2. Reproduced (SQLite 3.54.0's rows, errors with words, trigger log; default and parallel the same at each)
 
