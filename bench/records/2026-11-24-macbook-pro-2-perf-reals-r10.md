@@ -15,7 +15,8 @@ Verdict, losses first.
   before R9, r197), on 9fbfdbaf (main with R9, r183) and on the lane (r148, r183, r135), always the
   same line. Its "both at fleet scale" scenario under `A_rent` drops no copy (`dropped: 0`, asked
   320, granted 320, build_rows 6528), and the test expects at least one under `Press::Waves`. Its
-  tables have no REAL column and its statements no parameter. Not this lane's; left for its owner.
+  tables have no REAL column and its statements no parameter. It passes at 2ae4401e (r213), the
+  lane merged with main 2571f841, whose lane D4 landing changed `columns_ab.rs` and `columns_sql.rs`.
 - check-production failed once (r148): `bool::then_some` is a disallowed method, and the engine's
   ratchet counted 41 against 40. Fixed in caabee3d.
 
@@ -83,6 +84,10 @@ declared table (three runs), an undeclared one (three runs) and the pager's stor
   crates/engine with T19's Postgres dialect): clippy exit 0, the three focused tests passed (r10:
   handed 540, read by the copy 484; S8 filter_no_index `path=Rows` once, `path=Copy` once),
   check-production exit 0 with the ratchet holding.
+- r213 (adacachy2, `cpus=4,mem=12g`, 2ae4401e = the lane merged with main 2571f841): clippy exit 0,
+  the focused tests passed (the same counts), check-production exit 0, and cb4 passed.
+- Landed: main 39ecf1df..6f541481. Main had moved only in `crates/amphora`, which amphora-engine
+  doesn't depend on (`cargo tree -p amphora-engine -i amphora`: no path), so no re-run.
 
 ## 5. What the next lane inherits
 
