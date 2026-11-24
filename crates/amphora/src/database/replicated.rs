@@ -18078,20 +18078,18 @@ mod tests {
     }
 
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
-    /// measures", the bound stated; store.md, decision 45): a restart that falls due while a local
-    /// read is out waits for no read: it is made under one with no end; what that read keeps, the
-    /// segment it began on, it keeps until its deadline and no longer, and the restart after that
-    /// one is made once it has let go. Do: a voter and its learner on one filesystem, the learner
-    /// told it has room for 16 frames past its own file; a local read on the learner, on a thread of
-    /// its own, that reads member_items and then runs a query with no end in one transaction, under
-    /// a deadline on a clock the test moves (as `Database::query_local` puts one on every read),
-    /// standing at the read's start until the test passes it, so no wall-clock window decides it;
-    /// once it reads, 2 to 40 written at the voter, each applied and flushed by the learner, and
-    /// rounds until a restart is counted; then the read's deadline passed, and written on until
-    /// another is. Expect: a restart while the read runs, the read still out after it; the read
-    /// refused at its deadline; a restart after it.
+    /// measures", the bound stated; store.md, decision 45; Ada, 2026-11-24): a restart that falls
+    /// due while a local read is out waits for no read, and neither does the one after it that
+    /// needs the segment the read keeps: the read ends, at its next step, whatever it is doing.
+    /// Until lane V21 that one waited for the read's deadline. Do: a voter and its learner on one
+    /// filesystem, the learner told it has room for 16 frames past its own file; a local read on the
+    /// learner, on a thread of its own, that reads member_items and then runs a query with no end in
+    /// one transaction, under a deadline on a clock that stands at its start, so only the owner ends
+    /// it; once it reads, values written at the voter, each applied and flushed by the learner, until
+    /// the read is over. Expect: a restart while it ran; the read refused, typed, not at its deadline
+    /// but by the log's owner; a restart after it.
     #[test]
-    fn a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most() {
+    fn a_restart_due_waits_for_no_read_and_the_next_ends_the_one_that_holds_its_segment() {
         own_account();
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -18141,31 +18139,24 @@ mod tests {
                 })
             };
             reading.recv_timeout(HANG_READ).unwrap();
-            for value in 2..=40 {
-                write(&mut driven, &mut pump, voter, value);
+            let mut last = 1;
+            while !read.is_finished() {
+                last += 1;
+                assert!(last < u8::MAX, "the read was not ended");
+                write(&mut driven, &mut pump, voter, last);
                 settle_log(&mut driven, &mut pump, &clients);
             }
-            for _ in 0..ROUNDS {
-                if handle.counters().database_log_restarts > restarts {
-                    break;
-                }
-                driven.round(&mut pump);
-            }
             let under = handle.counters().database_log_restarts;
-            let out = handle.counters().local_readers_in_use;
-            passed.store(true, Ordering::Release);
             let answer = read.join().unwrap();
-            assert_eq!(out, 1, "the read ended before its deadline was passed");
             assert!(
                 under > restarts,
                 "the log's restart waited for a read: {:?}",
                 handle.counters()
             );
             assert!(
-                answer.is_err(),
-                "the read ran past its deadline: {answer:?}"
+                matches!(&answer, Err(Refusal::Serialization { why, .. }) if why.contains("snapshot too old")),
+                "{answer:?}"
             );
-            let mut last = 40;
             while handle.counters().database_log_restarts == under {
                 last += 1;
                 assert!(last < u8::MAX, "no restart: {:?}", handle.counters());
@@ -18432,11 +18423,16 @@ mod tests {
             .replica
             .machine()
             .set_free_bytes(free_for(0, 2));
+        // A pass says the room as it now stands; no flush is let through after it.
+        write(&mut driven, &mut pump, voter, 2);
+        settle_log(&mut driven, &mut pump, &clients);
+        driven.flushed(&mut pump, 0);
+        log_idle(&mut driven, &mut pump, 0);
         let gate = driven.owner(0).replica.machine().flush_gate();
         gate.hold();
         let before = handle.counters().database_log_restarts;
         let mut refused = None;
-        let mut value = 1;
+        let mut value = 2;
         while refused.is_none() && value < u8::MAX - 1 {
             value += 1;
             let answer = driven.call(&mut pump, voter, move |db| {

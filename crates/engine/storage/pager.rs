@@ -4353,6 +4353,14 @@ impl Pager {
             .is_some_and(|hold| hold.is_ended())
     }
 
+    /// Amphora: whether the log's owner ended this connection's last read, until its next begins.
+    pub fn was_read_ended(&self) -> bool {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.read_hold())
+            .is_some_and(|hold| hold.was_ended())
+    }
+
     /// `read_page_no_cache` for a cache miss: on the plain path a page the log doesn't hold is
     /// read in line, with no completion (decision 42).
     fn read_page_uncached(

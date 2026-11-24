@@ -4199,20 +4199,25 @@ pub struct SharedLog {
 pub(crate) struct ReadHold {
     held: Mutex<Option<(ReadGuardKind, ReadSpan)>>,
     /// The read under way was ended here: set with its hold taken, before its marks and counts are
-    /// given back, and cleared as the next begins.
+    /// given back, and cleared as it ends.
     ended: AtomicBool,
+    /// The last read was ended so, until the next begins.
+    was_ended: AtomicBool,
 }
 
 impl ReadHold {
     fn begin(&self, guard: ReadGuardKind, span: ReadSpan) {
         let mut held = self.held.lock();
         self.ended.store(false, Ordering::Release);
+        self.was_ended.store(false, Ordering::Release);
         *held = Some((guard, span));
     }
 
-    /// What the read holds, if nothing ended it first.
-    fn take(&self) -> Option<(ReadGuardKind, ReadSpan)> {
-        self.held.lock().take()
+    /// The read's own end, its hold given back already or not.
+    fn end(&self) -> Option<(ReadGuardKind, ReadSpan)> {
+        let mut held = self.held.lock();
+        self.ended.store(false, Ordering::Release);
+        held.take()
     }
 
     /// Whether the read under way was ended: what it reads of the log or the file from here on may
@@ -4221,6 +4226,11 @@ impl ReadHold {
     pub(crate) fn is_ended(&self) -> bool {
         fence(Ordering::SeqCst);
         self.ended.load(Ordering::Acquire)
+    }
+
+    /// Whether the last read was ended so: asked once it ended, until the next begins.
+    pub(crate) fn was_ended(&self) -> bool {
+        self.was_ended.load(Ordering::Acquire)
     }
 }
 
@@ -4327,6 +4337,7 @@ impl SharedLog {
                 continue;
             };
             // Before anything is given back: whoever sees the segment free sees this.
+            hold.was_ended.store(true, Ordering::Release);
             hold.ended.store(true, Ordering::SeqCst);
             if let Some((segment, slot)) = guard.read_mark() {
                 if let Some(mark) = self.segment(segment).read().runtime.read_locks.get(slot) {
@@ -5938,7 +5949,7 @@ impl Wal for WalFile {
         if slot != NO_LOCK_HELD {
             // A read guard is installed only with its span (`try_begin_read_tx`).
             // A read the log's owner ended gave back its mark and its count then.
-            if let Some((guard, span)) = self.hold.take() {
+            if let Some((guard, span)) = self.hold.end() {
                 self.coordination.end_read_tx(guard, span);
             }
             self.closing_max_frame.store(0, Ordering::Release);

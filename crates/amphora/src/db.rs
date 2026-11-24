@@ -823,7 +823,7 @@ impl Db {
 
     /// Whether the log's owner ended this connection's last read ([`Db::end_closing_reads`]).
     pub(crate) fn read_ended(&self) -> bool {
-        self.conn.get_pager().read_ended()
+        self.conn.get_pager().was_read_ended()
     }
 
     /// Ends the reads under way that count on the log's closing segment, and says how many: what
