@@ -18924,7 +18924,15 @@ mod tests {
             let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
             let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
             let holder = 2;
-            pump.losing = Some(Box::new(|from, message: &Message| {
+            let closes = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&closes);
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from == 3
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
+                    && message.entries.first().is_some_and(|entry| reads(&entry.data))
+                {
+                    counted.fetch_add(1, Ordering::AcqRel);
+                }
                 from == 1
                     && message.to == 3
                     && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndexResp
@@ -18945,6 +18953,20 @@ mod tests {
                 driven.round(&mut pump);
                 rounds += 1;
             }
+            let phase = |driven: &Driven| {
+                driven.owner(holder).pending.as_ref().map(|pending| match &pending.phase {
+                    Phase::Barrier(Some(_)) => "a write's barrier",
+                    Phase::Barrier(None) => "an owner session's barrier",
+                    Phase::Proposed(_) => "proposed",
+                    _ => "another phase",
+                })
+            };
+            assert_eq!(
+                phase(&driven),
+                Some("a write's barrier"),
+                "{durability:?}: member 3's slot, waiting {}",
+                driven.owner(holder).waiting.len()
+            );
             let own = submit(&clients[leader], driven.until(), |db| {
                 db.exec("INSERT INTO events VALUES (1)")?;
                 Ok(Vec::new())
@@ -18968,8 +18990,13 @@ mod tests {
                 Some(Err(Refusal::Timeout)),
                 "{durability:?}: member 3's write"
             );
-            pump.losing = None;
             driven.quiet(&mut pump);
+            pump.losing = None;
+            assert_eq!(
+                (closes.load(Ordering::Acquire), driven.owner(leader).slots.holder()),
+                (1, None),
+                "{durability:?}: member 3's closes sent, and the slot's holder after them"
+            );
             assert_eq!(
                 driven.settle(&mut pump, &own),
                 Ok(Vec::new()),
