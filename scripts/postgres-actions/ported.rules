@@ -1,0 +1,222 @@
+141 nil
+148 |_| Ok(Value::Int(0))
+215 set_stmt
+221 generic_set
+227 top
+238 top
+240 list1
+242 string_const
+250 |_| Ok(word("on"))
+251 top
+263 top
+275 show_stmt
+291 alter_table
+312 list1
+342 add_constraint
+390 |r| Ok(r.take(2))
+393 list1
+395 |r| def_elem(r, 3)
+425 copy_stmt
+427 |_| Ok(Value::Bool(true))
+428 |_| Ok(Value::Bool(false))
+430 |_| Ok(Value::Bool(false))
+432 null
+433 null
+434 top
+435 |r| Ok(r.take(2))
+437 nil
+455 null
+457 null
+460 list1
+462 |r| def_elem(r, 2)
+464 make_string
+473 create_stmt
+486 |_| Ok(Value::Char('p'))
+487 top
+491 list1
+492 append
+495 top
+500 column_def
+506 null
+510 null
+511 qual_append
+512 nil
+514 top
+517 not_null
+555 top
+560 primary_key
+569 |_| Ok(Value::Bool(false))
+571 |_| Ok(Value::Bool(false))
+573 nil
+574 list1
+580 make_string
+582 nil
+606 nil
+607 top
+608 null
+609 partition_spec
+610 list1
+612 part_elem
+616 null
+617 top
+619 nil
+623 |_| Ok(Value::Int(0))
+625 null
+627 null
+681 integer
+742 nil
+845 |_| Ok(Value::Int(0))
+892 top
+938 drop_if_exists
+950 |_| Ok(Value::Int(42))
+979 any_name_list
+980 any_name_append
+981 any_name
+987 truncate_stmt
+990 |_| Ok(Value::Bool(false))
+1139 nil
+1140 |_| Ok(Value::Int(1))
+1145 |_| Ok(Value::Int(0))
+1233 nil
+1491 end
+1590 vacuum_stmt
+1596 |_| Ok(Value::Bool(true))
+1599 |_| Ok(Value::Bool(false))
+1601 |_| Ok(Value::Bool(false))
+1603 |_| Ok(Value::Bool(false))
+1605 nil
+1606 vacuum_relation
+1607 list1
+1609 top
+1642 insert_stmt
+1643 top
+1647 insert_rest
+1652 list1
+1653 append
+1654 column_target
+1658 null
+1663 null
+1690 update_stmt
+1691 top
+1693 set_clause
+1695 column_target
+1733 |r| Ok(r.take(2))
+1735 top
+1738 select_options
+1743 top
+1745 simple_select
+1747 top
+1768 null
+1770 null
+1784 |_| Ok(Value::Int(0))
+1791 top
+1792 nil
+1793 top
+1794 list1
+1797 sort_by
+1800 top
+1804 limit
+1812 top
+1824 group_by
+1825 no_group
+1826 list1
+1827 append
+1828 top
+1838 null
+1842 nil
+1854 values_clause
+1856 top
+1857 nil
+1858 list1
+1860 aliased_relation
+1862 function_table
+1867 lateral_subselect
+1868 top
+1873 cross_join
+1874 typed_join
+1875 inner_join
+1878 alias_columns
+1879 alias
+1882 top
+1883 null
+1886 func_alias
+1892 |_| Ok(Value::Int(1))
+1898 top
+1899 relation_expr
+1904 list1
+1905 append
+1906 top
+1912 func_table
+1920 |_| Ok(Value::Bool(false))
+1921 top
+1922 null
+1923 top
+1964 typename
+1972 nil
+1974 top
+1976 top
+1977 top
+1990 |r| system_type_at(r, "int4")
+1993 |r| system_type_at(r, "int8")
+2009 top
+2013 character_with_length
+2016 character
+2022 |_| Ok(Value::Bool(false))
+2024 timestamp
+2030 |_| Ok(Value::Bool(false))
+2048 top
+2054 negate
+2055 |r| a_expr_op(r, "+")
+2056 |r| a_expr_op(r, "-")
+2058 |r| a_expr_op(r, "/")
+2063 |r| a_expr_op(r, "=")
+2069 and_expr
+2087 is_not_null
+2140 top
+2141 top
+2142 param
+2143 parenthesized
+2145 top
+2155 func_call
+2160 func_star
+2161 func_expr
+2163 top
+2164 top
+2171 current_timestamp
+2256 nil
+2258 null
+2261 |_| Ok(Value::Int(0))
+2263 nil
+2269 null
+2324 list1
+2325 append
+2326 list1
+2327 append
+2328 top
+2372 columnref
+2373 qualified_columnref
+2374 field
+2380 list1
+2382 nil
+2454 top
+2456 list1
+2457 append
+2460 target_el
+2464 qualified_name
+2465 dotted_relation
+2466 func_name
+2468 top
+2469 top
+2471 func_name
+2472 qualified_func_name
+2473 int_const
+2474 float_const
+2475 string_const
+2483 true_const
+2486 top
+2487 top
+2488 top
+2504 top
+2507 top
+2514 top
+2517 top
