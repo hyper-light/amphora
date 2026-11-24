@@ -947,6 +947,18 @@ impl ProgramBuilder {
         self.ctes_being_defined.extend(masked);
     }
 
+    /// Plans a use of a CTE without the names of the CTEs being defined around the use: its body reads
+    /// the names around its own definition.
+    pub fn outside_ctes_being_defined<T>(
+        &mut self,
+        plan: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let around_the_use = std::mem::take(&mut self.ctes_being_defined);
+        let planned = plan(self);
+        self.ctes_being_defined = around_the_use;
+        planned
+    }
+
     /// Expand a view with circular-reference tracking and without the caller's
     /// CTE context. Restore both stacks even when expansion returns an error.
     pub fn with_view_expansion<T>(

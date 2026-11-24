@@ -1818,6 +1818,27 @@ pub struct TablePlanEstimate {
     pub star_filter: Option<StarFilterPrice>,
 }
 
+/// A WITH clause and the names that the queries around it let its CTEs' bodies read.
+#[derive(Debug)]
+pub struct CteWith {
+    pub(super) definitions: Arc<Vec<CteDefinition>>,
+    pub(super) outer_query_refs: Vec<OuterQueryReference>,
+}
+
+/// A CTE and where it is defined. A use of it is planned from there, whatever the names around the
+/// use: its body reads what its own place in the statement sees, and each use has tables and cursors
+/// of its own.
+#[derive(Debug, Clone)]
+pub struct CteScope {
+    pub(super) with: Arc<CteWith>,
+    /// The CTE's place in its WITH clause.
+    pub(super) index: usize,
+    /// The CTE is read by another of its WITH clause, whose own uses of it share the entry's plan:
+    /// they are counted together, and materialized once where there are several. A CTE that is
+    /// defined inside that other one is counted apart, and has a plan of its own.
+    pub(super) uses_share_plan: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1837,12 +1858,9 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
-    /// Original CTE SELECT AST for re-planning. When a CTE is referenced
-    /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
-    /// Explicit column names from WITH t(a, b) AS (...) syntax.
-    pub cte_explicit_columns: Vec<String>,
+    /// The CTE this entry names, where a WITH clause made the entry: what each use of it is planned
+    /// from.
+    pub cte_scope: Option<CteScope>,
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
     /// for materialization decisions.
     pub cte_id: Option<usize>,
@@ -1872,9 +1890,7 @@ impl OuterQueryReference {
 
     /// Whether a WITH clause made this entry, rather than a FROM clause's use of the CTE.
     pub fn defines_cte_name(&self) -> bool {
-        self.cte_definition_only
-            || self.cte_select.is_some()
-            || matches!(self.table, Table::RecursiveCteInput(_))
+        self.cte_scope.is_some() || matches!(self.table, Table::RecursiveCteInput(_))
     }
 
     pub fn is_cte_name_in_scope(&self) -> bool {
@@ -2203,68 +2219,30 @@ impl TableReferences {
             .or_else(|| named().next())
     }
 
-    /// What the body of the CTE of `definition`, one of these entries, may read by name: its own WITH
-    /// clause's CTEs and the queries around that clause, and nothing of the queries between the clause
-    /// and this use, whose WITH clauses may define the same names.
-    pub fn cte_body_refs(&self, definition: &OuterQueryReference) -> Vec<OuterQueryReference> {
-        let entries = || self.outer_query_refs.iter().enumerate();
-        let Some((at, _)) = entries().find(|(_, entry)| std::ptr::eq(*entry, definition)) else {
-            return self.outer_query_refs.clone();
-        };
-        // A FROM clause's subquery has its own CTEs at the depth of those around it, added after them:
-        // of two entries of one name, the body's is the one added nearer to its own.
-        let distance = |index: usize| (index.abs_diff(at), index);
-        entries()
-            .filter(|(index, entry)| {
-                entry.scope_depth > definition.scope_depth
-                    || entry.scope_depth == definition.scope_depth
-                        && !(entry.defines_cte_name()
-                            && entries().any(|(other_index, other)| {
-                                other.defines_cte_name()
-                                    && other.scope_depth == entry.scope_depth
-                                    && other.identifier == entry.identifier
-                                    && distance(other_index) < distance(*index)
-                            }))
-            })
-            .map(|(_, entry)| entry.clone())
-            .collect()
-    }
-
     /// The entry the WITH clause made for the CTE `cte_ref` names, which each further use of the CTE
-    /// is planned from: its syntax, or a plan of its own where the syntax is kept back. A FROM
-    /// clause's use of a CTE holds the plan that use reads, and no other use may read it.
+    /// is planned from. A FROM clause's use of a CTE holds the plan that use reads, and no other use
+    /// may read it.
     pub fn cte_definition<'a>(
         &'a self,
         cte_ref: &'a OuterQueryReference,
     ) -> &'a OuterQueryReference {
-        if cte_ref.cte_select.is_some() || cte_ref.cte_id.is_none() {
+        if cte_ref.cte_scope.is_some() || cte_ref.cte_id.is_none() {
             return cte_ref;
         }
-        let entries = || {
-            self.outer_query_refs
-                .iter()
-                .filter(|other| other.cte_id == cte_ref.cte_id)
-        };
-        entries()
-            .find(|entry| entry.cte_select.is_some())
-            .or_else(|| entries().find(|entry| entry.cte_definition_only))
+        self.outer_query_refs
+            .iter()
+            .find(|entry| entry.cte_id == cte_ref.cte_id && entry.cte_scope.is_some())
             .unwrap_or(cte_ref)
     }
 
-    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
-    /// "CTE definition only". This prevents it from being used for column
-    /// resolution while still allowing CTE definition lookup in subquery FROM
-    /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead. A table of an outer FROM
-    /// clause that has the CTE's name, which holds no syntax, keeps its columns in reach.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
-        if let Some(outer_ref) = self
-            .outer_query_refs
-            .iter_mut()
-            .find(|t| t.identifier == identifier && t.cte_select.is_some())
-        {
-            outer_ref.cte_definition_only = true;
-        }
+    /// Takes the references to the queries around this one, which a view's body reads none of.
+    pub fn take_outer_query_refs(&mut self) -> Vec<OuterQueryReference> {
+        std::mem::take(&mut self.outer_query_refs)
+    }
+
+    /// Gives back what [Self::take_outer_query_refs] took.
+    pub fn set_outer_query_refs(&mut self, outer_query_refs: Vec<OuterQueryReference>) {
+        self.outer_query_refs = outer_query_refs;
     }
 
     /// Returns `(internal_id, &Table)` for the table with the given identifier.
