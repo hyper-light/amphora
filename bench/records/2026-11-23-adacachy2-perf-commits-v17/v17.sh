@@ -4,9 +4,10 @@
 # 2. MAIN (main without the fix): its lib tests built; the test V16's fix failed once in three suite rounds run
 #    alone on MAIN and MERGE in pairs, the order alternated, for WINDOW seconds, so both run it as many times.
 # 3. MERGE's release bench, then V16's ladder (32 and 128 spread writers, both classes, LADDER rounds).
-# Runs from the repository it sits in. usage: v17.sh MERGE MAIN WINDOW LADDER OUT THREADS
+# PARTS names the parts to run (default 123). Runs from the repository it sits in.
+# usage: v17.sh MERGE MAIN WINDOW LADDER OUT THREADS [PARTS]
 set -uo pipefail
-MERGE=${1:?}; MAIN=${2:?}; WINDOW=${3:?}; LADDER=${4:?}; OUT=${5:?}; T=${6:-8}
+MERGE=${1:?}; MAIN=${2:?}; WINDOW=${3:?}; LADDER=${4:?}; OUT=${5:?}; T=${6:-8}; PARTS=${7:-123}
 load() { echo "$(cut -d' ' -f1-3 /proc/loadavg) psi cpu $(head -1 /proc/pressure/cpu | cut -d' ' -f2) io $(head -1 /proc/pressure/io | cut -d' ' -f2)"; }
 B=$HOME/.cache/amphora-perf-bin/commits; mkdir -p "$B" "$OUT"
 build() {
@@ -17,6 +18,7 @@ build() {
   [ -x "$bin" ] || { echo "$out" | grep -E "^(error|warning)" -A 14 | head -90; exit 4; }
   cp "$bin" "$B/v17-tests-$1"
 }
+if [[ $PARTS == *1* ]]; then
 build "$MERGE"
 echo "== focused $MERGE $(date -u +%T) load=$(load)"
 "$B/v17-tests-$MERGE" --test-threads="$T" v15_a_write_its_deadline database::slot:: v14_a_slow a_slot_holder_whose_write_fails 2>&1 \
@@ -29,7 +31,9 @@ echo "== check-production $MERGE $(date -u +%T)"
 nice -n 10 bash scripts/check-production.sh 2>&1 | tail -4
 prod=${PIPESTATUS[0]}
 echo "== LANDING $MERGE focused=$focused clippy=$clippy check-production=$prod $(date -u +%T) load=$(load)"
+fi
 
+if [[ $PARTS == *2* ]]; then
 build "$MAIN"
 N=database::replicated::tests::a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it
 declare -A pass=(["$MAIN"]=0 ["$MERGE"]=0) fail=(["$MAIN"]=0 ["$MERGE"]=0)
@@ -48,7 +52,9 @@ while [ "$(date +%s)" -lt "$end" ]; do
   done
 done
 echo "== ALONE pairs=$r $MAIN pass=${pass[$MAIN]} fail=${fail[$MAIN]} $MERGE pass=${pass[$MERGE]} fail=${fail[$MERGE]} $(date -u +%T) load=$(load)"
+fi
 
+[[ $PARTS == *3* ]] || exit 0
 git checkout -q --detach "$MERGE" || exit 3
 s=$(date +%s); out=$(cd bench && nice -n 10 cargo build --release 2>&1); rc=$?
 echo "== release bench $MERGE rc=$rc in $(( $(date +%s) - s ))s load=$(load)"
