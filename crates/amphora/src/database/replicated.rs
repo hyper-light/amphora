@@ -5982,10 +5982,10 @@ mod tests {
     }
 
     /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write's charge is given back when a term
-    /// change ends it. Do: in a group of three voters, queue a write at the leader and let it take
-    /// it, lose what its barrier sent, then move the other two members' clocks until they elect
-    /// one of them. Expect: the write charged while under way; refused once the term moved, its
-    /// charge given back.
+    /// change ends it. Do: in a group of three voters, queue a write at the leader until it is
+    /// proposed, lose what the proposal's round hadn't sent, then move the other two members'
+    /// clocks until they elect one of them. Expect: the write charged while under way; refused
+    /// once the term moved, its charge given back.
     #[test]
     fn a21_a_replicated_writes_charge_is_given_back_on_a_term_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -6000,12 +6000,26 @@ mod tests {
         let evaluated = Arc::new(AtomicUsize::new(0));
         let budget = budget_of(64 << 20);
         let handle = clients[leader].handle();
+        let last = |driven: &Driven| {
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
         let asked = on_budget(&budget, || {
             waiting_call(&handle, 1 << 20, driven.until(), &evaluated)
         })
         .unwrap();
-        driven.step();
+        reach(&mut driven, &mut pump, "the write proposed", |driven| {
+            last(driven) > before
+        });
         handle.drain(usize::MAX).unwrap();
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(budget.held(crate::memory::Use::Queues), written(1 << 20));
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
