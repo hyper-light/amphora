@@ -1,0 +1,13 @@
+db	cx1
+sql	CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, b TEXT, n INTEGER)
+sql	CREATE TABLE lg(a, b, c, d, e, f, g)
+sql	CREATE TABLE m(b TEXT, nc TEXT COLLATE NOCASE)
+sql	INSERT INTO m VALUES ('admin', 'x'), ('other', 'Y')
+sql	CREATE INDEX mb ON m(b)
+sql	CREATE TRIGGER t1 AFTER INSERT ON u WHEN new.name = 'admin' BEGIN INSERT INTO lg VALUES ('when', new.name, new.name = 'admin', new.name IN ('admin'), new.r = 'x', new.id = '1', new.n = '1'); END
+sql	CREATE TRIGGER t2 AFTER INSERT ON u BEGIN INSERT INTO lg VALUES ('body', new.name, new.name = 'admin', new.name IN ('admin'), new.r = 'x', new.id = '1', new.n = '1'); END
+sql	CREATE TRIGGER t3 AFTER INSERT ON u WHEN EXISTS (SELECT 1 FROM m WHERE new.name = m.b) BEGIN INSERT INTO lg VALUES ('exists', (SELECT m.b FROM m WHERE new.name = m.b), (SELECT m.b FROM m WHERE m.b = new.name), new.name IN (SELECT m.b FROM m), CASE new.name WHEN 'admin' THEN 1 ELSE 0 END, new.name BETWEEN 'admin' AND 'admin', (new.name, 1) = ('admin', 1)); END
+sql	CREATE TRIGGER t4 AFTER INSERT ON u WHEN new.name IN (SELECT b FROM m) BEGIN INSERT INTO lg VALUES ('insel', max(new.name, 'b'), (SELECT count(*) FROM m WHERE m.b > new.name), (SELECT count(*) FROM m WHERE new.name < m.b), new.name IS 'admin', +new.name = 'admin', CAST(new.name AS TEXT) = 'admin'); END
+sql	CREATE TRIGGER t5 AFTER INSERT ON u WHEN (new.name, new.r) = ('admin', 'x') BEGIN INSERT INTO lg VALUES ('row', new.b = 'ADMIN', new.b = 'admin', new.b = (SELECT nc FROM m LIMIT 1), nullif(new.name, 'admin'), new.name || '' = 'admin', new.name COLLATE BINARY = 'admin'); END
+sql	INSERT INTO u VALUES (1, 'ADMIN', 'x  ', 'ADMIN', 1)
+q	SELECT * FROM lg ORDER BY rowid	5:'row',1,0,0,NULL,0,0;'insel','b',2,1,1,1,1;'exists','admin',NULL,1,1,1,1;'body','ADMIN',1,1,1,1,0;'when','ADMIN',1,1,1,1,0

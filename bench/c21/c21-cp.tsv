@@ -1,29 +1,29 @@
 db	cp1
 sql	CREATE TABLE p(s TEXT, i INTEGER, r REAL, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE)
 sql	INSERT INTO p VALUES ('1', 1, 1.0, '1', '1', '1', '1'), ('2', 2, 2.5, 2, 2, 2, 'A'), ('a', 0, 0.0, 'a', x'61', 'a', 'a')
-q	SELECT p.s, j.key FROM p, json_each('[5,6,7]') AS j WHERE p.s = j.key
-q	SELECT p.s, j.key FROM p, json_each('[5,6,7]') AS j WHERE j.key = p.s
-q	SELECT p.s FROM p WHERE p.s NOT IN (SELECT key FROM json_each('[5,6,7]'))
-q	SELECT p.s FROM p WHERE p.s IN (SELECT key FROM json_each('[5,6,7]'))
-q	SELECT p.i, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.i = j.value
-q	SELECT p.s, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.s = j.value
-q	SELECT p.b, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.b = j.value
-q	SELECT p.u, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.u = j.value
-q	SELECT p.n, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.n = j.value
-q	SELECT p.r, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.r = j.value
-q	SELECT p.nc, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.nc = j.value
-q	SELECT p.nc, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE j.value = p.nc
-q	SELECT p.s, g.value FROM p, generate_series(1,3) AS g WHERE p.s = g.value
-q	SELECT p.s, g.value FROM p, generate_series(1,3) AS g WHERE g.value = p.s
-q	SELECT g.value FROM generate_series(1,3) AS g WHERE g.value = '2'
-q	SELECT j.key FROM json_each('[5,6,7]') AS j WHERE j.key = '1'
-q	SELECT j.key FROM json_each('[5,6,7]') AS j WHERE j.key IN ('1', 2)
-q	SELECT p.s, (SELECT count(*) FROM json_each('[1,"1",2]') WHERE value = p.s) FROM p
-q	SELECT p.s, t.name FROM p, pragma_table_info('p') AS t WHERE t.cid = p.s
-q	SELECT p.s, t.name FROM p, pragma_table_info('p') AS t WHERE t.cid = p.i
-q	SELECT v FROM (SELECT value AS v FROM json_each('[1,"1",2]')) WHERE v = '1'
-q	SELECT p.s, v FROM p, (SELECT value AS v FROM json_each('[1,"1",2]')) WHERE v = p.s
-q	SELECT p.s, v FROM p JOIN (SELECT value AS v FROM json_each('[1,"1",2]') ORDER BY 1 LIMIT 10) ON v = p.s
-q	SELECT p.s FROM p WHERE EXISTS (SELECT 1 FROM json_each('[1,"1",2]') AS j WHERE j.value = p.s)
-q	SELECT p.s, j.value FROM p LEFT JOIN json_each('[1,"a",2]') AS j ON j.value = p.s
-q	SELECT p.s, j.value FROM json_each('[1,"a",2]') AS j LEFT JOIN p ON j.value = p.s
+q	SELECT p.s, j.key FROM p, json_each('[5,6,7]') AS j WHERE p.s = j.key	0:
+q	SELECT p.s, j.key FROM p, json_each('[5,6,7]') AS j WHERE j.key = p.s	0:
+q	SELECT p.s FROM p WHERE p.s NOT IN (SELECT key FROM json_each('[5,6,7]'))	3:'1';'2';'a'
+q	SELECT p.s FROM p WHERE p.s IN (SELECT key FROM json_each('[5,6,7]'))	0:
+q	SELECT p.i, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.i = j.value	3:1,'1';1,1;2,'2'
+q	SELECT p.s, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.s = j.value	3:'1','1';'2','2';'a','a'
+q	SELECT p.b, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.b = j.value	1:'1','1'
+q	SELECT p.u, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.u = j.value	2:'1','1';'a','a'
+q	SELECT p.n, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.n = j.value	4:'a','a';1,'1';1,1;2,'2'
+q	SELECT p.r, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.r = j.value	3:1.0,'1';1.0,1;2.5,2.5
+q	SELECT p.nc, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE p.nc = j.value	3:'1','1';'A','a';'a','a'
+q	SELECT p.nc, j.value FROM p, json_each('[1,"1","2",2.5,"a"]') AS j WHERE j.value = p.nc	2:'1','1';'a','a'
+q	SELECT p.s, g.value FROM p, generate_series(1,3) AS g WHERE p.s = g.value	ERROR no such table: generate_series
+q	SELECT p.s, g.value FROM p, generate_series(1,3) AS g WHERE g.value = p.s	ERROR no such table: generate_series
+q	SELECT g.value FROM generate_series(1,3) AS g WHERE g.value = '2'	ERROR no such table: generate_series
+q	SELECT j.key FROM json_each('[5,6,7]') AS j WHERE j.key = '1'	0:
+q	SELECT j.key FROM json_each('[5,6,7]') AS j WHERE j.key IN ('1', 2)	1:2
+q	SELECT p.s, (SELECT count(*) FROM json_each('[1,"1",2]') WHERE value = p.s) FROM p	3:'1',1;'2',0;'a',0
+q	SELECT p.s, t.name FROM p, pragma_table_info('p') AS t WHERE t.cid = p.s	0:
+q	SELECT p.s, t.name FROM p, pragma_table_info('p') AS t WHERE t.cid = p.i	3:'1','i';'2','r';'a','s'
+q	SELECT v FROM (SELECT value AS v FROM json_each('[1,"1",2]')) WHERE v = '1'	1:'1'
+q	SELECT p.s, v FROM p, (SELECT value AS v FROM json_each('[1,"1",2]')) WHERE v = p.s	1:'1','1'
+q	SELECT p.s, v FROM p JOIN (SELECT value AS v FROM json_each('[1,"1",2]') ORDER BY 1 LIMIT 10) ON v = p.s	1:'1','1'
+q	SELECT p.s FROM p WHERE EXISTS (SELECT 1 FROM json_each('[1,"1",2]') AS j WHERE j.value = p.s)	1:'1'
+q	SELECT p.s, j.value FROM p LEFT JOIN json_each('[1,"a",2]') AS j ON j.value = p.s	3:'1',NULL;'2',NULL;'a','a'
+q	SELECT p.s, j.value FROM json_each('[1,"a",2]') AS j LEFT JOIN p ON j.value = p.s	3:'a','a';NULL,1;NULL,2

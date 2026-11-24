@@ -1742,8 +1742,6 @@ pub fn merge_columns<'a>(
 pub struct UnmatchedRightRowsPlan {
     /// The operation that reads the right source.
     pub operation: Operation,
-    /// Correlated subqueries in a table function's arguments, coded again for this one-table read.
-    pub subqueries: Vec<NonFromClauseSubquery>,
     /// WHERE conditions to check for each unmatched right row before the shared body checks them all.
     /// Outer-join terms and terms that read a correlated subquery are not included.
     pub conditions: Vec<Expr>,
