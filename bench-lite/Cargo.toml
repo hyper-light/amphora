@@ -1,0 +1,16 @@
+[package]
+name = "oracle-lite"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[workspace]
+[dependencies]
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "bench"] }
+libloading = "0.8.9"
+anyhow = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "bench", "io_uring"] }
+[profile.release]
+debug = "line-tables-only"
+overflow-checks = true
