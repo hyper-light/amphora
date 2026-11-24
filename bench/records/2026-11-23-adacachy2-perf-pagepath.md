@@ -1522,3 +1522,96 @@ free beside its restore (1,080,033,280 before): on a disk between the two, check
 **Commands.** `~/.cache/amphora-perf/pagepath-b24/` on this machine holds the focused script (`run.sh`) and this record's draft; on
 adacachy2 the same folder holds `check.sh`, `arms2.sh` and one folder of logs a run (`red`, `arms1`, `merged-eb0c360d`, `final-8c4f29fa`,
 `landing-ecaee231`, `arms2`, `arms3`).
+
+## perf-B25 (2026-11-24, 08:31:32Z-09:31:32Z; lane B24's five backup notes, each driven by a scenario)
+
+**Losses first.**
+- Note 5 is real in one of the five ways tried: a pass of the checkpointer over a new database, before its first write. Opened and
+  closed (three times), grown over the segment's pages (400 rows, its log copied on the way), and backed up (every second restored), a new
+  database was its own on main too. The fix covers all; only that one way was shown wrong.
+- A base an archive holds from before lane B22's fix (its file short of the closing segment's frames: 20 of 41 rows gone with no
+  error, B22) still restores short: no frame and no manifest says what a base's file held, so a restore can't tell it. Read in the code, not run.
+- A restore refused for another reason part of the way (the store's error, a deadline) still leaves its files, which open as a
+  database as of the generation it reached. Only a short one's are removed (a check keeps the others "to look into"). Read in the code.
+- A failed check of a short archive begins no base: what mends it is the gap that follows a short generation in an archive of a
+  shipper before B24, which makes a base due. Read in the code.
+- Left gapped, refused typed: the commits made between a send's drain and a forced switch, and an opening on a closed segment the
+  archive holds short (tested). Both could be shipped from the closing segment; neither is one of the five notes.
+- A restore's refusal now removes the files a short check would have kept in its scratch: what is left to look into is the refusal.
+- No benchmark was run (rule 0). An opening reads 32 bytes more of the log, a restore compares two numbers a generation.
+- The branch holds a WIP message (cefdfbb1); main's history does not: the landing commit is the same tree (e07ca62f), checked as 84cfb3d6.
+- perf/pagepath-b25-red3 holds the lane's red arms and scripts (b25/), never for main.
+
+**What each note was.** Red is main's code with the tests (be013de6's sources, 3e028a02, over main 1a468eeb); green is the landed tree. Logs
+on adacachy2 in `~/.cache/amphora-perf/pagepath-b25/`.
+
+| note | the scenario (test) | red: what the user lost | green |
+|---|---|---|---|
+| 1, an archive of a shipper before B24 (46e2480f, whose scenario's folder was kept: `old-archives/r1`, `r2`) | every second restored from the first base's on (`old_read.py`) | r1: **47 seconds short with no error** (second 1044: 43 rows of 44; second 1090: 43 of 90), 41 whole, 79 refused (no base); r2: the same 47 short | r1 and r2: 41 whole, 0 short, 47 refused, typed: "frames 30 to 30 of generation 3 of the log, which the archive says it holds, don't replay: its frames end at 29" |
+| 1, the same made from today's archive | 60 rows in a generation of several parts, each part after the first made the next generation's frames, sealed (`a_restore_of_an_archive_short_of_its_frames_is_refused`) | second 1022 restored with no error, 21 of its 22 rows | every second to the last whole frame restores, each after it refused `Short` |
+| 1, frames lost | its last two frames zeroed (`a_restore_of_a_truncated_generation_is_refused`) | second 1069: 68 of 69 rows, no error | refused `Short` |
+| 1, a part shorter than its key | (`a_restore_of_a_part_shorter_than_its_key_is_refused`) | refused, untyped: "holds fewer frames than it says" | refused `Short` |
+| 1, what a refused restore leaves | a last frame zeroed, then the base's second restored at the same path (`a_short_restore_leaves_no_database`) | no error; what stands at the path answers 19 of 20 rows | refused, no file left; the second restore holds its rows |
+| 2, a base under way as the log breaks | rounds as the shipping thread runs them (`a_base_begun_before_the_log_broke_is_begun_again`), and `end_base` itself (`a_base_begun_before_a_break_is_refused_its_end`) | the last commit's second refused ("no base precedes second 1072"), no base begun; `end_base` Ok, no base needed | begun again in the same round; `end_base` refuses it |
+| 2, an archive holding one | a base's manifest begun before a break and ended in the generation after it, opened again (`a_shipper_opened_on_a_base_begun_before_a_break_begins_another`) | "no base precedes second 1073" | a base begins; the second restores |
+| 3, a process that ended between a switch and the next round | 45 rows shipped whole, the writer switches, 5 rows, the files as they stand opened (`d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment`) | 11 of 11 seconds after the opening refused, none wrong | 11 of 11 restore, no base ended |
+| 3, its other case | the switch forced with 25 rows unshipped (`d45_a_shipper_opened_after_a_forced_switch_is_past_a_break`) | not run on main's code, where every opening after a switch was a gap | refused to the next base's end, then whole; none wrong |
+| 4, a generation force-ended under a send | B24's scenario with no base after (`d45_a_generation_ended_by_force_is_whole_once_its_send_ships_it`) | 86 seconds refused (1091 to 1176) | 0 refused, every second with its rows |
+| 5, a checkpoint pass over a new database where a `-wal2` is left (289 frames of a removed database) | (`d45_a_new_databases_checkpoint_copies_no_log_segment_left_at_its_path`, engine `d45_open_discards_a_second_segment_beside_a_database_with_no_pages`) | the new database holds the removed one's tables (`removed`, `t`); the engine opens on the second segment | it is empty; the segment's file is gone |
+
+**The causes, and the fixes** (e69221de; its commit message says each in full).
+- *Note 1* (`restore.rs`): the replay compared nothing. The frames carry their proof (salts, running sums), and the engine's recovery keeps
+  those that hold, so the frames it recovered (`Db::log_end`) are compared with those the keys gave, before they are folded.
+- *Note 2* (`ship.rs`): `broken`, a flag `end_base` cleared whatever the base, is the two generations it stood for.
+- *Note 3* (`ship.rs`, `backup.rs`, engine `Database::wal_before`): the opening looks in both segments and tells the fence.
+- *Note 4* (`backup.rs`): `ended_whole` asks what was shipped since a forced restart. T-T1.12.P11's assertions are unchanged.
+- *Note 5* (engine `Database::open_second_segment`): the orphan rule, for `-wal2`.
+- Old archives: nothing new is written, so one is not migrated: whole, it restores as it did; short, it is refused and says which frames.
+  An older shipper's base begun before a break is in an archive still, and no restore takes it.
+
+**What landed.** Main e69221de at 09:09:24Z, a fast-forward from 2b713d77: 822901a2 and ba31e62d (the first red tests), fa05a15a (the merge of
+main 2b713d77), e69221de (the fixes, tests and docs); then 77f1e18f at 09:12:48Z (one test file). Main did not move under either push.
+
+**Checks** (adacachy2, `on` it, needs as named; the clone is `~/.cache/amphora-perf/pagepath-remote`, target
+`~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10; the scripts are `b25/` on perf/pagepath-b25-red3).
+
+| run | tree | needs, load | result |
+|---|---|---|---|
+| r1338 | 822901a2 (main 1a468eeb plus the first tests) | `cpus=4,mem=12g`, 24 to 47, 08:41Z | 5 of 8 of tests/backup.rs's fail and 2 of 4 of `backup::`'s, as the table above says (note 1's, 3's, 4's; 2's); note 5's first scenario passes |
+| r1347 | ba31e62d, then cefdfbb1 (the fixes) | `cpus=4,mem=12g`, 43 to 55, 08:44Z to 08:46Z | ba31e62d: the same 5 and 2 fail; cefdfbb1: 8 and 4 passed |
+| r1352, r1362 | e218c7ad and ccfd9441, then c1e73c06 and ec22cc0d | `cpus=4` and `cpus=6`, 25 to 45, 08:47Z to 08:52Z | note 5's scenarios: three pass on main's code (opened and closed, grown over, backed up), one fails (the checkpoint pass); 4 of 4 with the fix |
+| r1374 | aedd4bb6 (main 2b713d77 merged) | `cpus=8,mem=24g`, 24 to 36, 08:54Z to 08:58Z | nine of ten steps exit 0; check-production 1: `clippy::disallowed_methods` 41 above 40, a `then_some` in `wal_before` (fixed in 84cfb3d6) |
+| r1397 | 46e2480f (writes the old archives), 3e028a02 (main's code, every scenario test), 84cfb3d6 | `cpus=5,mem=16g`, 32 to 36, 09:00Z to 09:04Z | as the table above says: 47 and 47 seconds short with no error on main's code, none with the fix; on main's code 8 of the 12 of tests/backup.rs's run fail (the other 4: note 5's three and a test of lane B22's), 3 of 3 of `backup::`'s and 1 of 1 of the engine's |
+| r1409 | 84cfb3d6, whose tree (e07ca62f) is e69221de's, landed | `cpus=8,mem=20g`, 34 to 79, 09:04Z to 09:09Z | all ten steps exit 0: fmt; `backup::` 45 passed; tests/backup.rs 40 passed, 0 failed, 1 ignored (the benchmark) in 54 s, the drill among them; tests/store.rs 17; the power cut 1 (its 200 seeds); engine `d45_` 24; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 63 s ("Checking amphora-engine"); check-production 64 s ("Compiling amphora-engine" twice, "10617 left ... as the ratchet holds") |
+| r1442 | 77f1e18f, main itself | `cpus=8,mem=20g`, 44 to 71, 09:09Z to 09:19Z | tests/backup.rs 41 passed, 0 failed, 1 ignored in 30 s; clippy `-p amphora --all-targets --locked -D warnings` 0; the mutants below |
+| r1535 | 9b0a2ad7, main itself with lane A27 landed on top | `cpus=2,mem=8g`, 51 to 55, 09:21Z to 09:23Z | `backup::` 45 passed; tests/backup.rs 41 passed, 0 failed, 1 ignored in 53 s (clippy, check-production and tests/store.rs not run again) |
+
+`cargo fmt --all --check` 0 on each tree pushed. Refused for room: `cpus=8` at 08:36Z and 09:00Z, `cpus=6` at 09:19Z (3, 5 and 3 of 32 cores idle). Of the engine's
+other suites only `storage::wal::` and `storage::log_segments::` were run (r1521, 77f1e18f, `cpus=3,mem=12g`, load 52 to 57, 09:20Z to
+09:21Z: 129 passed, 0 failed, 1 ignored): the engine changes are the open's second segment and one reader of the log's state.
+
+**Each part of the fix is red when taken out** (r1442, on 77f1e18f, `mutants.py`; `--lib backup::` and the new tests of tests/backup.rs).
+
+| arm | what is taken out | red |
+|---|---|---|
+| m1 | a short restore's files are removed | `a_short_restore_leaves_no_database` |
+| m2 | what was replayed compared with what was written | `a_short_restore_...`, `a_restore_of_an_archive_short_...`, `a_restore_of_a_truncated_...` |
+| m3 | `end_base`'s refusal | `a_base_begun_before_a_break_is_refused_its_end` |
+| m4 | the round's drop of a base the log broke under | `a_base_begun_before_the_log_broke_is_begun_again` |
+| m5 | an opening's count of a base from its beginning (its end instead) | `a_shipper_opened_on_a_base_begun_before_a_break_begins_another` |
+| m6 | the current generation's unshipped frames, counted from nothing at an opening on the closed one | `d45_a_shipper_opened_after_a_switch_...` |
+| m8 | what was shipped since a forced restart counted | `d45_a_generation_ended_by_force_is_whole_once_its_send_ships_it`, `..._once_shipped` |
+| m9 | the fence told where a log is opened | `d45_a_shipper_opened_after_a_switch_...` |
+| m10 | that only where its writer made no restart since | `d45_a_fence_told_where_a_log_is_opened` |
+
+Note 5's fix has its red arm above (c1e73c06, 3e028a02: the checkpoint's test and the engine's).
+
+**Found on the way, left (read in the code, no scenario run, unless said).**
+- A restore refused midway for another reason than `Short` leaves files that open as a database of an earlier generation's end.
+- A failed check begins no base; the archive restores no second after its short generation until one is due another way.
+- The closing segment's frames the archive lacks after a forced switch, or at an opening, could be shipped from it (tested: refused, never wrong).
+- A base of a shipper before lane B22's fix can't be told from a whole one (above); a base's manifest could say its file held the closing segment.
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b25/` on this machine holds the scripts and this record's draft; on adacachy2 the same folder holds
+`check.sh`, `focus.sh`, `evidence.sh`, `mutants.{py,sh}`, `old_write.py`, `old_read.py`, the two old archives, and one folder of logs a run
+(`red`, `red2`, `green1` to `green3`, `red3`, `red4`, `merged-aedd4bb6`, `landing-84cfb3d6`) and the evidence's and mutants' logs beside them.
