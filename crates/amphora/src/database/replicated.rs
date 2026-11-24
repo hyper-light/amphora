@@ -759,10 +759,48 @@ impl Local {
         self.account.free();
     }
 }
+/// A record queued for the host, with its raft kind: QB.2's shed takes only a kind the core sends
+/// again (`resent`).
+struct Queued {
+    outbound: Outbound,
+    kind: hyper_raft::proto::MessageType,
+}
+/// Whether the core sends a record of `kind` again on its own while its member still lacks what it
+/// carries, so QB.2's shed may take it as a lossy link would (hyper-raft's `raft.rs`): appends go
+/// again from the member's progress, which the shed's unreachable report sets probing, heartbeats
+/// at each beat, and a lost answer to either is made good by the next heartbeat's answer. Every
+/// other kind is sent once and kept: a hand-off's order to campaign (the core takes no proposal
+/// until its hand-off ends), a snapshot (its member's replication pauses until its fate is
+/// reported, which a shed one's never is), votes and their answers (once a campaign), reads and
+/// proposals forwarded and their answers, and the fast track's records (no resend of them is
+/// established).
+fn resent(kind: hyper_raft::proto::MessageType) -> bool {
+    use hyper_raft::proto::MessageType as M;
+    match kind {
+        M::MsgAppend | M::MsgAppendResponse | M::MsgHeartbeat | M::MsgHeartbeatResponse => true,
+        M::MsgHup
+        | M::MsgBeat
+        | M::MsgPropose
+        | M::MsgRequestVote
+        | M::MsgRequestVoteResponse
+        | M::MsgSnapshot
+        | M::MsgUnreachable
+        | M::MsgSnapStatus
+        | M::MsgCheckQuorum
+        | M::MsgTransferLeader
+        | M::MsgTimeoutNow
+        | M::MsgReadIndex
+        | M::MsgReadIndexResp
+        | M::MsgRequestPreVote
+        | M::MsgRequestPreVoteResponse
+        | M::MsgFastPropose
+        | M::MsgFastVote => false,
+    }
+}
 #[derive(Default)]
 struct Outgoing {
     bytes: usize,
-    messages: VecDeque<Outbound>,
+    messages: VecDeque<Queued>,
     /// Bytes and messages the host drained since the owner last weighed them (QB.1).
     drained: (u64, u64),
     /// The same, to each member: what its path carried (lane constants-21). At most one a member
@@ -1624,7 +1662,10 @@ impl ReplicaHandle {
         }
         let mut messages = Vec::with_capacity(limit.min(outgoing.messages.len()));
         for _ in 0..limit {
-            let Some(message) = outgoing.messages.pop_front() else {
+            let Some(Queued {
+                outbound: message, ..
+            }) = outgoing.messages.pop_front()
+            else {
                 break;
             };
             outgoing.bytes = outgoing
@@ -4732,8 +4773,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
             api::bound("replica outgoing record", bytes.len(), wire)?;
-            // QB.2's shed: the oldest records go until the new one fits the bound, each counted;
-            // raft sends again what a member still lacks, as over a lossy link.
+            // QB.2's shed: the oldest records raft sends again go until the new one fits the
+            // bound, each counted, as over a lossy link; a record it sends once is never shed.
             if matches!(egress, super::drain::Egress::Shed) {
                 loop {
                     let held = u64::try_from(outgoing.bytes.saturating_add(bytes.len()))
@@ -4744,17 +4785,21 @@ impl<F: BlockFile + 'static> Actor<F> {
                     if !super::drain::past(outgoing.bound, held, count) {
                         break;
                     }
-                    let Some(oldest) = outgoing.messages.pop_front() else {
+                    let at = outgoing
+                        .messages
+                        .iter()
+                        .position(|queued| resent(queued.kind));
+                    let Some(oldest) = at.and_then(|at| outgoing.messages.remove(at)) else {
                         break;
                     };
                     outgoing.bytes = outgoing
                         .bytes
-                        .checked_sub(oldest.bytes.len())
+                        .checked_sub(oldest.outbound.bytes.len())
                         .ok_or_else(|| fenced("outgoing accounting underflow"))?;
                     outgoing.shed = outgoing.shed.saturating_add(1);
                     outgoing.owed = true;
-                    if !unreachable.contains(&oldest.to) {
-                        unreachable.push(oldest.to);
+                    if !unreachable.contains(&oldest.outbound.to) {
+                        unreachable.push(oldest.outbound.to);
                     }
                 }
             }
@@ -4785,9 +4830,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }
             }
             outgoing.bytes = total;
-            outgoing.messages.push_back(Outbound {
-                to: message.to,
-                bytes,
+            outgoing.messages.push_back(Queued {
+                outbound: Outbound {
+                    to: message.to,
+                    bytes,
+                },
+                kind: message.msg_type,
             });
         }
         self.control.sent.notify_all();
@@ -4924,7 +4972,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         let context = self.read_context()?;
-        self.replica.read(context).map_err(raft_error)
+        self.replica.read(context).map_err(raft_error)?;
+        // The read waits in the core for a drive, and this step's one drive is behind it: the
+        // owner drives again at once, not at its next wake (CP-T1.8, lane V16).
+        self.driving = true;
+        Ok(())
     }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
         if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {
@@ -5689,9 +5741,12 @@ mod tests {
             while outgoing.messages.len() < burst {
                 let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
                 outgoing.bytes += 1;
-                outgoing.messages.push_back(Outbound {
-                    to: 2,
-                    bytes: vec![n],
+                outgoing.messages.push_back(Queued {
+                    outbound: Outbound {
+                        to: 2,
+                        bytes: vec![n],
+                    },
+                    kind: hyper_raft::proto::MessageType::MsgAppend,
                 });
             }
             // A rebound can lower the learned limit while the previous burst is queued.
@@ -5712,6 +5767,60 @@ mod tests {
         assert_eq!(outgoing.bytes, 0);
         drop(outgoing);
         drop(driven);
+    }
+
+    /// QB.2 (CP-T1.13): the shed takes only a record raft sends again. A hand-off's order to
+    /// campaign is sent once, and the core takes no proposal until its hand-off ends. Do: a leader
+    /// of three, its outgoing queue held at its least bound (a record to each peer), releases the
+    /// order to one peer and a heartbeat to each peer at once, nothing drained between. Expect: one
+    /// record shed, and the order still queued for its peer.
+    #[test]
+    fn qb2_the_shed_never_takes_a_hand_offs_order_to_campaign() {
+        use hyper_raft::proto::MessageType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 0);
+        let handle = clients.get(leader).unwrap().handle();
+        handle.drain(usize::MAX).unwrap();
+        let owner = driven.owner_mut(leader);
+        let (id, term) = (owner.replica.id(), owner.replica.term());
+        let peers: Vec<u64> = (1..=3).filter(|&n| n != id).collect();
+        let heir = *peers.first().unwrap();
+        locked(&owner.control.outgoing).unwrap().bound.messages = 2;
+        let record = |to: u64, kind: MessageType| {
+            let mut message = hyper_raft::proto::message(to, kind);
+            message.from = id;
+            message.term = term;
+            message
+        };
+        let mut output = Output::default();
+        output
+            .messages
+            .push(record(heir, MessageType::MsgTimeoutNow));
+        for &peer in &peers {
+            output
+                .messages
+                .push(record(peer, MessageType::MsgHeartbeat));
+        }
+        owner.release(output).unwrap();
+        let shed = locked(&owner.control.outgoing).unwrap().shed;
+        let queued: Vec<(u64, MessageType)> = handle
+            .drain(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|record| (record.to, Message::decode(&record.bytes).unwrap().msg_type))
+            .collect();
+        assert_eq!(shed, 1, "{queued:?}");
+        assert!(
+            queued.contains(&(heir, MessageType::MsgTimeoutNow)),
+            "the order to campaign was shed: {queued:?}"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// A call waiting for a leader, as `ReplicaHandle::submit` queues it: charged its operation's
@@ -7039,8 +7148,9 @@ mod tests {
             self.settle(pump, &answer)
         }
         /// Rounds, time standing still, until the group is quiet: no write out on any owner's
-        /// disk, every admitted record taken, and a round with nothing to relay. A held owner's
-        /// records wait in its own queue.
+        /// disk, no owner that stepped with more to drive (its thread steps again at once,
+        /// `run_loop`), every admitted record taken, and a round with nothing to relay. A held
+        /// owner's records wait in its own queue.
         fn quiet(&mut self, pump: &mut Pump<'_>) {
             for _ in 0..ROUNDS {
                 let admitted = pump.drive_until(self.until());
@@ -7050,7 +7160,7 @@ mod tests {
                         .owners
                         .iter()
                         .flatten()
-                        .all(|(owner, _)| owner.replica.in_flight() == 0)
+                        .all(|(owner, _)| owner.replica.in_flight() == 0 && !owner.driving)
                 {
                     return;
                 }
@@ -18944,6 +19054,156 @@ mod tests {
                     .unwrap();
                 assert_eq!(ids, vec![1, 2], "{durability:?}: owner {owner}");
             }
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V15): a follower whose write's deadline ends it at its barrier
+    /// closes the write slot that barrier began, so the leader's own write waits on no time. Do,
+    /// in each class: owner 0 leads and its answers to member 3's barriers are lost; member 3
+    /// writes with one tick of its pace left, its barrier begins its slot, and the leader's own
+    /// write waits on that slot; then member 3's clock passes the deadline. Expect: member 3's
+    /// write refused `Timeout`; the leader's answered Ok; one slot ended released and none
+    /// expired; and no clock moved for a slot's end (`Driven::lapses` 0). Before lane V14 such a
+    /// write sent no close, and before lane V16 its close waited in the core for the owner's next
+    /// wake: either way its slot held until the leader's clock passed its end.
+    #[test]
+    fn v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot() {
+        use crate::meter::SlotEnd;
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            let holder = 2;
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            // Member 3's floor keeper attests once it applies the table: its session holds member
+            // 3's slot as a write's would, so it ends before member 3's write is made.
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(holder).pending.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                driven.owner(holder).pending.is_none(),
+                "{durability:?}: member 3's floor session never ended"
+            );
+            assert_eq!(
+                driven.owner(leader).slots.holder(),
+                None,
+                "{durability:?}: a slot was held before member 3 wrote"
+            );
+            let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
+            let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let losing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (counted, lost) = (Arc::clone(&closes), Arc::clone(&losing));
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from == 3
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
+                    && message
+                        .entries
+                        .first()
+                        .is_some_and(|entry| reads(&entry.data))
+                {
+                    counted.fetch_add(1, Ordering::AcqRel);
+                }
+                lost.load(Ordering::Acquire)
+                    && from == 1
+                    && message.to == 3
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndexResp
+            }));
+            let tick = driven.period(holder);
+            let deadline = driven.base + offset(&driven.clock(holder)) + tick;
+            let late = submit(&clients[holder], deadline, |db| {
+                db.exec("INSERT INTO events VALUES (3)")?;
+                Ok(Vec::new())
+            });
+            let mut rounds = 0;
+            while driven.owner(leader).slots.holder() != Some(3) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 3's write held no slot, {:?} did",
+                    driven.owner(leader).slots.holder()
+                );
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            let phase = |driven: &Driven| {
+                driven.owner(holder).pending.as_ref().map(|pending| {
+                    match (&pending.author, &pending.phase) {
+                        (Author::Application(_), Phase::Barrier(Some(_))) => "a write's barrier",
+                        (Author::Owner, _) => "an owner session",
+                        _ => "another phase",
+                    }
+                })
+            };
+            assert_eq!(
+                phase(&driven),
+                Some("a write's barrier"),
+                "{durability:?}: member 3's slot, waiting {}",
+                driven.owner(holder).waiting.len()
+            );
+            let own = submit(&clients[leader], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (1)")?;
+                Ok(Vec::new())
+            });
+            driven.quiet(&mut pump);
+            assert!(
+                matches!(own.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{durability:?}: the leader's write did not wait on the slot"
+            );
+            driven.advance(holder, tick);
+            let mut refused = None;
+            for _ in 0..ROUNDS {
+                if let Ok(answer) = late.try_recv() {
+                    refused = Some(answer.map(called));
+                    break;
+                }
+                driven.round(&mut pump);
+            }
+            assert_eq!(
+                refused,
+                Some(Err(Refusal::Timeout)),
+                "{durability:?}: member 3's write"
+            );
+            losing.store(false, Ordering::Release);
+            driven.quiet(&mut pump);
+            pump.losing = None;
+            assert_eq!(
+                (
+                    closes.load(Ordering::Acquire) > 0,
+                    driven.owner(leader).slots.holder()
+                ),
+                (true, None),
+                "{durability:?}: member 3 closed, and the slot's holder after"
+            );
+            assert_eq!(
+                driven.settle(&mut pump, &own),
+                Ok(Vec::new()),
+                "{durability:?}: the leader's write"
+            );
+            assert_eq!(
+                (
+                    ended(SlotEnd::Released) - released,
+                    ended(SlotEnd::Expired) - expired,
+                    driven.lapses
+                ),
+                (1, 0, 0),
+                "{durability:?}: member 3's slot ended (released, expired) and the clock moves for a slot's end"
+            );
+            driven.quiet(&mut pump);
             driven.drain(&mut pump);
             pump.finish();
         }
