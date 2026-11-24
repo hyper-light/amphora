@@ -1938,6 +1938,7 @@ mod tests {
             sort: Rate::measured(100.0, 100.0 * sort),
             bloom_probe: Rate::measured(100.0, 100.0 * probe / 4.0),
             where_step: Rate::measured(100.0, 100.0 * row),
+            scan_row: Rate::default(),
             page: Rate {
                 epoch: 4.0,
                 ..Rate::default()
