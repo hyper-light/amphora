@@ -193,6 +193,30 @@ mod amphora_target {
         Ok(rows)
     }
 
+    /// The holding a bench engine's group keeps with its rows, as Amphora's own engine keeps it
+    /// (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks every engine
+    /// for it, and a run stops at open without it.
+    pub fn holding(db: &mut Db) -> anyhow::Result<Option<Vec<u8>>> {
+        db.exec(HOLDING_TABLE)?;
+        let mut kept = None;
+        db.query("SELECT holding FROM __suite_holding WHERE one = 0", [], |r| {
+            kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
+            Ok(false)
+        })?;
+        Ok(kept)
+    }
+
+    /// Keeps `holding` in place of the one kept before, durable before it returns.
+    pub fn keep_holding(db: &mut Db, holding: &[u8]) -> anyhow::Result<()> {
+        let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
+        db.transaction(|db| {
+            db.exec(HOLDING_TABLE)?;
+            db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
+        })?;
+        (db.flusher())()?;
+        Ok(())
+    }
+
     /// Every row of each statement, every column taken: how many rows.
     fn read_all(db: &mut Db, stmts: &[&'static str], params: &[Vec<P>]) -> anyhow::Result<usize> {
         let mut n = 0;
@@ -262,26 +286,12 @@ mod amphora_target {
             Some(self.db.flusher())
         }
 
-        // The suite's one group keeps its holding with its rows, durable, as Amphora's own engine
-        // does (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks for it.
         fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-            self.db.exec(HOLDING_TABLE)?;
-            let mut kept = None;
-            self.db.query("SELECT holding FROM __suite_holding WHERE one = 0", [], |r| {
-                kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
-                Ok(false)
-            })?;
-            Ok(kept)
+            holding(&mut self.db)
         }
 
         fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
-            let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.db.transaction(|db| {
-                db.exec(HOLDING_TABLE)?;
-                db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
-            })?;
-            (self.db.flusher())()?;
-            Ok(())
+            keep_holding(&mut self.db, holding)
         }
 
         fn opener(&self) -> Option<Opener<Db>> {
@@ -483,7 +493,7 @@ mod amphora_target {
     }
 }
 
-pub use amphora_target::value as amphora_value;
+pub use amphora_target::{holding as amphora_holding, keep_holding as amphora_keep_holding, value as amphora_value};
 
 /// How the bench's Amphora databases share the pages their connections read (docs/design/store.md,
 /// decisions 20 and 26): `AMPHORA_SHARED_PAGES` unset or 0, none, as Amphora ships; `process`, the

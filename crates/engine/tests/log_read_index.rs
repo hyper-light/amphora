@@ -1,9 +1,8 @@
 //! The log's frame index and header read without the shared locks (G3 step 2; Amphora's
 //! `docs/design/store.md`, decision 40), under crashes: a crash at every write of a checkpoint and
-//! of a log restart, then the database opened again and read through each lock-free way.
+//! of a log restart, then the database opened again and read through the lock-free lookup.
 
 use amphora_engine::io::{FileId, FileSyncType};
-use amphora_engine::storage::log_index::LogReadIndex;
 use amphora_engine::{
     Buffer, CheckpointMode, Clock, Completion, ConnectOpts, Connection, Database, DatabaseOpts,
     File, LimboError, MonotonicInstant, Numeric, OpenFlags, OpenOptions, PlatformIO, SqliteDialect,
@@ -284,7 +283,7 @@ fn versioned(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}-versioned", path.display()))
 }
 
-/// Do (T-G3.2.2): for each lock-free way, crash at every write of a TRUNCATE checkpoint (which
+/// Do (T-G3.2.2): crash at every write of a TRUNCATE checkpoint (which
 /// restarts the log), of a commit into the restarted log, of a PASSIVE checkpoint and of a commit
 /// that restarts the log from its first frame; open the files as the crash left them and read every
 /// row, by a scan and one at a time. Expect: the rows as some state from the last step that
@@ -292,48 +291,41 @@ fn versioned(path: &Path) -> std::path::PathBuf {
 #[test]
 fn g3_2_reads_after_a_crash_in_a_checkpoint_or_log_restart_find_the_last_commit() {
     let dir = tempfile::tempdir().unwrap();
-    for mode in [
-        LogReadIndex::Filtered,
-        LogReadIndex::Published,
-        LogReadIndex::Optimistic,
-    ] {
-        LogReadIndex::set_process_default(mode);
-        // The writes the steps take when nothing crashes.
-        let whole = Arc::new(Crash::default());
-        whole.budget.store(u64::MAX, Ordering::Release);
-        let (_, steps) = run(&dir.path().join(format!("{mode:?}-whole.db")), &whole);
-        assert_eq!(steps, 4);
-        let writes = whole.writes.load(Ordering::Acquire);
-        assert!(writes > 4, "{mode:?}: {writes} writes");
-        for at in 0..writes {
-            let path = dir.path().join(format!("{mode:?}-{at}.db"));
-            let crash = Arc::new(Crash::default());
-            crash.budget.store(at, Ordering::Release);
-            let (states, steps) = run(&path, &crash);
-            let db = open_with(
-                Arc::new(PlatformIO::new().unwrap()),
-                &path.with_extension("crashed"),
+    // The writes the steps take when nothing crashes.
+    let whole = Arc::new(Crash::default());
+    whole.budget.store(u64::MAX, Ordering::Release);
+    let (_, steps) = run(&dir.path().join("whole.db"), &whole);
+    assert_eq!(steps, 4);
+    let writes = whole.writes.load(Ordering::Acquire);
+    assert!(writes > 4, "{writes} writes");
+    for at in 0..writes {
+        let path = dir.path().join(format!("{at}.db"));
+        let crash = Arc::new(Crash::default());
+        crash.budget.store(at, Ordering::Release);
+        let (states, steps) = run(&path, &crash);
+        let db = open_with(
+            Arc::new(PlatformIO::new().unwrap()),
+            &path.with_extension("crashed"),
+        );
+        let conn = connect(&db);
+        let read = table(&conn);
+        assert!(
+            states[steps..].contains(&read),
+            "crashed at write {at} of {writes}, {steps} steps returned: read {} rows",
+            read.len()
+        );
+        for (&id, expected) in &read {
+            let mut stmt = conn
+                .prepare(format!("SELECT body FROM t WHERE id = {id}"))
+                .unwrap();
+            let one = stmt.run_collect_rows().unwrap();
+            assert_eq!(one.len(), 1, "at {at}: row {id}");
+            assert_eq!(
+                &one[0][0].to_blob().unwrap().to_vec(),
+                expected,
+                "at {at}: row {id}"
             );
-            let conn = connect(&db);
-            let read = table(&conn);
-            assert!(
-                states[steps..].contains(&read),
-                "{mode:?}, crashed at write {at} of {writes}, {steps} steps returned: read {} rows",
-                read.len()
-            );
-            for (&id, expected) in &read {
-                let mut stmt = conn
-                    .prepare(format!("SELECT body FROM t WHERE id = {id}"))
-                    .unwrap();
-                let one = stmt.run_collect_rows().unwrap();
-                assert_eq!(one.len(), 1, "{mode:?} at {at}: row {id}");
-                assert_eq!(
-                    &one[0][0].to_blob().unwrap().to_vec(),
-                    expected,
-                    "{mode:?} at {at}: row {id}"
-                );
-            }
-            integrity(&conn);
         }
+        integrity(&conn);
     }
 }
