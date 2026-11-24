@@ -85,3 +85,17 @@ Both fixes are on `origin/t1/main-review`. The earlier C3 read-only commit fix `
 - **Cross-group recovery** — Before taking the first lock, every participant must have negotiated the version needed to finish the transaction, currently v9 for ResolveAt and RecoverAt. Amphora is unreleased and the current contract excludes recovery of transactions started on v8 under v9. Timestamp recovery across versions is a design item before any release supporting mixed-version fleets.
 - **Calibration on a shared home directory** — The queued key includes a hash of Linux's machine ID, macOS's IOPlatformUUID, or Windows's MachineGuid alongside the CPU record and executable path, length and mtime. Failure to read the identity triggers a fresh measurement.
 - **Engine production gate** — The cleanup lane will fix violations in code, starting at the T1 merge's sites, and lower the ceilings where the diagnostic counts fell. Its landing will be checked at its exact SHA.
+
+## D2 candidate, November 24 UTC
+
+On `e966cfbe`, I found 32 of the 33 test names added on the review branch since its shared base `62687f5d`. The missing case covered a lost resolution reply. D2 had moved wake delivery to the commit callback. Its merge dropped the test because the original test invoked a lower-level call that bypassed that callback.
+
+Commit `3b8620fa` on `origin/t1/main-review` exercises the same step used by the server. It holds the writer until the caller actually returns `UnknownOutcome`. A second lock request returns `Late` before the resolution retry, proving that the first attempt committed. The retry returns `Resolved`, the read returns `[7]`, and the keyed wake count is one. Linux r104 passed in 0.56 s. On D2 the same step takes the additional argument `step_answer(&first)`. Moving wake delivery from the commit callback to the waiting caller on that candidate made the reader time out after 123.14 s on arm64. [Lost-reply regression](../../crates/amphora/src/xgroup/sql.rs)
+
+The candidate also exposed a build break on arm64. Its portable descriptor test called the Linux-only `Descriptors::waiting` helper three times. Cargo reported E0599 at `descriptors.rs` lines 397, 402 and 410. Commit `f02b5e67` on `origin/t1/main-review` checks the waiting thread's own registration and the empty list after release. The descriptor and lost-reply regressions passed together on the arm64 candidate in 4.44 s. [Descriptor regression](../../crates/amphora/src/descriptors.rs)
+
+With wake delivery restored to the callback, all six arm64 cases passed in 7.19 s. They covered descriptor registration, busy-writer cleanup, the lost reply, a waiting scan, a waiting SQL read and a follower applying the resolution. Those six tests also passed on the review head `f02b5e67` in 13.93 s, and all-target owner Clippy passed with warnings denied. Merge `0f1f3f13` on the landing branch reinstated the lost-reply test with D2's answer bound.
+
+## Paired release rerun
+
+In the November 24 window, all 150 primary invocations completed and all reached a one-minute load of at least two. The corrected historical versioned point-read arms measured 549.94× and 112.66× by the ratio of medians at one and 64 clients. Eight-client Plain primary-key reads measured 0.98×. The record includes the cold-open and admission results, the checkout tails, and each arm's load and CPU and I/O pressure. [Paired release results](2026-11-24-adacachy2-perf-review-pairs.md)
