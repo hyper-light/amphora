@@ -1,6 +1,7 @@
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::MonotonicInstant;
+use crossbeam_utils::CachePadded;
 use std::sync::Arc;
 use std::task::{Wake, Waker};
 use std::time::Duration;
@@ -29,6 +30,10 @@ pub struct LockRelease {
     generation: AtomicU64,
     /// Whether any waker is held, so a release with nobody waiting takes no lock.
     armed: AtomicBool,
+    /// Number of statements currently retrying/waiting on a busy lock and therefore interested in
+    /// shared-read lock releases (`notify_shared`). Kept on its own cache line so uncontended
+    /// shared-read unlocks stay read-only and never dirty `generation` across cores.
+    shared_interest: CachePadded<AtomicU32>,
     wakers: Mutex<Vec<Waker>>,
 }
 
@@ -37,8 +42,22 @@ impl Default for LockRelease {
         Self {
             generation: AtomicU64::new(0),
             armed: AtomicBool::new(false),
+            shared_interest: CachePadded::new(AtomicU32::new(0)),
             wakers: Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// RAII registration keeping [`LockRelease::notify_shared`] active while a busy statement retries
+/// and waits for a lock release.
+#[derive(Debug)]
+pub(crate) struct SharedInterestGuard {
+    release: Arc<LockRelease>,
+}
+
+impl Drop for SharedInterestGuard {
+    fn drop(&mut self) {
+        self.release.shared_interest.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -106,6 +125,26 @@ impl LockRelease {
 
     fn key(&self) -> usize {
         std::ptr::from_ref(self) as usize
+    }
+
+    /// Registers interest in shared-read lock releases (`notify_shared`) with `SeqCst` visibility
+    /// so any reader that unlocks after a subsequent failed exclusive lock attempt observes the
+    /// interest and calls `notify()`.
+    pub(crate) fn interest(self: &Arc<Self>) -> SharedInterestGuard {
+        self.shared_interest.fetch_add(1, Ordering::SeqCst);
+        SharedInterestGuard {
+            release: Arc::clone(self),
+        }
+    }
+
+    /// A shared-read lock was released: wakes waiters only when a contending statement has
+    /// registered interest via [`Self::interest`]. With no contending waiter, this performs a
+    /// single read of an uncontended cache line and avoids dirtying `generation` across cores.
+    #[inline]
+    pub fn notify_shared(&self) {
+        if self.shared_interest.load(Ordering::SeqCst) != 0 {
+            self.notify();
+        }
     }
 
     /// A lock was released: wakes every statement waiting.

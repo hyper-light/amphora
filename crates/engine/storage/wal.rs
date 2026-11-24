@@ -13,7 +13,9 @@ use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
-use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use crate::sync::RwLock;
 use bitflags::bitflags;
 use std::fmt::{Debug, Formatter};
@@ -23,7 +25,7 @@ use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::log_index::{Lookup, ReadIndex};
-use super::log_segments::{ReadSpan, SegmentId, Segments, SegmentsCell};
+use super::log_segments::{shard_count, thread_shard, ReadSpan, SegmentId, Segments, SegmentsCell};
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
@@ -323,6 +325,311 @@ impl WalConnectionState {
 ///   lock are visible to the next acquirer
 /// - The embedded value can be atomically read without holding any lock
 pub struct TursoRwLock(AtomicU64);
+
+/// Per-core cache-line-sharded read-write lock with an embedded 32-bit value, replacing a single
+/// global `TursoRwLock` for read-heavy locks (`read_locks[0..5]` and `vacuum_lock`).
+///
+/// Concurrent shared readers perform a single `fetch_add`/`fetch_sub` on their own core's
+/// 128-byte-padded shard, eliminating cross-core cache-line ping-pong on every read transaction.
+/// Rare exclusive acquisitions (`write` / `upgrade`, used only by checkpoints, log restarts, and
+/// VACUUM) acquire the `EXCLUSIVE` bit across all shards and roll back cleanly if any shard is
+/// busy.
+#[derive(Debug)]
+pub struct ShardedRwLock {
+    value: AtomicU32,
+    upgraded_shard: AtomicUsize,
+    shards: Box<[crossbeam_utils::CachePadded<AtomicU64>]>,
+    mask: usize,
+}
+
+impl Default for ShardedRwLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShardedRwLock {
+    const EXCLUSIVE: u64 = 0b1;
+    const READER_INC: u64 = 0b10;
+    const READER_MASK: u64 = !Self::EXCLUSIVE;
+
+    pub fn new() -> Self {
+        let count = shard_count().max(1);
+        let shards = (0..count)
+            .map(|_| crossbeam_utils::CachePadded::new(AtomicU64::new(0)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            value: AtomicU32::new(0),
+            upgraded_shard: AtomicUsize::new(0),
+            shards,
+            mask: count.wrapping_sub(1),
+        }
+    }
+
+    #[inline]
+    pub fn read_on(&self, shard_idx: usize) -> bool {
+        let Some(shard) = self.shards.get(shard_idx & self.mask) else {
+            return false;
+        };
+        let prev = shard.fetch_add(Self::READER_INC, Ordering::Acquire);
+        if (prev & Self::EXCLUSIVE) != 0 {
+            shard.fetch_sub(Self::READER_INC, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    pub fn read_sharded(&self) -> Option<usize> {
+        let idx = thread_shard() & self.mask;
+        self.read_on(idx).then(|| idx)
+    }
+
+    #[inline]
+    pub fn unlock_read_on(&self, shard_idx: usize) {
+        if let Some(shard) = self.shards.get(shard_idx & self.mask) {
+            // SeqCst pairs with `LockRelease::shared_interest` in `notify_shared()` so a
+            // contending exclusive waiter never misses a reader release.
+            shard.fetch_sub(Self::READER_INC, Ordering::SeqCst);
+        }
+    }
+
+    /// Same-thread compatibility helper (used by tests and single-thread helpers).
+    #[inline]
+    pub fn read(&self) -> bool {
+        self.read_on(thread_shard() & self.mask)
+    }
+
+    /// Try to take an exclusive lock across all shards. Succeeds iff no readers and no writer.
+    #[inline]
+    pub fn write(&self) -> bool {
+        for (i, shard) in self.shards.iter().enumerate() {
+            if shard
+                .compare_exchange(0, Self::EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                for prev in self.shards.iter().take(i) {
+                    prev.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    pub fn unlock_write(&self) {
+        for shard in self.shards.iter() {
+            shard.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn is_write_locked(&self) -> bool {
+        self.shards
+            .first()
+            .is_some_and(|s| (s.load(Ordering::Acquire) & Self::EXCLUSIVE) != 0)
+    }
+
+    /// Upgrade a held shared read lock to exclusive iff there is exactly one reader across all
+    /// shards. Records the upgraded shard so [`Self::downgrade`] restores the read lock to the
+    /// exact same shard.
+    #[inline]
+    pub fn upgrade(&self) -> bool {
+        let mut upgraded: Option<usize> = None;
+        for (i, shard) in self.shards.iter().enumerate() {
+            if shard
+                .compare_exchange(0, Self::EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                continue;
+            }
+            if upgraded.is_none()
+                && shard
+                    .compare_exchange(
+                        Self::READER_INC,
+                        Self::EXCLUSIVE,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                upgraded = Some(i);
+                continue;
+            }
+            for (j, prev) in self.shards.iter().take(i).enumerate() {
+                if upgraded == Some(j) {
+                    // Add reader before clearing EXCLUSIVE so no writer can slip in.
+                    prev.fetch_add(Self::READER_INC, Ordering::AcqRel);
+                }
+                prev.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
+            }
+            return false;
+        }
+        let Some(shard_idx) = upgraded else {
+            self.unlock_write();
+            return false;
+        };
+        self.upgraded_shard.store(shard_idx, Ordering::Release);
+        true
+    }
+
+    /// Downgrade an exclusive lock acquired via [`Self::upgrade`] (or [`Self::write`]) back to a
+    /// single shared read lock on the recorded shard.
+    #[inline]
+    pub fn downgrade(&self) {
+        let target = self.upgraded_shard.load(Ordering::Acquire) & self.mask;
+        for (i, shard) in self.shards.iter().enumerate() {
+            if i == target {
+                shard.fetch_add(Self::READER_INC, Ordering::AcqRel);
+            }
+            shard.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
+        }
+    }
+
+    /// Compatibility unlock (exclusive if write-locked, otherwise shared on the current thread's
+    /// shard). Hot read paths call [`Self::unlock_read_on`] with their stored shard directly.
+    #[inline]
+    pub fn unlock(&self) {
+        if self.is_write_locked() {
+            self.unlock_write();
+        } else {
+            self.unlock_read_on(thread_shard() & self.mask);
+        }
+    }
+
+    #[inline]
+    pub fn get_value(&self) -> u32 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn held_value(&self) -> Option<u32> {
+        for shard in self.shards.iter() {
+            let cur = shard.load(Ordering::Acquire);
+            if (cur & Self::EXCLUSIVE) == 0 && (cur & Self::READER_MASK) != 0 {
+                return Some(self.value.load(Ordering::Acquire));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn set_value_exclusive(&self, v: u32) {
+        self.value.store(v, Ordering::Release);
+    }
+}
+
+/// Build the 5 initialized read-mark locks for one WAL segment (slots 0..2 start at 0, slots 2..5
+/// start at `READMARK_NOT_USED`).
+pub(crate) fn new_read_locks() -> Arc<[ShardedRwLock; 5]> {
+    let locks = array::from_fn(|_| ShardedRwLock::new());
+    for (i, lock) in locks.iter().enumerate() {
+        lock.write();
+        lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
+        lock.unlock_write();
+    }
+    Arc::new(locks)
+}
+
+/// Lock-free seqlock-protected authoritative WAL snapshot fields shared between `WalFileShared`
+/// and `SharedLog` so readers snapshot all 5 fields without taking `RwLock<WalFileShared>::read()`.
+#[derive(Debug)]
+pub struct SnapshotCell {
+    seq: AtomicU64,
+    write_guard: SpinLock<()>,
+    pub max_frame: AtomicU64,
+    pub nbackfills: AtomicU64,
+    pub transaction_count: AtomicU64,
+    last_checksum_packed: AtomicU64,
+    checkpoint_seq: AtomicU32,
+}
+
+impl SnapshotCell {
+    pub fn new(
+        max_frame: u64,
+        nbackfills: u64,
+        transaction_count: u64,
+        last_checksum: (u32, u32),
+        checkpoint_seq: u32,
+    ) -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            write_guard: SpinLock::new(()),
+            max_frame: AtomicU64::new(max_frame),
+            nbackfills: AtomicU64::new(nbackfills),
+            transaction_count: AtomicU64::new(transaction_count),
+            last_checksum_packed: AtomicU64::new(pack_checksum(last_checksum)),
+            checkpoint_seq: AtomicU32::new(checkpoint_seq),
+        }
+    }
+
+    #[inline]
+    pub fn last_checksum(&self) -> (u32, u32) {
+        let packed = self.last_checksum_packed.load(Ordering::Acquire);
+        (
+            u32::try_from(packed >> 32).unwrap_or(0),
+            u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0),
+        )
+    }
+
+    #[inline]
+    pub fn set_last_checksum(&self, checksum: (u32, u32)) {
+        self.update(|s| {
+            s.last_checksum_packed
+                .store(pack_checksum(checksum), Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn set_checkpoint_seq(&self, checkpoint_seq: u32) {
+        self.update(|s| {
+            s.checkpoint_seq.store(checkpoint_seq, Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn update(&self, f: impl FnOnce(&Self)) {
+        let _guard = self.write_guard.lock();
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        f(self);
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    #[inline]
+    fn load_snapshot(&self) -> WalSnapshot {
+        loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            if (s1 & 1) != 0 {
+                crate::thread::spin_loop();
+                continue;
+            }
+            let max_frame = self.max_frame.load(Ordering::Relaxed);
+            let nbackfills = self.nbackfills.load(Ordering::Relaxed);
+            let packed = self.last_checksum_packed.load(Ordering::Relaxed);
+            let checkpoint_seq = self.checkpoint_seq.load(Ordering::Relaxed);
+            let transaction_count = self.transaction_count.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let s2 = self.seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                return WalSnapshot {
+                    max_frame,
+                    nbackfills,
+                    last_checksum: (
+                        u32::try_from(packed >> 32).unwrap_or(0),
+                        u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0),
+                    ),
+                    checkpoint_seq,
+                    transaction_count,
+                };
+            }
+            crate::thread::spin_loop();
+        }
+    }
+}
 
 /// Amphora (AUDIT 2.1): one of the log's locks, alone on its cache-line pair. The five read locks,
 /// the vacuum, write and checkpoint locks shared one 64-byte line, so a reader taking read lock 1
@@ -1054,6 +1361,10 @@ trait WalCoordination: Debug + Send + Sync {
     fn current_segment(&self) -> SegmentId;
 
     /// Clone the shared WAL state backing this coordination backend.
+    /// Process-local shared WAL state borrowed without cloning the `Arc`.
+    fn shared_log(&self) -> &SharedLog;
+
+    /// Process-local shared WAL state (cloned handle for ownership transfer).
     fn shared_wal_state(&self) -> Arc<SharedLog>;
 
     /// Report whether the WAL header has already been written and synced.
@@ -1433,7 +1744,7 @@ impl InProcessWalCoordination {
 
     #[cfg(test)]
     fn try_read_mark_shared(&self, slot: usize) -> bool {
-        self.log.current().read().runtime.read_locks[slot].read()
+        self.log.read_locks(self.log.current_id())[slot].read()
     }
 
     fn try_read_mark_exclusive(&self, slot: usize) -> bool {
@@ -1443,10 +1754,7 @@ impl InProcessWalCoordination {
     /// Take `slot` of `segment` exclusively: a checkpoint pass's read mark 0 is its segment's.
     fn try_segment_read_mark_exclusive(&self, segment: SegmentId, slot: usize) -> bool {
         self.log
-            .segment(segment)
-            .read()
-            .runtime
-            .read_locks
+            .read_locks(segment)
             .get(slot)
             .is_some_and(|read_lock| read_lock.write())
     }
@@ -1455,45 +1763,35 @@ impl InProcessWalCoordination {
         self.unlock_segment_read_mark(self.log.current_id(), slot);
     }
 
-    /// Unlock `slot` on `segment`: a read's guard is released on the segment it was locked on.
+    /// Unlock `slot` on `segment` (used for exclusive releases such as checkpoint/restart).
     fn unlock_segment_read_mark(&self, segment: SegmentId, slot: usize) {
-        if let Some(read_lock) = self
-            .log
-            .segment(segment)
-            .read()
-            .runtime
-            .read_locks
-            .get(slot)
-        {
+        if let Some(read_lock) = self.log.read_locks(segment).get(slot) {
             read_lock.unlock();
         }
         self.log.released.notify();
     }
 
-    #[cfg(test)]
-    fn read_mark_value(&self, slot: usize) -> u32 {
-        self.log.current().read().runtime.read_locks[slot].get_value()
+    /// Release a shared read-mark guard acquired on `shard`: zero `RwLock<WalFileShared>::read()`,
+    /// private-shard `fetch_sub`, and zero-write `notify_shared()` when uncontended.
+    fn unlock_segment_read_mark_sharded(&self, segment: SegmentId, slot: usize, shard: usize) {
+        if let Some(read_lock) = self.log.read_locks(segment).get(slot) {
+            read_lock.unlock_read_on(shard);
+        }
+        self.log.released.notify_shared();
     }
 
-    fn snapshot_of(shared: &WalFileShared) -> WalSnapshot {
-        // Amphora: the generation without the header's lock (decision 28).
-        let checkpoint_seq = shared.metadata.wal_header.checkpoint_seq();
-        WalSnapshot {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            last_checksum: shared.metadata.last_checksum,
-            checkpoint_seq,
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-        }
+    #[cfg(test)]
+    fn read_mark_value(&self, slot: usize) -> u32 {
+        self.log.read_locks(self.log.current_id())[slot].get_value()
     }
 
     /// Lowest read-mark frame across slots currently held by a reader (1..5; slot 0 is the
     /// db-file read mark), or `None` if no reader holds a slot. Read-only / lock-free.
     fn min_pinned_read_frame_inner(&self) -> Option<u64> {
-        let shared = self.log.current().read();
+        let read_locks = self.log.read_locks(self.log.current_id());
         let mut min: Option<u64> = None;
-        for slot in 1..5 {
-            if let Some(v) = shared.runtime.read_locks[slot].held_value() {
+        for lock in read_locks.iter().skip(1) {
+            if let Some(v) = lock.held_value() {
                 if v != READMARK_NOT_USED {
                     let f = v as u64;
                     min = Some(min.map_or(f, |m: u64| m.min(f)));
@@ -1504,15 +1802,22 @@ impl InProcessWalCoordination {
     }
 
     fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
-        self.log.current().read().runtime.read_locks[slot].set_value_exclusive(value);
+        if let Some(lock) = self.log.read_locks(self.log.current_id()).get(slot) {
+            lock.set_value_exclusive(value);
+        }
     }
 
     fn try_upgrade_read_mark(&self, slot: usize) -> bool {
-        self.log.current().read().runtime.read_locks[slot].upgrade()
+        self.log
+            .read_locks(self.log.current_id())
+            .get(slot)
+            .is_some_and(ShardedRwLock::upgrade)
     }
 
     fn downgrade_read_mark(&self, slot: usize) {
-        self.log.current().read().runtime.read_locks[slot].downgrade();
+        if let Some(lock) = self.log.read_locks(self.log.current_id()).get(slot) {
+            lock.downgrade();
+        }
         self.log.released.notify();
     }
 
@@ -1524,12 +1829,9 @@ impl InProcessWalCoordination {
             "max_frame exceeds u32 read mark range"
         );
         let segment = span.current();
-        // One read lock on the shared state for the whole slot selection.
-        // The read marks are atomics inside it, so taking the lock once
-        // instead of once per access changes nothing about their ordering,
-        // and it saves about eight lock round trips per read transaction.
-        let shared = self.log.segment(segment).read();
-        let read_locks = &shared.runtime.read_locks;
+        let shard = span.shard();
+        let snap_cell = self.log.snapshot(segment);
+        let read_locks = self.log.read_locks(segment);
         // A fully backfilled WAL can be ignored: read straight from the
         // database file under read-mark 0. A checkpoint holds read-mark 0
         // exclusively for as long as it runs, though, and that can be several
@@ -1543,11 +1845,11 @@ impl InProcessWalCoordination {
         // rule 2).
         if snapshot.max_frame == snapshot.nbackfills
             && span.closing().is_none()
-            && read_locks[0].read()
+            && read_locks[0].read_on(shard)
         {
-            if Self::snapshot_of(&shared) != snapshot {
-                read_locks[0].unlock();
-                self.log.released.notify();
+            if snap_cell.load_snapshot() != snapshot {
+                read_locks[0].unlock_read_on(shard);
+                self.log.released.notify_shared();
                 return None;
             }
             return Some(ReadGuardKind::DbFile(segment));
@@ -1578,25 +1880,31 @@ impl InProcessWalCoordination {
                 read_lock.set_value_exclusive(snapshot.max_frame as u32);
                 best_idx = idx as i64;
                 best_mark = snapshot.max_frame as u32;
-                read_lock.unlock();
+                read_lock.unlock_write();
                 self.log.released.notify();
                 break;
             }
         }
 
-        if best_idx == -1 || !read_locks[best_idx as usize].read() {
+        let Ok(slot_idx) = usize::try_from(best_idx) else {
+            return None;
+        };
+        let Some(chosen) = read_locks.get(slot_idx) else {
+            return None;
+        };
+        if !chosen.read_on(shard) {
             return None;
         }
 
-        let snapshot_after_lock = Self::snapshot_of(&shared);
-        let current_slot_mark = read_locks[best_idx as usize].get_value();
+        let snapshot_after_lock = snap_cell.load_snapshot();
+        let current_slot_mark = chosen.get_value();
         if current_slot_mark != best_mark || snapshot_after_lock != snapshot {
-            read_locks[best_idx as usize].unlock();
-            self.log.released.notify();
+            chosen.unlock_read_on(shard);
+            self.log.released.notify_shared();
             return None;
         }
 
-        NonZeroUsize::new(best_idx as usize).map(|slot| ReadGuardKind::ReadMark(segment, slot))
+        NonZeroUsize::new(slot_idx).map(|slot| ReadGuardKind::ReadMark(segment, slot))
     }
 
     fn try_write_lock(&self) -> bool {
@@ -1620,20 +1928,19 @@ impl InProcessWalCoordination {
 
 impl WalCoordination for InProcessWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
-        Self::snapshot_of(&self.log.current().read())
+        self.log.snapshot(self.log.current_id()).load_snapshot()
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
-        let mut shared = self.log.current().write();
-        shared
-            .metadata
-            .max_frame
-            .store(commit.max_frame, Ordering::Release);
-        shared.metadata.last_checksum = commit.last_checksum;
-        shared
-            .metadata
-            .transaction_count
-            .store(commit.transaction_count, Ordering::Release);
+        let shared = self.log.current().write();
+        shared.metadata.snap.update(|s| {
+            s.max_frame.store(commit.max_frame, Ordering::Relaxed);
+            s.last_checksum_packed
+                .store(pack_checksum(commit.last_checksum), Ordering::Relaxed);
+            s.transaction_count
+                .store(commit.transaction_count, Ordering::Relaxed);
+        });
+        drop(shared);
         self.log.released.notify();
     }
 
@@ -1646,8 +1953,8 @@ impl WalCoordination for InProcessWalCoordination {
             .current()
             .write()
             .metadata
-            .nbackfills
-            .store(max_frame, Ordering::Release);
+            .snap
+            .update(|s| s.nbackfills.store(max_frame, Ordering::Relaxed));
     }
 
     fn install_durable_backfill_proof(
@@ -1696,7 +2003,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn segment_snapshot(&self, segment: SegmentId) -> WalSnapshot {
-        Self::snapshot_of(&self.log.segment(segment).read())
+        self.log.snapshot(segment).load_snapshot()
     }
 
     fn segment_header(&self, segment: SegmentId) -> WalHeader {
@@ -1708,8 +2015,8 @@ impl WalCoordination for InProcessWalCoordination {
             .segment(segment)
             .write()
             .metadata
-            .nbackfills
-            .store(max_frame, Ordering::Release);
+            .snap
+            .update(|s| s.nbackfills.store(max_frame, Ordering::Relaxed));
     }
 
     fn closing_copied(&self) {
@@ -1738,20 +2045,12 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn checkpoint_epoch(&self) -> u32 {
-        self.log
-            .current()
-            .read()
-            .runtime
-            .epoch
-            .load(Ordering::Acquire)
+        self.log.epoch(self.log.current_id()).load(Ordering::Acquire)
     }
 
     fn bump_checkpoint_epoch(&self) -> u32 {
         self.log
-            .current()
-            .read()
-            .runtime
-            .epoch
+            .epoch(self.log.current_id())
             .fetch_add(1, Ordering::Release)
     }
 
@@ -1768,7 +2067,7 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn end_read_tx(&self, guard: ReadGuardKind, span: ReadSpan) {
         if let Some((segment, slot)) = guard.read_mark() {
-            self.unlock_segment_read_mark(segment, slot);
+            self.unlock_segment_read_mark_sharded(segment, slot, span.shard());
         }
         self.log.end_read(span);
     }
@@ -1908,14 +2207,7 @@ impl WalCoordination for InProcessWalCoordination {
         }
         let mut shared = self.log.current().write();
         shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
-        Ok(WalSnapshot {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            last_checksum: shared.metadata.last_checksum,
-            checkpoint_seq,
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-        })
+        Ok(shared.metadata.snap.load_snapshot())
     }
 
     fn end_restart(&self) {
@@ -2003,7 +2295,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
-        let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> =
+        let shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> =
             self.log.current().write();
         if shared.metadata.initialized.load(Ordering::Acquire) {
             return None;
@@ -2033,7 +2325,7 @@ impl WalCoordination for InProcessWalCoordination {
             hdr.checksum_2 = c2;
             (*hdr, (c1, c2))
         };
-        shared.metadata.last_checksum = checksum;
+        shared.metadata.set_last_checksum(checksum);
         Some(header)
     }
 
@@ -2261,6 +2553,10 @@ impl WalCoordination for InProcessWalCoordination {
         Arc::as_ptr(&self.log) as usize
     }
 
+    fn shared_log(&self) -> &SharedLog {
+        &self.log
+    }
+
     fn shared_wal_state(&self) -> Arc<SharedLog> {
         self.log.clone()
     }
@@ -2307,18 +2603,18 @@ impl ShmWalCoordination {
             "max_frame exceeds u32 read mark range"
         );
         let segment = span.current();
-        let shared = self.log.segment(segment).read();
-        let read_locks = &shared.runtime.read_locks;
+        let shard = span.shard();
+        let read_locks = self.log.read_locks(segment);
 
         // See the in-process coordination: a checkpoint holding read-mark 0
         // must not make readers wait, so fall through to the other marks; and
         // a read that counts on a closing segment never takes it.
         if snapshot.max_frame == snapshot.nbackfills
             && span.closing().is_none()
-            && read_locks[0].read()
+            && read_locks[0].read_on(shard)
         {
             if self.load_snapshot() != snapshot {
-                read_locks[0].unlock();
+                read_locks[0].unlock_read_on(shard);
                 return None;
             }
             if !self.publish_shared_reader(read_locks, snapshot, 0, span, word) {
@@ -2350,23 +2646,29 @@ impl ShmWalCoordination {
                 lock.set_value_exclusive(snapshot.max_frame as u32);
                 best_idx = idx as i64;
                 best_mark = snapshot.max_frame as u32;
-                read_locks[idx].unlock();
+                lock.unlock_write();
                 break;
             }
         }
 
-        if best_idx == -1 || !read_locks[best_idx as usize].read() {
+        let Ok(slot_idx) = usize::try_from(best_idx) else {
+            return None;
+        };
+        let Some(chosen) = read_locks.get(slot_idx) else {
+            return None;
+        };
+        if !chosen.read_on(shard) {
             return None;
         }
 
-        let current_slot_mark = read_locks[best_idx as usize].get_value();
+        let current_slot_mark = chosen.get_value();
         if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
-            read_locks[best_idx as usize].unlock();
+            chosen.unlock_read_on(shard);
             return None;
         }
 
-        let read_mark_index = NonZeroUsize::new(best_idx as usize)?;
-        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize, span, word) {
+        let read_mark_index = NonZeroUsize::new(slot_idx)?;
+        if !self.publish_shared_reader(read_locks, snapshot, slot_idx, span, word) {
             return None;
         }
         Some(ReadGuardKind::ReadMark(segment, read_mark_index))
@@ -2411,8 +2713,8 @@ impl ShmWalCoordination {
             page_size: header.page_size,
             salt_1: header.salt_1,
             salt_2: header.salt_2,
-            checksum_1: shared.metadata.last_checksum.0,
-            checksum_2: shared.metadata.last_checksum.1,
+            checksum_1: shared.metadata.last_checksum().0,
+            checksum_2: shared.metadata.last_checksum().1,
             reader_slot_count: authority_snapshot.reader_slot_count,
         }
     }
@@ -2455,19 +2757,16 @@ impl ShmWalCoordination {
         snapshot: SharedWalCoordinationHeader,
         install_header: bool,
     ) {
-        shared
-            .metadata
-            .max_frame
-            .store(snapshot.max_frame, Ordering::Release);
-        shared
-            .metadata
-            .nbackfills
-            .store(snapshot.nbackfills, Ordering::Release);
-        shared.metadata.last_checksum = (snapshot.checksum_1, snapshot.checksum_2);
-        shared
-            .metadata
-            .transaction_count
-            .store(snapshot.transaction_count, Ordering::Release);
+        shared.metadata.snap.update(|s| {
+            s.max_frame.store(snapshot.max_frame, Ordering::Relaxed);
+            s.nbackfills.store(snapshot.nbackfills, Ordering::Relaxed);
+            s.last_checksum_packed.store(
+                pack_checksum((snapshot.checksum_1, snapshot.checksum_2)),
+                Ordering::Relaxed,
+            );
+            s.transaction_count
+                .store(snapshot.transaction_count, Ordering::Relaxed);
+        });
         shared
             .runtime
             .epoch
@@ -2784,8 +3083,8 @@ impl ShmWalCoordination {
             page_size: header.page_size,
             salt_1: header.salt_1,
             salt_2: header.salt_2,
-            checksum_1: other.metadata.last_checksum.0,
-            checksum_2: other.metadata.last_checksum.1,
+            checksum_1: other.metadata.last_checksum().0,
+            checksum_2: other.metadata.last_checksum().1,
         });
     }
 
@@ -2897,16 +3196,14 @@ impl WalCoordination for ShmWalCoordination {
 
     fn publish_commit(&self, commit: WalCommitState) {
         {
-            let mut shared = self.log.current().write();
-            shared
-                .metadata
-                .max_frame
-                .store(commit.max_frame, Ordering::Release);
-            shared.metadata.last_checksum = commit.last_checksum;
-            shared
-                .metadata
-                .transaction_count
-                .store(commit.transaction_count, Ordering::Release);
+            let shared = self.log.current().write();
+            shared.metadata.snap.update(|s| {
+                s.max_frame.store(commit.max_frame, Ordering::Relaxed);
+                s.last_checksum_packed
+                    .store(pack_checksum(commit.last_checksum), Ordering::Relaxed);
+                s.transaction_count
+                    .store(commit.transaction_count, Ordering::Relaxed);
+            });
             let mut header = shared.metadata.wal_header.lock();
             header.checksum_1 = commit.last_checksum.0;
             header.checksum_2 = commit.last_checksum.1;
@@ -3061,7 +3358,8 @@ impl WalCoordination for ShmWalCoordination {
     /// The span comes from the shared memory's word, where every process's switch, copy and
     /// reset is, and the read is counted only there (decision 45).
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<(ReadGuardKind, ReadSpan)> {
-        let (span, word) = self.authority.begin_span();
+        let (mut span, word) = self.authority.begin_span();
+        span.set_shard(thread_shard());
         let guard = self.try_read_mark(snapshot, &span, word)?;
         Some((guard, span))
     }
@@ -3073,7 +3371,8 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.reset_if_unread();
         }
         if let Some((segment, slot)) = guard.read_mark() {
-            self.fallback.unlock_segment_read_mark(segment, slot);
+            self.fallback
+                .unlock_segment_read_mark_sharded(segment, slot, span.shard());
         }
     }
 
@@ -3317,6 +3616,10 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.current_segment()
     }
 
+    fn shared_log(&self) -> &SharedLog {
+        &self.log
+    }
+
     fn shared_wal_state(&self) -> Arc<SharedLog> {
         self.log.clone()
     }
@@ -3442,7 +3745,7 @@ impl ShmWalCoordination {
     /// is released and the caller retries.
     fn publish_shared_reader(
         &self,
-        read_locks: &[PaddedLock; 5],
+        read_locks: &[ShardedRwLock; 5],
         snapshot: WalSnapshot,
         read_lock_idx: usize,
         span: &ReadSpan,
@@ -3469,7 +3772,7 @@ impl ShmWalCoordination {
                 .register_reader_for_snapshot(self.owner, snapshot.max_frame)
         };
         let Some(reader) = reader else {
-            read_locks[read_lock_idx].unlock();
+            read_locks[read_lock_idx].unlock_read_on(span.shard());
             return false;
         };
         // Decision 45: the read counts on its segments in its slot, where every process's
@@ -3492,7 +3795,7 @@ impl ShmWalCoordination {
                 self.authority.reset_if_unread();
             }
             self.authority.unregister_reader_for_snapshot(reader);
-            read_locks[read_lock_idx].unlock();
+            read_locks[read_lock_idx].unlock_read_on(span.shard());
             return false;
         }
         let mut active_reader = self.active_reader.lock();
@@ -3794,8 +4097,8 @@ pub struct WalFile {
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection. It names the lock's segment too ([`ReadGuardKind`]).
     max_frame_read_lock_index: AtomicUsize,
-    /// The segments the read under way counts on (decision 45), given back at its end.
-    read_span: Mutex<Option<ReadSpan>>,
+    /// The segments the read under way counts on (decision 45), packed into one word (no mutex).
+    read_span: AtomicU32,
     /// The last frame of the closing segment the read under way counts on, 0 when it counts on
     /// none: a page its own segment lacks is looked up there before the file (decision 45).
     closing_max_frame: AtomicU64,
@@ -3812,9 +4115,10 @@ pub struct WalFile {
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
-    /// Manages locks needed for VACUUM. This is very much similar to `checkpoint_guard`
-    /// This lock is to be held by all readers before they can begin. And VACUUM holds it
-    /// exclusively. See `install_vacuum_lock_guard` for its lifecycle.
+    /// Shard index of `SharedLog::vacuum_lock` held by an active normal read transaction
+    /// (`NO_VACUUM_SHARD` when not held). Released in `end_read_tx` and in `Drop for WalFile`.
+    vacuum_read_shard: AtomicU16,
+    /// Exclusive VACUUM lock guard (only installed during in-place VACUUM).
     vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
 
     io_ctx: RwLock<IOContext>,
@@ -3853,6 +4157,19 @@ struct Rechain {
 enum RechainBatch {
     Read(u64, Arc<Buffer>, Completion),
     Written(u64, Completion),
+}
+
+impl Drop for WalFile {
+    fn drop(&mut self) {
+        let shard = self
+            .vacuum_read_shard
+            .swap(NO_VACUUM_SHARD, Ordering::AcqRel);
+        if shard != NO_VACUUM_SHARD {
+            let log = self.coordination.shared_log();
+            log.vacuum_lock.unlock_read_on(usize::from(shard));
+            log.released.notify_shared();
+        }
+    }
 }
 
 impl fmt::Debug for WalFile {
@@ -3933,16 +4250,26 @@ pub struct HeaderCell {
     checkpoint_seq: AtomicU32,
     /// Amphora: the whole header, readable without the lock (G3 step 2, decision 40).
     copy: super::log_index::HeaderCopy,
+    /// Shared seqlock snapshot cell kept in sync with `checkpoint_seq` on header writes.
+    snap: Option<Arc<SnapshotCell>>,
 }
 
 impl HeaderCell {
     pub fn new(header: WalHeader) -> Self {
+        Self::with_snapshot(header, None)
+    }
+
+    pub fn with_snapshot(header: WalHeader, snap: Option<Arc<SnapshotCell>>) -> Self {
         let checkpoint_seq = AtomicU32::new(header.checkpoint_seq);
         let copy = super::log_index::HeaderCopy::new(&header);
+        if let Some(s) = snap.as_ref() {
+            s.set_checkpoint_seq(header.checkpoint_seq);
+        }
         Self {
             header: SpinLock::new(header),
             checkpoint_seq,
             copy,
+            snap,
         }
     }
 
@@ -3951,6 +4278,7 @@ impl HeaderCell {
             locked: self.header.lock(),
             copy: &self.checkpoint_seq,
             whole: &self.copy,
+            snap: self.snap.as_deref(),
             written: false,
         }
     }
@@ -3980,6 +4308,7 @@ pub struct HeaderGuard<'a> {
     locked: crate::fast_lock::SpinLockGuard<'a, WalHeader>,
     copy: &'a AtomicU32,
     whole: &'a super::log_index::HeaderCopy,
+    snap: Option<&'a SnapshotCell>,
     /// Amphora (AUDIT 2.1): set by `DerefMut`, the only way to change the header through the
     /// guard. A guard only read leaves the copies as the last writing guard left them, which is the
     /// header still, so its drop publishes nothing: a reader's drop wrote the seqlock's line every
@@ -4010,6 +4339,9 @@ impl Drop for HeaderGuard<'_> {
         self.copy
             .store(self.locked.checkpoint_seq, Ordering::Release);
         self.whole.store(&self.locked);
+        if let Some(snap) = self.snap {
+            snap.set_checkpoint_seq(self.locked.checkpoint_seq);
+        }
     }
 }
 
@@ -4018,13 +4350,21 @@ pub struct WalSharedMetadata {
     pub enabled: AtomicBool,
     pub wal_header: Arc<HeaderCell>,
     pub min_frame: AtomicU64,
-    pub max_frame: AtomicU64,
-    pub nbackfills: AtomicU64,
-    pub transaction_count: AtomicU64,
-    pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
+    /// Single authoritative storage for snapshot atomics (`max_frame`, `nbackfills`,
+    /// `transaction_count`, `last_checksum`, `checkpoint_seq`, `epoch`), also held directly on
+    /// [`SharedLog`] so read transactions snapshot without locking `RwLock<WalFileShared>`.
+    pub snap: Arc<SnapshotCell>,
     pub loaded: AtomicBool,
     pub loaded_from_disk_scan: AtomicBool,
     pub initialized: AtomicBool,
+}
+
+impl std::ops::Deref for WalSharedMetadata {
+    type Target = SnapshotCell;
+
+    fn deref(&self) -> &SnapshotCell {
+        &self.snap
+    }
 }
 
 /// Process-local coordination and caches layered around the shared WAL metadata.
@@ -4047,15 +4387,15 @@ pub struct WalSharedRuntime {
     pub frame_cache_high_water: AtomicU64,
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
-    /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
+    /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
     /// When checkpointing, we must acquire the exclusive read lock 0 to ensure that no readers read
     /// from a partially checkpointed db file.
-    /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
+    /// Slots 1-4 carry a frame-number in value and may be shared by many readers. Slot 1 is the
     /// default read lock and is to contain the max_frame in WAL.
-    pub read_locks: [PaddedLock; 5],
+    pub read_locks: Arc<[ShardedRwLock; 5]>,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
-    /// backfilling.
-    pub epoch: AtomicU32,
+    /// backfilling. Shared with [`SharedLog::epochs`] so readers read it lock-free.
+    pub epoch: Arc<AtomicU32>,
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
@@ -4154,6 +4494,14 @@ pub struct SharedLog {
     /// Each segment's lock-free frame index (decision 40), the `Arc` its runtime holds and never
     /// replaces, kept here so a lookup reaches it without the segment's lock: first, then second.
     read_indexes: [Arc<ReadIndex>; 2],
+    /// Each segment's lock-free seqlock snapshot cell, kept here so read transactions snapshot
+    /// without taking `RwLock<WalFileShared>::read()`.
+    snapshots: [Arc<SnapshotCell>; 2],
+    /// Each segment's per-core sharded read-mark locks, kept here so `try_read_mark` and
+    /// `end_read_tx` avoid taking `RwLock<WalFileShared>::read()`.
+    read_locks: [Arc<[ShardedRwLock; 5]>; 2],
+    /// Each segment's checkpoint epoch, kept here so `checkpoint_epoch` takes no lock.
+    epochs: [Arc<AtomicU32>; 2],
     pub(crate) segments: SegmentsCell,
     /// Whether `segments` says the second segment is current, published so that every access to
     /// the current segment's state reads it without unpacking that word. Written only with
@@ -4168,7 +4516,7 @@ pub struct SharedLog {
     /// Normal WAL transactions hold this shared for the lifetime of their
     /// transaction. VACUUM holds it exclusively until its final truncate
     /// checkpoint has completed.
-    pub vacuum_lock: PaddedLock,
+    pub vacuum_lock: ShardedRwLock,
     /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
     /// one used.
     pub write_lock: PaddedLock,
@@ -4226,25 +4574,62 @@ impl SharedLog {
         segments: Segments,
         second_path: Option<String>,
     ) -> Arc<Self> {
-        let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
+        let extract = |segment: &Arc<RwLock<WalFileShared>>| {
             let guard = segment.read();
             let read_index = guard.runtime.read_index.clone();
             read_index.set_header(guard.metadata.wal_header.clone());
-            read_index
+            (
+                read_index,
+                Arc::clone(&guard.metadata.snap),
+                Arc::clone(&guard.runtime.read_locks),
+                Arc::clone(&guard.runtime.epoch),
+            )
         };
-        let read_indexes = [read_index(&first), read_index(&second)];
+        let (ri_first, snap_first, rl_first, ep_first) = extract(&first);
+        let (ri_second, snap_second, rl_second, ep_second) = extract(&second);
+        let read_indexes = [ri_first, ri_second];
+        let snapshots = [snap_first, snap_second];
+        let read_locks = [rl_first, rl_second];
+        let epochs = [ep_first, ep_second];
         Arc::new(Self {
             first,
             second,
             read_indexes,
+            snapshots,
+            read_locks,
+            epochs,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
             segments: SegmentsCell::new(segments),
             second_path,
-            vacuum_lock: PaddedLock::new(TursoRwLock::new()),
+            vacuum_lock: ShardedRwLock::new(),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
             released: Arc::default(),
         })
+    }
+
+    pub(crate) fn snapshot(&self, id: SegmentId) -> &SnapshotCell {
+        let [first, second] = &self.snapshots;
+        match id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
+        }
+    }
+
+    pub(crate) fn read_locks(&self, id: SegmentId) -> &[ShardedRwLock; 5] {
+        let [first, second] = &self.read_locks;
+        match id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
+        }
+    }
+
+    pub(crate) fn epoch(&self, id: SegmentId) -> &AtomicU32 {
+        let [first, second] = &self.epochs;
+        match id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
+        }
     }
 
     pub fn segment(&self, id: SegmentId) -> &Arc<RwLock<WalFileShared>> {
@@ -4452,7 +4837,7 @@ impl fmt::Debug for WalFileShared {
             .field("max_frame", &self.metadata.max_frame)
             .field("nbackfills", &self.metadata.nbackfills)
             .field("frame_cache", &self.runtime.frame_cache)
-            .field("last_checksum", &self.metadata.last_checksum)
+            .field("last_checksum", &self.metadata.last_checksum())
             // Excluding `file`, `read_locks`, and `write_lock`
             .finish()
     }
@@ -4460,29 +4845,16 @@ impl fmt::Debug for WalFileShared {
 
 #[derive(Debug)]
 enum VacuumLockGuard {
-    Read { ptr: Arc<SharedLog> },
     Write { ptr: Arc<SharedLog> },
 }
 
 impl VacuumLockGuard {
-    fn try_read(ptr: Arc<SharedLog>) -> Option<Self> {
-        if ptr.vacuum_lock.read() {
-            Some(Self::Read { ptr })
-        } else {
-            None
-        }
-    }
-
     fn try_write(ptr: Arc<SharedLog>) -> Option<Self> {
         if ptr.vacuum_lock.write() {
             Some(Self::Write { ptr })
         } else {
             None
         }
-    }
-
-    const fn is_read(&self) -> bool {
-        matches!(self, Self::Read { .. })
     }
 
     const fn is_write(&self) -> bool {
@@ -4493,10 +4865,35 @@ impl VacuumLockGuard {
 impl Drop for VacuumLockGuard {
     fn drop(&mut self) {
         match self {
-            Self::Read { ptr } | Self::Write { ptr } => {
-                ptr.vacuum_lock.unlock();
+            Self::Write { ptr } => {
+                ptr.vacuum_lock.unlock_write();
                 ptr.released.notify();
             }
+        }
+    }
+}
+
+/// Sentinel for `WalFile::vacuum_read_shard` when no shared VACUUM read lock is held.
+const NO_VACUUM_SHARD: u16 = u16::MAX;
+
+/// Local RAII rollback guard for the shared VACUUM read lock during `try_begin_read_tx`.
+struct VacuumReadRollback<'a> {
+    log: &'a SharedLog,
+    shard: Option<usize>,
+}
+
+impl VacuumReadRollback<'_> {
+    fn disarm(mut self) -> u16 {
+        let shard = self.shard.take().unwrap_or(0);
+        u16::try_from(shard).unwrap_or(0)
+    }
+}
+
+impl Drop for VacuumReadRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(shard) = self.shard.take() {
+            self.log.vacuum_lock.unlock_read_on(shard);
+            self.log.released.notify_shared();
         }
     }
 }
@@ -5609,16 +6006,13 @@ impl WalFile {
     }
 
     fn has_vacuum_read_lock_guard(&self) -> bool {
-        self.vacuum_lock_guard
-            .read()
-            .as_ref()
-            .is_some_and(VacuumLockGuard::is_read)
+        self.vacuum_read_shard.load(Ordering::Acquire) != NO_VACUUM_SHARD
     }
 
     // VACUUM lock guard lifecycle:
-    // - Normal readers install a read guard in `try_begin_read_tx` after the
-    //   read-mark slot is selected; `end_read_tx` releases that guard through
-    //   `release_vacuum_read_lock_guard`.
+    // - Normal readers install their shard index in `vacuum_read_shard` during
+    //   `try_begin_read_tx` (zero `Arc` clone and zero `RwLock` write); `end_read_tx`
+    //   (and `WalFile::drop` on abort) releases that shard directly.
     // - Normal writers do not install their own VACUUM guard. They are an
     //   upgrade of an existing read transaction, so their guard is still the
     //   read guard owned by the read transaction.
@@ -5632,16 +6026,16 @@ impl WalFile {
     }
 
     fn release_vacuum_read_lock_guard(&self) {
-        let guard = {
-            let mut slot = self.vacuum_lock_guard.write();
-            turso_assert!(
-                slot.as_ref().is_some_and(VacuumLockGuard::is_read),
-                "VACUUM read lock guard is not held"
-            );
-            slot.take()
-                .expect("VACUUM read lock guard should be present after kind check")
-        };
-        drop(guard);
+        let shard = self
+            .vacuum_read_shard
+            .swap(NO_VACUUM_SHARD, Ordering::AcqRel);
+        turso_assert!(
+            shard != NO_VACUUM_SHARD,
+            "VACUUM read lock guard is not held"
+        );
+        let log = self.coordination.shared_log();
+        log.vacuum_lock.unlock_read_on(usize::from(shard));
+        log.released.notify_shared();
     }
 
     fn release_vacuum_write_lock_guard(&self) {
@@ -5668,18 +6062,21 @@ impl WalFile {
             { "lock_value": self.max_frame_read_lock_index.load(Ordering::Acquire), "expected": NO_LOCK_HELD }
         );
         turso_assert!(
-            self.vacuum_lock_guard.read().is_none(),
-            "VACUUM lock guard already held"
+            self.vacuum_read_shard.load(Ordering::Acquire) == NO_VACUUM_SHARD,
+            "VACUUM read lock already held"
         );
 
         // Before we can start the txn, we must first take read lock on the vacuum. If we cannot,
         // then vacuum is already in progress. Once we acquire a read lock, this would prevent
         // vacuum to run till the lock is released.
-        let Some(vacuum_lock_guard) =
-            VacuumLockGuard::try_read(self.coordination.shared_wal_state())
-        else {
+        let log = self.coordination.shared_log();
+        let Some(vshard) = log.vacuum_lock.read_sharded() else {
             tracing::debug!("begin_read_tx: VACUUM holds the vacuum lock, returning Busy");
             return TryBeginReadResult::Busy;
+        };
+        let vacuum_rollback = VacuumReadRollback {
+            log,
+            shard: Some(vshard),
         };
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
@@ -5737,8 +6134,9 @@ impl WalFile {
         });
         self.closing_max_frame
             .store(closing_max_frame, Ordering::Release);
-        *self.read_span.lock() = Some(span);
-        self.install_vacuum_lock_guard(vacuum_lock_guard);
+        self.read_span.store(span.pack_u32(), Ordering::Release);
+        let held_shard = vacuum_rollback.disarm();
+        self.vacuum_read_shard.store(held_shard, Ordering::Release);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
@@ -5833,7 +6231,10 @@ impl Wal for WalFile {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
             // A read guard is installed only with its span (`try_begin_read_tx`).
-            if let Some(span) = self.read_span.lock().take() {
+            let raw_span = self
+                .read_span
+                .swap(ReadSpan::PACKED_NONE, Ordering::AcqRel);
+            if let Some(span) = ReadSpan::unpack_u32(raw_span) {
                 self.coordination
                     .end_read_tx(ReadGuardKind::from_lock_index(slot), span);
             }
@@ -6777,7 +7178,8 @@ impl Wal for WalFile {
             "begin_vacuum_blocking_tx: must not already hold the write lock"
         );
         turso_assert!(
-            self.vacuum_lock_guard.read().is_none(),
+            self.vacuum_read_shard.load(Ordering::Acquire) == NO_VACUUM_SHARD
+                && self.vacuum_lock_guard.read().is_none(),
             "VACUUM lock guard already held"
         );
 
@@ -7513,11 +7915,12 @@ impl WalFile {
             syncing: Arc::new(AtomicBool::new(false)),
             write_lock_held: AtomicBool::new(false),
             write_base: AtomicU64::new(0),
+            vacuum_read_shard: AtomicU16::new(NO_VACUUM_SHARD),
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
-            read_span: Mutex::new(None),
+            read_span: AtomicU32::new(ReadSpan::PACKED_NONE),
             closing_max_frame: AtomicU64::new(0),
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
@@ -8627,7 +9030,7 @@ fn classify_authority_snapshot_against_wal(
 impl WalFileShared {
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
         (
-            self.metadata.last_checksum,
+            self.metadata.last_checksum(),
             self.metadata.max_frame.load(Ordering::Acquire),
         )
     }
@@ -8720,22 +9123,24 @@ impl WalFileShared {
             checksum_2: snapshot.checksum_2,
             ..WalHeader::new()
         };
-        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
-        for (i, lock) in read_locks.iter().enumerate() {
-            lock.write();
-            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            lock.unlock();
-        }
+        let read_locks = new_read_locks();
+        let snap = Arc::new(SnapshotCell::new(
+            snapshot.max_frame,
+            snapshot.nbackfills,
+            snapshot.transaction_count,
+            (snapshot.checksum_1, snapshot.checksum_2),
+            wal_header.checkpoint_seq,
+        ));
 
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(HeaderCell::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::with_snapshot(
+                    wal_header,
+                    Some(Arc::clone(&snap)),
+                )),
                 min_frame: AtomicU64::new(0),
-                max_frame: AtomicU64::new(snapshot.max_frame),
-                nbackfills: AtomicU64::new(snapshot.nbackfills),
-                transaction_count: AtomicU64::new(snapshot.transaction_count),
-                last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
+                snap,
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
                 initialized: AtomicBool::new(wal_is_initialized),
@@ -8745,7 +9150,7 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
-                epoch: AtomicU32::new(snapshot.checkpoint_epoch),
+                epoch: Arc::new(AtomicU32::new(snapshot.checkpoint_epoch)),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
@@ -8818,21 +9223,17 @@ impl WalFileShared {
 
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
         let wal_header = WalHeader::new();
-        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
-        for (i, lock) in read_locks.iter().enumerate() {
-            lock.write();
-            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            lock.unlock();
-        }
+        let read_locks = new_read_locks();
+        let snap = Arc::new(SnapshotCell::new(0, 0, 0, (0, 0), wal_header.checkpoint_seq));
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
-                wal_header: Arc::new(HeaderCell::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::with_snapshot(
+                    wal_header,
+                    Some(Arc::clone(&snap)),
+                )),
                 min_frame: AtomicU64::new(0),
-                max_frame: AtomicU64::new(0),
-                nbackfills: AtomicU64::new(0),
-                transaction_count: AtomicU64::new(0),
-                last_checksum: (0, 0),
+                snap,
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
@@ -8842,7 +9243,7 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
-                epoch: AtomicU32::new(0),
+                epoch: Arc::new(AtomicU32::new(0)),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
@@ -8862,24 +9263,17 @@ impl WalFileShared {
     #[cfg(test)]
     pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<SharedLog>> {
         let wal_header = WalHeader::new();
-        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
-        // slot zero is always zero as it signifies that reads can be done from the db file
-        // directly, and slot 1 is the default read mark containing the max frame. in this case
-        // our max frame is zero so both slots 0 and 1 begin at 0
-        for (i, lock) in read_locks.iter().enumerate() {
-            lock.write();
-            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            lock.unlock();
-        }
+        let read_locks = new_read_locks();
+        let snap = Arc::new(SnapshotCell::new(0, 0, 0, (0, 0), wal_header.checkpoint_seq));
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(HeaderCell::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::with_snapshot(
+                    wal_header,
+                    Some(Arc::clone(&snap)),
+                )),
                 min_frame: AtomicU64::new(0),
-                max_frame: AtomicU64::new(0),
-                nbackfills: AtomicU64::new(0),
-                transaction_count: AtomicU64::new(0),
-                last_checksum: (0, 0),
+                snap,
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
@@ -8889,7 +9283,7 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
-                epoch: AtomicU32::new(0),
+                epoch: Arc::new(AtomicU32::new(0)),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
@@ -8951,9 +9345,14 @@ impl WalFileShared {
             hdr.salt_1 = hdr.salt_1.wrapping_add(1);
             hdr.salt_2 = io.generate_random_number() as u32;
 
-            self.metadata.max_frame.store(0, Ordering::Release);
-            self.metadata.nbackfills.store(0, Ordering::Release);
-            self.metadata.last_checksum = (hdr.checksum_1, hdr.checksum_2);
+            self.metadata.snap.update(|s| {
+                s.max_frame.store(0, Ordering::Relaxed);
+                s.nbackfills.store(0, Ordering::Relaxed);
+                s.last_checksum_packed
+                    .store(pack_checksum((hdr.checksum_1, hdr.checksum_2)), Ordering::Relaxed);
+                s.checkpoint_seq
+                    .store(hdr.checkpoint_seq, Ordering::Relaxed);
+            });
             // `prepare_wal_start` (used in the `commit_wal_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
             // we change WAL state here, so on next write attempt `prepare_wal_start` will update WAL header
             self.metadata.initialized.store(false, Ordering::Release);
@@ -8965,7 +9364,10 @@ impl WalFileShared {
             // Keep an old opaque prefix from matching again after sequence reuse. Only wrap
             // needs a new header identity; ordinary restarts allocate nothing.
             let header = *self.metadata.wal_header.lock();
-            self.metadata.wal_header = Arc::new(HeaderCell::new(header));
+            self.metadata.wal_header = Arc::new(HeaderCell::with_snapshot(
+                header,
+                Some(Arc::clone(&self.metadata.snap)),
+            ));
             self.runtime.legacy_durable_allowed = false;
         }
         self.runtime
@@ -10433,21 +10835,16 @@ pub mod test {
     }
 
     fn set_shared_snapshot(shared: &Arc<SharedLog>, snapshot: WalSnapshot) {
-        let mut guard = shared.current().write();
-        guard
-            .metadata
-            .max_frame
-            .store(snapshot.max_frame, Ordering::Release);
-        guard
-            .metadata
-            .nbackfills
-            .store(snapshot.nbackfills, Ordering::Release);
-        guard.metadata.last_checksum = snapshot.last_checksum;
+        let guard = shared.current().write();
+        guard.metadata.snap.update(|s| {
+            s.max_frame.store(snapshot.max_frame, Ordering::Relaxed);
+            s.nbackfills.store(snapshot.nbackfills, Ordering::Relaxed);
+            s.last_checksum_packed
+                .store(super::pack_checksum(snapshot.last_checksum), Ordering::Relaxed);
+            s.transaction_count
+                .store(snapshot.transaction_count, Ordering::Relaxed);
+        });
         guard.metadata.wal_header.lock().checkpoint_seq = snapshot.checkpoint_seq;
-        guard
-            .metadata
-            .transaction_count
-            .store(snapshot.transaction_count, Ordering::Release);
     }
 
     fn make_test_coordination(shared: &Arc<SharedLog>) -> InProcessWalCoordination {
@@ -10628,11 +11025,7 @@ pub mod test {
             .read_locks
             .iter()
             .enumerate()
-            .filter_map(|(slot, lock)| {
-                let state = lock.0.load(Ordering::Acquire);
-                let has_readers = (state & super::TursoRwLock::READER_COUNT_MASK) != 0;
-                has_readers.then_some(slot)
-            })
+            .filter_map(|(slot, lock)| lock.held_value().is_some().then_some(slot))
             .collect()
     }
 
@@ -12638,10 +13031,10 @@ pub mod test {
         coordination_a.cache_frame(9, 4);
 
         {
-            let mut shared = shared_b.current().write();
+            let shared = shared_b.current().write();
             shared.metadata.max_frame.store(99, Ordering::Release);
             shared.metadata.nbackfills.store(77, Ordering::Release);
-            shared.metadata.last_checksum = (1, 2);
+            shared.metadata.set_last_checksum((1, 2));
             shared
                 .metadata
                 .transaction_count
@@ -12698,7 +13091,7 @@ pub mod test {
         let shared = shared_b.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
         assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
-        assert_eq!(shared.metadata.last_checksum, snapshot.last_checksum);
+        assert_eq!(shared.metadata.last_checksum(), snapshot.last_checksum);
         assert_eq!(
             shared.metadata.transaction_count.load(Ordering::Acquire),
             snapshot.transaction_count
@@ -12820,7 +13213,7 @@ pub mod test {
             snapshot.transaction_count
         );
         assert_eq!(
-            shared.metadata.last_checksum,
+            shared.metadata.last_checksum(),
             (snapshot.checksum_1, snapshot.checksum_2)
         );
         assert_eq!(
@@ -13033,7 +13426,7 @@ pub mod test {
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
         assert_eq!(
-            shared.metadata.last_checksum,
+            shared.metadata.last_checksum(),
             (valid_snapshot.checksum_1, valid_snapshot.checksum_2)
         );
         assert!(shared
@@ -13536,7 +13929,7 @@ pub mod test {
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
-        assert_eq!(shared.metadata.last_checksum, (31, 37));
+        assert_eq!(shared.metadata.last_checksum(), (31, 37));
         assert!(!shared.metadata.initialized.load(Ordering::Acquire));
         assert!(!shared
             .metadata
@@ -13919,10 +14312,10 @@ pub mod test {
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
         {
-            let mut shared = shared.current().write();
+            let shared = shared.current().write();
             shared.metadata.max_frame.store(11, Ordering::Release);
             shared.metadata.nbackfills.store(11, Ordering::Release);
-            shared.metadata.last_checksum = (11, 13);
+            shared.metadata.set_last_checksum((11, 13));
             shared
                 .metadata
                 .transaction_count
@@ -14029,14 +14422,14 @@ pub mod test {
             reader_slot_count: 64,
         };
         {
-            let mut shared = shared_a.current().write();
+            let shared = shared_a.current().write();
             shared.metadata.max_frame.store(0, Ordering::Release);
             shared.metadata.nbackfills.store(0, Ordering::Release);
             shared
                 .metadata
                 .transaction_count
                 .store(authoritative.transaction_count, Ordering::Release);
-            shared.metadata.last_checksum = (31, 37);
+            shared.metadata.set_last_checksum((31, 37));
             let mut header = shared.metadata.wal_header.lock();
             header.checkpoint_seq = authoritative.checkpoint_seq;
             header.page_size = authoritative.page_size;
@@ -14063,10 +14456,10 @@ pub mod test {
         // fell behind the authority after another process checkpointed and
         // restarted the WAL back to frame 0.
         {
-            let mut shared = shared_b.current().write();
+            let shared = shared_b.current().write();
             shared.metadata.max_frame.store(0, Ordering::Release);
             shared.metadata.nbackfills.store(0, Ordering::Release);
-            shared.metadata.last_checksum = (11, 13);
+            shared.metadata.set_last_checksum((11, 13));
             shared
                 .metadata
                 .transaction_count

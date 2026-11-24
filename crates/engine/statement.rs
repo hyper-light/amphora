@@ -13,7 +13,10 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases, ReleaseWait},
+    busy::{
+        BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases, ReleaseWait,
+        SharedInterestGuard,
+    },
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -357,6 +360,7 @@ pub struct Statement {
     lock_release: Option<std::sync::Arc<LockRelease>>,
     release_seen: u64,
     release_wait: Option<ReleaseWait>,
+    busy_interest: Option<SharedInterestGuard>,
     /// Per-execution timeout override for this statement.
     /// - `None`: use connection default
     /// - `Some(Some(duration))`: override with a query-specific timeout
@@ -500,6 +504,7 @@ impl Statement {
             lock_release: None,
             release_seen: 0,
             release_wait: None,
+            busy_interest: None,
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
@@ -893,14 +898,18 @@ impl Statement {
         if self.analyze_refresh.is_some() {
             return self.drive_analyze_refresh(waker);
         }
-        // Amphora (lane constants-22): the releases so far, read before the step tries its locks,
-        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]); this
-        // step's own releases counted apart (lane perf-A5).
-        let own = self.lock_release.as_ref().map(|release| {
-            let own = release.own_releases();
-            self.release_seen = release.generation();
-            own
-        });
+        // Amphora (lane constants-22): only sample `LockRelease::generation` and `OwnReleases`
+        // while this statement is actively retrying a busy lock (`busy_interest` armed), keeping
+        // uncontended steps free of global `SeqCst` loads and TLS traffic.
+        let own = if self.busy_interest.is_some() {
+            self.lock_release.as_ref().map(|release| {
+                let own = release.own_releases();
+                self.release_seen = release.generation();
+                own
+            })
+        } else {
+            None
+        };
         // Amphora (PL.13): a run handed to a second prepare starts again here, once.
         let res = loop {
             if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -1126,6 +1135,7 @@ impl Statement {
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.busy_interest = None;
             self.state.query_deadline = None;
             // Amphora (PL.9): an INSERT or DELETE adds its rows to its table's count, one add.
             if let Some(target) = self.program.write_target.as_ref() {
@@ -1179,16 +1189,25 @@ impl Statement {
             };
             if let Some((max, release, waker)) = release {
                 if let Some(left) = busy_state.until_released(max, now) {
-                    // Registered: sleep until the release (or the deadline). A release came
-                    // since the step read the count: step again now.
-                    let own = own.unwrap_or_else(|| release.own_releases());
-                    self.release_wait = release.subscribe(self.release_seen, &own, waker);
-                    let duration = if self.release_wait.is_some() {
-                        left
+                    if self.busy_interest.is_none() {
+                        // Arm shared-read release notifications and retry once immediately so
+                        // `release_seen` is sampled after `shared_interest` is globally visible.
+                        self.busy_interest = Some(release.interest());
+                        res = Ok(StepResult::Sleep {
+                            duration: Duration::ZERO,
+                        });
                     } else {
-                        Duration::ZERO
-                    };
-                    res = Ok(StepResult::Sleep { duration });
+                        // Registered: sleep until the release (or the deadline). A release came
+                        // since the step read the count: step again now.
+                        let own = own.unwrap_or_else(|| release.own_releases());
+                        self.release_wait = release.subscribe(self.release_seen, &own, waker);
+                        let duration = if self.release_wait.is_some() {
+                            left
+                        } else {
+                            Duration::ZERO
+                        };
+                        res = Ok(StepResult::Sleep { duration });
+                    }
                 }
                 // else: past the deadline, res stays as Busy
             } else if busy_state.invoke(&handler, now) {
@@ -1225,6 +1244,7 @@ impl Statement {
         // enough because callers do not always reset on error before
         // running another statement.
         if res.is_err() {
+            self.busy_interest = None;
             self.cleanup_orphaned_seq_inner_tx();
         }
 
@@ -2130,6 +2150,7 @@ impl Statement {
         }
 
         self.release_wait = None;
+        self.busy_interest = None;
         let mut reset_error: Option<LimboError> = None;
         // Amphora (PL.7): a run reset before its end is not timed.
         self.cost_sample = None;

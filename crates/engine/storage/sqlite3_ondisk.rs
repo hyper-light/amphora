@@ -59,7 +59,7 @@ use super::packed::{self, LogFormat, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
 use super::wal::{
-    OverflowFallbackCoverage, PaddedLock, TursoRwLock, WalSharedMetadata, WalSharedRuntime,
+    new_read_locks, OverflowFallbackCoverage, SnapshotCell, WalSharedMetadata, WalSharedRuntime,
 };
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
@@ -72,7 +72,6 @@ use crate::storage::page_transform::{
     page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
 };
 use crate::storage::pager::Pager;
-use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -1583,23 +1582,19 @@ impl BuildSharedWal {
     pub fn begin(file: &Arc<dyn File>) -> Result<Self> {
         let size = file.size()?;
 
-        let header = Arc::new(crate::storage::wal::HeaderCell::new(WalHeader::default()));
-        let read_locks = std::array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
-        for (i, l) in read_locks.iter().enumerate() {
-            l.write();
-            l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            l.unlock();
-        }
+        let snap = Arc::new(SnapshotCell::new(0, 0, 0, (0, 0), 0));
+        let header = Arc::new(crate::storage::wal::HeaderCell::with_snapshot(
+            WalHeader::default(),
+            Some(Arc::clone(&snap)),
+        ));
+        let read_locks = new_read_locks();
 
         let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
                 wal_header: header.clone(),
                 min_frame: AtomicU64::new(0),
-                max_frame: AtomicU64::new(0),
-                nbackfills: AtomicU64::new(0),
-                transaction_count: AtomicU64::new(0),
-                last_checksum: (0, 0),
+                snap,
                 loaded: AtomicBool::new(false),
                 loaded_from_disk_scan: AtomicBool::new(true),
                 initialized: AtomicBool::new(false),
@@ -1609,7 +1604,7 @@ impl BuildSharedWal {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
-                epoch: AtomicU32::new(0),
+                epoch: Arc::new(AtomicU32::new(0)),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
@@ -2145,7 +2140,7 @@ impl StreamingWalReader {
 
     /// Finalizes the loading process
     fn finalize_loading(&self) {
-        let mut wfs = self.wal_shared.write();
+        let wfs = self.wal_shared.write();
         let st = self.state.read();
         tracing::debug!(
             "WAL_SCAN finalize last_valid_frame={} pending_pages={} header_valid={}",
@@ -2177,7 +2172,7 @@ impl StreamingWalReader {
 
         wfs.metadata.max_frame.store(max_frame, Ordering::SeqCst);
         // use checksum of last valid commit frame, not necessarily the last frame
-        wfs.metadata.last_checksum = st.last_valid_checksum;
+        wfs.metadata.set_last_checksum(st.last_valid_checksum);
         if st.header_valid {
             wfs.metadata.initialized.store(true, Ordering::SeqCst);
         }
@@ -3002,10 +2997,10 @@ mod tests {
         let shared = build_shared_wal(&file, &io).unwrap();
         let guard = shared.read();
         assert_eq!(guard.metadata.max_frame.load(Ordering::Acquire), 1);
-        assert_eq!(guard.metadata.last_checksum, commit_checksum);
+        assert_eq!(guard.metadata.last_checksum(), commit_checksum);
 
         // checksum should only include committed frame.
-        assert_ne!(guard.metadata.last_checksum, after_frame3_checksum);
+        assert_ne!(guard.metadata.last_checksum(), after_frame3_checksum);
 
         let frame_cache = guard.runtime.frame_cache.read();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));

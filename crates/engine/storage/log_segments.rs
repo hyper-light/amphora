@@ -3,8 +3,35 @@
 //! Pure: the log keeps one [`Segments`] in a [`SegmentsCell`], each change one of its steps, and
 //! makes the I/O a step names (a switch's header and its sync before any frame; nothing at a reset).
 
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::Mutex;
+use crossbeam_utils::CachePadded;
 use std::iter;
+use std::sync::OnceLock;
+
+/// Power-of-two per-core shard count derived directly from hardware parallelism (`available_parallelism`),
+/// used by `SegmentsCell` and `ShardedRwLock` so concurrent readers touch disjoint cache lines.
+pub(crate) fn shard_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .next_power_of_two()
+    })
+}
+
+static NEXT_THREAD_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+crate::thread::thread_local! {
+    static THREAD_SHARD: usize = NEXT_THREAD_SHARD.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stable shard index for the current thread (no syscalls, one TLS load).
+#[inline]
+pub(crate) fn thread_shard() -> usize {
+    THREAD_SHARD.try_with(|&id| id).unwrap_or(0)
+}
 
 /// [`Segments::pack`]'s word: bit 60 says the closing segment is shipped, 61 that it is copied,
 /// 62 that the other segment is closing rather than free, and 63 that the second segment is
@@ -16,10 +43,12 @@ const SECOND_CURRENT: u64 = 0x8000_0000_0000_0000;
 /// The multi-process shared word's bits 0-59 ([`Segments::shared_word`]): how many times its
 /// segments and flags changed.
 const CHANGES: u64 = 0x0FFF_FFFF_FFFF_FFFF;
-/// [`SegmentsCell`]'s word holds the reads as well: bits 0-29 count those on the current segment
-/// and bits 30-59 those on the closing one.
+/// [`SegmentsCell`]'s word holds the flags in bits 60-63, `SATURATED` in bit 59 (set only when
+/// total reads reach the 30-bit cap), and a monotonic transition version in bits 0-58 so lock-free
+/// per-shard readers detect any concurrent segment switch/copy/reset.
 const READS: u64 = 0x3FFF_FFFF;
-const CLOSING_READS_SHIFT: u32 = 30;
+const SATURATED: u64 = 0x0800_0000_0000_0000;
+const VERSION_MASK: u64 = 0x07FF_FFFF_FFFF_FFFF;
 
 /// One of the log's two files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -60,17 +89,81 @@ pub struct Closing {
 }
 
 /// The segments one read counts on, given back whole at its end ([`Segments::end_read`]).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[must_use = "a read's span is given back at its end, or the segment it holds is never reset"]
 pub struct ReadSpan {
     current: SegmentId,
     closing: Option<SegmentId>,
+    /// Shard in [`SegmentsCell`] incremented when this read began, so ending the read on another
+    /// thread decrements the exact same shard.
+    shard: u16,
 }
 
+impl PartialEq for ReadSpan {
+    fn eq(&self, other: &Self) -> bool {
+        self.current == other.current && self.closing == other.closing
+    }
+}
+
+impl Eq for ReadSpan {}
+
 impl ReadSpan {
+    /// Sentinel value for an absent [`ReadSpan`] in packed atomic storage.
+    pub(crate) const PACKED_NONE: u32 = u32::MAX;
+
+    /// Pack into a `u32` for lock-free atomic storage on `WalFile`.
+    pub(crate) fn pack_u32(self) -> u32 {
+        let cur_bit: u32 = match self.current {
+            SegmentId::First => 0,
+            SegmentId::Second => 1,
+        };
+        let closing_bits: u32 = match self.closing {
+            None => 0,
+            Some(SegmentId::First) => 0b10,
+            Some(SegmentId::Second) => 0b110,
+        };
+        cur_bit | closing_bits | (u32::from(self.shard) << 16)
+    }
+
+    /// Unpack a value stored with [`Self::pack_u32`].
+    pub(crate) fn unpack_u32(packed: u32) -> Option<Self> {
+        if packed == Self::PACKED_NONE {
+            return None;
+        }
+        let current = if (packed & 1) == 0 {
+            SegmentId::First
+        } else {
+            SegmentId::Second
+        };
+        let closing = if (packed & 0b10) == 0 {
+            None
+        } else if (packed & 0b100) == 0 {
+            Some(SegmentId::First)
+        } else {
+            Some(SegmentId::Second)
+        };
+        let shard = u16::try_from(packed >> 16).unwrap_or(0);
+        Some(Self {
+            current,
+            closing,
+            shard,
+        })
+    }
+
     /// The segment current when the read began: its read marks guard the read.
     pub const fn current(&self) -> SegmentId {
         self.current
+    }
+
+    /// The per-core shard associated with this read transaction.
+    pub(crate) const fn shard(&self) -> usize {
+        self.shard as usize
+    }
+
+    /// Assigns the per-core shard for a span created outside [`SegmentsCell`] (e.g. shared memory).
+    #[cfg(host_shared_wal)]
+    pub(crate) fn set_shard(&mut self, shard: usize) {
+        self.shard = u16::try_from(shard).unwrap_or(0);
     }
 
     /// The closing segment the read counts on, if any: its uncopied frames are in no file, so
@@ -168,6 +261,7 @@ impl Segments {
         ReadSpan {
             current: self.current,
             closing,
+            shard: 0,
         }
     }
 
@@ -311,73 +405,292 @@ impl Segments {
     }
 }
 
-/// One process's [`Segments`], its reads counted, in one word: read without a lock, and changed by
-/// compare-and-swap, each change one step of the state machine applied whole. Every read's begin
-/// and end is such a change; under a spin lock they were point reads' hottest spin at 32 and 128
-/// clients (bench/records/2026-11-23-adacachy2-perf-reads-q3.md).
+/// One process's [`Segments`], with read counts striped across per-core cache-padded shards so
+/// concurrent readers never contend on a single global CAS word. Rare segment state transitions
+/// (switch, copy, ship, reset) bump a monotonic version in `state` and serialize under `transition`,
+/// using SeqCst Dekker ordering against per-shard counters so no read or closing-segment reset is
+/// ever missed.
 #[derive(Debug)]
-pub struct SegmentsCell(AtomicU64);
+pub struct SegmentsCell {
+    state: CachePadded<AtomicU64>,
+    shards: Box<[CachePadded<AtomicU64>]>,
+    mask: usize,
+    transition: Mutex<()>,
+}
 
 impl SegmentsCell {
-    /// A cell holding `segments`' segments and flags, no read counted.
+    const READY_TO_RESET: u64 = CLOSING | COPIED | SHIPPED;
+
+    /// A cell holding `segments`' segments and flags, with any initial reads placed on shard 0.
     pub fn new(segments: Segments) -> Self {
-        Self(AtomicU64::new(segments.pack()))
+        let count = shard_count().max(1);
+        let shards: Box<[CachePadded<AtomicU64>]> = (0..count)
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let (first_reads, second_reads) = Self::reads_by_segment(&segments);
+        if let Some(slot0) = shards.first() {
+            let packed = (first_reads & SlotReads::COUNT)
+                | (second_reads & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
+            slot0.store(packed, Ordering::Release);
+        }
+        let saturated = first_reads >= READS || second_reads >= READS;
+        let word = segments.pack() | if saturated { SATURATED } else { 0 };
+        Self {
+            state: CachePadded::new(AtomicU64::new(word)),
+            shards,
+            mask: count.wrapping_sub(1),
+            transition: Mutex::new(()),
+        }
+    }
+
+    const fn reads_by_segment(segments: &Segments) -> (u64, u64) {
+        let closing = match segments.other {
+            Some(c) => c.reads,
+            None => 0,
+        };
+        match segments.current {
+            SegmentId::First => (segments.reads, closing),
+            SegmentId::Second => (closing, segments.reads),
+        }
+    }
+
+    #[inline(always)]
+    const fn span_delta(current: SegmentId, closing: Option<SegmentId>) -> u64 {
+        let mut d = SlotReads::one(current);
+        if let Some(c) = closing {
+            d |= SlotReads::one(c);
+        }
+        d
+    }
+
+    fn sum_reads(&self) -> (u64, u64) {
+        let mut first = 0u64;
+        let mut second = 0u64;
+        for shard in self.shards.iter() {
+            let word = shard.load(Ordering::SeqCst);
+            let sr = SlotReads(word);
+            first = first.saturating_add(sr.on(SegmentId::First));
+            second = second.saturating_add(sr.on(SegmentId::Second));
+        }
+        (first, second)
+    }
+
+    fn assemble(word: u64, first: u64, second: u64) -> Segments {
+        let mut segments = Segments::unpack(word);
+        let (cur, oth) = match segments.current {
+            SegmentId::First => (first, second),
+            SegmentId::Second => (second, first),
+        };
+        segments.reads = cur;
+        if let Some(closing) = &mut segments.other {
+            closing.reads = oth;
+        }
+        segments
     }
 
     /// The state now.
     pub fn load(&self) -> Segments {
-        Self::unpack(self.0.load(Ordering::Acquire))
+        let word = self.state.load(Ordering::SeqCst);
+        let (first, second) = self.sum_reads();
+        Self::assemble(word, first, second)
     }
 
     /// Applies `step` to the state as one change, and gives back what it returned. None, with
     /// nothing changed, when the step would count more reads on a segment than its 30 bits hold.
     pub fn update<T>(&self, mut step: impl FnMut(&mut Segments) -> T) -> Option<T> {
-        let mut word = self.0.load(Ordering::Acquire);
-        loop {
-            let mut segments = Self::unpack(word);
-            let out = step(&mut segments);
-            let next = Self::pack(&segments)?;
-            match self
-                .0
-                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Some(out),
-                Err(seen) => word = seen,
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        let (before_first, before_second) = self.sum_reads();
+        let mut segments = Self::assemble(word, before_first, before_second);
+        let out = step(&mut segments);
+        let closing_reads = segments.other.map_or(0, |c| c.reads);
+        if segments.reads > READS || closing_reads > READS {
+            return None;
+        }
+        let (after_first, after_second) = Self::reads_by_segment(&segments);
+        if after_first != before_first || after_second != before_second {
+            if let Some(slot0) = self.shards.first() {
+                // Synthetic read-count adjustment (used by tests): apply delta on shard 0.
+                let mut cur = slot0.load(Ordering::SeqCst);
+                loop {
+                    let sr = SlotReads(cur);
+                    let f = if after_first >= before_first {
+                        sr.on(SegmentId::First)
+                            .saturating_add(after_first.saturating_sub(before_first))
+                    } else {
+                        sr.on(SegmentId::First)
+                            .saturating_sub(before_first.saturating_sub(after_first))
+                    };
+                    let s = if after_second >= before_second {
+                        sr.on(SegmentId::Second)
+                            .saturating_add(after_second.saturating_sub(before_second))
+                    } else {
+                        sr.on(SegmentId::Second)
+                            .saturating_sub(before_second.saturating_sub(after_second))
+                    };
+                    let next = (f & SlotReads::COUNT)
+                        | (s & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
+                    match slot0.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(seen) => cur = seen,
+                    }
+                }
             }
         }
+        let saturated = after_first >= READS || after_second >= READS;
+        let next_ver = word.wrapping_add(1) & VERSION_MASK;
+        let next_word = segments.pack() | if saturated { SATURATED } else { 0 } | next_ver;
+        self.state.store(next_word, Ordering::SeqCst);
+
+        // Dekker re-check: if a concurrent reader finished between our first sum and publishing
+        // COPIED|SHIPPED, free the closing segment now.
+        if (next_word & Self::READY_TO_RESET) == Self::READY_TO_RESET {
+            let closing_id = Segments::unpack(next_word).current().other();
+            let (f, s) = self.sum_reads();
+            let rem = match closing_id {
+                SegmentId::First => f,
+                SegmentId::Second => s,
+            };
+            if rem == 0 {
+                let cleared = (next_word & !(CLOSING | COPIED | SHIPPED)) & !VERSION_MASK
+                    | (next_word.wrapping_add(1) & VERSION_MASK);
+                self.state.store(cleared, Ordering::SeqCst);
+            }
+        }
+        Some(out)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn begin_read_saturated(&self, shard_idx: usize) -> Option<ReadSpan> {
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        let (first, second) = self.sum_reads();
+        let current = if (word & SECOND_CURRENT) == 0 {
+            SegmentId::First
+        } else {
+            SegmentId::Second
+        };
+        let closing = ((word & CLOSING) != 0 && (word & COPIED) == 0).then(|| current.other());
+        let check_segment = |seg: SegmentId| match seg {
+            SegmentId::First => first < READS,
+            SegmentId::Second => second < READS,
+        };
+        if !check_segment(current) || closing.is_some_and(|c| !check_segment(c)) {
+            return None;
+        }
+        let delta = Self::span_delta(current, closing);
+        let shard = self.shards.get(shard_idx)?;
+        shard.fetch_add(delta, Ordering::SeqCst);
+        let new_first = first.saturating_add(u64::from(
+            current == SegmentId::First || closing == Some(SegmentId::First),
+        ));
+        let new_second = second.saturating_add(u64::from(
+            current == SegmentId::Second || closing == Some(SegmentId::Second),
+        ));
+        if new_first < READS && new_second < READS && (word & SATURATED) != 0 {
+            let next_word = (word & !SATURATED & !VERSION_MASK)
+                | (word.wrapping_add(1) & VERSION_MASK);
+            self.state.store(next_word, Ordering::SeqCst);
+        }
+        Some(ReadSpan {
+            current,
+            closing,
+            shard: u16::try_from(shard_idx).unwrap_or(0),
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_reset_closing(&self) -> Option<SegmentId> {
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        let (first, second) = self.sum_reads();
+        if (word & SATURATED) != 0 && first < READS && second < READS {
+            let cleared = (word & !SATURATED & !VERSION_MASK)
+                | (word.wrapping_add(1) & VERSION_MASK);
+            self.state.store(cleared, Ordering::SeqCst);
+        }
+        let word = self.state.load(Ordering::SeqCst);
+        if (word & Self::READY_TO_RESET) != Self::READY_TO_RESET {
+            return None;
+        }
+        let closing_id = Segments::unpack(word).current().other();
+        let rem = match closing_id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
+        };
+        if rem != 0 {
+            return None;
+        }
+        let cleared = (word & !(CLOSING | COPIED | SHIPPED) & !VERSION_MASK)
+            | (word.wrapping_add(1) & VERSION_MASK);
+        self.state.store(cleared, Ordering::SeqCst);
+        Some(closing_id)
     }
 
     /// [`Segments::begin_read`]. None when a segment already counts as many reads as its bits
     /// hold: the read is refused and tried again.
+    #[inline]
     pub fn begin_read(&self) -> Option<ReadSpan> {
-        self.update(Segments::begin_read)
+        let shard_idx = thread_shard() & self.mask;
+        let shard = self.shards.get(shard_idx)?;
+        loop {
+            let w1 = self.state.load(Ordering::Acquire);
+            if (w1 & SATURATED) != 0 {
+                return self.begin_read_saturated(shard_idx);
+            }
+            let current = if (w1 & SECOND_CURRENT) == 0 {
+                SegmentId::First
+            } else {
+                SegmentId::Second
+            };
+            let closing = ((w1 & CLOSING) != 0 && (w1 & COPIED) == 0).then(|| current.other());
+            let delta = Self::span_delta(current, closing);
+            let prev = SlotReads(shard.fetch_add(delta, Ordering::SeqCst));
+            let overflow = (current == SegmentId::First && prev.on(SegmentId::First) >= READS)
+                || (current == SegmentId::Second && prev.on(SegmentId::Second) >= READS)
+                || (closing == Some(SegmentId::First) && prev.on(SegmentId::First) >= READS)
+                || (closing == Some(SegmentId::Second) && prev.on(SegmentId::Second) >= READS);
+            if overflow {
+                shard.fetch_sub(delta, Ordering::SeqCst);
+                return self.begin_read_saturated(shard_idx);
+            }
+            let w2 = self.state.load(Ordering::SeqCst);
+            if w1 == w2 {
+                return Some(ReadSpan {
+                    current,
+                    closing,
+                    shard: u16::try_from(shard_idx).unwrap_or(0),
+                });
+            }
+            shard.fetch_sub(delta, Ordering::SeqCst);
+            if (w2 & Self::READY_TO_RESET) == Self::READY_TO_RESET {
+                let _ = self.try_reset_closing();
+            }
+        }
     }
 
     /// [`Segments::end_read`]: the segment this resets, if the read was the last thing it waited
     /// for. Counts only fall here, so the change always fits the word.
+    #[inline]
     pub fn end_read(&self, span: ReadSpan) -> Option<SegmentId> {
-        self.update(|segments| {
-            segments.end_read(ReadSpan {
-                current: span.current,
-                closing: span.closing,
-            })
-        })
-        .flatten()
-    }
-
-    fn pack(segments: &Segments) -> Option<u64> {
-        let closing = segments.other.map_or(0, |closing| closing.reads);
-        (segments.reads <= READS && closing <= READS)
-            .then(|| segments.pack() | segments.reads | closing.wrapping_shl(CLOSING_READS_SHIFT))
-    }
-
-    fn unpack(word: u64) -> Segments {
-        let mut segments = Segments::unpack(word);
-        segments.reads = word & READS;
-        if let Some(closing) = &mut segments.other {
-            closing.reads = word.wrapping_shr(CLOSING_READS_SHIFT) & READS;
+        let shard_idx = usize::from(span.shard) & self.mask;
+        let delta = Self::span_delta(span.current, span.closing);
+        if let Some(shard) = self.shards.get(shard_idx) {
+            shard.fetch_sub(delta, Ordering::SeqCst);
         }
-        segments
+        let word = self.state.load(Ordering::SeqCst);
+        if (word & Self::READY_TO_RESET) != Self::READY_TO_RESET && (word & SATURATED) == 0 {
+            return None;
+        }
+        self.try_reset_closing()
     }
 }
 
@@ -731,6 +1044,7 @@ mod tests {
                 .with(&ReadSpan {
                     current: state.current(),
                     closing: state.closing(),
+                    shard: 0,
                 })
                 .expect("one read fits");
             let filled = unpacked.with_reads(counted);
@@ -757,10 +1071,12 @@ mod tests {
         let both = ReadSpan {
             current: Second,
             closing: Some(First),
+            shard: 0,
         };
         let first_only = ReadSpan {
             current: First,
             closing: None,
+            shard: 0,
         };
         let reads = SlotReads::default().with(&both).expect("fits");
         let reads = reads.with(&first_only).expect("fits");
@@ -771,6 +1087,7 @@ mod tests {
         let second_only = ReadSpan {
             current: Second,
             closing: None,
+            shard: 0,
         };
         let one_second = full.with(&second_only).expect("the second's count is free");
         assert_eq!(

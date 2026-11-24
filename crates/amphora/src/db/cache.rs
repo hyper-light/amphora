@@ -42,57 +42,82 @@ impl Default for Limits {
 }
 
 /// A kept statement, whether the session's validation accepted its text, and its neighbours in
-/// the recency order, named by their text.
-struct Entry {
+/// the recency order, linked by flat slab indices (no `Arc<str>` cloning or extra hash lookups on
+/// unlink/link).
+struct Slot {
+    key: Arc<str>,
     statement: Statement,
     validated: bool,
-    older: Option<Arc<str>>,
-    newer: Option<Arc<str>>,
+    older: Option<usize>,
+    newer: Option<usize>,
 }
 
 #[derive(Default)]
 struct State {
-    statements: HashMap<Arc<str>, Entry>,
-    oldest: Option<Arc<str>>,
-    newest: Option<Arc<str>>,
+    index: HashMap<Arc<str>, usize>,
+    slots: Vec<Option<Slot>>,
+    free: Vec<usize>,
+    oldest: Option<usize>,
+    newest: Option<usize>,
     sql_bytes: usize,
     schema: Option<(Arc<Schema>, u32)>,
 }
 impl State {
-    /// Takes `sql`'s statement out with its kept text and mark, its neighbours joined where it was.
-    fn remove(&mut self, sql: &str) -> Result<Option<Taken>> {
-        let Some((key, entry)) = self.statements.remove_entry(sql) else {
-            return Ok(None);
-        };
-        match &entry.older {
+    fn unlink(&mut self, idx: usize) -> Result<Slot> {
+        let slot = self
+            .slots
+            .get_mut(idx)
+            .and_then(Option::take)
+            .ok_or(Error::Accounting)?;
+        match slot.older {
             Some(older) => {
-                self.statements
+                self.slots
                     .get_mut(older)
+                    .and_then(Option::as_mut)
                     .ok_or(Error::Accounting)?
-                    .newer
-                    .clone_from(&entry.newer);
+                    .newer = slot.newer;
             }
-            None => self.oldest.clone_from(&entry.newer),
+            None => self.oldest = slot.newer,
         }
-        match &entry.newer {
+        match slot.newer {
             Some(newer) => {
-                self.statements
+                self.slots
                     .get_mut(newer)
+                    .and_then(Option::as_mut)
                     .ok_or(Error::Accounting)?
-                    .older
-                    .clone_from(&entry.older);
+                    .older = slot.older;
             }
-            None => self.newest.clone_from(&entry.older),
+            None => self.newest = slot.older,
         }
+        self.free.push(idx);
         self.sql_bytes = self
             .sql_bytes
-            .checked_sub(key.len())
+            .checked_sub(slot.key.len())
             .ok_or(Error::Accounting)?;
+        Ok(slot)
+    }
+
+    /// Takes `sql`'s statement out with its kept text and mark, its neighbours joined where it was.
+    fn remove(&mut self, sql: &str) -> Result<Option<Taken>> {
+        let Some(idx) = self.index.remove(sql) else {
+            return Ok(None);
+        };
+        let slot = self.unlink(idx)?;
         Ok(Some(Taken {
-            text: key,
-            statement: entry.statement,
-            validated: entry.validated,
+            text: slot.key,
+            statement: slot.statement,
+            validated: slot.validated,
         }))
+    }
+
+    /// Evicts and returns the least recently used statement.
+    fn remove_oldest(&mut self) -> Result<Statement> {
+        let oldest_idx = self.oldest.ok_or(Error::Accounting)?;
+        let slot = self.unlink(oldest_idx)?;
+        if self.index.remove(slot.key.as_ref()) != Some(oldest_idx) {
+            return Err(Error::Accounting);
+        }
+        Ok(slot.statement)
     }
 
     /// Makes `current` the schema entries are kept under. A change of schema hands back every
@@ -117,22 +142,34 @@ impl State {
         validated: bool,
         sql_bytes: usize,
     ) -> Result<()> {
-        match &self.newest {
+        let idx = if let Some(free_idx) = self.free.pop() {
+            free_idx
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(None);
+            idx
+        };
+        let prev_newest = self.newest;
+        match prev_newest {
             Some(newest) => {
-                self.statements
+                self.slots
                     .get_mut(newest)
+                    .and_then(Option::as_mut)
                     .ok_or(Error::Accounting)?
-                    .newer = Some(Arc::clone(&key));
+                    .newer = Some(idx);
             }
-            None => self.oldest = Some(Arc::clone(&key)),
+            None => self.oldest = Some(idx),
         }
-        let entry = Entry {
+        self.newest = Some(idx);
+        let slot = Slot {
+            key: Arc::clone(&key),
             statement,
             validated,
-            older: self.newest.replace(Arc::clone(&key)),
+            older: prev_newest,
             newer: None,
         };
-        if self.statements.insert(key, entry).is_some() {
+        *self.slots.get_mut(idx).ok_or(Error::Accounting)? = Some(slot);
+        if self.index.insert(key, idx).is_some() {
             return Err(Error::Accounting);
         }
         self.sql_bytes = sql_bytes;
@@ -225,14 +262,13 @@ impl Cache {
                     .sql_bytes
                     .checked_add(sql.len())
                     .ok_or(Error::Accounting)?;
-                if state.statements.len() < self.limits.entries && bytes <= self.limits.sql_bytes {
+                if state.index.len() < self.limits.entries && bytes <= self.limits.sql_bytes {
                     let key = text.unwrap_or_else(|| Arc::from(sql));
                     state.push(key, statement, validated, bytes)?;
                     admitted = true;
                     break;
                 }
-                let oldest = state.oldest.clone().ok_or(Error::Accounting)?;
-                retired.push(state.remove(&oldest)?.ok_or(Error::Accounting)?.statement);
+                retired.push(state.remove_oldest()?);
             }
             if !admitted {
                 return Err(Error::Accounting);
@@ -362,7 +398,7 @@ mod tests {
         let last = format!("SELECT {max}");
         put(&cache, &db, &last, db.conn.prepare(&last)?)?;
         assert_eq!(
-            cache.locked()?.statements.len(),
+            cache.locked()?.index.len(),
             max,
             "the cache holds its bound"
         );
