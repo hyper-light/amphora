@@ -1,0 +1,1589 @@
+columns	rows	SELECT a FROM u UNION SELECT a FROM u	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM u	0:
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM u	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u UNION SELECT a FROM t	8:NULL;abc;abc;m;q;q;q;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM t	4:NULL;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM t	1:abc
+columns	rows	SELECT a FROM u UNION SELECT a FROM r	8:NULL;abc;abc;abc;m;m;q;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM r	4:NULL;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM r	1:abc
+columns	rows	SELECT a FROM u UNION SELECT a FROM b	8:NULL;abc;abc;abc;m;q;q;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM b	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM b	0:
+columns	rows	SELECT a FROM u UNION SELECT a FROM n	7:7;NULL;abc;abc;q;x;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM n	4:NULL;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM n	1:abc
+columns	rows	SELECT a FROM u UNION SELECT a FROM e	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM e	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM u UNION SELECT a FROM k	8:NULL;abc;abc;abc;q;q;x;z
+columns	rows	SELECT a FROM u EXCEPT SELECT a FROM k	5:NULL;abc;abc;q;x
+columns	rows	SELECT a FROM u INTERSECT SELECT a FROM k	0:
+columns	rows	SELECT a FROM t UNION SELECT a FROM u	6:NULL;abc;m;q;q;x
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM u	2:m;q
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM u	1:abc
+columns	rows	SELECT a FROM t UNION SELECT a FROM t	3:abc;m;q
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM t	0:
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM t	3:abc;m;q
+columns	rows	SELECT a FROM t UNION SELECT a FROM r	5:abc;abc;m;m;q
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM r	1:q
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM r	2:abc;m
+columns	rows	SELECT a FROM t UNION SELECT a FROM b	4:abc;m;m;q
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM b	1:m
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM b	2:abc;q
+columns	rows	SELECT a FROM t UNION SELECT a FROM n	5:7;abc;m;q;x
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM n	2:m;q
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM n	1:abc
+columns	rows	SELECT a FROM t UNION SELECT a FROM e	3:abc;m;q
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM e	3:abc;m;q
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM t UNION SELECT a FROM k	4:abc;m;q;z
+columns	rows	SELECT a FROM t EXCEPT SELECT a FROM k	1:m
+columns	rows	SELECT a FROM t INTERSECT SELECT a FROM k	2:abc;q
+columns	rows	SELECT a FROM r UNION SELECT a FROM u	6:NULL;abc;abc;m;q;x
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM u	1:m
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM u	2:abc;abc
+columns	rows	SELECT a FROM r UNION SELECT a FROM t	5:abc;abc;m;q;q
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM t	1:abc
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM t	2:abc;m
+columns	rows	SELECT a FROM r UNION SELECT a FROM r	3:abc;abc;m
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM r	0:
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM r	3:abc;abc;m
+columns	rows	SELECT a FROM r UNION SELECT a FROM b	6:abc;abc;abc;m;m;q
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM b	3:abc;abc;m
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM b	0:
+columns	rows	SELECT a FROM r UNION SELECT a FROM n	5:7;abc;abc;m;x
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM n	2:abc;m
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM n	1:abc
+columns	rows	SELECT a FROM r UNION SELECT a FROM e	3:abc;abc;m
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM e	3:abc;abc;m
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM r UNION SELECT a FROM k	6:abc;abc;abc;m;q;z
+columns	rows	SELECT a FROM r EXCEPT SELECT a FROM k	3:abc;abc;m
+columns	rows	SELECT a FROM r INTERSECT SELECT a FROM k	0:
+columns	rows	SELECT a FROM b UNION SELECT a FROM u	8:NULL;abc;abc;abc;m;q;q;x
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM u	3:abc;m;q
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM u	0:
+columns	rows	SELECT a FROM b UNION SELECT a FROM t	6:abc;abc;m;m;q;q
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM t	2:abc;m
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM t	1:q
+columns	rows	SELECT a FROM b UNION SELECT a FROM r	7:abc;abc;abc;m;m;m;q
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM r	3:abc;m;q
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM r	0:
+columns	rows	SELECT a FROM b UNION SELECT a FROM b	3:abc;m;q
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM b	0:
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM b	3:abc;m;q
+columns	rows	SELECT a FROM b UNION SELECT a FROM n	6:7;abc;abc;m;q;x
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM n	3:abc;m;q
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM n	0:
+columns	rows	SELECT a FROM b UNION SELECT a FROM e	3:abc;m;q
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM e	3:abc;m;q
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM b UNION SELECT a FROM k	5:abc;abc;m;q;z
+columns	rows	SELECT a FROM b EXCEPT SELECT a FROM k	2:abc;m
+columns	rows	SELECT a FROM b INTERSECT SELECT a FROM k	1:q
+columns	rows	SELECT a FROM n UNION SELECT a FROM u	7:7;NULL;abc;abc;q;x;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM u	2:7;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM u	1:abc
+columns	rows	SELECT a FROM n UNION SELECT a FROM t	7:7;abc;abc;m;q;q;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM t	3:7;abc;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM t	0:
+columns	rows	SELECT a FROM n UNION SELECT a FROM r	6:7;abc;abc;m;m;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM r	2:7;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM r	1:abc
+columns	rows	SELECT a FROM n UNION SELECT a FROM b	6:7;abc;abc;m;q;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM b	3:7;abc;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM b	0:
+columns	rows	SELECT a FROM n UNION SELECT a FROM n	3:7;abc;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM n	0:
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM n	3:7;abc;x
+columns	rows	SELECT a FROM n UNION SELECT a FROM e	3:7;abc;x
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM e	3:7;abc;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM n UNION SELECT a FROM k	6:7;abc;abc;q;x;z
+columns	rows	SELECT a FROM n EXCEPT SELECT a FROM k	3:7;abc;x
+columns	rows	SELECT a FROM n INTERSECT SELECT a FROM k	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM u	4:NULL;abc;q;x
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM u	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM u	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM t	3:abc;m;q
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM t	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM t	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM r	4:abc;abc;m;m
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM r	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM r	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM b	3:abc;m;q
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM b	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM b	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM n	3:7;abc;x
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM n	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM n	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM e	0:
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM e	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM e UNION SELECT a FROM k	3:abc;q;z
+columns	rows	SELECT a FROM e EXCEPT SELECT a FROM k	0:
+columns	rows	SELECT a FROM e INTERSECT SELECT a FROM k	0:
+columns	rows	SELECT a FROM k UNION SELECT a FROM u	6:NULL;abc;q;q;x;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM u	2:q;z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM u	1:abc
+columns	rows	SELECT a FROM k UNION SELECT a FROM t	4:abc;m;q;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM t	1:z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM t	2:abc;q
+columns	rows	SELECT a FROM k UNION SELECT a FROM r	6:abc;abc;m;m;q;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM r	2:q;z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM r	1:abc
+columns	rows	SELECT a FROM k UNION SELECT a FROM b	4:abc;m;q;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM b	1:z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM b	2:abc;q
+columns	rows	SELECT a FROM k UNION SELECT a FROM n	5:7;abc;q;x;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM n	2:q;z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM n	1:abc
+columns	rows	SELECT a FROM k UNION SELECT a FROM e	3:abc;q;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM e	3:abc;q;z
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM e	0:
+columns	rows	SELECT a FROM k UNION SELECT a FROM k	3:abc;q;z
+columns	rows	SELECT a FROM k EXCEPT SELECT a FROM k	0:
+columns	rows	SELECT a FROM k INTERSECT SELECT a FROM k	3:abc;q;z
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT lower(a) FROM u	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT lower(a) FROM r	2:abc;m
+two	rows	SELECT a FROM n UNION SELECT a FROM v	7:7;abc;abc;m;q;q;x
+two	rows	SELECT a FROM r UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a FROM e INTERSECT SELECT coalesce(a, 'Z') FROM u	0:
+two	rows	SELECT a FROM b INTERSECT SELECT 'm ' COLLATE RTRIM	0:
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT coalesce(a, 'Z') FROM u	5:NULL;abc;q;x;z
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	4:NULL;abc;q;x
+two	rows	SELECT 'm ' COLLATE RTRIM EXCEPT SELECT a || '' FROM t	0:
+two	rows	VALUES ('abc' COLLATE NOCASE) EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	0:
+two	rows	VALUES ('abc') INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT coalesce(a, 'Z') FROM t	0:
+two	rows	SELECT max(a) FROM u UNION SELECT a FROM u LEFT JOIN t USING (a)	5:NULL;abc;abc;q;x
+two	rows	SELECT (SELECT max(a) FROM t) EXCEPT SELECT a COLLATE RTRIM FROM b	0:
+two	rows	SELECT max(a) FROM u UNION SELECT coalesce(a, 'Z') FROM u	5:abc;abc;q;x;z
+two	rows	SELECT lower(a) FROM u EXCEPT SELECT a FROM k	3:NULL;q;x
+two	rows	SELECT +a FROM r UNION SELECT a FROM f	3:abc;abc;m
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a FROM n	4:abc;m;q;q
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a COLLATE RTRIM FROM b	0:
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT a FROM u	4:NULL;abc;q;x
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT a FROM k	3:abc;q;z
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT +a FROM t	2:abc;m
+two	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+two	rows	SELECT (a) FROM t INTERSECT SELECT a COLLATE BINARY FROM t	3:abc;m;q
+two	rows	SELECT max(a) FROM r INTERSECT SELECT max(a) FROM u	0:
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT a FROM b	2:abc;q
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT 'm '	1:m
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	3:abc;m;q
+two	rows	SELECT a COLLATE BINARY FROM t INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM t EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u	2:m;q
+two	rows	SELECT a FROM r UNION SELECT a FROM v	5:abc;abc;m;q;q
+two	rows	SELECT lower(a) FROM r UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	8:NULL;abc;abc;abc;m;m;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT lower(a COLLATE NOCASE) FROM u	2:m;q
+two	rows	SELECT max(a) FROM t INTERSECT SELECT CAST(a AS TEXT) FROM r	0:
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT (a) FROM u	4:NULL;abc;q;x
+two	rows	SELECT +a FROM t UNION SELECT lower(a COLLATE NOCASE) FROM u	6:NULL;abc;m;q;q;x
+two	rows	SELECT (SELECT max(a) FROM t) INTERSECT SELECT (SELECT max(a) FROM t)	1:q
+two	rows	SELECT NULL INTERSECT SELECT a FROM f	0:
+two	rows	SELECT a FROM n INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT a || '' FROM r UNION SELECT a || '' FROM t	7:abc;abc;abc;m;m;q;q
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT a FROM n	2:m;q
+two	rows	SELECT a FROM u GROUP BY a INTERSECT SELECT a COLLATE NOCASE FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a || '' FROM t INTERSECT SELECT 'abc'	0:
+two	rows	SELECT +a FROM r UNION VALUES ('abc' COLLATE NOCASE)	3:abc;abc;m
+two	rows	SELECT max(a) FROM r EXCEPT SELECT +a FROM r	0:
+two	rows	SELECT a FROM r INTERSECT SELECT 'm ' COLLATE RTRIM	1:m
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT DISTINCT a FROM t	3:abc;m;q
+two	rows	SELECT a || '' FROM u INTERSECT SELECT a FROM k	1:abc
+two	rows	SELECT max(a) FROM u UNION SELECT lower(a) FROM u	4:NULL;abc;q;x
+two	rows	SELECT a FROM r UNION SELECT CAST(a AS TEXT) FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a FROM r INTERSECT SELECT a FROM v	2:abc;m
+two	rows	SELECT 'abc' COLLATE NOCASE INTERSECT SELECT a FROM t	1:abc
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT a FROM u	0:
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT (a) FROM t	0:
+two	rows	SELECT a FROM b UNION SELECT a FROM u LEFT JOIN t USING (a)	8:NULL;abc;abc;abc;m;q;q;x
+two	rows	SELECT a FROM n INTERSECT SELECT 'Q'	0:
+two	rows	SELECT (a) FROM t UNION SELECT a COLLATE BINARY FROM t	3:abc;m;q
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT coalesce(a, 'Z') FROM r	1:abc
+two	rows	SELECT a FROM v UNION SELECT a || '' FROM t	3:abc;m;q
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u	0:
+two	rows	SELECT 'm ' COLLATE RTRIM INTERSECT SELECT 'm ' COLLATE RTRIM	1:m
+two	rows	SELECT 7 INTERSECT VALUES ('abc' COLLATE NOCASE)	0:
+two	rows	SELECT (a) FROM r UNION SELECT +a FROM r	3:abc;abc;m
+two	rows	SELECT a FROM t EXCEPT SELECT max(a) FROM t	2:abc;m
+two	rows	SELECT 'abc' COLLATE NOCASE INTERSECT SELECT +a FROM t	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a FROM u	3:m;q;q
+two	rows	SELECT +a FROM u EXCEPT VALUES ('abc')	4:NULL;abc;q;x
+two	rows	SELECT a FROM b EXCEPT SELECT a COLLATE BINARY FROM t	2:abc;m
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT a FROM f	3:abc;m;m
+two	rows	SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT CAST(a AS TEXT) FROM r	3:q;x;z
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a || '' FROM t	1:abc
+two	rows	SELECT a FROM v INTERSECT SELECT 'abc' COLLATE NOCASE	1:abc
+two	rows	SELECT a COLLATE RTRIM FROM b INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	0:
+two	rows	SELECT a COLLATE RTRIM FROM b UNION SELECT 'abc' COLLATE NOCASE	4:abc;abc;m;q
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT max(a) FROM u	3:abc;m;q
+two	rows	SELECT +a FROM t EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	2:m;q
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT a FROM k	2:abc;m
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT t.a FROM t JOIN u ON t.a = u.a	1:abc
+two	rows	SELECT max(a) FROM r EXCEPT SELECT coalesce(a, 'Z') FROM t	1:m
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT max(a) FROM t	3:abc;m;q
+two	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT (a) FROM u	6:NULL;abc;abc;q;x;z
+two	rows	SELECT a FROM r UNION SELECT x FROM (SELECT a AS x FROM t)	5:abc;abc;m;q;q
+two	rows	SELECT max(a) FROM t INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	0:
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT lower(a) FROM t	2:abc;m
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT a COLLATE NOCASE FROM u	2:m;q
+two	rows	SELECT a FROM r EXCEPT SELECT +a FROM t	1:abc
+two	rows	SELECT 'm ' COLLATE RTRIM UNION SELECT lower(a) FROM r	2:abc;m
+two	rows	SELECT CAST(a AS TEXT) FROM u INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t)	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT coalesce(a, 'Z') FROM t	2:abc;m
+two	rows	SELECT 'm ' EXCEPT SELECT coalesce(a, 'Z') FROM r	0:
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT NULL	4:NULL;abc;q;x
+two	rows	SELECT +a FROM t EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	0:
+two	rows	SELECT lower(a) FROM u UNION SELECT 'Q'	5:NULL;abc;q;q;x
+two	rows	SELECT a FROM f UNION SELECT a FROM t	7:abc;abc;abc;m;m;q;q
+two	rows	SELECT (SELECT max(a) FROM t) EXCEPT SELECT 'm '	1:q
+two	rows	SELECT a FROM b UNION SELECT +a FROM u	8:NULL;abc;abc;abc;m;q;q;x
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a FROM n	2:m;q
+two	rows	SELECT (a) FROM t INTERSECT SELECT lower(a) FROM r	2:abc;m
+two	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT 'm ' COLLATE RTRIM	2:abc;abc
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	2:m;q
+two	rows	SELECT (SELECT max(a) FROM t) EXCEPT SELECT max(a) FROM u	1:q
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT 'Q'	6:NULL;abc;abc;q;q;x
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT 7	5:NULL;abc;abc;q;x
+two	rows	SELECT +a FROM r UNION SELECT 'Q'	4:abc;abc;m;q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT 'abc' COLLATE NOCASE	2:m;q
+two	rows	SELECT (a) FROM u EXCEPT SELECT max(a) FROM r	5:NULL;abc;abc;q;x
+two	rows	SELECT max(a) FROM t INTERSECT SELECT a FROM b	1:q
+two	rows	SELECT NULL INTERSECT SELECT 'm '	0:
+two	rows	SELECT max(a) FROM r EXCEPT SELECT lower(a) FROM u	1:m
+two	rows	SELECT a || '' FROM u EXCEPT SELECT coalesce(a, 'Z') FROM t	4:NULL;abc;q;x
+two	rows	SELECT max(a) FROM r INTERSECT SELECT 'm ' COLLATE RTRIM	1:m
+two	rows	SELECT a FROM r UNION SELECT a COLLATE RTRIM FROM b	6:abc;abc;abc;m;m;q
+two	rows	SELECT a FROM k EXCEPT SELECT (a) FROM t	1:z
+two	rows	SELECT a FROM e INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	0:
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT a COLLATE BINARY FROM t	1:m
+two	rows	SELECT a FROM t INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	1:abc
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT NULL	1:NULL
+two	rows	SELECT 7 UNION SELECT lower(a) FROM t	4:7;abc;m;q
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) INTERSECT SELECT a FROM n	1:abc
+two	rows	SELECT (a) FROM r EXCEPT SELECT a COLLATE RTRIM FROM b	3:abc;abc;m
+two	rows	SELECT a FROM t UNION SELECT DISTINCT a FROM t	3:abc;m;q
+two	rows	SELECT a FROM f EXCEPT SELECT (a) FROM u	3:abc;m;m
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT max(a) FROM r	1:m
+two	rows	SELECT a FROM f INTERSECT SELECT CAST(a AS TEXT) FROM u	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT (a) FROM r	8:NULL;abc;abc;abc;m;m;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT coalesce(a, 'Z') FROM u	3:abc;m;m
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT a || '' FROM t	4:abc;m;q;q
+two	rows	SELECT a FROM t INTERSECT SELECT lower(a) FROM t	3:abc;m;q
+two	rows	SELECT 'abc' UNION SELECT a FROM u GROUP BY a	5:NULL;abc;abc;q;x
+two	rows	SELECT a || '' FROM t UNION SELECT coalesce(a, 'Z') FROM u	8:abc;abc;m;q;q;q;x;z
+two	rows	SELECT lower(a) FROM t INTERSECT SELECT 'm ' COLLATE RTRIM	1:m
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT (a) FROM r	0:
+two	rows	VALUES ('abc') UNION SELECT (a) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT 'm '	1:m
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT coalesce(a, 'Z') FROM r	8:NULL;abc;abc;abc;m;m;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT max(a) FROM u	4:abc;abc;m;x
+two	rows	SELECT a COLLATE RTRIM FROM b UNION SELECT lower(a) FROM u	7:NULL;abc;abc;m;q;q;x
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT 'Q'	2:abc;m
+two	rows	SELECT a FROM n INTERSECT SELECT (SELECT max(a) FROM t)	0:
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT a FROM r	3:abc;abc;m
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT a FROM n	1:abc
+two	rows	SELECT (SELECT max(a) FROM t) INTERSECT SELECT a COLLATE NOCASE FROM u	0:
+two	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT lower(a) FROM u	2:abc;m
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	0:
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) INTERSECT SELECT coalesce(a, 'Z') FROM t	1:abc
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT (a) FROM t	4:NULL;abc;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT 'Q'	3:abc;abc;m
+two	rows	SELECT a FROM u GROUP BY a INTERSECT SELECT 7	0:
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a FROM v	0:
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT a FROM u	2:abc;abc
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	1:abc
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT DISTINCT a FROM t	1:abc
+two	rows	SELECT a || '' FROM r UNION SELECT a COLLATE BINARY FROM t	7:abc;abc;abc;m;m;q;q
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT (a) FROM t	2:abc;m
+two	rows	SELECT lower(a) FROM u INTERSECT SELECT (SELECT max(a) FROM t)	0:
+two	rows	SELECT a FROM v INTERSECT SELECT a || '' FROM u	1:abc
+two	rows	SELECT NULL INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	1:NULL
+two	rows	VALUES ('abc' COLLATE NOCASE) UNION VALUES ('abc')	1:abc
+two	rows	SELECT a FROM n INTERSECT SELECT NULL	0:
+two	rows	SELECT a FROM f INTERSECT SELECT a FROM r	3:abc;m;m
+two	rows	SELECT a FROM r UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	5:NULL;abc;abc;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT max(a) FROM t	4:abc;m;q;q
+two	rows	SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT DISTINCT a FROM t	1:abc
+two	rows	VALUES ('abc' COLLATE NOCASE) INTERSECT SELECT +a FROM t	1:abc
+two	rows	SELECT a FROM f EXCEPT SELECT 7	4:abc;abc;m;m
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT a FROM e	4:NULL;abc;q;x
+two	rows	SELECT a || '' FROM r EXCEPT SELECT DISTINCT a FROM t	2:abc;m
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT a FROM n	2:abc;x
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT max(a) FROM t	2:abc;q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT CAST(a AS TEXT) FROM r	1:q
+two	rows	SELECT a FROM t UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	3:abc;m;q
+two	rows	SELECT lower(a) FROM u UNION VALUES ('abc' COLLATE NOCASE)	4:NULL;abc;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT a FROM u GROUP BY a	1:abc
+two	rows	SELECT NULL INTERSECT SELECT a FROM u	1:NULL
+two	rows	SELECT 'abc' INTERSECT SELECT NULL	0:
+two	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a || '' FROM t	3:abc;m;q
+two	rows	SELECT +a FROM u EXCEPT SELECT x FROM (SELECT a AS x FROM t)	4:NULL;abc;q;x
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT a FROM r	3:abc;m;q
+two	rows	SELECT 'Q' INTERSECT SELECT a FROM b	1:q
+two	rows	SELECT 'Q' INTERSECT SELECT lower(a) FROM r	0:
+two	rows	SELECT DISTINCT a FROM t INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t	1:abc
+two	rows	SELECT a FROM n UNION SELECT a || '' FROM t	7:7;abc;abc;m;q;q;x
+two	rows	SELECT a COLLATE NOCASE FROM u UNION SELECT a || '' FROM u	4:NULL;abc;q;x
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT max(a) FROM r	1:abc
+two	rows	SELECT a FROM e UNION SELECT x FROM (SELECT a AS x FROM t)	3:abc;m;q
+two	rows	SELECT 'abc' INTERSECT SELECT max(a) FROM r	0:
+two	rows	SELECT a || '' FROM r EXCEPT SELECT 'm '	3:abc;abc;m
+two	rows	SELECT max(a) FROM r EXCEPT SELECT 'abc'	1:m
+two	rows	SELECT NULL INTERSECT SELECT a FROM v	0:
+two	rows	VALUES ('abc') UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	5:abc;abc;m;q;q
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT max(a) FROM r	3:abc;m;q
+two	rows	SELECT a FROM r INTERSECT SELECT 'abc'	1:abc
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	0:
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT a COLLATE NOCASE FROM u	4:NULL;abc;q;x
+two	rows	SELECT (a) FROM r UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT a FROM b	3:abc;m;q
+two	rows	SELECT max(a) FROM t INTERSECT SELECT 'abc'	0:
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT a COLLATE BINARY FROM t	1:abc
+two	rows	SELECT (a) FROM r UNION SELECT (a COLLATE NOCASE) || '' FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT VALUES ('abc' COLLATE NOCASE)	1:abc
+two	rows	SELECT a COLLATE BINARY FROM t INTERSECT SELECT NULL	0:
+two	rows	SELECT a FROM f UNION SELECT 7	5:7;abc;abc;m;m
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM b	8:NULL;abc;abc;abc;m;q;q;x
+two	rows	SELECT a FROM v INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+two	rows	SELECT max(a) FROM t EXCEPT SELECT lower(a) FROM t	1:q
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT max(a) FROM u	1:abc
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT (a) FROM u	4:NULL;abc;q;x
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a FROM b	0:
+two	rows	VALUES ('abc') UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	2:abc;abc
+two	rows	SELECT a COLLATE RTRIM FROM b INTERSECT SELECT +a FROM u	0:
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT a COLLATE RTRIM FROM b	6:abc;abc;m;m;q;q
+two	rows	VALUES ('abc') EXCEPT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	0:
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT a FROM e	5:NULL;abc;abc;q;x
+two	rows	SELECT a || '' FROM r INTERSECT SELECT CAST(a AS TEXT) FROM u	1:abc
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT (SELECT max(a) FROM t)	2:abc;m
+two	rows	SELECT a FROM v INTERSECT SELECT max(a) FROM t	1:q
+two	rows	SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	3:abc;q;x
+two	rows	SELECT (a) FROM r EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	2:abc;m
+two	rows	SELECT lower(a) FROM r EXCEPT SELECT (a) FROM u	3:abc;m;m
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT a FROM b	0:
+two	rows	SELECT a FROM k INTERSECT SELECT lower(a) FROM t	2:abc;q
+two	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT a FROM r	6:abc;abc;m;q;x;z
+two	rows	SELECT 'm ' UNION VALUES ('abc')	2:abc;m
+two	rows	SELECT +a FROM t UNION SELECT coalesce(a, 'Z') FROM r	5:abc;abc;m;m;q
+two	rows	SELECT a FROM u GROUP BY a UNION SELECT (a) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a FROM u GROUP BY a INTERSECT SELECT a FROM n	1:abc
+two	rows	SELECT a || '' FROM u UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	5:NULL;abc;abc;q;x
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT 'Q'	5:NULL;abc;abc;q;x
+two	rows	SELECT (a) FROM t UNION SELECT 'abc'	3:abc;m;q
+two	rows	SELECT a FROM k EXCEPT SELECT (a) FROM r	2:q;z
+two	rows	VALUES ('abc') UNION SELECT 'Q'	2:abc;q
+two	rows	SELECT a FROM u EXCEPT SELECT lower(a) FROM t	4:NULL;abc;q;x
+two	rows	SELECT a FROM r INTERSECT SELECT NULL	0:
+two	rows	SELECT a || '' FROM t EXCEPT SELECT 'Q'	3:abc;m;q
+two	rows	SELECT DISTINCT a FROM t INTERSECT SELECT 'Q'	1:q
+two	rows	SELECT a COLLATE NOCASE FROM u EXCEPT SELECT a FROM u GROUP BY a	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT coalesce(a, 'Z') FROM u	8:abc;abc;m;q;q;q;x;z
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT a FROM e	0:
+two	rows	SELECT a FROM r UNION SELECT a FROM f	3:abc;abc;m
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t)	1:abc
+two	rows	SELECT 'Q' EXCEPT SELECT max(a) FROM u	1:q
+two	rows	SELECT a FROM e UNION SELECT coalesce(a, 'Z') FROM t	3:abc;m;q
+two	rows	SELECT a FROM e UNION SELECT NULL	1:NULL
+two	rows	SELECT NULL UNION SELECT (a) FROM r	4:NULL;abc;abc;m
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT max(a) FROM t	2:abc;m
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT +a FROM u	4:NULL;abc;q;x
+two	rows	SELECT max(a) FROM t INTERSECT SELECT (a) FROM t	1:q
+two	rows	SELECT a FROM t EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	0:
+two	rows	SELECT 7 INTERSECT SELECT CAST(a AS TEXT) FROM u	0:
+two	rows	SELECT a FROM e UNION SELECT a FROM v	3:abc;m;q
+two	rows	SELECT lower(a) FROM t INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	1:abc
+two	rows	SELECT a FROM n INTERSECT SELECT a COLLATE RTRIM FROM b	0:
+two	rows	SELECT +a FROM t INTERSECT SELECT a COLLATE RTRIM FROM b	2:abc;q
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT CAST(a AS TEXT) FROM u	0:
+two	rows	SELECT a FROM n UNION SELECT max(a) FROM r	4:7;abc;m;x
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT a FROM u GROUP BY a	4:NULL;abc;q;x
+two	rows	SELECT a || '' FROM r EXCEPT VALUES ('abc' COLLATE NOCASE)	3:abc;m;m
+two	rows	SELECT a FROM k EXCEPT SELECT +a FROM r	2:q;z
+two	rows	SELECT a FROM f UNION SELECT lower(a) FROM r	4:abc;abc;m;m
+two	rows	SELECT max(a) FROM u INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	1:x
+two	rows	SELECT 'abc' COLLATE NOCASE UNION SELECT a FROM n	3:7;abc;x
+two	rows	SELECT a FROM u GROUP BY a UNION SELECT 'Q'	6:NULL;abc;abc;q;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT VALUES ('abc' COLLATE NOCASE)	1:abc
+two	rows	SELECT lower(a) FROM r UNION VALUES ('abc')	4:abc;abc;m;m
+two	rows	SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT CAST(a AS TEXT) FROM t	1:abc
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT DISTINCT a FROM t	4:NULL;abc;q;x
+two	rows	SELECT a FROM u GROUP BY a UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	5:NULL;abc;abc;q;x
+two	rows	SELECT lower(a) FROM t INTERSECT SELECT +a FROM u	1:abc
+two	rows	SELECT max(a) FROM r UNION SELECT lower(a) FROM t	4:abc;m;m;q
+two	rows	SELECT a || '' FROM t EXCEPT SELECT lower(a) FROM u	4:abc;m;q;q
+two	rows	SELECT lower(a) FROM r EXCEPT SELECT max(a) FROM r	3:abc;abc;m
+two	rows	SELECT max(a) FROM u UNION VALUES ('abc')	2:abc;x
+two	rows	SELECT a FROM b UNION SELECT (a) FROM u	8:NULL;abc;abc;abc;m;q;q;x
+two	rows	SELECT lower(a) FROM u INTERSECT SELECT a FROM u	4:NULL;abc;q;x
+two	rows	SELECT 'm ' EXCEPT SELECT x FROM (SELECT lower(a) AS x FROM t)	0:
+two	rows	SELECT a || '' FROM r INTERSECT SELECT a FROM f	3:abc;m;m
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT x FROM (SELECT lower(a) AS x FROM t)	3:abc;m;q
+two	rows	SELECT CAST(a AS TEXT) FROM u INTERSECT SELECT a FROM f	1:abc
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT +a FROM t	1:abc
+two	rows	SELECT +a FROM t INTERSECT SELECT x FROM (SELECT a AS x FROM t)	3:abc;m;q
+two	rows	SELECT +a FROM u INTERSECT SELECT a || '' FROM t	1:abc
+two	rows	SELECT +a FROM u EXCEPT SELECT +a FROM t	4:NULL;abc;q;x
+two	rows	SELECT (a) FROM r EXCEPT SELECT 7	3:abc;abc;m
+two	rows	SELECT 'm ' EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	1:m
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT (a) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a FROM t INTERSECT SELECT DISTINCT a FROM t	3:abc;m;q
+two	rows	SELECT (a) FROM t EXCEPT SELECT a FROM e	3:abc;m;q
+two	rows	SELECT max(a) FROM r INTERSECT SELECT coalesce(a, 'Z') FROM u	0:
+two	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT max(a) FROM r	3:abc;abc;m
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT DISTINCT a FROM t	1:abc
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT a COLLATE BINARY FROM t	2:abc;m
+two	rows	VALUES ('abc') UNION SELECT lower(a) FROM t	3:abc;m;q
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	1:abc
+two	rows	SELECT a FROM t UNION SELECT CAST(a AS TEXT) FROM r	5:abc;abc;m;m;q
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a || '' FROM u	1:abc
+two	rows	VALUES ('abc') INTERSECT SELECT a FROM u GROUP BY a	1:abc
+two	rows	SELECT a || '' FROM t UNION SELECT a FROM u	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT lower(a) FROM r EXCEPT SELECT a FROM f	0:
+two	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT a FROM t	3:abc;m;q
+two	rows	SELECT 'Q' INTERSECT SELECT NULL	0:
+two	rows	SELECT a FROM n EXCEPT SELECT (a) FROM t	3:7;abc;x
+two	rows	SELECT a FROM u GROUP BY a EXCEPT SELECT lower(a) FROM u	1:abc
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT lower(a) FROM t	0:
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT lower(a) FROM t	7:NULL;abc;abc;m;q;q;x
+two	rows	SELECT a FROM t EXCEPT SELECT a || '' FROM t	0:
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) INTERSECT VALUES ('abc' COLLATE NOCASE)	1:abc
+two	rows	SELECT a COLLATE BINARY FROM t UNION SELECT 'abc'	5:abc;abc;m;q;q
+two	rows	SELECT (a) FROM r UNION SELECT DISTINCT a FROM t	4:abc;abc;m;q
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT max(a) FROM u	1:x
+two	rows	SELECT +a FROM r UNION SELECT +a FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	3:abc;m;q
+two	rows	SELECT NULL UNION SELECT 'abc' COLLATE NOCASE	2:NULL;abc
+two	rows	SELECT 'm ' COLLATE RTRIM UNION SELECT x FROM (SELECT a AS x FROM t)	4:abc;m;q;q
+two	rows	SELECT a FROM k EXCEPT SELECT a COLLATE NOCASE FROM u	2:q;z
+two	rows	SELECT (a) FROM t UNION SELECT a FROM v	3:abc;m;q
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT lower(a) FROM t	5:abc;abc;m;q;q
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT coalesce(a, 'Z') FROM u	7:abc;abc;m;q;q;x;z
+two	rows	SELECT a COLLATE NOCASE FROM u INTERSECT SELECT 'abc' COLLATE NOCASE	1:abc
+two	rows	SELECT (a) FROM r INTERSECT SELECT a || '' FROM r	3:abc;abc;m
+two	rows	SELECT a FROM b INTERSECT SELECT a || '' FROM t	1:q
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT lower(a) FROM r	1:abc
+two	rows	SELECT +a FROM r EXCEPT SELECT (a) FROM u	1:m
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT 'abc' COLLATE NOCASE	1:abc
+two	rows	SELECT a FROM u GROUP BY a INTERSECT SELECT a FROM u GROUP BY a	5:NULL;abc;abc;q;x
+two	rows	SELECT a FROM f INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t)	2:abc;m
+two	rows	SELECT DISTINCT a FROM t UNION SELECT lower(a) FROM u	6:NULL;abc;m;q;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT a FROM e	3:abc;m;q
+two	rows	SELECT a COLLATE BINARY FROM t EXCEPT SELECT coalesce(a, 'Z') FROM t	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT 'm '	3:abc;q;q
+two	rows	SELECT a COLLATE RTRIM FROM b INTERSECT SELECT coalesce(a, 'Z') FROM r	0:
+two	rows	SELECT a FROM f INTERSECT SELECT a || '' FROM t	1:m
+two	rows	SELECT (a) FROM r UNION SELECT max(a) FROM r	3:abc;abc;m
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT a FROM v	4:NULL;abc;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	1:abc
+two	rows	SELECT a COLLATE NOCASE FROM u EXCEPT SELECT lower(a) FROM u	0:
+two	rows	SELECT a || '' FROM t EXCEPT SELECT (a) FROM t	0:
+two	rows	SELECT max(a) FROM r INTERSECT SELECT NULL	0:
+two	rows	SELECT (a) FROM r INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT 'm ' EXCEPT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	1:m
+two	rows	SELECT a FROM v INTERSECT SELECT +a FROM u	1:abc
+two	rows	SELECT (a) FROM u EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	4:NULL;abc;q;x
+two	rows	SELECT a FROM t INTERSECT SELECT 7	0:
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT a FROM t	3:abc;m;q
+two	rows	SELECT a FROM t INTERSECT SELECT (SELECT max(a) FROM t)	1:q
+two	rows	SELECT NULL INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a	0:
+two	rows	SELECT a FROM t EXCEPT SELECT max(a) FROM u	3:abc;m;q
+two	rows	SELECT CAST(a AS TEXT) FROM u INTERSECT SELECT 'abc'	1:abc
+two	rows	SELECT (a) FROM r INTERSECT SELECT max(a) FROM r	1:m
+two	rows	VALUES ('abc') UNION SELECT max(a) FROM r	2:abc;m
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT SELECT lower(a) FROM u	4:abc;m;q;q
+two	rows	SELECT 'abc' UNION SELECT a FROM t	3:abc;m;q
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT CAST(a AS TEXT) FROM t	0:
+two	rows	SELECT a FROM f UNION SELECT max(a) FROM u	5:abc;abc;m;m;x
+two	rows	SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT lower(a) FROM r	1:m
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT DISTINCT a FROM t	0:
+two	rows	SELECT a FROM e EXCEPT SELECT max(a) FROM t	0:
+two	rows	SELECT +a FROM r EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	1:m
+two	rows	SELECT a FROM r INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+two	rows	SELECT a FROM k INTERSECT SELECT a || '' FROM r	1:abc
+two	rows	SELECT a FROM t UNION SELECT 'abc' COLLATE NOCASE	3:abc;m;q
+two	rows	SELECT (a) FROM r EXCEPT SELECT coalesce(a, 'Z') FROM r	0:
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT a || '' FROM u	0:
+two	rows	SELECT 7 UNION SELECT 'm ' COLLATE RTRIM	2:7;m
+two	rows	SELECT +a FROM t INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	1:abc
+two	rows	SELECT 'abc' COLLATE NOCASE INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	1:abc
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT lower(a) FROM u	0:
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT a || '' FROM t	3:abc;m;q
+two	rows	SELECT 'Q' INTERSECT VALUES ('abc' COLLATE NOCASE)	0:
+two	rows	SELECT a COLLATE BINARY FROM t EXCEPT SELECT a FROM r	3:abc;q;q
+two	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM t	3:abc;m;q
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT SELECT (a) FROM r	2:q;q
+two	rows	SELECT a FROM r EXCEPT SELECT +a FROM r	0:
+two	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT a FROM f	8:abc;abc;abc;m;m;q;x;z
+two	rows	SELECT +a FROM r UNION SELECT a COLLATE NOCASE FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a COLLATE BINARY FROM t EXCEPT SELECT 'm '	3:abc;q;q
+two	rows	SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT (SELECT max(a) FROM t)	1:q
+two	rows	SELECT a || '' FROM r EXCEPT SELECT a COLLATE BINARY FROM t	3:abc;abc;m
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT a FROM b	4:abc;abc;m;m
+two	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT DISTINCT a FROM t	3:abc;m;q
+two	rows	SELECT x FROM (SELECT a AS x FROM t) UNION SELECT max(a) FROM r	4:abc;m;m;q
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT CAST(a AS TEXT) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT lower(a) FROM r UNION SELECT coalesce(a, 'Z') FROM r	5:abc;abc;abc;m;m
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a COLLATE RTRIM FROM b	1:m
+two	rows	SELECT a COLLATE NOCASE FROM u EXCEPT SELECT +a FROM t	3:NULL;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT (a) FROM u	3:m;q;q
+two	rows	SELECT a FROM b UNION SELECT +a FROM r	7:abc;abc;abc;m;m;m;q
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a FROM t	0:
+two	rows	SELECT a FROM t UNION SELECT (SELECT max(a) FROM t)	3:abc;m;q
+two	rows	SELECT a FROM u EXCEPT SELECT x FROM (SELECT a AS x FROM t)	4:NULL;abc;q;x
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT a || '' FROM r	0:
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT a FROM k	0:
+two	rows	SELECT CAST(a AS TEXT) FROM u EXCEPT SELECT a COLLATE RTRIM FROM b	5:NULL;abc;abc;q;x
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT a FROM u	2:m;q
+two	rows	SELECT (a) FROM t INTERSECT SELECT max(a) FROM t	1:q
+two	rows	SELECT a FROM k EXCEPT SELECT 'Q'	2:abc;z
+two	rows	SELECT a || '' FROM r INTERSECT SELECT (a) FROM u	1:abc
+two	rows	SELECT a FROM k EXCEPT SELECT lower(a) FROM u	2:q;z
+two	rows	SELECT 'abc' UNION SELECT x FROM (SELECT lower(a) AS x FROM t)	3:abc;m;q
+two	rows	SELECT +a FROM t INTERSECT SELECT a FROM v	3:abc;m;q
+two	rows	SELECT a FROM r EXCEPT SELECT a FROM f	1:abc
+two	rows	SELECT +a FROM t INTERSECT SELECT max(a) FROM r	0:
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT a COLLATE RTRIM FROM b	0:
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT coalesce(a, 'Z') FROM u	1:abc
+two	rows	SELECT 'abc' EXCEPT SELECT (SELECT max(a) FROM t)	1:abc
+two	rows	SELECT a FROM n EXCEPT SELECT DISTINCT a FROM t	3:7;abc;x
+two	rows	SELECT 'm ' EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	1:m
+two	rows	SELECT DISTINCT a FROM t UNION SELECT a FROM f	5:abc;abc;m;m;q
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	5:NULL;abc;abc;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT CAST(a AS TEXT) FROM u	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT 'm ' INTERSECT SELECT coalesce(a, 'Z') FROM r	1:m
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT +a FROM t	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM r UNION SELECT +a FROM t	5:abc;abc;m;m;q
+two	rows	SELECT (a) FROM r INTERSECT SELECT a || '' FROM u	2:abc;abc
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a FROM t WHERE a IN (SELECT a FROM u)	2:m;q
+two	rows	SELECT a FROM u GROUP BY a EXCEPT SELECT x FROM (SELECT a AS x FROM t)	4:NULL;abc;q;x
+two	rows	SELECT (a) FROM t EXCEPT SELECT +a FROM t	0:
+two	rows	SELECT a FROM b UNION SELECT coalesce(a, 'Z') FROM u	8:abc;abc;abc;m;q;q;x;z
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT coalesce(a, 'Z') FROM r	1:abc
+two	rows	SELECT lower(a) FROM r INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT (a) FROM t	2:abc;m
+two	rows	SELECT 7 INTERSECT SELECT lower(a) FROM t	0:
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT coalesce(a, 'Z') FROM r	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a FROM u GROUP BY a	3:m;q;q
+two	rows	SELECT 'm ' INTERSECT SELECT a FROM b	0:
+two	rows	SELECT (a) FROM t INTERSECT SELECT a FROM u GROUP BY a	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT a || '' FROM u	1:abc
+two	rows	SELECT max(a) FROM r EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	1:m
+two	rows	SELECT a FROM v EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	2:m;q
+two	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT lower(a) FROM u	6:NULL;abc;abc;q;x;z
+two	rows	VALUES ('abc' COLLATE NOCASE) INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	1:abc
+two	rows	SELECT (a) FROM r INTERSECT SELECT a FROM f	2:abc;m
+two	rows	SELECT +a FROM u INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a FROM v UNION SELECT a FROM b	4:abc;m;m;q
+two	rows	SELECT CAST(a AS TEXT) FROM u EXCEPT SELECT a FROM f	4:NULL;abc;q;x
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u EXCEPT SELECT a COLLATE NOCASE FROM u	0:
+two	rows	SELECT max(a) FROM r INTERSECT SELECT +a FROM t	0:
+two	rows	VALUES ('abc') EXCEPT SELECT a COLLATE RTRIM FROM b	1:abc
+two	rows	SELECT a FROM b INTERSECT SELECT a FROM u GROUP BY a	0:
+two	rows	SELECT (a) FROM r EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	1:m
+two	rows	SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT a || '' FROM t	3:abc;m;q
+two	rows	SELECT a FROM u GROUP BY a EXCEPT SELECT 7	5:NULL;abc;abc;q;x
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT a FROM f	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT lower(a) FROM u	3:abc;m;m
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a INTERSECT SELECT lower(a) FROM t	1:abc
+two	rows	SELECT NULL UNION SELECT a COLLATE RTRIM FROM b	4:NULL;abc;m;q
+two	rows	SELECT lower(a) FROM u EXCEPT SELECT a FROM u	0:
+two	rows	VALUES ('abc') EXCEPT SELECT coalesce(a, 'Z') FROM t	1:abc
+two	rows	SELECT 'Q' UNION SELECT a COLLATE NOCASE FROM u	5:NULL;abc;q;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT max(a) FROM u	0:
+two	rows	SELECT max(a) FROM u INTERSECT SELECT a FROM r	0:
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT a FROM f EXCEPT SELECT a FROM e	4:abc;abc;m;m
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT a FROM t	2:abc;m
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM v	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT a FROM t	0:
+two	rows	SELECT a || '' FROM u INTERSECT SELECT coalesce(a, 'Z') FROM t	1:abc
+two	rows	SELECT a || '' FROM t UNION SELECT t.a FROM t JOIN u ON t.a = u.a	3:abc;m;q
+two	rows	SELECT a || '' FROM u UNION SELECT coalesce(a, 'Z') FROM u	6:NULL;abc;abc;q;x;z
+two	rows	SELECT 'm ' COLLATE RTRIM INTERSECT SELECT a FROM b	0:
+two	rows	SELECT (a) FROM t INTERSECT SELECT +a FROM u	1:abc
+two	rows	SELECT a || '' FROM t UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	4:abc;m;q;q
+two	rows	SELECT max(a) FROM t UNION SELECT lower(a) FROM r	5:abc;abc;m;m;q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT 7	3:abc;m;q
+two	rows	SELECT max(a) FROM u EXCEPT SELECT a COLLATE BINARY FROM t	1:x
+two	rows	SELECT a FROM r INTERSECT SELECT max(a) FROM u	0:
+two	rows	VALUES ('abc') UNION SELECT lower(a) FROM u	4:NULL;abc;q;x
+two	rows	SELECT (SELECT max(a) FROM t) EXCEPT VALUES ('abc')	1:q
+two	rows	SELECT lower(a) FROM r EXCEPT SELECT 7	4:abc;abc;m;m
+two	rows	SELECT lower(a) FROM u INTERSECT SELECT a || '' FROM t	0:
+two	rows	SELECT (a) FROM r INTERSECT SELECT 'abc'	1:abc
+two	rows	SELECT (a) FROM t UNION SELECT x FROM (SELECT a AS x FROM t)	3:abc;m;q
+two	rows	SELECT a FROM f UNION SELECT max(a) FROM r	4:abc;abc;m;m
+two	rows	SELECT 'm ' COLLATE RTRIM UNION VALUES ('abc')	2:abc;m
+two	rows	SELECT (SELECT max(a) FROM t) EXCEPT SELECT +a FROM t	0:
+two	rows	SELECT a FROM e EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	0:
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION VALUES ('abc' COLLATE NOCASE)	5:NULL;abc;abc;q;x
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	0:
+two	rows	SELECT 'm ' INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	0:
+two	rows	SELECT a FROM u INTERSECT SELECT coalesce(a, 'Z') FROM r	1:abc
+two	rows	VALUES ('abc') UNION SELECT a || '' FROM r	4:abc;abc;m;m
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a FROM v	1:abc
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT 'abc' COLLATE NOCASE	5:NULL;abc;abc;q;x
+two	rows	SELECT (a) FROM r EXCEPT SELECT DISTINCT a FROM t	1:abc
+two	rows	SELECT max(a) FROM t INTERSECT SELECT a FROM f	0:
+two	rows	SELECT +a FROM u EXCEPT SELECT a COLLATE NOCASE FROM u	0:
+two	rows	SELECT a FROM v UNION VALUES ('abc')	3:abc;m;q
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT a FROM k	1:abc
+two	rows	SELECT NULL INTERSECT SELECT CAST(a AS TEXT) FROM u	1:NULL
+two	rows	SELECT 'abc' EXCEPT VALUES ('abc' COLLATE NOCASE)	0:
+two	rows	SELECT 'abc' INTERSECT SELECT 7	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	1:abc
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT a FROM e	5:NULL;abc;abc;q;x
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT coalesce(a, 'Z') FROM t	0:
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT NULL	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT lower(a) FROM r	7:abc;abc;abc;m;m;q;q
+two	rows	SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT (a) FROM u	1:abc
+two	rows	SELECT a COLLATE NOCASE FROM u INTERSECT SELECT max(a) FROM t	0:
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a	1:abc
+two	rows	SELECT (SELECT max(a) FROM t) INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a	0:
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT a || '' FROM t	4:abc;m;q;q
+two	rows	SELECT a COLLATE NOCASE FROM u UNION VALUES ('abc' COLLATE NOCASE)	4:NULL;abc;q;x
+two	rows	SELECT max(a) FROM t UNION SELECT max(a) FROM t	1:q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT a || '' FROM u	2:m;q
+two	rows	SELECT max(a) FROM t UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	4:abc;m;q;q
+two	rows	SELECT a FROM u GROUP BY a EXCEPT SELECT a FROM u GROUP BY a	0:
+two	rows	SELECT 'm ' COLLATE RTRIM EXCEPT SELECT a FROM b	1:m
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM u GROUP BY a	5:NULL;abc;abc;q;x
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT a FROM r	1:abc
+two	rows	SELECT (a) FROM r EXCEPT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	1:m
+two	rows	SELECT +a FROM u INTERSECT SELECT a || '' FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT a FROM f	7:abc;abc;abc;m;m;q;q
+two	rows	SELECT (SELECT max(a) FROM t) INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	1:q
+two	rows	SELECT 'abc' INTERSECT SELECT a FROM u	1:abc
+two	rows	SELECT a FROM r EXCEPT SELECT 'm '	2:abc;abc
+two	rows	SELECT a || '' FROM u INTERSECT SELECT 'Q'	0:
+two	rows	SELECT a || '' FROM t EXCEPT SELECT lower(a) FROM t	2:abc;q
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t	0:
+two	rows	SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT max(a) FROM r	0:
+two	rows	VALUES ('abc') EXCEPT SELECT a FROM r	0:
+two	rows	SELECT 'Q' EXCEPT SELECT a || '' FROM t	0:
+two	rows	SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT 'abc'	1:abc
+two	rows	SELECT a FROM e INTERSECT SELECT lower(a) FROM t	0:
+two	rows	SELECT a FROM u GROUP BY a UNION SELECT a FROM n	7:7;NULL;abc;abc;q;x;x
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	0:
+two	rows	SELECT max(a) FROM u UNION SELECT lower(a) FROM t	4:abc;m;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT a FROM u GROUP BY a	7:NULL;abc;abc;m;q;q;x
+two	rows	SELECT a FROM t INTERSECT SELECT CAST(a AS TEXT) FROM t	3:abc;m;q
+two	rows	SELECT 'm ' INTERSECT SELECT a || '' FROM t	1:m
+two	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT CAST(a AS TEXT) FROM r	5:abc;abc;m;m;q
+two	rows	SELECT (a) FROM r EXCEPT SELECT (a) FROM u	1:m
+two	rows	SELECT lower(a) FROM u UNION SELECT t.a FROM t JOIN u ON t.a = u.a	4:NULL;abc;q;x
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT lower(a) FROM t	0:
+two	rows	SELECT a FROM k EXCEPT SELECT 'm ' COLLATE RTRIM	3:abc;q;z
+two	rows	SELECT a FROM u INTERSECT SELECT a FROM f	1:abc
+two	rows	VALUES ('abc' COLLATE NOCASE) EXCEPT VALUES ('abc')	0:
+two	rows	SELECT +a FROM r INTERSECT SELECT +a FROM u	2:abc;abc
+two	rows	SELECT a FROM v INTERSECT SELECT +a FROM t	3:abc;m;q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	2:m;q
+two	rows	SELECT a COLLATE NOCASE FROM u INTERSECT SELECT lower(a) FROM u	4:NULL;abc;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT a FROM r	3:abc;abc;m
+two	rows	SELECT 7 UNION SELECT (SELECT max(a) FROM t)	2:7;q
+two	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT (SELECT max(a) FROM t)	3:abc;abc;m
+two	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT a FROM t	5:abc;abc;m;q;q
+two	rows	SELECT 'abc' EXCEPT SELECT +a FROM r	0:
+two	rows	SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT (a) FROM r	2:abc;abc
+two	rows	SELECT (a) FROM t INTERSECT SELECT a FROM b	2:abc;q
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT a FROM b	1:abc
+two	rows	SELECT (a) FROM u UNION SELECT lower(a) FROM r	8:NULL;abc;abc;abc;m;m;q;x
+two	rows	SELECT (a) FROM r UNION SELECT CAST(a AS TEXT) FROM r	3:abc;abc;m
+two	rows	SELECT +a FROM u INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT CAST(a AS TEXT) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT a || '' FROM t	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT NULL INTERSECT SELECT coalesce(a, 'Z') FROM t	0:
+two	rows	SELECT max(a) FROM r INTERSECT SELECT coalesce(a, 'Z') FROM t	0:
+two	rows	SELECT a || '' FROM t UNION SELECT max(a) FROM t	4:abc;m;q;q
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT SELECT a FROM e	3:abc;m;q
+two	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT a || '' FROM t	5:abc;abc;m;q;q
+two	rows	VALUES ('abc') INTERSECT SELECT (SELECT max(a) FROM t)	0:
+two	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT lower(a) FROM r	5:abc;abc;m;m;q
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT max(a) FROM r	2:abc;m
+two	rows	SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT CAST(a AS TEXT) FROM t	1:abc
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT +a FROM r	1:abc
+two	rows	VALUES ('abc') INTERSECT SELECT a COLLATE BINARY FROM t	0:
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t	1:abc
+two	rows	SELECT a FROM e EXCEPT SELECT CAST(a AS TEXT) FROM u	0:
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT coalesce(a, 'Z') FROM r	3:abc;abc;m
+two	rows	SELECT a || '' FROM t INTERSECT SELECT a FROM b	1:q
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	0:
+two	rows	SELECT +a FROM r INTERSECT SELECT +a FROM t	2:abc;m
+two	rows	SELECT coalesce(a, 'Z') FROM t UNION SELECT +a FROM r	5:abc;abc;m;q;q
+two	rows	SELECT (a) FROM t EXCEPT SELECT a FROM b	1:m
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT lower(a) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT (a) FROM u UNION SELECT t.a FROM t JOIN u ON t.a = u.a	5:NULL;abc;abc;q;x
+two	rows	SELECT (a COLLATE NOCASE) || '' FROM u EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	3:NULL;q;x
+two	rows	SELECT (a) FROM u EXCEPT SELECT a FROM v	4:NULL;abc;q;x
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT a FROM e	1:abc
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT lower(a COLLATE NOCASE) FROM u	2:m;q
+two	rows	SELECT a FROM r INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT a FROM k UNION SELECT CAST(a AS TEXT) FROM t	4:abc;m;q;z
+two	rows	SELECT a FROM r UNION SELECT CAST(a AS TEXT) FROM r	3:abc;abc;m
+two	rows	SELECT CAST(a AS TEXT) FROM u INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	5:NULL;abc;abc;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT a COLLATE NOCASE FROM u	6:NULL;abc;m;q;q;x
+two	rows	SELECT a || '' FROM u UNION SELECT a COLLATE RTRIM FROM b	8:NULL;abc;abc;abc;m;q;q;x
+two	rows	SELECT a || '' FROM u INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+two	rows	SELECT a FROM t EXCEPT SELECT lower(a COLLATE NOCASE) FROM u	2:m;q
+two	rows	SELECT lower(a) FROM t EXCEPT SELECT a FROM b	3:abc;m;q
+two	rows	VALUES ('abc') UNION SELECT x FROM (SELECT lower(a) AS x FROM t)	3:abc;m;q
+two	rows	SELECT (a) FROM r UNION SELECT a || '' FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT a FROM t	4:NULL;abc;q;x
+two	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT 'm ' COLLATE RTRIM	2:abc;q
+two	rows	SELECT +a FROM r EXCEPT SELECT lower(a) FROM r	1:abc
+two	rows	SELECT (a) FROM r INTERSECT SELECT a COLLATE RTRIM FROM b	0:
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a COLLATE NOCASE FROM u EXCEPT SELECT x FROM (SELECT a AS x FROM t)	3:NULL;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT a || '' FROM u	6:NULL;abc;abc;m;q;x
+two	rows	SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT a || '' FROM r	4:abc;q;x;z
+two	rows	SELECT 'abc' EXCEPT SELECT max(a) FROM u	1:abc
+two	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT lower(a) FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT +a FROM u UNION SELECT a COLLATE BINARY FROM t	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT a FROM b EXCEPT SELECT coalesce(a, 'Z') FROM r	3:abc;m;q
+two	rows	SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	1:abc
+two	rows	SELECT 'abc' EXCEPT SELECT a || '' FROM t	1:abc
+two	rows	SELECT a || '' FROM t EXCEPT SELECT lower(a) FROM r	3:abc;q;q
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM r	8:NULL;abc;abc;abc;m;m;q;x
+two	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT a FROM u GROUP BY a	1:abc
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT 'm ' COLLATE RTRIM	1:abc
+two	rows	SELECT a || '' FROM t INTERSECT SELECT (a) FROM t	3:abc;m;q
+two	rows	SELECT a FROM e INTERSECT SELECT +a FROM r	0:
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) EXCEPT SELECT NULL	4:abc;abc;q;x
+two	rows	SELECT a FROM t UNION SELECT CAST(a AS TEXT) FROM t	3:abc;m;q
+two	rows	SELECT a || '' FROM u UNION SELECT a || '' FROM t	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT a || '' FROM r INTERSECT SELECT coalesce(a, 'Z') FROM t	1:m
+two	rows	SELECT (a) FROM u EXCEPT SELECT +a FROM u	0:
+two	rows	SELECT a FROM e EXCEPT SELECT a || '' FROM u	0:
+two	rows	SELECT a COLLATE NOCASE FROM u UNION SELECT a FROM f	7:NULL;abc;abc;m;m;q;x
+two	rows	SELECT a FROM u INTERSECT VALUES ('abc')	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT (SELECT max(a) FROM t)	6:NULL;abc;abc;q;q;x
+two	rows	SELECT t.a FROM t JOIN u ON t.a = u.a INTERSECT SELECT a FROM e	0:
+two	rows	SELECT a FROM k UNION VALUES ('abc' COLLATE NOCASE)	3:abc;q;z
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT 'm ' COLLATE RTRIM	0:
+two	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT +a FROM u	5:NULL;abc;abc;q;x
+two	rows	VALUES ('abc' COLLATE NOCASE) INTERSECT SELECT a FROM t	1:abc
+two	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT 'abc' COLLATE NOCASE	2:abc;m
+two	rows	SELECT lower(a) FROM r INTERSECT SELECT lower(a) FROM t	2:abc;m
+two	rows	SELECT a FROM v UNION SELECT max(a) FROM r	4:abc;m;m;q
+two	rows	SELECT a || '' FROM u EXCEPT SELECT coalesce(a, 'Z') FROM r	4:NULL;abc;q;x
+two	rows	SELECT 'm ' INTERSECT SELECT 'm '	1:m
+two	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a COLLATE BINARY FROM t	8:NULL;abc;abc;m;q;q;q;x
+two	rows	SELECT 'abc' COLLATE NOCASE UNION SELECT a FROM u	4:NULL;abc;q;x
+two	rows	VALUES ('abc') EXCEPT SELECT +a FROM u	0:
+two	rows	SELECT 'abc' INTERSECT SELECT CAST(a AS TEXT) FROM u	1:abc
+two	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a FROM u	2:m;q
+two	rows	SELECT DISTINCT a FROM t UNION SELECT (a) FROM u	6:NULL;abc;m;q;q;x
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	4:NULL;abc;q;x
+two	rows	SELECT a FROM f EXCEPT SELECT coalesce(a, 'Z') FROM r	1:abc
+two	rows	SELECT a FROM e UNION SELECT lower(a) FROM t	3:abc;m;q
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT 'm '	1:m
+two	rows	SELECT a || '' FROM r INTERSECT VALUES ('abc' COLLATE NOCASE)	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT a COLLATE NOCASE FROM u	3:abc;m;m
+two	rows	SELECT a || '' FROM u INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	1:abc
+two	rows	SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT lower(a COLLATE NOCASE) FROM u	1:abc
+two	rows	SELECT (a) FROM r UNION SELECT a FROM k	6:abc;abc;abc;m;q;z
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+two	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT (SELECT max(a) FROM t)	5:NULL;abc;abc;q;x
+two	rows	SELECT +a FROM t EXCEPT SELECT a FROM r	1:q
+two	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT VALUES ('abc')	4:abc;m;q;q
+two	rows	SELECT a COLLATE RTRIM FROM b UNION SELECT 'm '	4:abc;m;m;q
+two	rows	SELECT a FROM f INTERSECT SELECT x FROM (SELECT a AS x FROM t)	1:m
+two	rows	SELECT a FROM k EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	2:q;z
+two	rows	SELECT lower(a) FROM u EXCEPT SELECT coalesce(a, 'Z') FROM u	1:NULL
+two	rows	SELECT 'abc' INTERSECT SELECT +a FROM r	1:abc
+two	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT a || '' FROM t	0:
+two	rows	SELECT a FROM f INTERSECT SELECT a || '' FROM r	3:abc;m;m
+two	rows	SELECT NULL INTERSECT SELECT a FROM t	0:
+two	rows	SELECT a COLLATE BINARY FROM t UNION SELECT 'm ' COLLATE RTRIM	4:abc;m;q;q
+two	rows	SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a FROM v	0:
+two	rows	SELECT a COLLATE RTRIM FROM b INTERSECT SELECT 'abc' COLLATE NOCASE	0:
+two	rows	SELECT 7 INTERSECT SELECT a FROM r	0:
+two	rows	SELECT max(a) FROM r INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t	0:
+two	rows	SELECT (a) FROM u EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	4:NULL;abc;q;x
+two	rows	SELECT max(a) FROM t UNION SELECT a FROM t WHERE a IN (SELECT a FROM u)	2:abc;q
+two	rows	SELECT lower(a) FROM t INTERSECT SELECT (SELECT max(a) FROM t)	0:
+two	rows	SELECT (a) FROM t EXCEPT SELECT DISTINCT a FROM t	0:
+two	rows	SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT lower(a COLLATE NOCASE) FROM u	1:abc
+two	rows	SELECT 'abc' INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	0:
+two	rows	SELECT a FROM f UNION VALUES ('abc')	4:abc;abc;m;m
+two	rows	SELECT max(a) FROM r INTERSECT SELECT 'abc' COLLATE NOCASE	0:
+two	rows	SELECT 7 INTERSECT SELECT a FROM k	0:
+two	rows	SELECT 'abc' UNION SELECT +a FROM u	5:NULL;abc;abc;q;x
+two	rows	SELECT a COLLATE RTRIM FROM b EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	3:abc;m;q
+two	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT coalesce(a, 'Z') FROM r	8:abc;abc;abc;m;m;q;x;z
+two	rows	SELECT a FROM r INTERSECT SELECT 'm '	1:m
+two	rows	SELECT a FROM v UNION SELECT x FROM (SELECT lower(a) AS x FROM t)	3:abc;m;q
+two	rows	SELECT max(a) FROM u EXCEPT SELECT 'abc'	1:x
+two	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT 'abc' COLLATE NOCASE	1:abc
+two	rows	SELECT (a) FROM t INTERSECT SELECT a || '' FROM r	2:abc;m
+two	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT x FROM (SELECT a AS x FROM t)	3:abc;m;q
+two	rows	SELECT +a FROM r INTERSECT SELECT a FROM b	0:
+two	rows	SELECT (a) FROM t UNION SELECT lower(a COLLATE NOCASE) FROM u	6:NULL;abc;m;q;q;x
+two	rows	SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	1:abc
+two	rows	SELECT 'm ' COLLATE RTRIM INTERSECT SELECT a FROM r	1:m
+two	rows	SELECT lower(a) FROM u UNION SELECT a COLLATE BINARY FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT a FROM f UNION ALL SELECT a || '' FROM r EXCEPT SELECT a FROM t WHERE a IN (SELECT a FROM u)	5:abc;abc;abc;m;m
+three	rows	SELECT lower(a) FROM t UNION SELECT (a) FROM u UNION SELECT a COLLATE NOCASE FROM u	7:NULL;abc;abc;m;q;q;x
+three	rows	SELECT a FROM k UNION VALUES ('abc') EXCEPT SELECT 7	3:abc;q;z
+three	rows	SELECT max(a) FROM u UNION ALL SELECT a FROM r UNION SELECT a FROM n	6:7;abc;abc;m;x;x
+three	rows	VALUES ('abc' COLLATE NOCASE) INTERSECT SELECT max(a) FROM u UNION SELECT max(a) FROM r	1:m
+three	rows	SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT 'Q' INTERSECT SELECT a FROM u GROUP BY a	1:abc
+three	rows	SELECT a || '' FROM u INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT 'abc'	1:abc
+three	rows	SELECT CAST(a AS TEXT) FROM t INTERSECT SELECT DISTINCT a FROM t UNION SELECT a FROM u GROUP BY a	6:NULL;abc;m;q;q;x
+three	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT coalesce(a, 'Z') FROM r UNION SELECT t.a FROM t JOIN u ON t.a = u.a	8:NULL;abc;abc;abc;m;m;q;x
+three	rows	SELECT +a FROM t UNION ALL SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT (SELECT max(a) FROM t)	4:abc;abc;m;m
+three	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT CAST(a AS TEXT) FROM t UNION SELECT DISTINCT a FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT a || '' FROM r UNION SELECT a FROM u UNION ALL SELECT a COLLATE NOCASE FROM u	13:NULL;NULL;abc;abc;abc;abc;abc;m;m;q;q;x;x
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT coalesce(a, 'Z') FROM u	6:abc;abc;abc;q;x;z
+three	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT a FROM e UNION SELECT 'Q'	6:NULL;abc;abc;q;q;x
+three	rows	SELECT a FROM t UNION ALL SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT (a) FROM r	2:abc;m
+three	rows	SELECT a FROM f UNION SELECT a FROM u INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	5:NULL;abc;abc;q;x
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT (a) FROM r UNION SELECT CAST(a AS TEXT) FROM t	5:abc;abc;m;m;q
+three	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL VALUES ('abc') UNION SELECT a COLLATE BINARY FROM t	3:abc;m;q
+three	rows	SELECT lower(a COLLATE NOCASE) FROM u EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT a FROM e	3:NULL;q;x
+three	rows	SELECT (a COLLATE NOCASE) || '' FROM u UNION ALL SELECT (a) FROM u UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t	14:NULL;NULL;abc;abc;abc;abc;abc;abc;abc;abc;q;q;x;x
+three	rows	SELECT 'm ' COLLATE RTRIM INTERSECT SELECT 'm ' COLLATE RTRIM UNION ALL SELECT coalesce(a, 'Z') FROM u	6:abc;abc;m;q;x;z
+three	rows	SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT VALUES ('abc') UNION ALL SELECT 'm '	2:abc;m
+three	rows	SELECT (a) FROM r UNION SELECT a FROM e UNION SELECT a FROM b	6:abc;abc;abc;m;m;q
+three	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a COLLATE RTRIM FROM b UNION SELECT lower(a) FROM r	4:abc;abc;m;m
+three	rows	SELECT +a FROM t INTERSECT SELECT a FROM e EXCEPT SELECT +a FROM u	0:
+three	rows	SELECT a FROM e EXCEPT SELECT a FROM n UNION SELECT max(a) FROM r	1:m
+three	rows	SELECT max(a) FROM r UNION ALL SELECT (a) FROM u EXCEPT SELECT CAST(a AS TEXT) FROM t	5:NULL;abc;m;q;x
+three	rows	SELECT a FROM t UNION ALL SELECT a FROM u INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t)	3:abc;m;q
+three	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT a || '' FROM r	4:abc;abc;m;m
+three	rows	SELECT max(a) FROM u UNION SELECT a FROM b EXCEPT SELECT a FROM f	4:abc;m;q;x
+three	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT (a) FROM u	0:
+three	rows	SELECT a FROM b UNION SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT 'Q'	4:abc;abc;m;q
+three	rows	SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT a || '' FROM u UNION SELECT a || '' FROM r	5:abc;abc;m;m;z
+three	rows	SELECT a FROM b UNION SELECT max(a) FROM r UNION ALL SELECT a FROM n	7:7;abc;abc;m;m;q;x
+three	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT +a FROM u INTERSECT SELECT lower(a) FROM r	1:abc
+three	rows	SELECT a FROM u UNION SELECT 'abc' COLLATE NOCASE UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t)	9:NULL;abc;abc;abc;m;q;q;q;x
+three	rows	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT (SELECT max(a) FROM t) UNION SELECT (a) FROM r	4:abc;abc;m;q
+three	rows	SELECT max(a) FROM u UNION SELECT +a FROM r EXCEPT SELECT a FROM t	2:abc;x
+three	rows	SELECT a FROM n UNION ALL SELECT a FROM k UNION ALL SELECT coalesce(a, 'Z') FROM r	10:7;abc;abc;abc;abc;m;m;q;x;z
+three	rows	VALUES ('abc') UNION ALL SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT a FROM v	3:q;x;z
+three	rows	SELECT +a FROM t UNION ALL SELECT a COLLATE BINARY FROM t UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	3:abc;m;q
+three	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT 7 UNION ALL SELECT coalesce(a, 'Z') FROM u	11:7;NULL;abc;abc;abc;abc;q;q;x;x;z
+three	rows	SELECT max(a) FROM r UNION SELECT DISTINCT a FROM t EXCEPT SELECT +a FROM u	3:m;m;q
+three	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t	10:NULL;abc;abc;abc;abc;abc;m;q;q;x
+three	rows	SELECT (SELECT max(a) FROM t) UNION ALL SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT t.a FROM t JOIN u ON t.a = u.a	5:NULL;abc;q;q;x
+three	rows	SELECT a FROM f UNION ALL SELECT coalesce(a, 'Z') FROM r EXCEPT SELECT a FROM t WHERE a IN (SELECT a FROM u)	5:abc;abc;abc;m;m
+three	rows	SELECT a COLLATE RTRIM FROM b UNION SELECT lower(a) FROM u UNION SELECT a FROM u LEFT JOIN t USING (a)	8:NULL;abc;abc;abc;m;q;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT a COLLATE BINARY FROM t EXCEPT SELECT lower(a) FROM r	3:abc;q;q
+three	rows	SELECT max(a) FROM u UNION SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT coalesce(a, 'Z') FROM t	5:abc;m;q;q;x
+three	rows	SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT CAST(a AS TEXT) FROM r UNION SELECT 7	7:7;abc;abc;m;q;x;z
+three	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT SELECT a FROM n UNION ALL SELECT a || '' FROM t	8:abc;abc;m;m;q;q;q;q
+three	rows	SELECT a FROM e UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	3:abc;m;q
+three	rows	SELECT 'm ' UNION ALL SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT (SELECT max(a) FROM t)	7:abc;abc;m;q;q;x;z
+three	rows	SELECT lower(a) FROM t UNION SELECT DISTINCT a FROM t EXCEPT SELECT 'abc'	2:m;q
+three	rows	SELECT 'Q' UNION ALL SELECT CAST(a AS TEXT) FROM t UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;m;q;q;x
+three	rows	SELECT (a COLLATE NOCASE) || '' FROM u EXCEPT SELECT a COLLATE RTRIM FROM b UNION SELECT DISTINCT a FROM t	6:NULL;abc;m;q;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM r INTERSECT SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT (a) FROM r	0:
+three	rows	SELECT a FROM r INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;abc;m;q;x
+three	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT a FROM u EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a	6:NULL;abc;m;q;q;x
+three	rows	SELECT 7 UNION SELECT a || '' FROM r EXCEPT SELECT lower(a) FROM u	4:7;abc;m;m
+three	rows	SELECT a COLLATE BINARY FROM t UNION ALL SELECT a || '' FROM u UNION SELECT coalesce(a, 'Z') FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT max(a) FROM t EXCEPT SELECT max(a) FROM r UNION SELECT coalesce(a, 'Z') FROM t	4:abc;m;q;q
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT a FROM u UNION ALL SELECT a COLLATE NOCASE FROM u	5:NULL;abc;abc;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT a || '' FROM t UNION SELECT 'Q'	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT lower(a) FROM u EXCEPT SELECT a FROM r UNION ALL SELECT a FROM v	7:NULL;abc;m;q;q;q;x
+three	rows	SELECT max(a) FROM u UNION SELECT a FROM r EXCEPT SELECT a FROM r	1:x
+three	rows	SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT max(a) FROM r UNION SELECT (SELECT max(a) FROM t)	1:q
+three	rows	SELECT a FROM f UNION SELECT coalesce(a, 'Z') FROM t UNION VALUES ('abc' COLLATE NOCASE)	7:abc;abc;abc;m;m;q;q
+three	rows	SELECT 'm ' UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	0:
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT (SELECT max(a) FROM t)	2:abc;q
+three	rows	SELECT a FROM t EXCEPT SELECT DISTINCT a FROM t UNION SELECT (SELECT max(a) FROM t)	1:q
+three	rows	SELECT max(a) FROM u UNION ALL SELECT a COLLATE BINARY FROM t EXCEPT SELECT +a FROM r	4:abc;q;q;x
+three	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT 'abc' UNION SELECT (SELECT max(a) FROM t)	5:abc;abc;m;q;q
+three	rows	SELECT x FROM (SELECT a AS x FROM t) UNION SELECT CAST(a AS TEXT) FROM r UNION SELECT a FROM b	5:abc;abc;m;m;q
+three	rows	SELECT max(a) FROM u UNION SELECT max(a) FROM r UNION ALL SELECT a FROM n	5:7;abc;m;x;x
+three	rows	SELECT NULL UNION SELECT 7 UNION SELECT 7	2:7;NULL
+three	rows	SELECT a COLLATE BINARY FROM t INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a INTERSECT SELECT (a) FROM u	1:abc
+three	rows	SELECT a || '' FROM u UNION SELECT 7 INTERSECT SELECT 'Q'	0:
+three	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT CAST(a AS TEXT) FROM r UNION SELECT a FROM r	7:NULL;abc;abc;m;m;q;x
+three	rows	SELECT (a) FROM r UNION SELECT a COLLATE BINARY FROM t UNION SELECT 'm '	5:abc;abc;m;q;q
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT a FROM k EXCEPT SELECT a FROM u LEFT JOIN t USING (a)	0:
+three	rows	SELECT 'Q' UNION ALL SELECT x FROM (SELECT a AS x FROM t) UNION ALL SELECT a COLLATE RTRIM FROM b	8:abc;abc;m;m;q;q;q;q
+three	rows	VALUES ('abc') EXCEPT SELECT max(a) FROM t INTERSECT SELECT 'abc'	1:abc
+three	rows	SELECT a FROM k UNION SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT lower(a) FROM r	9:NULL;abc;abc;m;m;q;q;x;z
+three	rows	SELECT (a) FROM r INTERSECT SELECT CAST(a AS TEXT) FROM t UNION SELECT 'm ' COLLATE RTRIM	2:abc;m
+three	rows	SELECT a || '' FROM t UNION SELECT a || '' FROM u UNION ALL SELECT DISTINCT a FROM t	11:NULL;abc;abc;abc;m;m;q;q;q;q;x
+three	rows	SELECT coalesce(a, 'Z') FROM u UNION SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT (a COLLATE NOCASE) || '' FROM u	10:NULL;abc;abc;abc;abc;q;q;x;x;z
+three	rows	SELECT a FROM b EXCEPT SELECT a FROM r UNION SELECT 'abc'	4:abc;abc;m;q
+three	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT NULL	6:NULL;abc;abc;m;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT 7 UNION ALL SELECT 'abc'	5:7;abc;abc;abc;m
+three	rows	SELECT a FROM f UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT (a) FROM r	9:NULL;abc;abc;abc;abc;m;m;q;x
+three	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT max(a) FROM t EXCEPT SELECT CAST(a AS TEXT) FROM u	1:q
+three	rows	SELECT 'abc' COLLATE NOCASE UNION SELECT a COLLATE NOCASE FROM u UNION ALL SELECT coalesce(a, 'Z') FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT 7 UNION SELECT 'm ' COLLATE RTRIM UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u)	3:7;abc;m
+three	rows	SELECT lower(a) FROM u INTERSECT SELECT a FROM n INTERSECT SELECT a || '' FROM t	0:
+three	rows	SELECT DISTINCT a FROM t UNION SELECT a COLLATE BINARY FROM t UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;m;q;q;x
+three	rows	SELECT a COLLATE NOCASE FROM u UNION SELECT (SELECT max(a) FROM t) UNION SELECT +a FROM t	6:NULL;abc;m;q;q;x
+three	rows	SELECT (a) FROM t UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT a FROM b	2:abc;q
+three	rows	SELECT +a FROM r UNION SELECT a FROM k UNION ALL SELECT a FROM f	10:abc;abc;abc;abc;abc;m;m;m;q;z
+three	rows	SELECT max(a) FROM r UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT a FROM u	11:NULL;NULL;abc;abc;abc;abc;m;q;q;x;x
+three	rows	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT a FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT a || '' FROM r UNION ALL SELECT coalesce(a, 'Z') FROM u UNION SELECT a COLLATE RTRIM FROM b	9:abc;abc;abc;m;m;q;q;x;z
+three	rows	SELECT a COLLATE RTRIM FROM b UNION SELECT a COLLATE NOCASE FROM u UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	9:NULL;abc;abc;abc;m;m;q;q;x
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT max(a) FROM u UNION SELECT a FROM t	3:abc;m;q
+three	rows	SELECT a FROM r UNION SELECT a FROM v UNION SELECT a || '' FROM t	5:abc;abc;m;q;q
+three	rows	SELECT a FROM u GROUP BY a EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT 'm '	1:m
+three	rows	SELECT NULL UNION ALL SELECT (SELECT max(a) FROM t) UNION ALL SELECT lower(a COLLATE NOCASE) FROM u	7:NULL;NULL;abc;abc;q;q;x
+three	rows	SELECT NULL INTERSECT SELECT a FROM u GROUP BY a UNION SELECT NULL	1:NULL
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT a FROM r EXCEPT SELECT a FROM b	0:
+three	rows	SELECT +a FROM r UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a FROM u GROUP BY a	5:NULL;abc;abc;q;x
+three	rows	SELECT (a) FROM r UNION ALL SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t	10:abc;abc;abc;abc;abc;abc;abc;abc;m;m
+three	rows	SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM v INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	5:NULL;abc;abc;q;x
+three	rows	SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT a || '' FROM u UNION SELECT a FROM u	4:NULL;abc;q;x
+three	rows	SELECT 'Q' UNION SELECT 'm ' COLLATE RTRIM UNION ALL SELECT a COLLATE BINARY FROM t	6:abc;m;m;q;q;q
+three	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT (SELECT max(a) FROM t) EXCEPT SELECT a FROM u GROUP BY a	1:q
+three	rows	SELECT (a) FROM r UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION SELECT 'm ' COLLATE RTRIM	6:NULL;abc;abc;m;q;x
+three	rows	SELECT max(a) FROM t UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT +a FROM t	3:abc;m;q
+three	rows	SELECT a FROM f EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t)	8:abc;abc;abc;m;m;m;q;q
+three	rows	SELECT NULL UNION SELECT a FROM e UNION ALL SELECT a COLLATE NOCASE FROM u	6:NULL;NULL;abc;abc;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT max(a) FROM u UNION ALL SELECT lower(a) FROM r	9:abc;abc;abc;m;m;m;q;q;x
+three	rows	SELECT +a FROM u UNION ALL SELECT a FROM n EXCEPT SELECT a || '' FROM r	6:7;NULL;abc;q;x;x
+three	rows	SELECT a FROM u UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT a FROM n	7:7;NULL;abc;abc;q;x;x
+three	rows	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT 'abc' COLLATE NOCASE EXCEPT SELECT 'Q'	4:abc;abc;m;m
+three	rows	SELECT a FROM t WHERE a IN (SELECT a FROM u) INTERSECT SELECT (a) FROM r UNION ALL SELECT +a FROM t	5:abc;abc;m;q;q
+three	rows	SELECT CAST(a AS TEXT) FROM t UNION SELECT +a FROM u EXCEPT SELECT 'Q'	5:NULL;abc;m;q;x
+three	rows	SELECT a || '' FROM u UNION ALL SELECT NULL INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+three	rows	SELECT a FROM n UNION SELECT a FROM r EXCEPT SELECT (a) FROM r	2:7;x
+three	rows	SELECT 'Q' UNION SELECT lower(a) FROM t UNION SELECT 'Q'	4:abc;m;q;q
+three	rows	SELECT a FROM f UNION ALL SELECT a FROM t UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u)	9:abc;abc;abc;abc;m;m;m;q;q
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a COLLATE BINARY FROM t UNION SELECT +a FROM u	6:NULL;abc;m;q;q;x
+three	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT lower(a) FROM r UNION SELECT 'Q'	9:NULL;abc;abc;abc;m;m;q;q;x
+three	rows	SELECT 'abc' COLLATE NOCASE EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u	0:
+three	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT a FROM n INTERSECT SELECT a || '' FROM t	1:abc
+three	rows	SELECT 'm ' EXCEPT SELECT a COLLATE BINARY FROM t UNION ALL SELECT +a FROM r	4:abc;abc;m;m
+three	rows	SELECT a FROM u GROUP BY a INTERSECT SELECT (SELECT max(a) FROM t) UNION SELECT a FROM u LEFT JOIN t USING (a)	5:NULL;abc;abc;q;x
+three	rows	SELECT a COLLATE NOCASE FROM u UNION SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT a FROM f	7:NULL;abc;abc;m;m;q;x
+three	rows	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT +a FROM u UNION SELECT coalesce(a, 'Z') FROM r	10:NULL;abc;abc;abc;m;m;q;q;q;x
+three	rows	SELECT DISTINCT a FROM t INTERSECT SELECT a COLLATE RTRIM FROM b UNION ALL SELECT a FROM r	6:abc;abc;abc;m;m;q
+three	rows	SELECT a FROM e EXCEPT SELECT 'abc' INTERSECT SELECT max(a) FROM t	0:
+three	rows	SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT a FROM u GROUP BY a UNION ALL SELECT CAST(a AS TEXT) FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT a COLLATE NOCASE FROM u UNION SELECT (a) FROM t UNION SELECT (SELECT max(a) FROM t)	6:NULL;abc;m;q;q;x
+three	rows	SELECT 'm ' COLLATE RTRIM INTERSECT SELECT max(a) FROM r UNION SELECT 'abc' COLLATE NOCASE	2:abc;m
+three	rows	SELECT a || '' FROM u UNION SELECT a FROM e UNION ALL SELECT CAST(a AS TEXT) FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT +a FROM u UNION SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT a FROM t	8:NULL;abc;abc;m;q;q;q;x
+three	rows	SELECT CAST(a AS TEXT) FROM r UNION SELECT +a FROM u UNION ALL SELECT (a) FROM u	11:NULL;NULL;abc;abc;abc;abc;m;q;q;x;x
+three	rows	VALUES ('abc') UNION ALL SELECT NULL UNION SELECT (a) FROM t	4:NULL;abc;m;q
+three	rows	SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	9:NULL;NULL;abc;abc;abc;q;q;x;x
+three	rows	SELECT a FROM r UNION SELECT a FROM u GROUP BY a EXCEPT SELECT a FROM v	3:NULL;abc;x
+three	rows	SELECT DISTINCT a FROM t INTERSECT SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT max(a) FROM r	2:abc;m
+three	rows	SELECT NULL UNION SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT a COLLATE RTRIM FROM b	5:NULL;abc;abc;m;q
+three	rows	SELECT a FROM e EXCEPT SELECT a COLLATE BINARY FROM t UNION SELECT a || '' FROM r	4:abc;abc;m;m
+three	rows	SELECT lower(a) FROM r EXCEPT SELECT a FROM t UNION ALL SELECT lower(a) FROM t	6:abc;abc;m;m;q;q
+three	rows	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT a FROM r UNION SELECT lower(a) FROM t	5:abc;abc;m;m;q
+three	rows	SELECT a FROM t EXCEPT SELECT a FROM e UNION ALL VALUES ('abc' COLLATE NOCASE)	4:abc;abc;m;q
+three	rows	SELECT coalesce(a, 'Z') FROM u UNION ALL VALUES ('abc') UNION SELECT NULL	6:NULL;abc;abc;q;x;z
+three	rows	SELECT 'abc' EXCEPT SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT a || '' FROM r	4:abc;abc;m;m
+three	rows	SELECT DISTINCT a FROM t UNION SELECT DISTINCT a FROM t UNION SELECT a FROM b	4:abc;m;m;q
+three	rows	SELECT DISTINCT a FROM t EXCEPT SELECT a COLLATE BINARY FROM t UNION ALL SELECT coalesce(a, 'Z') FROM u	5:abc;abc;q;x;z
+three	rows	SELECT a FROM v INTERSECT SELECT a FROM t EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	2:m;q
+three	rows	SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT lower(a) FROM u UNION SELECT lower(a) FROM u	6:NULL;abc;m;q;q;x
+three	rows	SELECT (a) FROM u UNION SELECT a FROM b INTERSECT SELECT 'm '	0:
+three	rows	SELECT a FROM u UNION SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	5:NULL;abc;abc;q;x
+three	rows	SELECT lower(a) FROM t UNION SELECT 'm ' COLLATE RTRIM UNION SELECT +a FROM r	4:abc;abc;m;q
+three	rows	SELECT (a) FROM t UNION SELECT (a) FROM r UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t)	9:abc;abc;abc;m;m;m;q;q;q
+three	rows	SELECT lower(a) FROM u UNION VALUES ('abc') UNION ALL SELECT lower(a) FROM r	8:NULL;abc;abc;abc;m;m;q;x
+three	rows	SELECT a || '' FROM r UNION SELECT a FROM u EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u	3:abc;m;m
+three	rows	SELECT 7 UNION SELECT 'abc' COLLATE NOCASE UNION ALL SELECT +a FROM u	7:7;NULL;abc;abc;abc;q;x
+three	rows	SELECT a FROM b EXCEPT SELECT NULL UNION ALL VALUES ('abc')	4:abc;abc;m;q
+three	rows	SELECT CAST(a AS TEXT) FROM r UNION VALUES ('abc' COLLATE NOCASE) EXCEPT SELECT NULL	3:abc;abc;m
+three	rows	SELECT +a FROM u UNION ALL SELECT a FROM r EXCEPT VALUES ('abc')	7:NULL;abc;abc;m;m;q;x
+three	rows	SELECT 7 EXCEPT SELECT a FROM b EXCEPT SELECT +a FROM t	1:7
+three	rows	SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT lower(a) FROM u	1:m
+three	rows	SELECT 'abc' COLLATE NOCASE UNION SELECT lower(a) FROM u UNION SELECT a FROM e	4:NULL;abc;q;x
+three	rows	SELECT +a FROM u UNION ALL SELECT lower(a) FROM r EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)	3:abc;m;m
+three	rows	SELECT 'Q' UNION VALUES ('abc') EXCEPT SELECT a FROM k	0:
+three	rows	SELECT a || '' FROM r UNION SELECT 'abc' UNION SELECT 'm '	4:abc;abc;m;m
+three	rows	VALUES ('abc' COLLATE NOCASE) EXCEPT SELECT 'm ' UNION SELECT x FROM (SELECT a AS x FROM t)	3:abc;m;q
+three	rows	SELECT 'm ' UNION VALUES ('abc' COLLATE NOCASE) UNION SELECT coalesce(a, 'Z') FROM t	3:abc;m;q
+three	rows	SELECT max(a) FROM u INTERSECT SELECT CAST(a AS TEXT) FROM u UNION VALUES ('abc')	2:abc;x
+three	rows	SELECT a || '' FROM t EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT a FROM u LEFT JOIN t USING (a)	6:NULL;abc;m;q;q;x
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION ALL SELECT a COLLATE NOCASE FROM u INTERSECT VALUES ('abc' COLLATE NOCASE)	1:abc
+three	rows	SELECT (a COLLATE NOCASE) || '' FROM u UNION SELECT DISTINCT a FROM t UNION SELECT coalesce(a, 'Z') FROM u	7:NULL;abc;m;q;q;x;z
+three	rows	SELECT a FROM r UNION SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT a || '' FROM u	5:NULL;abc;abc;q;x
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT a || '' FROM t UNION SELECT +a FROM u	6:NULL;abc;m;q;q;x
+three	rows	VALUES ('abc' COLLATE NOCASE) UNION SELECT coalesce(a, 'Z') FROM r UNION SELECT max(a) FROM r	4:abc;abc;m;m
+three	rows	SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT NULL INTERSECT SELECT 'm '	0:
+three	rows	SELECT (a) FROM u UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	4:NULL;abc;q;x
+order by	ordered	SELECT x FROM (SELECT a AS x FROM t) UNION ALL SELECT a FROM f ORDER BY 1	8:abc;abc;abc;m;m;m;q;q
+order by	ordered	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT a FROM e UNION ALL SELECT a || '' FROM r ORDER BY 1	9:NULL;abc;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT a FROM t UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t ORDER BY 1	12:abc;abc;abc;abc;abc;q;abc;m;m;q;q;q
+order by	ordered	SELECT a FROM t UNION ALL SELECT a FROM e ORDER BY 1	4:abc;m;q;q
+order by	ordered	SELECT +a FROM t UNION ALL SELECT max(a) FROM r ORDER BY 1	5:abc;m;m;q;q
+order by	ordered	SELECT a FROM k UNION ALL SELECT a FROM v ORDER BY 1	7:abc;abc;m;q;q;q;z
+order by	ordered	SELECT a FROM e UNION ALL SELECT +a FROM t UNION ALL SELECT a FROM r ORDER BY 1	8:abc;abc;abc;m;m;m;q;q
+order by	ordered	SELECT 'abc' UNION ALL SELECT 'm ' UNION ALL SELECT a FROM u ORDER BY 1	7:NULL;abc;abc;abc;m;q;x
+order by	ordered	SELECT a FROM k UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t ORDER BY 1	7:abc;abc;m;q;q;q;z
+order by	ordered	SELECT lower(a) FROM u UNION ALL SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT x FROM (SELECT a AS x FROM u LIMIT 9) ORDER BY 1	15:NULL;NULL;NULL;abc;abc;abc;abc;abc;abc;q;q;q;x;x;x
+order by	ordered	SELECT a FROM t UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) ORDER BY 1	8:abc;abc;m;m;q;q;q;q
+order by	ordered	SELECT max(a) FROM u UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT max(a) FROM t ORDER BY 1	6:abc;q;q;m;q;x
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT x FROM (SELECT a AS x FROM t) ORDER BY 1	5:abc;m;q;q;q
+order by	ordered	SELECT a || '' FROM u UNION ALL SELECT a FROM t UNION ALL SELECT max(a) FROM u ORDER BY 1	10:NULL;abc;abc;abc;m;q;q;q;x;x
+order by	ordered	SELECT a FROM t UNION ALL SELECT lower(a) FROM u ORDER BY 1	9:NULL;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT +a FROM u UNION ALL SELECT NULL UNION ALL SELECT 'm ' COLLATE RTRIM ORDER BY 1	7:NULL;NULL;abc;abc;m;q;x
+order by	ordered	SELECT a || '' FROM t UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t ORDER BY 1	8:abc;abc;q;q;m;m;q;q
+order by	ordered	SELECT max(a) FROM u UNION ALL SELECT (a) FROM t ORDER BY 1	5:abc;m;q;q;x
+order by	ordered	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT a FROM b UNION ALL SELECT 'Q' ORDER BY 1	9:NULL;abc;m;q;q;abc;abc;q;x
+order by	ordered	SELECT lower(a) FROM u UNION ALL SELECT 7 ORDER BY 1	6:NULL;7;abc;abc;q;x
+order by	ordered	SELECT 'abc' COLLATE NOCASE UNION ALL SELECT a COLLATE BINARY FROM t ORDER BY 1	5:abc;abc;m;q;q
+order by	ordered	SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a ORDER BY 1	10:NULL;NULL;abc;abc;abc;abc;q;q;x;x
+order by	ordered	SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT a FROM n UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a ORDER BY 1	12:NULL;7;abc;abc;abc;abc;m;q;q;q;x;x
+order by	ordered	SELECT 'Q' UNION ALL SELECT a FROM n UNION ALL SELECT 'm ' ORDER BY 1	5:7;q;x;abc;m
+order by	ordered	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT (a) FROM t UNION ALL SELECT max(a) FROM r ORDER BY 1	9:abc;q;abc;m;m;m;q;q;q
+order by	ordered	SELECT a || '' FROM t UNION ALL SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT 'm ' COLLATE RTRIM ORDER BY 1	7:abc;abc;abc;m;m;q;q
+order by	ordered	SELECT first_value(a) OVER (ORDER BY a) FROM t UNION ALL SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT max(a) FROM u ORDER BY 1	10:NULL;abc;abc;abc;abc;abc;abc;q;x;x
+order by	ordered	SELECT a FROM n UNION ALL SELECT 'abc' ORDER BY 1	4:7;x;abc;abc
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT NULL UNION ALL SELECT coalesce(a, 'Z') FROM r ORDER BY 1	6:NULL;abc;q;abc;m;m
+order by	ordered	SELECT 'm ' COLLATE RTRIM UNION ALL SELECT coalesce(a, 'Z') FROM t ORDER BY 1	5:abc;q;m;m;q
+order by	ordered	SELECT 'Q' UNION ALL SELECT max(a) FROM r ORDER BY 1	2:q;m
+order by	ordered	SELECT a || '' FROM t UNION ALL SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT a || '' FROM t ORDER BY 1	13:NULL;abc;abc;abc;q;q;abc;m;m;q;q;q;x
+order by	ordered	SELECT a COLLATE BINARY FROM t UNION ALL SELECT DISTINCT a FROM t UNION ALL SELECT 'abc' ORDER BY 1	8:abc;abc;q;q;abc;m;m;q
+order by	ordered	SELECT (a) FROM t UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION ALL SELECT +a FROM u ORDER BY 1	14:NULL;NULL;abc;abc;abc;abc;abc;m;q;q;q;q;x;x
+order by	ordered	SELECT (a) FROM r UNION ALL SELECT NULL ORDER BY 1	5:NULL;abc;abc;m;m
+order by	ordered	SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT (a) FROM u UNION ALL SELECT max(a) FROM t ORDER BY 1	10:NULL;abc;abc;abc;m;q;q;q;q;x
+order by	ordered	SELECT a FROM f UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) ORDER BY 1	8:abc;abc;abc;m;m;m;q;q
+order by	ordered	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT coalesce(a, 'Z') FROM u ORDER BY 1	9:abc;abc;z;abc;abc;m;m;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM t UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) ORDER BY 1	8:abc;q;abc;m;m;q;q;q
+order by	ordered	SELECT a || '' FROM u UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t UNION ALL SELECT CAST(a AS TEXT) FROM t ORDER BY 1	13:NULL;abc;abc;abc;abc;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT 'm ' UNION ALL SELECT a COLLATE BINARY FROM t ORDER BY 1	9:abc;q;abc;m;m;m;q;q;q
+order by	ordered	SELECT a FROM n UNION ALL SELECT max(a) FROM t ORDER BY 1	4:7;q;x;abc
+order by	ordered	SELECT 'm ' UNION ALL SELECT +a FROM u ORDER BY 1	6:NULL;abc;abc;m;q;x
+order by	ordered	SELECT a FROM k UNION ALL SELECT +a FROM t UNION ALL SELECT max(a) FROM t ORDER BY 1	8:abc;abc;m;q;q;q;q;z
+order by	ordered	SELECT 'm ' COLLATE RTRIM UNION ALL SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) ORDER BY 1	10:abc;z;abc;abc;m;m;q;q;q;x
+order by	ordered	SELECT a FROM k UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT a COLLATE NOCASE FROM u ORDER BY 1	9:NULL;abc;abc;abc;abc;q;q;x;z
+order by	ordered	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT a FROM b ORDER BY 1	12:NULL;abc;abc;m;q;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT (a) FROM u UNION ALL SELECT max(a) FROM t ORDER BY 1	6:NULL;abc;q;abc;q;x
+order by	ordered	SELECT +a FROM u UNION ALL SELECT 'm ' COLLATE RTRIM UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	9:NULL;abc;abc;q;abc;m;m;q;x
+order by	ordered	SELECT (a COLLATE NOCASE) || '' FROM u UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT (a) FROM r ORDER BY 1	13:NULL;abc;abc;abc;abc;abc;m;m;m;q;q;q;x
+order by	ordered	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT 'Q' ORDER BY 1	2:abc;q
+order by	ordered	SELECT (a) FROM u UNION ALL SELECT 'abc' COLLATE NOCASE ORDER BY 1	6:NULL;abc;abc;abc;q;x
+order by	ordered	SELECT first_value(a) OVER (ORDER BY a) FROM t UNION ALL SELECT a FROM n UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t ORDER BY 1	11:7;abc;abc;abc;abc;abc;abc;abc;abc;x;abc
+order by	ordered	SELECT CAST(a AS TEXT) FROM r UNION ALL SELECT 'Q' UNION ALL SELECT NULL ORDER BY 1	6:NULL;abc;q;abc;m;m
+order by	ordered	SELECT a FROM u GROUP BY a UNION ALL SELECT NULL UNION ALL SELECT a FROM u ORDER BY 1	11:NULL;NULL;NULL;abc;abc;abc;abc;q;q;x;x
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT a COLLATE BINARY FROM t UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	6:abc;abc;q;q;m;q
+order by	ordered	SELECT max(a) FROM r UNION ALL SELECT a COLLATE NOCASE FROM u UNION ALL SELECT (a) FROM t ORDER BY 1	10:NULL;abc;abc;abc;m;m;q;q;q;x
+order by	ordered	SELECT +a FROM t UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t UNION ALL SELECT x FROM (SELECT a AS x FROM t) ORDER BY 1	12:abc;abc;abc;abc;abc;abc;m;m;q;q;q;q
+order by	ordered	SELECT a FROM v UNION ALL SELECT lower(a) FROM t ORDER BY 1	8:abc;abc;m;m;q;q;q;q
+order by	ordered	SELECT lower(a) FROM t UNION ALL SELECT (a COLLATE NOCASE) || '' FROM u UNION ALL SELECT coalesce(a, 'Z') FROM u ORDER BY 1	14:NULL;abc;abc;abc;abc;abc;m;q;q;q;q;x;x;z
+order by	ordered	SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT a || '' FROM r ORDER BY 1	14:NULL;NULL;abc;abc;abc;abc;abc;abc;m;m;q;q;x;x
+order by	ordered	SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT a FROM b UNION ALL SELECT a || '' FROM t ORDER BY 1	9:abc;abc;abc;abc;m;m;q;q;q
+order by	ordered	SELECT (SELECT max(a) FROM t) UNION ALL SELECT 'Q' ORDER BY 1	2:q;q
+order by	ordered	SELECT (a) FROM r UNION ALL SELECT a FROM t UNION ALL SELECT max(a) FROM t ORDER BY 1	9:abc;abc;q;q;abc;m;m;m;q
+order by	ordered	SELECT 7 UNION ALL SELECT a FROM b UNION ALL SELECT a FROM u LEFT JOIN t USING (a) ORDER BY 1	9:NULL;7;abc;m;q;abc;abc;q;x
+order by	ordered	SELECT a FROM u UNION ALL SELECT a FROM u GROUP BY a UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a ORDER BY 1	15:NULL;NULL;NULL;abc;abc;abc;abc;abc;abc;q;q;q;x;x;x
+order by	ordered	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT +a FROM t ORDER BY 1	9:NULL;abc;abc;q;abc;m;q;q;x
+order by	ordered	SELECT a FROM b UNION ALL SELECT a FROM n ORDER BY 1	6:7;m;q;x;abc;abc
+order by	ordered	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT DISTINCT a FROM t UNION ALL SELECT +a FROM r ORDER BY 1	12:NULL;abc;abc;abc;q;abc;abc;m;m;m;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT lower(a) FROM r UNION ALL SELECT 7 ORDER BY 1	9:7;abc;abc;abc;abc;m;m;m;m
+order by	ordered	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT 7 UNION ALL SELECT a FROM u ORDER BY 1	7:NULL;7;abc;abc;abc;q;x
+order by	ordered	SELECT (a) FROM t UNION ALL SELECT first_value(a) OVER (ORDER BY a) FROM t UNION ALL SELECT a FROM n ORDER BY 1	11:7;abc;abc;abc;abc;abc;abc;m;q;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT a COLLATE NOCASE FROM u ORDER BY 1	10:NULL;abc;abc;abc;abc;q;q;x;x;z
+order by	ordered	SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT max(a) FROM u UNION ALL SELECT a || '' FROM r ORDER BY 1	10:abc;abc;z;abc;abc;m;m;q;x;x
+order by	ordered	SELECT 7 UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	2:7;abc
+order by	ordered	SELECT (a) FROM t UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t ORDER BY 1	12:abc;abc;abc;m;m;m;q;q;q;q;q;q
+order by	ordered	SELECT a COLLATE BINARY FROM t UNION ALL SELECT a || '' FROM t UNION ALL SELECT a FROM v ORDER BY 1	12:abc;abc;abc;q;q;q;m;m;m;q;q;q
+order by	ordered	SELECT a FROM e UNION ALL SELECT max(a) FROM u UNION ALL SELECT 'abc' COLLATE NOCASE ORDER BY 1	2:abc;x
+order by	ordered	SELECT a FROM k UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT +a FROM r ORDER BY 1	11:abc;abc;abc;abc;m;m;m;q;q;q;z
+order by	ordered	SELECT +a FROM u UNION ALL SELECT 'abc' ORDER BY 1	6:NULL;abc;abc;abc;q;x
+order by	ordered	SELECT a FROM e UNION ALL SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t ORDER BY 1	9:NULL;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT a FROM b UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	11:NULL;abc;abc;abc;abc;m;m;q;q;q;x
+order by	ordered	SELECT +a FROM u UNION ALL SELECT max(a) FROM u ORDER BY 1	6:NULL;abc;abc;q;x;x
+order by	ordered	SELECT a COLLATE RTRIM FROM b UNION ALL SELECT (a COLLATE NOCASE) || '' FROM u UNION ALL SELECT (SELECT max(a) FROM t) ORDER BY 1	9:NULL;abc;m;q;q;abc;abc;q;x
+order by	ordered	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT coalesce(a, 'Z') FROM u ORDER BY 1	10:NULL;abc;abc;z;abc;abc;q;q;x;x
+order by	ordered	SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT a FROM b ORDER BY 1	12:NULL;abc;abc;m;q;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT 'abc' UNION ALL SELECT CAST(a AS TEXT) FROM r UNION ALL SELECT a || '' FROM u ORDER BY 1	10:NULL;abc;abc;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT a || '' FROM u UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	8:NULL;abc;abc;abc;m;q;q;x
+order by	ordered	SELECT 'abc' COLLATE NOCASE UNION ALL SELECT a FROM v ORDER BY 1	5:abc;abc;m;q;q
+order by	ordered	SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT a COLLATE RTRIM FROM b ORDER BY 1	12:NULL;abc;abc;abc;abc;m;m;q;q;q;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT a COLLATE BINARY FROM t ORDER BY 1	8:abc;abc;q;abc;m;m;m;q
+order by	ordered	SELECT 'abc' UNION ALL SELECT DISTINCT a FROM t UNION ALL SELECT 'abc' COLLATE NOCASE ORDER BY 1	5:abc;abc;abc;m;q
+order by	ordered	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT a FROM u UNION ALL SELECT CAST(a AS TEXT) FROM u ORDER BY 1	14:NULL;NULL;abc;abc;abc;abc;abc;m;q;q;q;q;x;x
+order by	ordered	SELECT a FROM f UNION ALL SELECT a FROM r UNION ALL SELECT a || '' FROM t ORDER BY 1	12:abc;abc;q;abc;abc;abc;m;m;m;m;m;q
+order by	ordered	SELECT a FROM r UNION ALL SELECT 'm ' UNION ALL SELECT a FROM t ORDER BY 1	9:abc;abc;q;abc;m;m;m;m;q
+order by	ordered	SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT 'abc' COLLATE NOCASE UNION ALL SELECT (a) FROM u ORDER BY 1	11:NULL;abc;abc;abc;abc;abc;q;q;x;x;z
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT a || '' FROM t UNION ALL SELECT coalesce(a, 'Z') FROM t ORDER BY 1	9:abc;abc;q;q;q;m;m;q;q
+order by	ordered	SELECT x FROM (SELECT lower(a) AS x FROM t) UNION ALL SELECT lower(a) FROM r ORDER BY 1	8:abc;abc;abc;m;m;m;q;q
+order by	ordered	SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT (a) FROM u ORDER BY 1	10:NULL;NULL;abc;abc;abc;abc;q;q;x;x
+order by	ordered	SELECT a FROM u GROUP BY a UNION ALL SELECT lower(a) FROM t UNION ALL SELECT lower(a) FROM u ORDER BY 1	14:NULL;NULL;abc;abc;abc;abc;abc;m;q;q;q;q;x;x
+order by	ordered	SELECT 'Q' UNION ALL SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT a FROM n ORDER BY 1	9:NULL;7;abc;q;x;abc;abc;q;x
+order by	ordered	SELECT a || '' FROM r UNION ALL SELECT coalesce(a, 'Z') FROM t ORDER BY 1	8:abc;abc;q;abc;m;m;m;q
+order by	ordered	SELECT coalesce(a, 'Z') FROM u UNION ALL SELECT (a) FROM r UNION ALL SELECT max(a) FROM u ORDER BY 1	10:abc;abc;z;abc;abc;m;m;q;x;x
+order by	ordered	SELECT +a FROM t UNION ALL SELECT a FROM v ORDER BY 1	8:abc;abc;m;m;q;q;q;q
+order by	ordered	SELECT lower(a) FROM r UNION ALL SELECT CAST(a AS TEXT) FROM u UNION ALL SELECT a FROM n ORDER BY 1	12:NULL;7;abc;x;abc;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT (SELECT max(a) FROM t) UNION ALL SELECT coalesce(a, 'Z') FROM u ORDER BY 1	6:abc;q;z;abc;q;x
+order by	ordered	SELECT 'abc' COLLATE NOCASE UNION ALL SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT max(a) FROM r ORDER BY 1	6:abc;abc;abc;m;m;m
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT 7 UNION ALL SELECT (a) FROM t ORDER BY 1	6:7;abc;m;q;q;q
+order by	ordered	SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT +a FROM u UNION ALL SELECT t.a FROM t JOIN u ON t.a = u.a ORDER BY 1	9:NULL;abc;abc;abc;abc;abc;abc;q;x
+order by	ordered	SELECT a FROM t UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a ORDER BY 1	9:NULL;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT a || '' FROM r UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	5:abc;abc;abc;m;m
+order by	ordered	SELECT a FROM t UNION ALL SELECT lower(a) FROM r UNION ALL SELECT lower(a COLLATE NOCASE) FROM u ORDER BY 1	13:NULL;abc;abc;abc;abc;abc;m;m;m;q;q;q;x
+order by	ordered	SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT t.a FROM t JOIN u ON t.a = u.a UNION ALL SELECT 'm ' COLLATE RTRIM ORDER BY 1	8:NULL;abc;abc;abc;abc;m;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a ORDER BY 1	9:NULL;abc;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT x FROM (SELECT a AS x FROM u LIMIT 9) UNION ALL SELECT +a FROM t UNION ALL SELECT a || '' FROM u ORDER BY 1	14:NULL;NULL;abc;abc;abc;q;abc;abc;m;q;q;q;x;x
+order by	ordered	SELECT a COLLATE RTRIM FROM b UNION ALL SELECT NULL UNION ALL SELECT (a) FROM r ORDER BY 1	8:NULL;abc;m;q;abc;abc;m;m
+order by	ordered	SELECT 'abc' COLLATE NOCASE UNION ALL SELECT x FROM (SELECT a AS x FROM t) UNION ALL SELECT a || '' FROM r ORDER BY 1	9:abc;abc;abc;abc;m;m;m;q;q
+order by	ordered	SELECT a FROM v UNION ALL SELECT coalesce(a, 'Z') FROM u ORDER BY 1	9:abc;abc;abc;m;q;q;q;x;z
+order by	ordered	SELECT a FROM b UNION ALL SELECT a FROM v UNION ALL SELECT a FROM f ORDER BY 1	11:abc;m;q;q;abc;abc;abc;m;m;m;q
+order by	ordered	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	12:NULL;abc;abc;abc;q;q;abc;m;m;q;q;x
+order by	ordered	SELECT a FROM v UNION ALL SELECT a FROM u ORDER BY 1	9:NULL;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT a COLLATE RTRIM FROM b UNION ALL SELECT 'Q' ORDER BY 1	4:m;q;q;abc
+order by	ordered	SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION ALL SELECT a FROM u GROUP BY a ORDER BY 1	6:NULL;abc;abc;abc;q;x
+order by	ordered	SELECT 'abc' COLLATE NOCASE UNION ALL SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT (a) FROM t ORDER BY 1	10:NULL;abc;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT a FROM r UNION ALL SELECT +a FROM r UNION ALL SELECT a FROM v ORDER BY 1	12:abc;abc;abc;q;abc;abc;m;m;m;m;m;q
+order by	ordered	SELECT max(a) FROM u UNION ALL SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT a || '' FROM u ORDER BY 1	11:NULL;NULL;abc;abc;abc;abc;q;q;x;x;x
+order by	ordered	SELECT lower(a) FROM r UNION ALL SELECT a FROM b ORDER BY 1	7:m;q;abc;abc;abc;m;m
+order by	ordered	SELECT lower(a) FROM t UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION ALL SELECT lower(a) FROM r ORDER BY 1	13:NULL;abc;abc;abc;abc;abc;m;m;m;q;q;q;x
+order by	ordered	SELECT x FROM (SELECT a AS x FROM t) UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT NULL ORDER BY 1	9:NULL;abc;abc;m;m;q;q;q;q
+order by	ordered	SELECT a || '' FROM r UNION ALL SELECT NULL UNION ALL SELECT (SELECT max(a) FROM t) ORDER BY 1	6:NULL;abc;q;abc;m;m
+order by	ordered	SELECT CAST(a AS TEXT) FROM r UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	7:abc;abc;q;abc;m;m;m
+order by	ordered	SELECT a COLLATE RTRIM FROM b UNION ALL SELECT lower(a) FROM u UNION ALL SELECT CAST(a AS TEXT) FROM t ORDER BY 1	12:NULL;abc;m;q;q;abc;abc;abc;m;q;q;x
+order by	ordered	SELECT +a FROM r UNION ALL SELECT a COLLATE RTRIM FROM b UNION ALL SELECT +a FROM u ORDER BY 1	12:NULL;abc;abc;m;q;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT 'm ' COLLATE RTRIM UNION ALL SELECT +a FROM u UNION ALL SELECT a FROM n ORDER BY 1	9:NULL;7;abc;x;abc;abc;m;q;x
+order by	ordered	SELECT lower(a COLLATE NOCASE) FROM u UNION ALL SELECT coalesce(a, 'Z') FROM t UNION ALL SELECT +a FROM u ORDER BY 1	14:NULL;NULL;abc;abc;abc;abc;abc;m;q;q;q;q;x;x
+order by	ordered	SELECT a FROM v UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	7:abc;abc;m;m;q;q;q
+order by	ordered	SELECT max(a) FROM u UNION ALL SELECT max(a) FROM u ORDER BY 1	2:x;x
+order by	ordered	SELECT 7 UNION ALL SELECT a FROM v ORDER BY 1	5:7;abc;m;q;q
+order by	ordered	SELECT (a) FROM t UNION ALL SELECT max(a) FROM t ORDER BY 1	5:abc;m;q;q;q
+order by	ordered	SELECT CAST(a AS TEXT) FROM t UNION ALL SELECT a COLLATE RTRIM FROM b ORDER BY 1	7:abc;abc;m;m;q;q;q
+order by	ordered	SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION ALL SELECT CAST(a AS TEXT) FROM r ORDER BY 1	12:abc;abc;abc;q;q;abc;m;m;m;m;q;q
+order by	ordered	SELECT max(a) FROM t UNION ALL SELECT DISTINCT a FROM t ORDER BY 1	4:abc;m;q;q
+order by	ordered	SELECT NULL UNION ALL SELECT a COLLATE RTRIM FROM b UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	5:NULL;abc;m;q;abc
+order by	ordered	SELECT a COLLATE BINARY FROM t UNION ALL SELECT (a) FROM u UNION ALL SELECT a FROM t ORDER BY 1	13:NULL;abc;abc;abc;q;q;abc;m;m;q;q;q;x
+order by	ordered	SELECT coalesce(a, 'Z') FROM r UNION ALL SELECT (a) FROM t UNION ALL SELECT a FROM f ORDER BY 1	12:abc;abc;abc;abc;abc;m;m;m;m;m;q;q
+order by	ordered	SELECT a FROM r UNION ALL SELECT a || '' FROM u UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	10:NULL;abc;abc;abc;abc;abc;m;m;q;x
+order by	ordered	SELECT a FROM v UNION ALL SELECT 'abc' ORDER BY 1	5:abc;abc;m;q;q
+order by	ordered	SELECT a || '' FROM r UNION ALL SELECT coalesce(a, 'Z') FROM t UNION ALL SELECT (a) FROM u ORDER BY 1	13:NULL;abc;abc;abc;q;abc;abc;m;m;m;q;q;x
+order by	ordered	SELECT (SELECT max(a) FROM t) UNION ALL SELECT (a) FROM t UNION ALL SELECT CAST(a AS TEXT) FROM r ORDER BY 1	9:abc;abc;abc;m;m;m;q;q;q
+order by	ordered	SELECT a FROM v UNION ALL SELECT a FROM t WHERE a IN (SELECT a FROM u) ORDER BY 1	5:abc;abc;m;q;q
+order by	ordered	SELECT lower(a) FROM r UNION ALL SELECT a FROM b UNION ALL SELECT max(a) FROM r ORDER BY 1	8:m;q;abc;abc;abc;m;m;m
+order by	ordered	SELECT lower(a) FROM t UNION ALL SELECT t.a FROM t JOIN u ON t.a = u.a ORDER BY 1	6:abc;abc;abc;m;q;q
+order by	ordered	SELECT a COLLATE NOCASE FROM u UNION ALL SELECT NULL UNION ALL SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t ORDER BY 1	10:NULL;NULL;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT a FROM u LEFT JOIN t USING (a) UNION ALL SELECT coalesce(a, 'Z') FROM t UNION ALL SELECT x FROM (SELECT lower(a) AS x FROM t) ORDER BY 1	13:NULL;abc;abc;q;abc;abc;m;m;q;q;q;q;x
+order by	ordered	SELECT +a FROM t UNION ALL SELECT (a) FROM u UNION ALL SELECT 7 ORDER BY 1	10:NULL;7;abc;abc;abc;m;q;q;q;x
+order by	ordered	SELECT lower(a) FROM t UNION ALL SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION ALL SELECT +a FROM t ORDER BY 1	13:NULL;abc;abc;q;abc;abc;m;m;q;q;q;q;x
+order by	ordered	SELECT 'm ' UNION ALL SELECT a COLLATE NOCASE FROM u ORDER BY 1	6:NULL;abc;abc;m;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM n UNION SELECT a FROM u GROUP BY a) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT 'm ' INTERSECT SELECT a FROM v) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT 'Q' INTERSECT SELECT lower(a) FROM r) AS s	0:
+cte	rows	WITH c(z) AS (SELECT 'abc' COLLATE NOCASE EXCEPT SELECT 'abc') SELECT z FROM c	0:
+count	rows	SELECT count(*) FROM (SELECT max(a) FROM u EXCEPT SELECT 'abc' COLLATE NOCASE) AS s	1:1
+from	rows	SELECT * FROM (SELECT a || '' FROM r UNION SELECT a FROM e) AS s	4:abc;abc;m;m
+insert	dml	INSERT INTO o SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT NULL	4:abc;abc;q;x
+count	rows	SELECT count(*) FROM (SELECT (a) FROM u UNION SELECT max(a) FROM u) AS s	1:5
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u GROUP BY a UNION SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT a FROM u GROUP BY a EXCEPT SELECT 'abc' COLLATE NOCASE) AS s	1:4
+insert	dml	INSERT INTO o SELECT max(a) FROM r INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	0:
+from	rows	SELECT * FROM (SELECT a || '' FROM u UNION SELECT max(a) FROM r) AS s	6:NULL;abc;abc;m;q;x
+cte	rows	WITH c(z) AS (SELECT 'abc' COLLATE NOCASE INTERSECT VALUES ('abc' COLLATE NOCASE)) SELECT z FROM c	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT lower(a) FROM t INTERSECT SELECT 'm ' COLLATE RTRIM) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT +a FROM t EXCEPT SELECT 'Q') SELECT z FROM c	2:abc;m
+from	rows	SELECT * FROM (SELECT 'm ' COLLATE RTRIM INTERSECT SELECT a COLLATE NOCASE FROM u) AS s	0:
+count	rows	SELECT count(*) FROM (SELECT a || '' FROM t UNION SELECT +a FROM r) AS s	1:5
+insert	dml	INSERT INTO o SELECT x FROM (SELECT a AS x FROM u LIMIT 9) EXCEPT VALUES ('abc' COLLATE NOCASE)	4:NULL;abc;q;x
+insert	dml	INSERT INTO o SELECT a FROM u GROUP BY a EXCEPT SELECT (a) FROM t	4:NULL;abc;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT lower(a) FROM r UNION SELECT (a) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT (a) FROM r UNION SELECT max(a) FROM u) AS s	4:abc;abc;m;x
+from	rows	SELECT * FROM (SELECT 'm ' EXCEPT SELECT a FROM u LEFT JOIN t USING (a)) AS s	1:m
+count	rows	SELECT count(*) FROM (SELECT 'm ' COLLATE RTRIM UNION SELECT (SELECT max(a) FROM t)) AS s	1:2
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT a || '' FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE BINARY FROM t UNION SELECT (a) FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a COLLATE NOCASE FROM u EXCEPT SELECT a FROM u GROUP BY a) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT lower(a) FROM t EXCEPT SELECT lower(a) FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+insert	dml	INSERT INTO o SELECT a || '' FROM r UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	5:abc;abc;abc;m;m
+cte	rows	WITH c(z) AS (SELECT lower(a COLLATE NOCASE) FROM u INTERSECT SELECT (a) FROM t) SELECT z FROM c	1:abc
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT 'abc' EXCEPT SELECT a || '' FROM u) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE NOCASE FROM u EXCEPT SELECT coalesce(a, 'Z') FROM u) FROM u	5:NULL,NULL;abc,NULL;abc,NULL;q,NULL;x,NULL
+cte	rows	WITH c(z) AS (VALUES ('abc' COLLATE NOCASE) EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t) SELECT z FROM c	0:
+cte	rows	WITH c(z) AS (SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT lower(a COLLATE NOCASE) FROM u) SELECT z FROM c	5:NULL;abc;abc;q;x
+from	rows	SELECT * FROM (SELECT (a COLLATE NOCASE) || '' FROM u EXCEPT SELECT 7) AS s	4:NULL;abc;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT max(a) FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+insert	dml	INSERT INTO o SELECT +a FROM u EXCEPT VALUES ('abc')	4:NULL;abc;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t UNION SELECT lower(a COLLATE NOCASE) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT lower(a) FROM t EXCEPT SELECT 'm ' COLLATE RTRIM) AS s	2:abc;q
+insert	dml	INSERT INTO o SELECT a FROM u GROUP BY a EXCEPT SELECT a COLLATE BINARY FROM t	4:NULL;abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE RTRIM FROM b INTERSECT SELECT CAST(a AS TEXT) FROM r) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT a COLLATE RTRIM FROM b EXCEPT SELECT 'abc') AS s	1:3
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT 'm ' EXCEPT VALUES ('abc' COLLATE NOCASE)) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM t UNION SELECT 'm ' COLLATE RTRIM) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+insert	dml	INSERT INTO o SELECT +a FROM u EXCEPT SELECT a COLLATE RTRIM FROM b	5:NULL;abc;abc;q;x
+count	rows	SELECT count(*) FROM (SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT 7) AS s	1:6
+from	rows	SELECT * FROM (SELECT CAST(a AS TEXT) FROM t EXCEPT SELECT max(a) FROM u) AS s	3:abc;m;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT 7 EXCEPT SELECT a FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT lower(a) FROM u EXCEPT SELECT max(a) FROM u) AS s	3:NULL;abc;q
+cte	rows	WITH c(z) AS (SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT coalesce(a, 'Z') FROM t) SELECT z FROM c	3:abc;m;q
+cte	rows	WITH c(z) AS (SELECT a FROM k INTERSECT SELECT 7) SELECT z FROM c	0:
+count	rows	SELECT count(*) FROM (SELECT a || '' FROM t INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t) AS s	1:1
+from	rows	SELECT * FROM (SELECT a || '' FROM t UNION SELECT a COLLATE NOCASE FROM u) AS s	6:NULL;abc;m;q;q;x
+insert	dml	INSERT INTO o SELECT a FROM e INTERSECT SELECT a FROM k	0:
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (a) FROM u INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+cte	rows	WITH c(z) AS (SELECT (a) FROM t UNION SELECT (a) FROM r) SELECT z FROM c	5:abc;abc;m;m;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE NOCASE FROM u UNION SELECT max(a) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM t) UNION SELECT max(a) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,1
+from	rows	SELECT * FROM (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a EXCEPT SELECT lower(a) FROM u) AS s	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM r EXCEPT SELECT (a) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+insert	dml	INSERT INTO o SELECT 'abc' COLLATE NOCASE INTERSECT SELECT a FROM f	1:abc
+from	rows	SELECT * FROM (SELECT a FROM n INTERSECT SELECT CAST(a AS TEXT) FROM t) AS s	0:
+cte	rows	WITH c(z) AS (SELECT (SELECT max(a) FROM t) UNION SELECT (SELECT max(a) FROM t)) SELECT z FROM c	1:q
+from	rows	SELECT * FROM (VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM f) AS s	4:abc;abc;m;m
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT a || '' FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT (SELECT max(a) FROM t) UNION SELECT max(a) FROM u) AS s	1:2
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (VALUES ('abc') INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT a FROM t UNION SELECT 'abc') AS s	1:3
+from	rows	SELECT * FROM (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT max(a) FROM u) AS s	1:x
+insert	dml	INSERT INTO o VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM n	3:7;abc;x
+cte	rows	WITH c(z) AS (SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t) SELECT z FROM c	2:m;q
+count	rows	SELECT count(*) FROM (SELECT coalesce(a, 'Z') FROM t UNION SELECT NULL) AS s	1:5
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a || '' FROM r EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a COLLATE NOCASE FROM u EXCEPT SELECT max(a) FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT lower(a COLLATE NOCASE) FROM u UNION SELECT (a COLLATE NOCASE) || '' FROM u) AS s	4:NULL;abc;q;x
+insert	dml	INSERT INTO o SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT max(a) FROM t	5:NULL;abc;abc;q;x
+count	rows	SELECT count(*) FROM (SELECT (a) FROM r EXCEPT SELECT lower(a) FROM u) AS s	1:2
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM u GROUP BY a UNION SELECT lower(a) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+cte	rows	WITH c(z) AS (SELECT a || '' FROM u EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) SELECT z FROM c	0:
+count	rows	SELECT count(*) FROM (SELECT lower(a) FROM t INTERSECT SELECT a COLLATE RTRIM FROM b) AS s	1:0
+count	rows	SELECT count(*) FROM (SELECT +a FROM u EXCEPT SELECT a FROM k) AS s	1:5
+cte	rows	WITH c(z) AS (SELECT a FROM v UNION SELECT (SELECT max(a) FROM t)) SELECT z FROM c	3:abc;m;q
+count	rows	SELECT count(*) FROM (VALUES ('abc' COLLATE NOCASE) INTERSECT SELECT t.a FROM t JOIN u ON t.a = u.a) AS s	1:1
+insert	dml	INSERT INTO o SELECT a || '' FROM r EXCEPT SELECT lower(a) FROM u	3:abc;m;m
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT lower(a) FROM u UNION SELECT lower(a) FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT 'Q') AS s	1:abc
+count	rows	SELECT count(*) FROM (SELECT (a) FROM u INTERSECT SELECT +a FROM r) AS s	1:1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT a COLLATE NOCASE FROM u) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a || '' FROM u EXCEPT SELECT (a) FROM t) FROM u	5:NULL,NULL;abc,NULL;abc,NULL;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT a FROM e INTERSECT SELECT DISTINCT a FROM t) AS s	1:0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a || '' FROM r UNION SELECT a FROM k) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (a) FROM r UNION SELECT a FROM k) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT 7 UNION SELECT +a FROM u) AS s	1:6
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT max(a) FROM u EXCEPT SELECT a FROM t WHERE a IN (SELECT a FROM u)) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM r EXCEPT SELECT (a) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+from	rows	SELECT * FROM (SELECT 'Q' EXCEPT SELECT a FROM t) AS s	0:
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT 'm ' EXCEPT SELECT 'm ') FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT a FROM u) INTERSECT SELECT a FROM t) AS s	1:1
+cte	rows	WITH c(z) AS (SELECT a FROM t WHERE a IN (SELECT a FROM u) UNION SELECT a || '' FROM r) SELECT z FROM c	4:abc;abc;m;m
+count	rows	SELECT count(*) FROM (SELECT (a) FROM t INTERSECT SELECT a COLLATE NOCASE FROM u) AS s	1:1
+from	rows	SELECT * FROM (SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT VALUES ('abc')) AS s	0:
+from	rows	SELECT * FROM (SELECT a || '' FROM u UNION SELECT (a) FROM u) AS s	5:NULL;abc;abc;q;x
+cte	rows	WITH c(z) AS (SELECT +a FROM u UNION SELECT a FROM e) SELECT z FROM c	5:NULL;abc;abc;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM v UNION SELECT lower(a COLLATE NOCASE) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+insert	dml	INSERT INTO o SELECT a COLLATE NOCASE FROM u EXCEPT SELECT max(a) FROM t	4:NULL;abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT (a) FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM t WHERE a IN (SELECT a FROM u) EXCEPT SELECT 'abc') FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT lower(a) FROM r INTERSECT SELECT max(a) FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT a FROM u EXCEPT SELECT lower(a) FROM t) SELECT z FROM c	4:NULL;abc;q;x
+insert	dml	INSERT INTO o SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT a FROM b	0:
+from	rows	SELECT * FROM (SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT lower(a COLLATE NOCASE) FROM u) AS s	4:NULL;abc;q;x
+from	rows	SELECT * FROM (SELECT coalesce(a, 'Z') FROM u INTERSECT SELECT 7) AS s	0:
+cte	rows	WITH c(z) AS (SELECT a FROM t UNION SELECT a COLLATE BINARY FROM t) SELECT z FROM c	3:abc;m;q
+insert	dml	INSERT INTO o SELECT a FROM r UNION SELECT NULL	4:NULL;abc;abc;m
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM t UNION SELECT 'abc') FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+from	rows	SELECT * FROM (SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT lower(a COLLATE NOCASE) FROM u) AS s	4:NULL;abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE RTRIM FROM b INTERSECT SELECT max(a) FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t) AS s	1:4
+count	rows	SELECT count(*) FROM (SELECT a || '' FROM u EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) AS s	1:0
+from	rows	SELECT * FROM (SELECT a FROM e UNION SELECT a FROM v) AS s	3:abc;m;q
+insert	dml	INSERT INTO o SELECT a FROM f EXCEPT SELECT (a) FROM u	3:abc;m;m
+cte	rows	WITH c(z) AS (SELECT a COLLATE BINARY FROM t EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t) SELECT z FROM c	3:m;q;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT NULL EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+insert	dml	INSERT INTO o SELECT lower(a) FROM u INTERSECT SELECT a FROM t WHERE a IN (SELECT a FROM u)	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT CAST(a AS TEXT) FROM t EXCEPT SELECT t.a FROM t JOIN u ON t.a = u.a) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT 7) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+insert	dml	INSERT INTO o SELECT a FROM r EXCEPT VALUES ('abc')	2:abc;m
+count	rows	SELECT count(*) FROM (SELECT +a FROM u UNION SELECT a COLLATE RTRIM FROM b) AS s	1:8
+from	rows	SELECT * FROM (SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT 'Q') AS s	5:NULL;abc;abc;q;x
+cte	rows	WITH c(z) AS (SELECT x FROM (SELECT a AS x FROM t) UNION SELECT CAST(a AS TEXT) FROM u) SELECT z FROM c	6:NULL;abc;m;q;q;x
+cte	rows	WITH c(z) AS (SELECT a FROM v INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) SELECT z FROM c	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT 'm ' COLLATE RTRIM EXCEPT SELECT 'Q') FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT +a FROM r UNION SELECT a || '' FROM t) SELECT z FROM c	5:abc;abc;m;q;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT t.a FROM t JOIN u ON t.a = u.a UNION SELECT a FROM k) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+from	rows	SELECT * FROM (SELECT x FROM (SELECT a AS x FROM u LIMIT 9) EXCEPT SELECT a || '' FROM t) AS s	4:NULL;abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM u INTERSECT SELECT +a FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+insert	dml	INSERT INTO o SELECT a COLLATE NOCASE FROM u INTERSECT SELECT coalesce(a, 'Z') FROM u	3:abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT CAST(a AS TEXT) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT lower(a) FROM r INTERSECT SELECT CAST(a AS TEXT) FROM u) AS s	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE BINARY FROM t UNION SELECT 'abc' COLLATE NOCASE) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM f INTERSECT SELECT a FROM b) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT 'Q' UNION SELECT (SELECT max(a) FROM t)) AS s	1:q
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT lower(a) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT a FROM u INTERSECT SELECT (a) FROM t) AS s	1:abc
+insert	dml	INSERT INTO o SELECT a FROM u GROUP BY a UNION SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	8:NULL;abc;abc;m;q;q;q;x
+count	rows	SELECT count(*) FROM (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT lower(a) FROM u) AS s	1:8
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a COLLATE NOCASE FROM u INTERSECT SELECT CAST(a AS TEXT) FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+from	rows	SELECT * FROM (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t UNION SELECT 7) AS s	5:7;abc;m;q;q
+cte	rows	WITH c(z) AS (SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT +a FROM t) SELECT z FROM c	0:
+from	rows	SELECT * FROM (SELECT x FROM (SELECT lower(a) AS x FROM t) UNION SELECT a FROM k) AS s	6:abc;abc;m;q;q;z
+insert	dml	INSERT INTO o SELECT a COLLATE BINARY FROM t UNION SELECT x FROM (SELECT a AS x FROM t)	4:abc;m;q;q
+from	rows	SELECT * FROM (SELECT (a) FROM u UNION SELECT (a) FROM r) AS s	8:NULL;abc;abc;abc;m;m;q;x
+from	rows	SELECT * FROM (SELECT lower(a) FROM u INTERSECT SELECT 7) AS s	0:
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT 'abc' COLLATE NOCASE) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (SELECT max(a) FROM t) INTERSECT SELECT 'm ' COLLATE RTRIM) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT DISTINCT a FROM t INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t) AS s	1:3
+count	rows	SELECT count(*) FROM (SELECT a FROM u EXCEPT SELECT coalesce(a, 'Z') FROM u) AS s	1:1
+insert	dml	INSERT INTO o SELECT +a FROM t EXCEPT SELECT 'm '	2:abc;q
+cte	rows	WITH c(z) AS (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT a || '' FROM u) SELECT z FROM c	1:abc
+cte	rows	WITH c(z) AS (SELECT 'm ' COLLATE RTRIM UNION SELECT CAST(a AS TEXT) FROM r) SELECT z FROM c	3:abc;abc;m
+count	rows	SELECT count(*) FROM (SELECT a FROM v UNION SELECT lower(a) FROM t) AS s	1:3
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT a || '' FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+insert	dml	INSERT INTO o SELECT a FROM u EXCEPT SELECT lower(a COLLATE NOCASE) FROM u	1:abc
+insert	dml	INSERT INTO o SELECT 'm ' COLLATE RTRIM INTERSECT SELECT 7	0:
+cte	rows	WITH c(z) AS (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT CAST(a AS TEXT) FROM u) SELECT z FROM c	5:NULL;abc;abc;q;x
+cte	rows	WITH c(z) AS (SELECT 'Q' EXCEPT SELECT a COLLATE NOCASE FROM u) SELECT z FROM c	1:q
+count	rows	SELECT count(*) FROM (SELECT first_value(a) OVER (ORDER BY a) FROM t EXCEPT SELECT a COLLATE RTRIM FROM b) AS s	1:1
+count	rows	SELECT count(*) FROM (SELECT lower(a COLLATE NOCASE) FROM u EXCEPT SELECT (a) FROM u) AS s	1:0
+cte	rows	WITH c(z) AS (SELECT (a) FROM t EXCEPT SELECT a COLLATE NOCASE FROM u) SELECT z FROM c	2:m;q
+from	rows	SELECT * FROM (SELECT a FROM u INTERSECT SELECT CAST(a AS TEXT) FROM r) AS s	1:abc
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM n EXCEPT SELECT coalesce(a, 'Z') FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,1
+insert	dml	INSERT INTO o SELECT a FROM e UNION SELECT a || '' FROM t	3:abc;m;q
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT lower(a COLLATE NOCASE) FROM u EXCEPT SELECT (SELECT max(a) FROM t)) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT (a COLLATE NOCASE) || '' FROM u) SELECT z FROM c	1:abc
+in	rows	SELECT a, (a COLLATE NOCASE) IN (VALUES ('abc') INTERSECT SELECT coalesce(a, 'Z') FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+from	rows	SELECT * FROM (SELECT a FROM u UNION SELECT first_value(a) OVER (ORDER BY a) FROM t) AS s	5:NULL;abc;abc;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT DISTINCT a FROM t EXCEPT SELECT a FROM u GROUP BY a) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM v INTERSECT SELECT +a FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+cte	rows	WITH c(z) AS (SELECT 'm ' COLLATE RTRIM UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a) SELECT z FROM c	6:NULL;abc;abc;m;q;x
+count	rows	SELECT count(*) FROM (SELECT lower(a) FROM u UNION SELECT first_value(a) OVER (ORDER BY a) FROM t) AS s	1:5
+from	rows	SELECT * FROM (SELECT 'abc' COLLATE NOCASE UNION SELECT lower(a) FROM r) AS s	4:abc;abc;m;m
+cte	rows	WITH c(z) AS (SELECT a FROM v INTERSECT SELECT a FROM n) SELECT z FROM c	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t EXCEPT SELECT lower(a COLLATE NOCASE) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT a FROM e UNION SELECT max(a) FROM r) AS s	1:m
+cte	rows	WITH c(z) AS (SELECT DISTINCT a FROM t UNION SELECT a FROM t) SELECT z FROM c	3:abc;m;q
+insert	dml	INSERT INTO o SELECT a FROM u INTERSECT SELECT a FROM v	1:abc
+insert	dml	INSERT INTO o SELECT x FROM (SELECT a AS x FROM t) UNION SELECT max(a) FROM t	3:abc;m;q
+from	rows	SELECT * FROM (SELECT (a) FROM r UNION SELECT max(a) FROM t) AS s	4:abc;abc;m;q
+count	rows	SELECT count(*) FROM (SELECT (SELECT max(a) FROM t) UNION SELECT a FROM t WHERE a IN (SELECT a FROM u)) AS s	1:2
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM u EXCEPT SELECT a || '' FROM u) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT max(a) FROM r EXCEPT SELECT (SELECT max(a) FROM t)) AS s	1:m
+count	rows	SELECT count(*) FROM (SELECT a FROM f UNION SELECT lower(a COLLATE NOCASE) FROM u) AS s	1:7
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT lower(a) FROM u) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (VALUES ('abc' COLLATE NOCASE) UNION SELECT +a FROM t) AS s	3:abc;m;q
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT coalesce(a, 'Z') FROM u EXCEPT SELECT a COLLATE RTRIM FROM b) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a COLLATE BINARY FROM t INTERSECT SELECT lower(a) FROM r) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT a || '' FROM t EXCEPT SELECT (a COLLATE NOCASE) || '' FROM u) AS s	2:m;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM r INTERSECT SELECT a FROM u LEFT JOIN t USING (a)) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT +a FROM u UNION SELECT max(a) FROM t) SELECT z FROM c	6:NULL;abc;abc;q;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (VALUES ('abc' COLLATE NOCASE) UNION SELECT +a FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT lower(a) FROM r EXCEPT SELECT a COLLATE RTRIM FROM b) AS s	1:2
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM f UNION SELECT a FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT max(a) FROM t UNION SELECT CAST(a AS TEXT) FROM r) SELECT z FROM c	4:abc;abc;m;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT max(a) FROM r EXCEPT SELECT x FROM (SELECT a AS x FROM t)) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+insert	dml	INSERT INTO o SELECT 7 INTERSECT VALUES ('abc' COLLATE NOCASE)	0:
+count	rows	SELECT count(*) FROM (SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT 'abc' COLLATE NOCASE) AS s	1:2
+cte	rows	WITH c(z) AS (SELECT coalesce(a, 'Z') FROM r UNION SELECT u.a FROM u LEFT JOIN t ON t.a = u.a) SELECT z FROM c	8:NULL;abc;abc;abc;m;m;q;x
+from	rows	SELECT * FROM (SELECT 7 UNION SELECT +a FROM u) AS s	6:7;NULL;abc;abc;q;x
+insert	dml	INSERT INTO o SELECT a || '' FROM t UNION SELECT a FROM r	5:abc;abc;m;q;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE BINARY FROM t UNION SELECT a FROM t WHERE a IN (SELECT a FROM u)) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+insert	dml	INSERT INTO o SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a COLLATE NOCASE FROM u	1:abc
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (a) FROM u INTERSECT SELECT CAST(a AS TEXT) FROM u) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+from	rows	SELECT * FROM (SELECT lower(a) FROM u EXCEPT SELECT coalesce(a, 'Z') FROM u) AS s	1:NULL
+cte	rows	WITH c(z) AS (SELECT +a FROM t EXCEPT SELECT coalesce(a, 'Z') FROM r) SELECT z FROM c	1:q
+count	rows	SELECT count(*) FROM (SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT coalesce(a, 'Z') FROM r) AS s	1:4
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT NULL EXCEPT SELECT (a) FROM r) FROM u	5:NULL,NULL;abc,NULL;abc,NULL;q,NULL;x,NULL
+count	rows	SELECT count(*) FROM (SELECT x FROM (SELECT lower(a) AS x FROM t) EXCEPT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) AS s	1:2
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM t EXCEPT SELECT a FROM k) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT a FROM u LEFT JOIN t USING (a) INTERSECT SELECT CAST(a AS TEXT) FROM t) SELECT z FROM c	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT lower(a COLLATE NOCASE) FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a UNION SELECT 'Q') AS s	6:NULL;abc;abc;q;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM n INTERSECT SELECT CAST(a AS TEXT) FROM t) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+insert	dml	INSERT INTO o SELECT x FROM (SELECT lower(a) AS x FROM t) INTERSECT SELECT a FROM u LEFT JOIN t USING (a)	1:abc
+cte	rows	WITH c(z) AS (SELECT (a) FROM t UNION SELECT a FROM n) SELECT z FROM c	5:7;abc;m;q;x
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT 7 EXCEPT SELECT a FROM r) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+cte	rows	WITH c(z) AS (SELECT a FROM u LEFT JOIN t USING (a) UNION SELECT +a FROM r) SELECT z FROM c	8:NULL;abc;abc;abc;m;m;q;x
+insert	dml	INSERT INTO o SELECT +a FROM u EXCEPT SELECT a FROM u	0:
+from	rows	SELECT * FROM (SELECT coalesce(a, 'Z') FROM t EXCEPT SELECT lower(a) FROM r) AS s	3:abc;q;q
+count	rows	SELECT count(*) FROM (SELECT 'm ' COLLATE RTRIM UNION SELECT coalesce(a, 'Z') FROM u) AS s	1:6
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT lower(a) AS x FROM t) UNION VALUES ('abc' COLLATE NOCASE)) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+insert	dml	INSERT INTO o SELECT 'Q' INTERSECT SELECT lower(a) FROM u	0:
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT (SELECT max(a) FROM t)) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+from	rows	SELECT * FROM (SELECT a COLLATE RTRIM FROM b UNION SELECT a FROM n) AS s	6:7;abc;abc;m;q;x
+count	rows	SELECT count(*) FROM (SELECT max(a) FROM r EXCEPT SELECT a FROM e) AS s	1:1
+from	rows	SELECT * FROM (SELECT 'abc' EXCEPT SELECT 'm ' COLLATE RTRIM) AS s	1:abc
+insert	dml	INSERT INTO o SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT DISTINCT a FROM t	1:abc
+cte	rows	WITH c(z) AS (SELECT a COLLATE RTRIM FROM b INTERSECT SELECT coalesce(a, 'Z') FROM t) SELECT z FROM c	1:q
+insert	dml	INSERT INTO o SELECT t.a FROM t JOIN u ON t.a = u.a EXCEPT SELECT 'abc'	0:
+from	rows	SELECT * FROM (SELECT a FROM k EXCEPT SELECT a FROM n) AS s	2:q;z
+count	rows	SELECT count(*) FROM (SELECT 'abc' UNION SELECT a FROM u LEFT JOIN t USING (a)) AS s	1:5
+cte	rows	WITH c(z) AS (SELECT a COLLATE NOCASE FROM u UNION SELECT x FROM (SELECT a AS x FROM t)) SELECT z FROM c	6:NULL;abc;m;q;q;x
+cte	rows	WITH c(z) AS (SELECT coalesce(a, 'Z') FROM t INTERSECT SELECT x FROM (SELECT a AS x FROM u LIMIT 9)) SELECT z FROM c	1:abc
+from	rows	SELECT * FROM (SELECT 'abc' COLLATE NOCASE INTERSECT SELECT coalesce(a, 'Z') FROM r) AS s	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT +a FROM r INTERSECT SELECT a || '' FROM r) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT lower(a) FROM u UNION SELECT 'abc' COLLATE NOCASE) AS s	1:4
+from	rows	SELECT * FROM (SELECT a || '' FROM r INTERSECT SELECT (a) FROM t) AS s	2:abc;m
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT 'abc') FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT 'abc' COLLATE NOCASE INTERSECT SELECT lower(a) FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT first_value(a) OVER (ORDER BY a) FROM t UNION SELECT +a FROM t) AS s	1:3
+from	rows	SELECT * FROM (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT 'm ') AS s	0:
+insert	dml	INSERT INTO o SELECT x FROM (SELECT a AS x FROM t) EXCEPT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a	2:m;q
+cte	rows	WITH c(z) AS (SELECT lower(a) FROM r EXCEPT SELECT 'abc') SELECT z FROM c	3:abc;m;m
+from	rows	SELECT * FROM (SELECT coalesce(a, 'Z') FROM r INTERSECT SELECT 7) AS s	0:
+from	rows	SELECT * FROM (SELECT a COLLATE NOCASE FROM u UNION SELECT x FROM (SELECT a AS x FROM t)) AS s	6:NULL;abc;m;q;q;x
+from	rows	SELECT * FROM (SELECT +a FROM t UNION SELECT a || '' FROM u) AS s	6:NULL;abc;m;q;q;x
+insert	dml	INSERT INTO o SELECT a FROM r UNION SELECT (a) FROM r	3:abc;abc;m
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT DISTINCT a FROM t UNION SELECT (SELECT max(a) FROM t)) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+insert	dml	INSERT INTO o SELECT 'm ' UNION SELECT a || '' FROM u	6:NULL;abc;abc;m;q;x
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE NOCASE FROM u UNION SELECT lower(a) FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT max(a) FROM u UNION SELECT max(a) FROM r) AS s	2:m;x
+cte	rows	WITH c(z) AS (SELECT a FROM b UNION SELECT 'm ') SELECT z FROM c	4:abc;m;m;q
+cte	rows	WITH c(z) AS (SELECT CAST(a AS TEXT) FROM u INTERSECT SELECT a FROM b) SELECT z FROM c	0:
+count	rows	SELECT count(*) FROM (SELECT max(a) FROM t UNION SELECT coalesce(a, 'Z') FROM t) AS s	1:4
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE RTRIM FROM b EXCEPT SELECT a FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT 7 EXCEPT SELECT a COLLATE NOCASE FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM u UNION SELECT max(a) FROM u) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM u LIMIT 9) INTERSECT SELECT a FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (a) FROM r INTERSECT SELECT a FROM e) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+insert	dml	INSERT INTO o SELECT a || '' FROM r UNION SELECT (SELECT max(a) FROM t)	5:abc;abc;m;m;q
+insert	dml	INSERT INTO o SELECT a FROM u EXCEPT SELECT max(a) FROM u	4:NULL;abc;abc;q
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT (a) FROM t INTERSECT VALUES ('abc')) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a COLLATE NOCASE FROM u UNION SELECT DISTINCT a FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u LEFT JOIN t USING (a) EXCEPT SELECT a FROM k) FROM u	5:NULL,NULL;abc,1;abc,1;q,1;x,1
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a COLLATE NOCASE) || '' FROM u INTERSECT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT 'm ' COLLATE RTRIM UNION SELECT a FROM e) SELECT z FROM c	1:m
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT CAST(a AS TEXT) FROM r UNION SELECT 'm ') FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a || '' FROM t UNION SELECT t.a FROM t JOIN u ON t.a = u.a) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+insert	dml	INSERT INTO o SELECT max(a) FROM t INTERSECT SELECT 'm '	0:
+insert	dml	INSERT INTO o SELECT a || '' FROM t EXCEPT SELECT first_value(a) OVER (ORDER BY a) FROM t	3:m;q;q
+insert	dml	INSERT INTO o VALUES ('abc') EXCEPT SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (a) FROM r UNION SELECT x FROM (SELECT lower(a) AS x FROM t)) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT a FROM b INTERSECT SELECT u.a FROM u LEFT JOIN t ON t.a = u.a) AS s	1:0
+count	rows	SELECT count(*) FROM (SELECT a FROM u GROUP BY a UNION SELECT CAST(a AS TEXT) FROM t) AS s	1:8
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT CAST(a AS TEXT) FROM u UNION SELECT a FROM k) FROM u	5:NULL,NULL;abc,0;abc,0;q,0;x,0
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (VALUES ('abc' COLLATE NOCASE) UNION SELECT 7) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT u.a FROM u LEFT JOIN t ON t.a = u.a INTERSECT SELECT lower(a COLLATE NOCASE) FROM u) AS s	1:4
+insert	dml	INSERT INTO o SELECT (a) FROM t UNION SELECT a FROM f	5:abc;abc;m;m;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT (SELECT max(a) FROM t) UNION SELECT t.a FROM t JOIN u ON t.a = u.a) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+from	rows	SELECT * FROM (SELECT a FROM t INTERSECT SELECT a COLLATE RTRIM FROM b) AS s	2:abc;q
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT a || '' FROM t EXCEPT SELECT (a) FROM t) FROM u	5:NULL,1;abc,1;abc,1;q,1;x,1
+count	rows	SELECT count(*) FROM (SELECT max(a) FROM r INTERSECT SELECT first_value(a) OVER (ORDER BY a) FROM t) AS s	1:0
+insert	dml	INSERT INTO o SELECT a FROM r INTERSECT SELECT a || '' FROM u	2:abc;abc
+from	rows	SELECT * FROM (SELECT a FROM u INTERSECT SELECT a || '' FROM u) AS s	5:NULL;abc;abc;q;x
+cte	rows	WITH c(z) AS (SELECT a FROM k INTERSECT SELECT CAST(a AS TEXT) FROM t) SELECT z FROM c	2:abc;q
+insert	dml	INSERT INTO o VALUES ('abc' COLLATE NOCASE) UNION SELECT a FROM f	4:abc;abc;m;m
+insert	dml	INSERT INTO o SELECT DISTINCT a FROM t EXCEPT SELECT (a) FROM u	2:m;q
+from	rows	SELECT * FROM (SELECT CASE WHEN a = 'q' THEN a ELSE a END FROM t INTERSECT SELECT a || '' FROM r) AS s	1:m
+count	rows	SELECT count(*) FROM (SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT max(a) FROM r) AS s	1:0
+from	rows	SELECT * FROM (SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT a FROM t) AS s	3:abc;m;q
+insert	dml	INSERT INTO o SELECT CAST(a AS TEXT) FROM r EXCEPT SELECT 'abc'	2:abc;m
+count	rows	SELECT count(*) FROM (SELECT a FROM r UNION SELECT lower(a) FROM u) AS s	1:6
+from	rows	SELECT * FROM (SELECT t.a FROM t JOIN u ON t.a = u.a INTERSECT SELECT (a) FROM r) AS s	1:abc
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT +a FROM t INTERSECT SELECT a FROM e) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM t) INTERSECT SELECT lower(a) FROM r) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (VALUES ('abc' COLLATE NOCASE) EXCEPT SELECT a || '' FROM u) FROM u	5:NULL,0;abc,0;abc,0;q,0;x,0
+from	rows	SELECT * FROM (SELECT (a) FROM r INTERSECT SELECT a || '' FROM t) AS s	2:abc;m
+cte	rows	WITH c(z) AS (VALUES ('abc') INTERSECT SELECT a || '' FROM t) SELECT z FROM c	0:
+from	rows	SELECT * FROM (SELECT +a FROM u INTERSECT SELECT +a FROM t) AS s	1:abc
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT 'abc' UNION SELECT NULL) FROM u	5:NULL,NULL;abc,0;abc,0;q,NULL;x,NULL
+not in	rows	SELECT a, (a COLLATE NOCASE) NOT IN (SELECT DISTINCT a FROM t INTERSECT SELECT a FROM k) FROM u	5:NULL,NULL;abc,0;abc,0;q,1;x,1
+cte	rows	WITH c(z) AS (SELECT lower(a) FROM t UNION SELECT t.a FROM t JOIN u ON t.a = u.a) SELECT z FROM c	3:abc;m;q
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT x FROM (SELECT a AS x FROM t) UNION SELECT 'abc' COLLATE NOCASE) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+count	rows	SELECT count(*) FROM (SELECT a FROM u INTERSECT SELECT x FROM (SELECT lower(a) AS x FROM t)) AS s	1:1
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT lower(a) FROM t INTERSECT SELECT a FROM f) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT first_value(a) OVER (ORDER BY a) FROM t INTERSECT SELECT a || '' FROM t) FROM u	5:NULL,NULL;abc,1;abc,1;q,0;x,0
+from	rows	SELECT * FROM (SELECT (a) FROM r INTERSECT SELECT lower(a) FROM r) AS s	2:abc;m
+insert	dml	INSERT INTO o SELECT a FROM f EXCEPT SELECT lower(a) FROM r	0:
+insert	dml	INSERT INTO o SELECT a FROM k UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	3:abc;q;z
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u UNION SELECT a FROM t) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u EXCEPT SELECT a FROM t) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u INTERSECT SELECT a FROM t) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u UNION SELECT a FROM r) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u EXCEPT SELECT a FROM r) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u INTERSECT SELECT a FROM r) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t UNION SELECT a FROM u) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t EXCEPT SELECT a FROM u) FROM n	3:7,0;abc,0;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t INTERSECT SELECT a FROM u) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t UNION SELECT a FROM r) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t EXCEPT SELECT a FROM r) FROM n	3:7,0;abc,0;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM t INTERSECT SELECT a FROM r) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r UNION SELECT a FROM u) FROM n	3:7,NULL;abc,1;x,1
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r EXCEPT SELECT a FROM u) FROM n	3:7,0;abc,0;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r INTERSECT SELECT a FROM u) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r UNION SELECT a FROM t) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r EXCEPT SELECT a FROM t) FROM n	3:7,0;abc,1;x,0
+in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM r INTERSECT SELECT a FROM t) FROM n	3:7,0;abc,0;x,0
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM u UNION SELECT s.a FROM c JOIN u AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:NULL;abc;abc;q;x
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM u UNION SELECT s.a, 0 FROM c, u AS s) SELECT z, d FROM c	5:NULL,0;abc,0;abc,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1) SELECT z, d FROM c	6:NULL,1;abc,0;abc,1;abc,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM u UNION SELECT s.a FROM c JOIN t AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:NULL;abc;abc;q;x
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM u UNION SELECT s.a, 0 FROM c, t AS s) SELECT z, d FROM c	8:NULL,0;abc,0;abc,0;m,0;q,0;q,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1) SELECT z, d FROM c	7:NULL,1;abc,0;abc,1;m,1;q,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM u UNION SELECT s.a FROM c JOIN r AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:NULL;abc;abc;q;x
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM u UNION SELECT s.a, 0 FROM c, r AS s) SELECT z, d FROM c	8:NULL,0;abc,0;abc,0;abc,0;m,0;m,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1) SELECT z, d FROM c	7:NULL,1;abc,0;abc,1;abc,1;m,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM u UNION SELECT s.a FROM c JOIN b AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	6:NULL;abc;abc;abc;q;x
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM u UNION SELECT s.a, 0 FROM c, b AS s) SELECT z, d FROM c	8:NULL,0;abc,0;abc,0;abc,0;m,0;q,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1) SELECT z, d FROM c	9:NULL,1;abc,0;abc,1;abc,1;abc,1;m,1;q,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM u UNION SELECT s.a FROM c JOIN k AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	6:NULL;abc;abc;abc;q;x
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM u UNION SELECT s.a, 0 FROM c, k AS s) SELECT z, d FROM c	8:NULL,0;abc,0;abc,0;abc,0;q,0;q,0;x,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1) SELECT z, d FROM c	7:NULL,1;abc,0;abc,1;q,1;q,1;x,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM t UNION SELECT s.a FROM c JOIN u AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM t UNION SELECT s.a, 0 FROM c, u AS s) SELECT z, d FROM c	6:NULL,0;abc,0;m,0;q,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1) SELECT z, d FROM c	9:NULL,1;abc,0;abc,1;abc,1;m,1;q,1;q,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM t UNION SELECT s.a FROM c JOIN t AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM t UNION SELECT s.a, 0 FROM c, t AS s) SELECT z, d FROM c	3:abc,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1) SELECT z, d FROM c	4:abc,0;abc,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM t UNION SELECT s.a FROM c JOIN r AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM t UNION SELECT s.a, 0 FROM c, r AS s) SELECT z, d FROM c	5:abc,0;abc,0;m,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1) SELECT z, d FROM c	6:abc,0;abc,1;abc,1;m,1;q,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM t UNION SELECT s.a FROM c JOIN b AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM t UNION SELECT s.a, 0 FROM c, b AS s) SELECT z, d FROM c	4:abc,0;m,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1) SELECT z, d FROM c	7:abc,0;abc,1;abc,1;m,1;m,1;q,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM t UNION SELECT s.a FROM c JOIN k AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM t UNION SELECT s.a, 0 FROM c, k AS s) SELECT z, d FROM c	4:abc,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1) SELECT z, d FROM c	5:abc,0;abc,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM r UNION SELECT s.a FROM c JOIN u AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;abc;m
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM r UNION SELECT s.a, 0 FROM c, u AS s) SELECT z, d FROM c	6:NULL,0;abc,0;abc,0;m,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1) SELECT z, d FROM c	9:NULL,1;abc,0;abc,1;abc,1;abc,1;m,1;m,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM r UNION SELECT s.a FROM c JOIN t AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;abc;m
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM r UNION SELECT s.a, 0 FROM c, t AS s) SELECT z, d FROM c	5:abc,0;abc,0;m,0;q,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1) SELECT z, d FROM c	6:abc,0;abc,1;abc,1;m,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM r UNION SELECT s.a FROM c JOIN r AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;abc;m
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM r UNION SELECT s.a, 0 FROM c, r AS s) SELECT z, d FROM c	3:abc,0;abc,0;m,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1) SELECT z, d FROM c	4:abc,0;abc,1;abc,1;m,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM r UNION SELECT s.a FROM c JOIN b AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:abc;abc;abc;m;m
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM r UNION SELECT s.a, 0 FROM c, b AS s) SELECT z, d FROM c	6:abc,0;abc,0;abc,0;m,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1) SELECT z, d FROM c	8:abc,0;abc,1;abc,1;abc,1;m,1;m,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM r UNION SELECT s.a FROM c JOIN k AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	4:abc;abc;abc;m
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM r UNION SELECT s.a, 0 FROM c, k AS s) SELECT z, d FROM c	6:abc,0;abc,0;abc,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1) SELECT z, d FROM c	7:abc,0;abc,1;abc,1;m,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM b UNION SELECT s.a FROM c JOIN u AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:abc;abc;abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM b UNION SELECT s.a, 0 FROM c, u AS s) SELECT z, d FROM c	8:NULL,0;abc,0;abc,0;abc,0;m,0;q,0;q,0;x,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1) SELECT z, d FROM c	9:NULL,1;abc,0;abc,1;abc,1;abc,1;m,1;q,1;q,1;x,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM b UNION SELECT s.a FROM c JOIN t AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:abc;abc;m;q;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM b UNION SELECT s.a, 0 FROM c, t AS s) SELECT z, d FROM c	6:abc,0;abc,0;m,0;m,0;q,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1) SELECT z, d FROM c	5:abc,0;abc,1;m,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM b UNION SELECT s.a FROM c JOIN r AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	5:abc;abc;m;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM b UNION SELECT s.a, 0 FROM c, r AS s) SELECT z, d FROM c	7:abc,0;abc,0;abc,0;m,0;m,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1) SELECT z, d FROM c	7:abc,0;abc,1;abc,1;abc,1;m,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM b UNION SELECT s.a FROM c JOIN b AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM b UNION SELECT s.a, 0 FROM c, b AS s) SELECT z, d FROM c	3:abc,0;m,0;q,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1) SELECT z, d FROM c	4:abc,0;abc,1;m,1;q,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM b UNION SELECT s.a FROM c JOIN k AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	4:abc;abc;m;q
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM b UNION SELECT s.a, 0 FROM c, k AS s) SELECT z, d FROM c	5:abc,0;abc,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1) SELECT z, d FROM c	5:abc,0;abc,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM k UNION SELECT s.a FROM c JOIN u AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;q;z
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM k UNION SELECT s.a, 0 FROM c, u AS s) SELECT z, d FROM c	6:NULL,0;abc,0;q,0;q,0;x,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, u AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1) SELECT z, d FROM c	9:NULL,1;abc,0;abc,1;abc,1;abc,1;q,1;q,1;x,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM k UNION SELECT s.a FROM c JOIN t AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;q;z
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM k UNION SELECT s.a, 0 FROM c, t AS s) SELECT z, d FROM c	4:abc,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, t AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1) SELECT z, d FROM c	5:abc,0;abc,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM k UNION SELECT s.a FROM c JOIN r AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;q;z
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM k UNION SELECT s.a, 0 FROM c, r AS s) SELECT z, d FROM c	6:abc,0;abc,0;m,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, r AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1) SELECT z, d FROM c	7:abc,0;abc,1;abc,1;abc,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM k UNION SELECT s.a FROM c JOIN b AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;q;z
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM k UNION SELECT s.a, 0 FROM c, b AS s) SELECT z, d FROM c	4:abc,0;m,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, b AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1) SELECT z, d FROM c	6:abc,0;abc,1;abc,1;m,1;q,1;z,1
+recursive	rows	WITH RECURSIVE c(z) AS (SELECT a FROM k UNION SELECT s.a FROM c JOIN k AS s ON s.a = c.z COLLATE NOCASE) SELECT z FROM c	3:abc;q;z
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT a, 0 FROM k UNION SELECT s.a, 0 FROM c, k AS s) SELECT z, d FROM c	3:abc,0;q,0;z,0
+recursive	rows	WITH RECURSIVE c(z, d) AS (SELECT 'abc', 0 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1 UNION SELECT s.a, d + 1 FROM c, k AS s WHERE d < 1) SELECT z, d FROM c	4:abc,0;abc,1;q,1;z,1
