@@ -42,9 +42,14 @@ use std::collections::HashMap;
 
 const HEADER_MAGIC: u64 = 0x4144_4548_4f52_5041;
 const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
-/// The word after a header's stamp: the header was written only once its checkpoint's pages were
-/// flushed (AUDIT 7.5). A header written before this order has no word after its stamp.
+/// An optional word after the stamp confirms its checkpoint's pages were flushed first
+/// (AUDIT 7.5). Old headers and stamps that fill the page have no such word.
 const PAGES_FLUSHED: u64 = 1;
+/// The seal's magic, body length and hash are each an encoded u64.
+const SEAL_LEN: usize = size_of::<[u64; 3]>();
+/// A header page holds the seal, the four fixed words in `Stamp::encode`, and one word per root.
+const HEADER_ROOT_SLOTS: usize =
+    (PAGE_SIZE - SEAL_LEN - size_of::<[u64; 4]>()) / size_of::<u64>();
 
 /// A checkpoint as a header or journal names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -125,7 +130,7 @@ impl Stamp {
 /// `magic`, the body's length and XXH3, the body.
 fn seal(magic: u64, body: &[u8]) -> Result<Vec<u8>> {
     let len = u64::try_from(body.len()).map_err(|_| LimboError::IntegerOverflow)?;
-    let mut out = Vec::with_capacity(body.len().saturating_add(24));
+    let mut out = Vec::with_capacity(body.len().saturating_add(SEAL_LEN));
     out.extend_from_slice(&magic.to_le_bytes());
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&twox_hash::XxHash3_64::oneshot(body).to_le_bytes());
@@ -182,7 +187,7 @@ fn partition(op: &Op, parts: usize) -> usize {
 }
 
 /// A seal's own bytes ahead of its body: magic, length and hash (`seal`'s format).
-const SEAL_BYTES: u64 = 24;
+const SEAL_BYTES: u64 = SEAL_LEN as u64;
 
 /// A journal page: its number (`u64`) and its bytes (the journal's format).
 const ENTRY_BYTES: usize = 8 + PAGE_SIZE;
@@ -390,6 +395,12 @@ impl Journal {
             disk.write_at(File::Data, page_offset(no)?, page)?;
         }
         disk.sync(File::Data)?;
+        // An older writer could publish an oversized journal, then fail to write its header.
+        // Keep that durable journal as the recovery source. Checkpoint refuses this catalog
+        // before switching redo turns or overwriting either journal (T-T1.3.1).
+        if stamp.roots.len() > HEADER_ROOT_SLOTS {
+            return Ok(());
+        }
         Database::write_header(disk, stamp)?;
         disk.sync(File::Data)
     }
@@ -643,6 +654,9 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        if all > HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let v = Versioned::new_in(Pool::backed_in(room, disk.clone(), 0)?, all, |i| {
             if i == trees {
                 bytes_order()
@@ -694,6 +708,9 @@ impl Database {
     pub fn make_tree(&self, d: &mut Descender, cmp: Comparator) -> Result<u64> {
         let _alone = self.gate.write();
         self.redo.usable()?;
+        if self.v.root_slots() >= HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let id = self.v.make_tree(cmp)?;
         let logged = self.log_alone(d, Op::Made { tree: id });
         if logged.is_err() {
@@ -747,7 +764,11 @@ impl Database {
     fn write_header(disk: &dyn Disk, stamp: &Stamp) -> Result<()> {
         let mut body = Vec::new();
         stamp.encode(&mut body)?;
-        body.extend_from_slice(&PAGES_FLUSHED.to_le_bytes());
+        let marker = PAGES_FLUSHED.to_le_bytes();
+        // Preserve every root slot in the legacy page. A full page replays its journal on open.
+        if body.len().saturating_add(SEAL_LEN).saturating_add(marker.len()) <= PAGE_SIZE {
+            body.extend_from_slice(&marker);
+        }
         let mut page = seal(HEADER_MAGIC, &body)?;
         if page.len() > PAGE_SIZE {
             return Err(LimboError::TooBig);
@@ -1097,10 +1118,14 @@ impl Database {
 
     /// A checkpoint (decision 7): the pages written since the last, the rows to correct, the
     /// redo log before its timestamp cut. Its timestamp. One that fails leaves the database
-    /// making nothing more durable until reopened.
+    /// making nothing more durable until reopened. An oversized catalog recovered from an older
+    /// journal is refused before the checkpoint changes anything.
     pub fn checkpoint(&self) -> Result<Ts> {
         let mut last = self.last.lock();
         self.redo.usable()?;
+        if self.v.root_slots() > HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let seq = last.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         match self.checkpoint_as(seq) {
             Ok(ts) => {
@@ -1205,28 +1230,37 @@ mod tests {
         assert!(got == want || got == with_late, "{} rows", got.len());
     }
 
-    /// T-T1.3.1, AUDIT 2.4. Publish a buffered write after a reader takes its snapshot and
-    /// before it finishes durably. Its snapshot still misses the write. Recovery must keep it.
+    /// T-T1.3.1, AUDIT 2.4. Publish a buffered write on each of two lanes after a reader
+    /// takes its snapshot. Neither row is visible to the reader. Its finish must make both durable.
     #[test]
     fn audit_review_unwritten_commit_flushes_the_prefix_at_finish() {
-        let disk = Arc::new(Simulated::new(5, 1).unwrap());
+        let disk = Arc::new(Simulated::new(5, 2).unwrap());
         let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let reader = db.begin().unwrap();
-        let mut writer = db.begin().unwrap();
-        db.put(&mut d, &mut writer, 0, b"key", b"value").unwrap();
-        db.commit(writer, &mut d, db.lane(), false).unwrap();
-        assert_eq!(db.get(&mut d, &reader.snapshot(), 0, b"key").unwrap(), None);
+        let lanes = [db.lane(), db.lane()];
+        assert_ne!(lanes[0], lanes[1]);
+        let writes = [(b"a", b"first".as_slice()), (b"b", b"second".as_slice())];
+        for ((key, value), lane) in writes.into_iter().zip(lanes) {
+            let mut writer = db.begin().unwrap();
+            db.put(&mut d, &mut writer, 0, key, value).unwrap();
+            db.commit(writer, &mut d, lane, false).unwrap();
+            assert_eq!(db.get(&mut d, &reader.snapshot(), 0, key).unwrap(), None);
+        }
+        assert_eq!(db.log_counters().records, 0);
         assert!(db.end_unwritten(reader).unwrap().is_none());
         let flushed = db.log_counters().records;
         drop(db);
         disk.power_cut().unwrap();
         let reopened = Database::open(disk, 2_000, 1, cmp).unwrap();
-        assert_eq!(
-            rows(&reopened).get(b"key".as_slice()).map(Vec::as_slice),
-            Some(b"value".as_slice())
-        );
-        assert_eq!(flushed, 1, "only the writer logged a record");
+        let recovered = rows(&reopened);
+        for (key, value) in writes {
+            assert_eq!(
+                recovered.get(key.as_slice()).map(Vec::as_slice),
+                Some(value)
+            );
+        }
+        assert_eq!(flushed, 2, "only the writers logged records");
     }
 
     /// The rows of tree `tree`, as a snapshot begun now sees them.
@@ -1405,6 +1439,134 @@ mod tests {
         page.resize(PAGE_SIZE, 0);
         disk.write_at(File::Data, 0, &page).unwrap();
         disk.sync(File::Data).unwrap();
+    }
+
+    /// T-T1.3.1, AUDIT 7.5. An old checkpoint can use the whole header page for its
+    /// roots. Recover its committed row, checkpoint it again and recover after a power cut.
+    #[test]
+    fn review_a_full_legacy_header_can_reopen_and_checkpoint() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let mut d = Descender::new();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"row", b"kept").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+
+        let mut first = vec![0; PAGE_SIZE];
+        disk.read_at(File::Data, 0, &mut first).unwrap();
+        let mut stamp = Header::decode(unseal(HEADER_MAGIC, &first).unwrap())
+            .unwrap()
+            .stamp;
+        let mut body = Vec::new();
+        stamp.encode(&mut body).unwrap();
+        let room = PAGE_SIZE - seal(HEADER_MAGIC, &body).unwrap().len();
+        for _ in 0..room / size_of::<u64>() {
+            db.make_tree(&mut d, cmp()).unwrap();
+        }
+        stamp.seq += 1;
+        stamp.ts = db.newest();
+        stamp.roots = db.v.roots();
+        stamp.allocated = db.v.pool.allocated();
+        let epoch = db.v.pool.begin_copy().unwrap();
+        Journal::write(
+            &*disk,
+            &stamp,
+            &db.v.corrections(stamp.ts).unwrap(),
+            |each| db.v.pool.copy_owed(epoch, stamp.allocated, each),
+        )
+        .unwrap();
+        body.clear();
+        stamp.encode(&mut body).unwrap();
+        let legacy = seal(HEADER_MAGIC, &body).unwrap();
+        assert_eq!(legacy.len(), PAGE_SIZE);
+        // The old writer could persist the header before its checkpoint's journaled pages.
+        disk.write_at(File::Data, 0, &legacy).unwrap();
+        disk.sync(File::Data).unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+
+        let want = [(b"row".to_vec(), b"kept".to_vec())].into_iter().collect();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp)
+            .expect("recover the full legacy header");
+        assert_eq!(rows(&db), want);
+        db.checkpoint().unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(rows(&db), want);
+    }
+
+    /// AC-NS.2.5, T-T1.3.1. Fill the root directory, try to add one tree, then checkpoint.
+    /// The extra tree must be refused while the last supported tree's data remains recoverable.
+    #[test]
+    fn review_tree_growth_is_refused_before_it_can_make_recovery_fail() {
+        let disk = Arc::new(Simulated::new(9, 1).unwrap());
+        let trees = HEADER_ROOT_SLOTS - 1; // The overflow tree occupies one slot.
+        assert!(matches!(
+            Database::open(disk.clone(), 2_000, HEADER_ROOT_SLOTS, cmp),
+            Err(LimboError::TooBig)
+        ));
+        assert_eq!(disk.len(File::Journal).unwrap(), 0);
+        let db = Database::open(disk.clone(), 2_000, trees, cmp).unwrap();
+        let tree = u64::try_from(trees - 1).unwrap();
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, tree, b"k", b"last").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        let added = db.make_tree(&mut d, cmp());
+        assert!(matches!(added, Err(LimboError::TooBig)), "{added:?}");
+        db.checkpoint().unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, trees, cmp).unwrap();
+        assert_eq!(tree_rows(&db, tree).get(b"k".as_slice()).unwrap(), b"last");
+    }
+
+    /// T-T1.3.1. Older writers could flush a journal whose roots did not fit the data header.
+    /// Recover its row; a refused checkpoint must leave that journal and later redo usable.
+    #[test]
+    fn review_recovers_an_existing_oversized_checkpoint_journal() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"k", b"old").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        for _ in db.v.root_slots()..=HEADER_ROOT_SLOTS {
+            db.v.make_tree(cmp()).unwrap();
+        }
+        let stamp = Stamp {
+            seq: 1,
+            ts: db.newest(),
+            allocated: db.v.pool.allocated(),
+            roots: db.v.roots(),
+        };
+        let epoch = db.v.pool.begin_copy().unwrap();
+        Journal::write(
+            &*disk,
+            &stamp,
+            &db.v.corrections(stamp.ts).unwrap(),
+            |each| db.v.pool.copy_owed(epoch, stamp.allocated, each),
+        )
+        .unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).expect("recover the durable journal");
+        assert_eq!(rows(&db).get(b"k".as_slice()).unwrap(), b"old");
+        let before = disk.operations();
+        assert!(matches!(db.checkpoint(), Err(LimboError::TooBig)));
+        assert_eq!(
+            before,
+            disk.operations(),
+            "the recovery journal must stay in place"
+        );
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"k", b"later").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(rows(&db).get(b"k".as_slice()).unwrap(), b"later");
     }
 
     /// A simulated disk that counts the data file's writes and flushes.

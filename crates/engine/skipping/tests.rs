@@ -2503,7 +2503,7 @@ mod chooser {
 
 /// Lane skip-8 (T-SKU.10): a measured summary's dropped method built again off the scan's path,
 /// one build per summary at a time, installed only when no write came in during it.
-mod builds {
+pub(super) mod builds {
     use super::super::{
         start_build, zone_map_of_table, BuildEnd, BuildMode, Chooser, CrackerColumn, Lead,
         RowWrite, SkipMethod, SkipRegistry, Skipping, Upkeep, ZoneMap, ZoneMapBuilder,
@@ -2541,7 +2541,7 @@ mod builds {
         chooser
     }
 
-    fn registry_due() -> SkipRegistry {
+    pub(in crate::skipping) fn registry_due() -> SkipRegistry {
         let registry = SkipRegistry::default();
         registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
         registry
@@ -2812,6 +2812,35 @@ mod builds {
         assert_eq!(held, Some(500));
         assert!(!db.skipping.building(root));
         assert_eq!(db.skipping.claim_build(root), None);
+    }
+
+    /// T-SKU.10. A background rebuild opens a versioned cursor outside a SQL statement. Once
+    /// the completed build's thread exits, a later commit must advance the collection watermark.
+    #[test]
+    fn review_a_background_build_releases_its_versioned_snapshot() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        let root = fill_table(&conn, 2);
+        db.skipping
+            .set(root, 0, Skipping::Measured(Box::new(cracker_due())));
+        let clock = &conn.versioned.as_ref().unwrap().storage().db().v.clock;
+        let before = clock.published();
+        let build = start_build(&conn, root, 2).unwrap();
+        assert_eq!(build.join().unwrap(), BuildEnd::Installed);
+        assert_eq!(
+            cracker_rows(&db.skipping, root),
+            Some(vec![(1, Some(0)), (2, Some(1))])
+        );
+        conn.execute("INSERT INTO t VALUES (2, 'y')").unwrap();
+        assert!(clock.published() > before);
+        assert_eq!(
+            clock.low_watermark(),
+            clock.published(),
+            "finished build kept its snapshot"
+        );
     }
 
     /// A table `t (a INTEGER, pad TEXT)` of `rows` rows (`a` = 0, 1, ...) on `conn`, and its root.
@@ -3638,6 +3667,30 @@ mod versioned {
     }
 
     const FILTER: &str = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+
+    /// AC-NS.2.1 / T-SKU.10. Dropping a connection with an uncommitted versioned write
+    /// restores its row and releases the writer observed by a waiting summary builder.
+    #[test]
+    fn review_dropping_a_versioned_connection_releases_its_writer() {
+        let (db, reader, root) = waiting_table();
+        let writer = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer
+            .execute("UPDATE t SET a = -7 WHERE rowid = 1")
+            .unwrap();
+        drop(writer);
+        let switch = reader.versioned_for(crate::MAIN_DB_ID).unwrap();
+        assert_eq!(switch.wait_unwritten(root, None).unwrap(), Ok(false));
+        assert_eq!(
+            rowids(&reader, "SELECT rowid FROM t WHERE a = 0").0,
+            vec![1]
+        );
+        reader
+            .execute("UPDATE t SET a = 42 WHERE rowid = 1")
+            .unwrap();
+    }
 
     /// The filter's rows once row 3001 (`a` = 110) is in.
     fn with_the_new_row() -> Vec<i64> {

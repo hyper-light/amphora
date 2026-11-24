@@ -699,7 +699,7 @@ fn wake_address(listening: SocketAddr) -> SocketAddr {
     let ip = match listening.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
+        _ => return listening,
     };
     SocketAddr::new(ip, listening.port())
 }
@@ -1692,6 +1692,18 @@ mod tests {
     }
     fn until() -> Instant {
         Instant::now() + HANG
+    }
+
+    /// AC-FD.1.2. The stop connection uses the same interface as a scoped IPv6 listener.
+    #[test]
+    fn review_wake_address_preserves_the_bound_ipv6_scope() {
+        let address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1234,
+            0,
+            7,
+        ));
+        assert_eq!(wake_address(address), address);
     }
 
     /// An owner answering each connection with one byte, at the loopback.

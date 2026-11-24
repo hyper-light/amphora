@@ -12,7 +12,13 @@ Command (each label built from its own tree, then run three times):
 `room`: `memory::process().room(Use::Queues)`, ns a call, best of five rounds of 200,000 calls: what
 every `Database` request's admission pays (`Admission::reserve` -> `Budget::take` -> `room`).
 `call`: `Database::call` of an empty closure, calls a second over 3 s after a 1 s warm-up, at each
-client count (one thread a client). No call was refused in any run.
+client count (one thread a client). The harness recorded zero refusals per second, rounded to
+the nearest integer. One refusal during a three-second arm also rounds to zero. Exact refusal
+counts for these historical runs are unavailable.
+
+The revised example emits exact `completed` and `refused` totals for calls begun in the
+measured interval. It also emits `unexpected_errors` and fails if any refusal was other than
+admission `Full`. A successful GET must return the fixture's absent key.
 
 ## Verified
 
