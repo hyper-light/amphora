@@ -319,6 +319,18 @@ pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>,
     Ok(on_base(base.base_index, base.base_term, before))
 }
 
+/// Lane V13's trace: a prepared transaction's base index, if `data` is one.
+pub(crate) fn v13_base(data: &[u8]) -> Option<u64> {
+    let (_, data) = closed::open(data).ok()?;
+    let base: Base = if let Some(payload) = data.strip_prefix(BASELINE_DELTA) {
+        let (_, base): (api::replication::Bootstrap, Base) = postcard::from_bytes(payload).ok()?;
+        base
+    } else {
+        postcard::from_bytes(data).ok()?
+    };
+    Some(base.base_index)
+}
+
 /// A local apply result is released only once its entry is committed: in the persisted class once
 /// this member's raft log holds it durably, so a restart that finds the database's log behind it
 /// applies it again from the raft log (durable.md §4.1, §4.3).

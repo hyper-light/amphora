@@ -324,6 +324,21 @@ impl<T> Slots<T> {
     pub(super) fn holds(&self) -> bool {
         self.holding.is_some()
     }
+    /// Lane V13's trace: the holder, its slot's start index, and the queue and waiting members.
+    pub(super) fn v13_view(&self) -> String {
+        let holder = self
+            .holding
+            .as_ref()
+            .map_or_else(|| "-".to_string(), |h| format!("{}@{}", h.member, h.last));
+        let queue: Vec<u64> = self.queue.iter().copied().collect();
+        let waiting: Vec<u64> = self.waiting.iter().map(|(m, _)| *m).collect();
+        let forwards: Vec<u64> = self.forwards.iter().map(|(m, _)| *m).collect();
+        format!(
+            "holder={holder} turn={} q={queue:?} w={waiting:?} held={forwards:?} read={}",
+            self.turn,
+            self.read.as_ref().map_or(0, |(m, _)| *m)
+        )
+    }
 
     /// Whether the leader's own turn is owed: a slot ended, and the leader has not written since.
     pub(super) fn turn(&self) -> bool {

@@ -3490,6 +3490,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         };
         match &pending.phase {
             Phase::Barrier(_) => {
+                v13_trace::log(format_args!(
+                    "tmo ctx={} expired={expired} changed_term={changed_term}",
+                    v13_trace::hex(&pending.context)
+                ));
                 if expired {
                     if let Some(response) = pending.response.take() {
                         answer(response, Err(Refusal::Timeout));
@@ -3789,6 +3793,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                             return Err(refusal);
                         }
                     };
+                    v13_trace::log(format_args!(
+                        "sub ctx={} w={} leader={}",
+                        v13_trace::hex(&context),
+                        operation.writes(),
+                        self.replica.is_leader()
+                    ));
                     match self.replica.read(context.clone()) {
                         Ok(()) => {
                             self.pending = Some(Pending {
@@ -4167,7 +4177,19 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.is_leader() && !self.slot_off() {
             match message.msg_type {
                 hyper_raft::proto::MessageType::MsgPropose => {
+                    let ctx = message
+                        .entries
+                        .first()
+                        .map(|e| v13_trace::hex(&e.context))
+                        .unwrap_or_default();
+                    let before = self.slots.v13_view();
                     let forward = self.slots.forward(from, self.at, (message, reservation));
+                    v13_trace::log(format_args!(
+                        "fwd from={from} ctx={ctx} step={} ended={:?} before[{before}] after[{}]",
+                        forward.step.is_some(),
+                        forward.ended.map(|e| (e.member, e.how)),
+                        self.slots.v13_view()
+                    ));
                     if let Some(unmeasured) = forward.unmeasured {
                         tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
                     }
@@ -4187,12 +4209,24 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .entries
                         .first()
                         .is_some_and(|entry| reads(&entry.data));
+                    let ctx = message
+                        .entries
+                        .first()
+                        .map(|e| v13_trace::hex(&e.data))
+                        .unwrap_or_default();
+                    let before = self.slots.v13_view();
                     let read = if marked {
                         self.slots.pass(from, self.at, (message, reservation))
                     } else {
                         self.slots.ask(from);
                         self.slots.read(from, self.at, (message, reservation))
                     };
+                    v13_trace::log(format_args!(
+                        "bar from={from} ctx={ctx} marked={marked} step={} ended={:?} before[{before}] after[{}]",
+                        read.step.is_some(),
+                        read.ended.map(|e| (e.member, e.how)),
+                        self.slots.v13_view()
+                    ));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
                         Some((message, _reservation)) => {
@@ -4239,9 +4273,44 @@ impl<F: BlockFile + 'static> Actor<F> {
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
-            if let Ok(Err(Refusal::Serialization { .. })) =
-                crate::replication::verdict(&entry.data, before)
-            {
+            let stale = matches!(
+                crate::replication::verdict(&entry.data, before),
+                Ok(Err(Refusal::Serialization { .. }))
+            );
+            let base = crate::replication::v13_base(&entry.data);
+            let mut between = String::new();
+            if stale && let Some(base) = base {
+                let log = self.replica.core().raft.log();
+                let low = base.saturating_add(1);
+                let high = before.index.saturating_add(1);
+                if low < high
+                    && let Ok(entries) = log.slice(low, high, u64::MAX)
+                {
+                    for e in entries.iter().take(24) {
+                        let origin = e
+                            .context
+                            .get(..8)
+                            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                            .map_or(0, u64::from_le_bytes);
+                        between.push_str(&format!(
+                            " {}:{}:{:?}:{}",
+                            e.index,
+                            origin,
+                            e.entry_type,
+                            v13_trace::hex(&e.context)
+                        ));
+                    }
+                }
+            }
+            v13_trace::log(format_args!(
+                "app from={from} ctx={} idx={} base={base:?} before={} stale={stale} commit={} slot[{}] between=[{between}]",
+                v13_trace::hex(&entry.context),
+                before.index.saturating_add(1),
+                before.index,
+                self.replica.core().raft.log().committed(),
+                self.slots.v13_view()
+            ));
+            if stale {
                 refused = true;
             }
             let Some(index) = before.index.checked_add(1) else {
@@ -4358,6 +4427,16 @@ impl<F: BlockFile + 'static> Actor<F> {
         let (mut forwards, mut barriers) = (0u64, 0u64);
         while let Some((from, (message, _reservation))) = self.slots.ready() {
             let proposal = message.msg_type == hyper_raft::proto::MessageType::MsgPropose;
+            v13_trace::log(format_args!(
+                "ready from={from} proposal={proposal} ctx={} leader={} slot[{}]",
+                message
+                    .entries
+                    .first()
+                    .map(|e| v13_trace::hex(if proposal { &e.context } else { &e.data }))
+                    .unwrap_or_default(),
+                self.replica.is_leader(),
+                self.slots.v13_view()
+            ));
             let stepped = if !self.replica.is_leader() {
                 if proposal {
                     forwards = forwards.saturating_add(1);
@@ -4399,6 +4478,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let at = self.at;
         let leading = (self.replica.is_leader() && !self.slot_off()).then(|| self.replica.term());
         let ended = self.slots.lead(leading, at);
+        if let Some(e) = ended {
+            v13_trace::log(format_args!("end site=lead member={} how={:?} held_us={}", e.member, e.how, e.held.as_micros()));
+        }
         self.slot_ended(ended);
         if leading.is_some() {
             let configuration = self.replica.core().raft.configuration();
@@ -4408,13 +4490,29 @@ impl<F: BlockFile + 'static> Actor<F> {
                 |member| configuration.contains(member),
                 |member| detected.contains(&member),
             );
+            if let Some(e) = ended {
+                v13_trace::log(format_args!("end site=keep member={} how={:?} held_us={} detected={:?}", e.member, e.how, e.held.as_micros(), self.detected));
+            }
             self.slot_ended(ended);
             let ended = self.slots.expire(at);
+            if let Some(e) = ended {
+                v13_trace::log(format_args!(
+                    "end site=expire member={} how={:?} held_us={} at_lag_us={} slot[{}]",
+                    e.member,
+                    e.how,
+                    e.held.as_micros(),
+                    std::time::Instant::now().saturating_duration_since(at).as_micros(),
+                    self.slots.v13_view()
+                ));
+            }
             self.slot_ended(ended);
             self.slots
                 .committed(self.replica.core().raft.log().committed());
             if self.changing.is_some() || self.transferring.is_some() {
                 let ended = self.slots.release(at);
+                if let Some(e) = ended {
+                    v13_trace::log(format_args!("end site=release member={} how={:?} held_us={}", e.member, e.how, e.held.as_micros()));
+                }
                 self.slot_ended(ended);
             }
             self.start_slot()?;
@@ -4438,7 +4536,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
-        if let Some((_, length)) = self.slots.start(self.at, last, commit, own) {
+        if let Some((member, length)) = self.slots.start(self.at, last, commit, own) {
+            v13_trace::log(format_args!(
+                "start member={member} last={last} commit={commit} len_us={} own={own} slot[{}]",
+                length.as_micros(),
+                self.slots.v13_view()
+            ));
             self.control.meter.slot_began(length);
         }
         Ok(())
@@ -4472,6 +4575,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "the member is this node or not a current member",
             ));
         }
+        v13_trace::log(format_args!(
+            "det member={member} suspected={} leader={}",
+            matches!(verdict, Verdict::Suspected(_)),
+            self.replica.is_leader()
+        ));
         match verdict {
             Verdict::Suspected(_) => {
                 self.detected.insert(member);
@@ -4578,6 +4686,15 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .pending
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
+            if matches || matches!(applied.result, Err(Refusal::Serialization { .. })) {
+                v13_trace::log(format_args!(
+                    "res ctx={} idx={} ok={} ser={} mine={matches}",
+                    v13_trace::hex(&applied.context),
+                    applied.index,
+                    applied.result.is_ok(),
+                    matches!(applied.result, Err(Refusal::Serialization { .. }))
+                ));
+            }
             if matches && let Some(mut pending) = self.pending.take() {
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
@@ -4641,7 +4758,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }
             }
         }
-        for (context, _) in output.reads {
+        for (context, read_index) in output.reads {
+            v13_trace::log(format_args!(
+                "rd ctx={} idx={read_index} applied={} last={} mine={}",
+                v13_trace::hex(&context),
+                self.replica.applied().index,
+                self.replica.core().raft.log().last_index().unwrap_or(0),
+                self.pending.as_ref().is_some_and(|p| p.context == context)
+            ));
             if self.pending.as_ref().is_some_and(|p| p.context == context) {
                 self.prepare()?;
             } else if self.changing.as_ref().is_some_and(|c| c.context == context) {
@@ -5112,6 +5236,19 @@ impl<F: BlockFile + 'static> Actor<F> {
             bytes.len(),
             self.entry_room(context.len())?,
         )?;
+        {
+            let log = self.replica.core().raft.log();
+            v13_trace::log(format_args!(
+                "own ctx={} leader={} last={} commit={} applied={} base={:?} slot[{}]",
+                v13_trace::hex(context),
+                self.replica.is_leader(),
+                log.last_index().unwrap_or(0),
+                log.committed(),
+                self.replica.applied().index,
+                crate::replication::v13_base(&bytes),
+                self.slots.v13_view()
+            ));
+        }
         // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
         let observed = self.control.observed.load(Ordering::Acquire);
         let now = self.wall_now()?.max(observed.saturating_add(1));
@@ -5350,6 +5487,15 @@ impl<F: BlockFile + 'static> Actor<F> {
                 return Ok(());
             }
         }
+        v13_trace::log(format_args!(
+            "prep ctx={} applied={} last={} commit={} leader={} turn={}",
+            v13_trace::hex(&pending.context),
+            self.replica.applied().index,
+            self.replica.core().raft.log().last_index().unwrap_or(0),
+            self.replica.core().raft.log().committed(),
+            self.replica.is_leader(),
+            self.slots.turn()
+        ));
         let prepared = if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation
         {
             let room = self.entry_room(pending.context.len())?;
@@ -19364,5 +19510,47 @@ mod tests {
         driven.quiet(&mut pump);
         driven.drain(&mut pump);
         pump.finish();
+    }
+}
+
+/// Lane V13's refusal trace (diagnostic branch `diag/commits-v13-refusals`, never main): one line an
+/// event, `<CLOCK_MONOTONIC ns> <event> ...`, to the file `AMPHORA_TRACE13` names; nothing when unset.
+pub(crate) mod v13_trace {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    /// An `Instant` as CLOCK_MONOTONIC nanoseconds (std's Linux `Instant` is that clock; its Debug
+    /// form names `tv_sec` and `tv_nsec`), comparable across the three members on one host.
+    pub(crate) fn key(at: Instant) -> u128 {
+        let s = format!("{at:?}");
+        let num = |key: &str| -> u128 {
+            s.split(key)
+                .nth(1)
+                .map(|r| {
+                    r.chars()
+                        .skip_while(|c| !c.is_ascii_digit())
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0)
+        };
+        num("tv_sec") * 1_000_000_000 + num("tv_nsec")
+    }
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    pub(crate) fn log(line: std::fmt::Arguments<'_>) {
+        let out = OUT.get_or_init(|| {
+            std::env::var_os("AMPHORA_TRACE13")
+                .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+                .map(Mutex::new)
+        });
+        if let Some(file) = out
+            && let Ok(mut f) = file.lock()
+        {
+            let _ = f.write_all(format!("{} {line}\n", key(Instant::now())).as_bytes());
+        }
     }
 }
