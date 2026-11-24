@@ -21862,17 +21862,22 @@ pub fn op_morsel_aggregate(
     // G11 step 5 (CS.5): on the versioned storage the pager holds no table's rows; the table's
     // column copy answers when the planner chooses it, else the serial loop reads the rows.
     if let Some(switch) = connection.versioned.as_ref() {
-        let copied = crate::storage::versioned::columns_sql::aggregate(
+        use crate::storage::versioned::columns_sql::{Handed, RowsTiming};
+        let handed = crate::storage::versioned::columns_sql::aggregate(
             switch,
             data,
             connection,
             pager.statement_memory_budget(),
         )?;
-        let Some(rows) = copied else {
-            state.pc = data.target_pc_serial.as_offset_int();
-            return Ok(InsnFunctionStepResult::Step);
+        let timed = match handed {
+            Handed::Copy(rows) => return morsel_rows(state, data, rows),
+            Handed::Rows(timed) => timed,
         };
-        return morsel_rows(state, data, rows);
+        // The serial loop the copies handed the statement to is timed to its end for its table's
+        // row path (lane R6), as the copy's scans are timed for the copy's.
+        state.rows_timed = timed.map(|t| RowsTiming::start(t, state.metrics.rows_read));
+        state.pc = data.target_pc_serial.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
     }
     // A scan's rows under a LIMIT with no ORDER BY run on morsels only behind their switch; off,
     // the control, the serial loop answers (lane qs6-8).
