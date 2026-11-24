@@ -11,8 +11,8 @@
 //! usage: amphora-bench --vlog --dir <empty dir> [--writers 32] [--lanes 1,<cores>] [--seconds 10]
 //!        [--keys 200000] [--value 200] [--uring]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use amphora_engine::storage::versioned::blink::Descender;
@@ -57,7 +57,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--vlog" => {}
             "--dir" => o.dir = v()?.into(),
@@ -70,15 +73,23 @@ fn opts() -> anyhow::Result<Opts> {
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    anyhow::ensure!(!o.dir.as_os_str().is_empty(), "--dir names an empty directory for the files");
-    anyhow::ensure!(o.writers > 0 && o.keys >= o.writers as u64, "--keys at least --writers, and a writer");
+    anyhow::ensure!(
+        !o.dir.as_os_str().is_empty(),
+        "--dir names an empty directory for the files"
+    );
+    anyhow::ensure!(
+        o.writers > 0 && o.keys >= o.writers as u64,
+        "--keys at least --writers, and a writer"
+    );
     Ok(o)
 }
 
 fn disk(dir: &std::path::Path, lanes: usize, uring: bool) -> anyhow::Result<Arc<dyn Disk>> {
     if uring {
         #[cfg(target_os = "linux")]
-        return Ok(Arc::new(amphora_engine::storage::versioned::uring::Uring::open(dir, lanes).map_err(e)?));
+        return Ok(Arc::new(
+            amphora_engine::storage::versioned::uring::Uring::open(dir, lanes).map_err(e)?,
+        ));
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("--uring: io_uring is Linux's");
     }
@@ -107,7 +118,11 @@ fn quantiles(ns: &mut [u64]) -> serde_json::Value {
 
 /// One run: `o.writers` writers committing for `o.seconds`, checkpoints back to back if
 /// `checkpoints`; each commit's time, and whether a checkpoint ran during it.
-fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u64>, Vec<u64>, u64, f64)> {
+fn run(
+    o: &Opts,
+    db: &Arc<Database>,
+    checkpoints: bool,
+) -> anyhow::Result<(Vec<u64>, Vec<u64>, u64, f64)> {
     let stop = Arc::new(crate::Stop::default());
     // Odd while a checkpoint runs; moved on as each begins and ends.
     let phase = Arc::new(AtomicU64::new(0));
@@ -158,7 +173,11 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
                     db.commit(t, &mut d, lane, true).map_err(e)?;
                     let p1 = phase.load(Ordering::Acquire);
                     let ns = start.elapsed().as_nanos() as u64;
-                    if p0 % 2 == 1 || p1 != p0 { during.push(ns) } else { quiet.push(ns) }
+                    if p0 % 2 == 1 || p1 != p0 {
+                        during.push(ns)
+                    } else {
+                        quiet.push(ns)
+                    }
                 }
                 Ok((quiet, during))
             })
@@ -168,14 +187,20 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
     stop.stop();
     let (mut quiet, mut during) = (Vec::new(), Vec::new());
     for w in writers {
-        let (q, d) = w.join().map_err(|_| anyhow::anyhow!("a writer panicked"))??;
+        let (q, d) = w
+            .join()
+            .map_err(|_| anyhow::anyhow!("a writer panicked"))??;
         quiet.extend(q);
         during.extend(d);
     }
     let secs = began.elapsed().as_secs_f64();
-    collector.join().map_err(|_| anyhow::anyhow!("the collector panicked"))??;
+    collector
+        .join()
+        .map_err(|_| anyhow::anyhow!("the collector panicked"))??;
     let n = match checkpointer {
-        Some(c) => c.join().map_err(|_| anyhow::anyhow!("the checkpointer panicked"))??,
+        Some(c) => c
+            .join()
+            .map_err(|_| anyhow::anyhow!("the checkpointer panicked"))??,
         None => 0,
     };
     Ok((quiet, during, n, secs))
@@ -183,18 +208,30 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
 
 pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
-    let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_owned();
+    let host = std::fs::read_to_string("/etc/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     for &lanes in &o.lanes {
-        let dir = o.dir.join(format!("lanes-{lanes}{}", if o.uring { "-uring" } else { "" }));
+        let dir = o.dir.join(format!(
+            "lanes-{lanes}{}",
+            if o.uring { "-uring" } else { "" }
+        ));
         std::fs::create_dir_all(&dir)?;
-        anyhow::ensure!(std::fs::read_dir(&dir)?.next().is_none(), "{} isn't empty", dir.display());
+        anyhow::ensure!(
+            std::fs::read_dir(&dir)?.next().is_none(),
+            "{} isn't empty",
+            dir.display()
+        );
         // A frame for each 1,500 bytes of rows (a page about half full after splits, as the
         // `--blink` bench sizes its pool), and room for the splits a checkpoint's copies follow.
         let row = 8 + o.value as u64 + 6;
         let frames = usize::try_from(o.keys * row / 1_500 + 1_000)?;
         let db = Arc::new(
-            Database::open(disk(&dir, lanes, o.uring)?, frames, 1, || Box::new(|a: &[u8], b: &[u8]| a.cmp(b)))
-                .map_err(e)?,
+            Database::open(disk(&dir, lanes, o.uring)?, frames, 1, || {
+                Box::new(|a: &[u8], b: &[u8]| a.cmp(b))
+            })
+            .map_err(e)?,
         );
         // The rows first, then a checkpoint: the runs change rows that exist.
         let mut d = Descender::new();
@@ -204,7 +241,8 @@ pub fn main() -> anyhow::Result<()> {
         for w in 0..o.writers as u64 {
             for i in 0..each {
                 let mut t = db.begin().map_err(e)?;
-                db.put(&mut d, &mut t, 0, &mix(w * each + i).to_be_bytes(), &value).map_err(e)?;
+                db.put(&mut d, &mut t, 0, &mix(w * each + i).to_be_bytes(), &value)
+                    .map_err(e)?;
                 db.commit(t, &mut d, lane, false).map_err(e)?;
             }
         }

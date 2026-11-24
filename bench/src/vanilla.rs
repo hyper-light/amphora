@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::schema as sql;
-use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, SqliteDialect,
+    StepResult, Value,
+};
 
 use crate::Event;
 use crate::pool::Blocking;
@@ -52,23 +55,44 @@ struct Busy;
 impl Turso {
     pub fn open(dir: &str) -> anyhow::Result<Self> {
         let path = fresh(dir)?;
-        let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
+        let name = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-        let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let t = Self { io, db, pool: Mutex::new(Vec::new()), rev: AtomicU64::new(0), seen: Mutex::new(HashSet::new()) };
+        let db = Database::open(
+            io.clone(),
+            name,
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let t = Self {
+            io,
+            db,
+            pool: Mutex::new(Vec::new()),
+            rev: AtomicU64::new(0),
+            seen: Mutex::new(HashSet::new()),
+        };
         let c = t.connection()?;
         for s in schema() {
-            c.execute(&s).map_err(|e| anyhow::anyhow!("{e} (in: {s})"))?;
+            c.execute(&s)
+                .map_err(|e| anyhow::anyhow!("{e} (in: {s})"))?;
         }
         t.give(c);
         Ok(t)
     }
 
     fn connection(&self) -> anyhow::Result<Arc<Connection>> {
-        if let Some(c) = self.pool.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.pop() {
+        if let Some(c) = self
+            .pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?
+            .pop()
+        {
             return Ok(c);
         }
-        self.db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))
+        self.db
+            .connect(ConnectOpts::new())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     fn give(&self, c: Arc<Connection>) {
@@ -78,10 +102,20 @@ impl Turso {
     }
 
     /// Runs `sql` with `params`, handing each row's columns to `each`.
-    fn run(&self, c: &Arc<Connection>, sql: &str, params: &[Value], mut each: impl FnMut(&turso_core::Row)) -> anyhow::Result<Result<(), Busy>> {
+    fn run(
+        &self,
+        c: &Arc<Connection>,
+        sql: &str,
+        params: &[Value],
+        mut each: impl FnMut(&turso_core::Row),
+    ) -> anyhow::Result<Result<(), Busy>> {
         let mut stmt = c.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
-            stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, p.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            stmt.bind_at(
+                NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                p.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         loop {
             match stmt.step() {
@@ -91,9 +125,14 @@ impl Turso {
                     }
                 }
                 Ok(StepResult::Done) => return Ok(Ok(())),
-                Ok(StepResult::IO | StepResult::Yield) => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                Ok(StepResult::IO | StepResult::Yield) => {
+                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                }
                 Ok(StepResult::Sleep { duration }) => {
-                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff")]
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff"
+                    )]
                     std::thread::sleep(duration);
                     self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
@@ -104,22 +143,52 @@ impl Turso {
         }
     }
 
-    fn try_write(&self, c: &Arc<Connection>, events: &[Event], new: &[String]) -> anyhow::Result<Result<(), Busy>> {
+    fn try_write(
+        &self,
+        c: &Arc<Connection>,
+        events: &[Event],
+        new: &[String],
+    ) -> anyhow::Result<Result<(), Busy>> {
         if let Err(b) = self.run(c, "BEGIN IMMEDIATE", &[], |_| {})? {
             return Ok(Err(b));
         }
         let t = |s: &str| Value::from_text(s.to_owned());
         let i = |n: i64| Value::from_i64(n);
         for s in new {
-            let rev = i(i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1).unwrap_or(i64::MAX));
-            let params = [t(s), t("{}"), Value::Null, Value::Null, Value::Null, i(0), i(0), rev];
+            let rev =
+                i(i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1).unwrap_or(i64::MAX));
+            let params = [
+                t(s),
+                t("{}"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                i(0),
+                i(0),
+                rev,
+            ];
             if let Err(b) = self.run(c, sql::SESSION_UPSERT, &params, |_| {})? {
                 return Ok(Err(b));
             }
         }
         for e in events {
-            let rev = i(i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1).unwrap_or(i64::MAX));
-            let params = [t(&e.session), t(&e.id), i(i64::try_from(e.seq).unwrap_or(i64::MAX)), i(e.at), Value::Null, Value::Null, t(e.kind), Value::Null, Value::Null, Value::Null, t(&e.text), t(&e.body), rev];
+            let rev =
+                i(i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1).unwrap_or(i64::MAX));
+            let params = [
+                t(&e.session),
+                t(&e.id),
+                i(i64::try_from(e.seq).unwrap_or(i64::MAX)),
+                i(e.at),
+                Value::Null,
+                Value::Null,
+                t(e.kind),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                t(&e.text),
+                t(&e.body),
+                rev,
+            ];
             if let Err(b) = self.run(c, sql::EVENT_UPSERT, &params, |_| {})? {
                 return Ok(Err(b));
             }
@@ -132,7 +201,11 @@ impl Blocking for Turso {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            events.iter().filter(|e| seen.insert(e.session.clone())).map(|e| e.session.clone()).collect()
+            events
+                .iter()
+                .filter(|e| seen.insert(e.session.clone()))
+                .map(|e| e.session.clone())
+                .collect()
         };
         let c = self.connection()?;
         let done = loop {
@@ -140,7 +213,10 @@ impl Blocking for Turso {
                 Ok(Ok(())) => break Ok(()),
                 Ok(Err(Busy)) => {
                     let _ = c.execute("ROLLBACK");
-                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
+                    )]
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 Err(e) => {
@@ -155,7 +231,10 @@ impl Blocking for Turso {
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
         let c = self.connection()?;
-        let params = [Value::from_text(session.to_owned()), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+        let params = [
+            Value::from_text(session.to_owned()),
+            Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ];
         let done = loop {
             let mut n = 0;
             // Every column taken, as a reader of the page would (the store builds its rows).
@@ -166,7 +245,10 @@ impl Blocking for Turso {
             }) {
                 Ok(Ok(())) => break Ok(n),
                 Ok(Err(Busy)) => {
-                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
+                    )]
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 Err(e) => break Err(e),
@@ -179,7 +261,10 @@ impl Blocking for Turso {
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let c = self.connection()?;
         let mut n = 0;
-        let params = [Value::from_text(like(word)), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+        let params = [
+            Value::from_text(like(word)),
+            Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ];
         let done = match self.run(&c, SEARCH, &params, |_| n += 1) {
             Ok(_) => Ok(n),
             Err(e) => Err(e),
@@ -199,7 +284,12 @@ pub struct Sqlite {
 impl Sqlite {
     pub fn open(dir: &str) -> anyhow::Result<Self> {
         let path = fresh(dir)?;
-        let s = Self { path, pool: Mutex::new(Vec::new()), rev: AtomicU64::new(0), seen: Mutex::new(HashSet::new()) };
+        let s = Self {
+            path,
+            pool: Mutex::new(Vec::new()),
+            rev: AtomicU64::new(0),
+            seen: Mutex::new(HashSet::new()),
+        };
         let c = s.connection()?;
         for stmt in schema() {
             c.execute_batch(&stmt)?;
@@ -209,11 +299,18 @@ impl Sqlite {
     }
 
     fn connection(&self) -> anyhow::Result<rusqlite::Connection> {
-        if let Some(c) = self.pool.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.pop() {
+        if let Some(c) = self
+            .pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?
+            .pop()
+        {
             return Ok(c);
         }
         let c = rusqlite::Connection::open(&self.path)?;
-        c.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 60000;")?;
+        c.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 60000;",
+        )?;
         Ok(c)
     }
 
@@ -228,32 +325,47 @@ impl Blocking for Sqlite {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            events.iter().filter(|e| seen.insert(e.session.clone())).map(|e| e.session.clone()).collect()
+            events
+                .iter()
+                .filter(|e| seen.insert(e.session.clone()))
+                .map(|e| e.session.clone())
+                .collect()
         };
         let mut c = self.connection()?;
         let done = (|| -> anyhow::Result<()> {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for s in &new {
                 let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
-                tx.prepare_cached(sql::SESSION_UPSERT)?.execute(rusqlite::params![s, "{}", None::<String>, None::<String>, None::<String>, 0i64, 0i64, rev as i64])?;
+                tx.prepare_cached(sql::SESSION_UPSERT)?
+                    .execute(rusqlite::params![
+                        s,
+                        "{}",
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
+                        0i64,
+                        0i64,
+                        rev as i64
+                    ])?;
             }
             for e in events {
                 let rev = self.rev.fetch_add(1, Ordering::Relaxed) + 1;
-                tx.prepare_cached(sql::EVENT_UPSERT)?.execute(rusqlite::params![
-                    e.session,
-                    e.id,
-                    e.seq as i64,
-                    e.at,
-                    None::<String>,
-                    None::<String>,
-                    e.kind,
-                    None::<String>,
-                    None::<String>,
-                    None::<String>,
-                    e.text,
-                    e.body,
-                    rev as i64
-                ])?;
+                tx.prepare_cached(sql::EVENT_UPSERT)?
+                    .execute(rusqlite::params![
+                        e.session,
+                        e.id,
+                        e.seq as i64,
+                        e.at,
+                        None::<String>,
+                        None::<String>,
+                        e.kind,
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
+                        e.text,
+                        e.body,
+                        rev as i64
+                    ])?;
             }
             tx.commit()?;
             Ok(())
@@ -270,7 +382,9 @@ impl Blocking for Sqlite {
             let mut n = 0;
             // Every column taken, as a reader of the page would (the store builds its rows).
             while let Some(r) = rows.next()? {
-                let row: Vec<rusqlite::types::Value> = (0..12).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect::<Result<_, _>>()?;
+                let row: Vec<rusqlite::types::Value> = (0..12)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<Result<_, _>>()?;
                 std::hint::black_box(row);
                 n += 1;
             }

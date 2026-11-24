@@ -13,8 +13,8 @@
 
 pub mod checks;
 pub mod engines;
-pub mod synth;
 pub mod reduce;
+pub mod synth;
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -40,13 +40,31 @@ struct Opts {
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { oracles: Oracle::ALL.to_vec(), seconds: 60, seed: 1, per_state: 40, reduce_seconds: 20, features: "bench/corpus/features.json".into(), out: "oracle-out".into(), label: String::new(), state: None };
+    let mut o = Opts {
+        oracles: Oracle::ALL.to_vec(),
+        seconds: 60,
+        seed: 1,
+        per_state: 40,
+        reduce_seconds: 20,
+        features: "bench/corpus/features.json".into(),
+        out: "oracle-out".into(),
+        label: String::new(),
+        state: None,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--oracle" => {}
-            "--oracles" => o.oracles = v()?.split(',').map(|s| Oracle::parse(s).ok_or_else(|| anyhow::anyhow!("no oracle {s}"))).collect::<anyhow::Result<_>>()?,
+            "--oracles" => {
+                o.oracles = v()?
+                    .split(',')
+                    .map(|s| Oracle::parse(s).ok_or_else(|| anyhow::anyhow!("no oracle {s}")))
+                    .collect::<anyhow::Result<_>>()?
+            }
             "--seconds" => o.seconds = v()?.parse()?,
             "--seed" => o.seed = v()?.parse()?,
             "--per-state" => o.per_state = v()?.parse()?,
@@ -61,7 +79,9 @@ fn opts() -> anyhow::Result<Opts> {
             "--replay" => {
                 v()?;
             }
-            other => anyhow::bail!("unknown argument {other} (--oracle takes --oracles, --seconds, --seed, --per-state, --reduce-seconds, --features, --out, --label, --sqlite)"),
+            other => anyhow::bail!(
+                "unknown argument {other} (--oracle takes --oracles, --seconds, --seed, --per-state, --reduce-seconds, --features, --out, --label, --sqlite)"
+            ),
         }
     }
     Ok(o)
@@ -70,12 +90,19 @@ fn opts() -> anyhow::Result<Opts> {
 /// Both engines with the same database: each statement on SQLite first, inside a savepoint, then on
 /// Amphora; one SQLite refuses is left out, one Amphora refuses is undone on SQLite, so the two
 /// always hold the same rows. Returns the statements both took.
-pub fn setup(stmts: &[String], n: u64) -> anyhow::Result<(Amphora, Sqlite, Vec<String>, Vec<String>)> {
+pub fn setup(
+    stmts: &[String],
+    n: u64,
+) -> anyhow::Result<(Amphora, Sqlite, Vec<String>, Vec<String>)> {
     let mut a = Amphora::new(n)?;
     let mut s = Sqlite::new()?;
     let mut kept = Vec::new();
     let mut refused = Vec::new();
-    let on_sqlite = |s: &mut Sqlite, sql: &str| s.run(sql).map(|_| ()).map_err(|e| anyhow::anyhow!("{sql}: {e}"));
+    let on_sqlite = |s: &mut Sqlite, sql: &str| {
+        s.run(sql)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{sql}: {e}"))
+    };
     for st in stmts {
         on_sqlite(&mut s, "SAVEPOINT oracle")?;
         if s.run(st).is_err() {
@@ -99,7 +126,10 @@ pub fn setup(stmts: &[String], n: u64) -> anyhow::Result<(Amphora, Sqlite, Vec<S
 }
 
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
-    p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned())).unwrap_or_else(|| "a panic".into())
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_else(|| "a panic".into())
 }
 
 /// Runs the case on fresh databases made from its statements.
@@ -113,14 +143,22 @@ fn rerun(r: &Repro, n: u64) -> Option<Failure> {
     }));
     match got {
         Ok(f) => f,
-        Err(p) => Some(Failure { kind: Kind::Panic, detail: panic_text(p), queries: checks::sqls(&r.case), cause: None }),
+        Err(p) => Some(Failure {
+            kind: Kind::Panic,
+            detail: panic_text(p),
+            queries: checks::sqls(&r.case),
+            cause: None,
+        }),
     }
 }
 
 /// An error's message with its numbers taken out, so refusals group by kind ("no such function:
 /// median" stays whole: which functions Amphora lacks is what the count is for).
 fn shape(e: &str) -> String {
-    e.chars().take(120).map(|c| if c.is_ascii_digit() { '#' } else { c }).collect()
+    e.chars()
+        .take(120)
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect()
 }
 
 #[derive(Default)]
@@ -148,8 +186,20 @@ fn finding_id(case: &Case, f: &Failure) -> String {
     format!("{}-{:016x}", case.oracle().name(), h.finish())
 }
 
-fn write_finding(dir: &std::path::Path, id: &str, r: &Repro, f: &Failure, seed: u64, state: u64) -> anyhow::Result<()> {
-    let mut md = format!("# {} {:?}: {}\n\nseed {seed}, state {state}\n\n## Statements\n\n```sql\n", r.case.oracle().name(), f.kind, f.detail.lines().next().unwrap_or_default());
+fn write_finding(
+    dir: &std::path::Path,
+    id: &str,
+    r: &Repro,
+    f: &Failure,
+    seed: u64,
+    state: u64,
+) -> anyhow::Result<()> {
+    let mut md = format!(
+        "# {} {:?}: {}\n\nseed {seed}, state {state}\n\n## Statements\n\n```sql\n",
+        r.case.oracle().name(),
+        f.kind,
+        f.detail.lines().next().unwrap_or_default()
+    );
     for s in &r.stmts {
         md.push_str(s);
         md.push_str(";\n");
@@ -159,7 +209,10 @@ fn write_finding(dir: &std::path::Path, id: &str, r: &Repro, f: &Failure, seed: 
         md.push_str(q);
         md.push_str(";\n");
     }
-    md.push_str(&format!("```\n\n## What differed\n\n```\n{}\n```\n", f.detail));
+    md.push_str(&format!(
+        "```\n\n## What differed\n\n```\n{}\n```\n",
+        f.detail
+    ));
     std::fs::write(dir.join(format!("{id}.md")), md)?;
     Ok(())
 }
@@ -168,16 +221,52 @@ fn write_finding(dir: &std::path::Path, id: &str, r: &Repro, f: &Failure, seed: 
 /// both answers and Amphora's plan (text and JSON), for triage.
 fn replay(path: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)?;
-    let blocks: Vec<&str> = text.split("```sql\n").skip(1).filter_map(|b| b.split("```").next()).collect();
-    let stmts: Vec<String> = blocks.first().map(|b| b.split(";\n").map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
-    let queries: Vec<String> = blocks.get(1).map(|b| b.split(";\n").map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+    let blocks: Vec<&str> = text
+        .split("```sql\n")
+        .skip(1)
+        .filter_map(|b| b.split("```").next())
+        .collect();
+    let stmts: Vec<String> = blocks
+        .first()
+        .map(|b| {
+            b.split(";\n")
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let queries: Vec<String> = blocks
+        .get(1)
+        .map(|b| {
+            b.split(";\n")
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let (mut a, mut s, kept, refused) = setup(&stmts, 0)?;
-    println!("statements: {} run, {} refused by Amphora {refused:?}", kept.len(), stmts.len() - kept.len());
+    println!(
+        "statements: {} run, {} refused by Amphora {refused:?}",
+        kept.len(),
+        stmts.len() - kept.len()
+    );
     for q in &queries {
-        println!("\n== {q}\n-- SQLite:  {}\n-- Amphora: {}", engines::show_up_to(&s.run(q), usize::MAX), engines::show_up_to(&a.run(q), usize::MAX));
+        println!(
+            "\n== {q}\n-- SQLite:  {}\n-- Amphora: {}",
+            engines::show_up_to(&s.run(q), usize::MAX),
+            engines::show_up_to(&a.run(q), usize::MAX)
+        );
         if q.trim_start().to_ascii_uppercase().starts_with("SELECT") {
-            println!("-- Amphora's plan: {}", engines::show(&a.run(&format!("EXPLAIN QUERY PLAN {q}"))));
-            println!("-- Amphora's plan (JSON): {}", engines::show(&a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {q}"))));
+            println!(
+                "-- Amphora's plan: {}",
+                engines::show(&a.run(&format!("EXPLAIN QUERY PLAN {q}")))
+            );
+            println!(
+                "-- Amphora's plan (JSON): {}",
+                engines::show(&a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {q}")))
+            );
         }
     }
     Ok(())
@@ -187,35 +276,66 @@ fn replay(path: &str) -> anyhow::Result<()> {
 /// (exit 0) or not (exit 1): told against two builds, which one a finding is the fault of.
 fn replay_check(path: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)?;
-    let blocks: Vec<&str> = text.split("```sql\n").skip(1).filter_map(|b| b.split("```").next()).collect();
-    let split = |b: &str| -> Vec<String> { b.split(";\n").map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect() };
+    let blocks: Vec<&str> = text
+        .split("```sql\n")
+        .skip(1)
+        .filter_map(|b| b.split("```").next())
+        .collect();
+    let split = |b: &str| -> Vec<String> {
+        b.split(";\n")
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
     let stmts = blocks.first().map(|b| split(b)).unwrap_or_default();
     let queries = blocks.get(1).map(|b| split(b)).unwrap_or_default();
     let (mut a, mut s, _, _) = setup(&stmts, 0)?;
     // A CERT finding's two queries: the more restrictive (the second) estimated at no more rows.
-    if std::path::Path::new(path).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("cert-")) {
+    if std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("cert-"))
+    {
         if let [q, more] = queries.as_slice() {
-            let (Some(eq), Some(er)) = (checks::estimate_any(&mut a, q), checks::estimate_any(&mut a, more)) else {
+            let (Some(eq), Some(er)) = (
+                checks::estimate_any(&mut a, q),
+                checks::estimate_any(&mut a, more),
+            ) else {
                 println!("no estimate: {q}");
                 std::process::exit(1);
             };
             if !checks::no_more(er, eq) {
-                println!("estimates {er} rows for the more restrictive query, {eq} for the query: {more}");
+                println!(
+                    "estimates {er} rows for the more restrictive query, {eq} for the query: {more}"
+                );
                 std::process::exit(1);
             }
             return Ok(());
         }
     }
     // An order finding's two queries: the same join written in two orders, estimated alike.
-    if std::path::Path::new(path).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("order-")) {
+    if std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("order-"))
+    {
         if let [q, other] = queries.as_slice() {
-            let strip = |s: &str| s.trim_start_matches("EXPLAIN QUERY PLAN FORMAT=JSON ").to_owned();
-            let (Some(eq), Some(eo)) = (checks::estimate_any(&mut a, &strip(q)), checks::estimate_any(&mut a, &strip(other))) else {
+            let strip = |s: &str| {
+                s.trim_start_matches("EXPLAIN QUERY PLAN FORMAT=JSON ")
+                    .to_owned()
+            };
+            let (Some(eq), Some(eo)) = (
+                checks::estimate_any(&mut a, &strip(q)),
+                checks::estimate_any(&mut a, &strip(other)),
+            ) else {
                 println!("no estimate: {other}");
                 std::process::exit(1);
             };
             if !checks::same_estimate(eq, eo) {
-                println!("estimates {eo} rows for one order, {eq} for the query as written: {other}");
+                println!(
+                    "estimates {eo} rows for one order, {eq} for the query as written: {other}"
+                );
                 std::process::exit(1);
             }
             return Ok(());
@@ -237,19 +357,37 @@ fn replay_check(path: &str) -> anyhow::Result<()> {
 
 pub fn main() -> anyhow::Result<()> {
     if let Some(i) = std::env::args().position(|a| a == "--sqlite") {
-        engines::use_library(std::env::args().nth(i + 1).ok_or_else(|| anyhow::anyhow!("--sqlite takes a library's path"))?).map_err(|e| anyhow::anyhow!(e))?;
+        engines::use_library(
+            std::env::args()
+                .nth(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--sqlite takes a library's path"))?,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
     }
     if let Some(i) = std::env::args().position(|a| a == "--replay-check") {
-        return replay_check(&std::env::args().nth(i + 1).ok_or_else(|| anyhow::anyhow!("--replay-check takes a finding's file"))?);
+        return replay_check(
+            &std::env::args()
+                .nth(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--replay-check takes a finding's file"))?,
+        );
     }
     if let Some(i) = std::env::args().position(|a| a == "--replay") {
-        return replay(&std::env::args().nth(i + 1).ok_or_else(|| anyhow::anyhow!("--replay takes a finding's file"))?);
+        return replay(
+            &std::env::args()
+                .nth(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--replay takes a finding's file"))?,
+        );
     }
     let o = opts()?;
     let features: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&o.features)?)?;
     let mut catalog = Sqlite::new()?;
     let funcs = synth::functions(&features, &mut catalog)?;
-    let sqlite_version = match catalog.run("SELECT sqlite_version()").map_err(|e| anyhow::anyhow!(e))?.first().and_then(|r| r.first()) {
+    let sqlite_version = match catalog
+        .run("SELECT sqlite_version()")
+        .map_err(|e| anyhow::anyhow!(e))?
+        .first()
+        .and_then(|r| r.first())
+    {
         Some(engines::V::Text(v)) => v.clone(),
         _ => String::new(),
     };
@@ -267,7 +405,10 @@ pub fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&fdir)?;
     let began = Instant::now();
     let until = began + Duration::from_secs(o.seconds);
-    let mut tally: BTreeMap<Oracle, Tally> = std::iter::once(Oracle::Same).chain(o.oracles.iter().copied()).map(|x| (x, Tally::default())).collect();
+    let mut tally: BTreeMap<Oracle, Tally> = std::iter::once(Oracle::Same)
+        .chain(o.oracles.iter().copied())
+        .map(|x| (x, Tally::default()))
+        .collect();
     let mut findings: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut duplicates = 0u64;
     let mut states = 0u64;
@@ -292,11 +433,22 @@ pub fn main() -> anyhow::Result<()> {
             }
             Ok(Err(e)) => anyhow::bail!("setting up a database: {e:#}"),
             Err(p) => {
-                let f = Failure { kind: Kind::Panic, detail: format!("Amphora panicked making the database: {}", panic_text(p)), queries: vec![], cause: None };
-                let r = Repro { stmts: stmts.clone(), case: Case::Diff(synth::query(&mut rng, &schema, &funcs)) };
+                let f = Failure {
+                    kind: Kind::Panic,
+                    detail: format!("Amphora panicked making the database: {}", panic_text(p)),
+                    queries: vec![],
+                    cause: None,
+                };
+                let r = Repro {
+                    stmts: stmts.clone(),
+                    case: Case::Diff(synth::query(&mut rng, &schema, &funcs)),
+                };
                 let id = format!("setup-panic-{:016x}", state_seed);
                 write_finding(&fdir, &id, &r, &f, o.seed, states)?;
-                findings.insert(id, json!({ "oracle": "setup", "kind": "Panic", "detail": f.detail }));
+                findings.insert(
+                    id,
+                    json!({ "oracle": "setup", "kind": "Panic", "detail": f.detail }),
+                );
                 continue;
             }
         };
@@ -314,9 +466,12 @@ pub fn main() -> anyhow::Result<()> {
                 break;
             }
             let oracle = case.oracle();
-            let t = tally.get_mut(&oracle).ok_or_else(|| anyhow::anyhow!("an oracle not asked for"))?;
+            let t = tally
+                .get_mut(&oracle)
+                .ok_or_else(|| anyhow::anyhow!("an oracle not asked for"))?;
             t.checks += 1;
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| checks::check(&case, &mut a, &mut s)));
+            let outcome =
+                std::panic::catch_unwind(AssertUnwindSafe(|| checks::check(&case, &mut a, &mut s)));
             let failure = match outcome {
                 Ok(Outcome::Pass { plan_changed }) => {
                     t.passed += 1;
@@ -332,11 +487,19 @@ pub fn main() -> anyhow::Result<()> {
                     None
                 }
                 Ok(Outcome::Fail(f)) => Some(f),
-                Err(p) => Some(Failure { kind: Kind::Panic, detail: panic_text(p), queries: checks::sqls(&case), cause: None }),
+                Err(p) => Some(Failure {
+                    kind: Kind::Panic,
+                    detail: panic_text(p),
+                    queries: checks::sqls(&case),
+                    cause: None,
+                }),
             };
             let Some(f) = failure else { continue };
             t.failed += 1;
-            let start = Repro { stmts: kept.clone(), case: case.clone() };
+            let start = Repro {
+                stmts: kept.clone(),
+                case: case.clone(),
+            };
             let deadline = Instant::now() + Duration::from_secs(o.reduce_seconds);
             let kind = f.kind;
             let small = reduce::reduce(start, kind, deadline, |r| {
@@ -351,7 +514,10 @@ pub fn main() -> anyhow::Result<()> {
             } else {
                 write_finding(&fdir, &id, &small, &final_f, o.seed, states)?;
                 findings.insert(id.clone(), json!({ "oracle": oracle.name(), "kind": format!("{:?}", final_f.kind), "detail": final_f.detail.lines().next().unwrap_or_default(), "statements": small.stmts.len(), "at_seconds": began.elapsed().as_secs_f64() }));
-                eprintln!("finding {id}: {}", final_f.detail.lines().next().unwrap_or_default());
+                eprintln!(
+                    "finding {id}: {}",
+                    final_f.detail.lines().next().unwrap_or_default()
+                );
             }
             if kind == Kind::Panic || oracle == Oracle::Same {
                 break; // the engine may be left anyhow, or the rows differ: a new database
@@ -368,7 +534,15 @@ pub fn main() -> anyhow::Result<()> {
         "functions": funcs.len(), "oracles": per, "setup_refused": setup_refused,
         "findings": findings, "duplicates": duplicates,
     });
-    std::fs::write(out.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
-    eprintln!("{states} databases, {} checks, {} findings ({duplicates} more of the same), in {:.0} s", tally.values().map(|t| t.checks).sum::<u64>(), findings.len(), began.elapsed().as_secs_f64());
+    std::fs::write(
+        out.join("summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    eprintln!(
+        "{states} databases, {} checks, {} findings ({duplicates} more of the same), in {:.0} s",
+        tally.values().map(|t| t.checks).sum::<u64>(),
+        findings.len(),
+        began.elapsed().as_secs_f64()
+    );
     Ok(())
 }

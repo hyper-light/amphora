@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use answers::{Answer, Refusal};
 use data::Format;
-use engines::{for_dialect, Amphora, ClickHouse, Count, Duck, Outcome, Postgres, Sqlite, Target};
+use engines::{Amphora, ClickHouse, Count, Duck, Outcome, Postgres, Sqlite, Target, for_dialect};
 
 struct Opts {
     bench: String,
@@ -108,7 +108,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--planner" => {}
             "--bench" => o.bench = v()?,
@@ -130,7 +133,9 @@ fn opts() -> anyhow::Result<Opts> {
             "--answers" => o.answers = Some(v()?.into()),
             "--prepared" => o.prepared = Some(v()?.into()),
             "--params" => o.params = Some(v()?.into()),
-            "--plan-cache-modes" => o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect(),
+            "--plan-cache-modes" => {
+                o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect()
+            }
             "--phase" => {
                 o.cold = match v()?.as_str() {
                     "cold" => true,
@@ -143,20 +148,48 @@ fn opts() -> anyhow::Result<Opts> {
             "--limit" => o.limit = Some(v()?.parse()?),
             "--clickhouse" => o.clickhouse = v()?,
             "--pin-weights" => o.pin_weights = Some(pinned_weights(Path::new(&v()?))?),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped, --cores, --limit, --clickhouse, --pin-weights)"),
+            other => anyhow::bail!(
+                "unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped, --cores, --limit, --clickhouse, --pin-weights)"
+            ),
         }
     }
-    anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
-    anyhow::ensure!(!o.data.as_os_str().is_empty() && !o.queries.as_os_str().is_empty() && !o.dir.as_os_str().is_empty() && !o.out.as_os_str().is_empty(), "--planner needs --data, --queries, --dir and --out");
+    anyhow::ensure!(
+        matches!(o.bench.as_str(), "job" | "tpch"),
+        "--bench is job or tpch"
+    );
+    anyhow::ensure!(
+        !o.data.as_os_str().is_empty()
+            && !o.queries.as_os_str().is_empty()
+            && !o.dir.as_os_str().is_empty()
+            && !o.out.as_os_str().is_empty(),
+        "--planner needs --data, --queries, --dir and --out"
+    );
     anyhow::ensure!(o.runs > 0, "--runs is at least 1");
     // A cold run is the first statement its process runs on each engine: one query a process, so
     // no correction learned on another query's run reaches it.
-    anyhow::ensure!(!o.cold || (o.only.len() == 1 && o.only[0] != "-" && o.prepared.is_none() && o.answers.is_none() && !o.resume), "--phase cold times the one query --only names, without --prepared, --answers or --resume");
+    anyhow::ensure!(
+        !o.cold
+            || (o.only.len() == 1
+                && o.only[0] != "-"
+                && o.prepared.is_none()
+                && o.answers.is_none()
+                && !o.resume),
+        "--phase cold times the one query --only names, without --prepared, --answers or --resume"
+    );
     anyhow::ensure!(o.cores.iter().all(|c| *c > 0), "--cores are at least 1");
-    anyhow::ensure!(o.limit.is_none() || !o.cores.is_empty(), "--limit is the scaling ladder's: give --cores");
+    anyhow::ensure!(
+        o.limit.is_none() || !o.cores.is_empty(),
+        "--limit is the scaling ladder's: give --cores"
+    );
     if o.prepared.is_some() {
-        anyhow::ensure!(o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"], "--prepared runs TPC-H on amphora alone, with --params");
-        anyhow::ensure!(!o.plan_cache_modes.is_empty(), "--plan-cache-modes names at least one");
+        anyhow::ensure!(
+            o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"],
+            "--prepared runs TPC-H on amphora alone, with --params"
+        );
+        anyhow::ensure!(
+            !o.plan_cache_modes.is_empty(),
+            "--plan-cache-modes names at least one"
+        );
         for m in &o.plan_cache_modes {
             prepared::mode(m)?;
         }
@@ -165,7 +198,8 @@ fn opts() -> anyhow::Result<Opts> {
 }
 
 fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights> {
-    let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))?;
     weights_json(&text).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))
 }
 
@@ -173,13 +207,30 @@ fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights>
 /// `row_in_pages` and `page_miss` may be null, as a process that has read no page from its file
 /// has them. The trace's "the weights this plan is made on" prints the same fields.
 fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
-    const FIELDS: [&str; 8] = ["row_in_pages", "seek", "hash_build", "hash_probe", "sort", "bloom_probe", "where_step", "page_miss"];
+    const FIELDS: [&str; 8] = [
+        "row_in_pages",
+        "seek",
+        "hash_build",
+        "hash_probe",
+        "sort",
+        "bloom_probe",
+        "where_step",
+        "page_miss",
+    ];
     let v: serde_json::Value = serde_json::from_str(text)?;
-    let fields = v.as_object().ok_or_else(|| anyhow::anyhow!("not a JSON object"))?;
+    let fields = v
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("not a JSON object"))?;
     if let Some(other) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
         anyhow::bail!("{other} is not one of {}", FIELDS.join(", "));
     }
-    let number = |k: &str| fields.get(k).and_then(serde_json::Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| anyhow::anyhow!("{k} is a finite number"));
+    let number = |k: &str| {
+        fields
+            .get(k)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("{k} is a finite number"))
+    };
     let maybe = |k: &str| match fields.get(k) {
         Some(serde_json::Value::Null) => Ok(None),
         _ => number(k).map(Some),
@@ -207,10 +258,14 @@ struct Bench {
     source_revision: Option<String>,
 }
 
-const TPCH_TABLES: [&str; 8] = ["region", "nation", "part", "supplier", "partsupp", "customer", "orders", "lineitem"];
+const TPCH_TABLES: [&str; 8] = [
+    "region", "nation", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
+];
 
 fn bench(o: &Opts) -> anyhow::Result<Bench> {
-    let read = |p: PathBuf| std::fs::read_to_string(&p).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()));
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(&p).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))
+    };
     if o.bench == "job" {
         let schema = read(o.queries.join("schema.sql"))?;
         // Every CREATE TABLE's name, in order.
@@ -223,8 +278,14 @@ fn bench(o: &Opts) -> anyhow::Result<Bench> {
         let mut queries: Vec<(String, String)> = Vec::new();
         for entry in std::fs::read_dir(&o.queries)? {
             let path = entry?.path();
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned();
-            if path.extension().is_some_and(|e| e == "sql") && name.starts_with(|c: char| c.is_ascii_digit()) {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            if path.extension().is_some_and(|e| e == "sql")
+                && name.starts_with(|c: char| c.is_ascii_digit())
+            {
                 queries.push((name, read(path)?));
             }
         }
@@ -233,24 +294,48 @@ fn bench(o: &Opts) -> anyhow::Result<Bench> {
             let digits: String = n.chars().take_while(char::is_ascii_digit).collect();
             (digits.parse::<u32>().unwrap_or(u32::MAX), n.clone())
         });
-        let revision = std::process::Command::new("git").arg("-C").arg(&o.queries).args(["rev-parse", "HEAD"]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
-        return Ok(Bench { schema, indexes: read(o.queries.join("fkindexes.sql"))?, tables, format: Format::Csv, queries, source_revision: revision });
+        let revision = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&o.queries)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+        return Ok(Bench {
+            schema,
+            indexes: read(o.queries.join("fkindexes.sql"))?,
+            tables,
+            format: Format::Csv,
+            queries,
+            source_revision: revision,
+        });
     }
-    let here = o.queries.parent().ok_or_else(|| anyhow::anyhow!("--queries for tpch is bench/planner/tpch/queries"))?;
+    let here = o
+        .queries
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("--queries for tpch is bench/planner/tpch/queries"))?;
     // TPC-H's Q11 keeps the parts worth more than 0.0001 of the whole at scale factor 1, less as it grows.
     let fraction = format!("{}", 0.0001 / o.sf);
     let mut queries = Vec::new();
     for n in 1..=22 {
         let name = format!("q{n:02}");
-        queries.push((name.clone(), read(o.queries.join(format!("{name}.sql")))?.replace("{FRACTION}", &fraction)));
+        queries.push((
+            name.clone(),
+            read(o.queries.join(format!("{name}.sql")))?.replace("{FRACTION}", &fraction),
+        ));
     }
     Ok(Bench {
         schema: read(here.join("schema.sql"))?,
         indexes: read(here.join("indexes.sql"))?,
-        tables: TPCH_TABLES.iter().map(|t| (t.to_string(), o.data.join(format!("{t}.tbl")))).collect(),
+        tables: TPCH_TABLES
+            .iter()
+            .map(|t| (t.to_string(), o.data.join(format!("{t}.tbl"))))
+            .collect(),
         format: Format::Pipe,
         queries,
-        source_revision: read(o.data.join("REVISION")).ok().map(|s| s.trim().to_owned()),
+        source_revision: read(o.data.join("REVISION"))
+            .ok()
+            .map(|s| s.trim().to_owned()),
     })
 }
 
@@ -274,7 +359,9 @@ pub(crate) fn load_average() -> Option<f64> {
 #[cfg(windows)]
 pub(crate) fn load_average() -> Option<f64> {
     let cores = std::thread::available_parallelism().map(usize::from).ok()? as f64;
-    let out = powershell("$s = Get-Counter '\\Processor(_Total)\\% Processor Time','\\System\\Processor Queue Length' -SampleInterval 1 -MaxSamples 3; $busy = ($s | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average; $queue = ($s | ForEach-Object { $_.CounterSamples[1].CookedValue } | Measure-Object -Average).Average; \"$busy $queue\"");
+    let out = powershell(
+        "$s = Get-Counter '\\Processor(_Total)\\% Processor Time','\\System\\Processor Queue Length' -SampleInterval 1 -MaxSamples 3; $busy = ($s | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average; $queue = ($s | ForEach-Object { $_.CounterSamples[1].CookedValue } | Measure-Object -Average).Average; \"$busy $queue\"",
+    );
     let mut parts = out.split_whitespace().filter_map(|v| v.parse::<f64>().ok());
     let (busy, queue) = (parts.next()?, parts.next()?);
     Some(busy / 100.0 * cores + queue)
@@ -282,7 +369,11 @@ pub(crate) fn load_average() -> Option<f64> {
 
 #[cfg(windows)]
 fn powershell(script: &str) -> String {
-    std::process::Command::new("powershell").args(["-NoProfile", "-Command", script]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// Waits, a second at a time and for at most `wait`, until the load average is under `max`: the
@@ -294,7 +385,10 @@ fn quiet(max: f64, wait: Duration) -> Option<f64> {
         if load.is_none_or(|l| l < max) || Instant::now() >= until {
             return load;
         }
-        #[expect(clippy::disallowed_methods, reason = "the load average has no event: the kernel recomputes it on a period of its own")]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the load average has no event: the kernel recomputes it on a period of its own"
+        )]
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -309,7 +403,13 @@ fn page_cache_kib() -> Option<u64> {
 /// `Cached`'s KiB in /proc/meminfo's text (not `SwapCached`'s).
 #[cfg_attr(windows, allow(dead_code))]
 fn cached_kib(meminfo: &str) -> Option<u64> {
-    meminfo.lines().find_map(|l| l.strip_prefix("Cached:"))?.split_whitespace().next()?.parse().ok()
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("Cached:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[cfg(windows)]
@@ -347,10 +447,18 @@ fn host(dir: &Path) -> serde_json::Value {
 
 /// The time now, UTC, to the second: `YYYY-MM-DDTHH:MM:SSZ`.
 fn utc_now() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (year, month, day) = civil(days).unwrap_or((1970, 1, 1));
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest % 3600 / 60, rest % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 /// The proleptic Gregorian year, month and day `days` after 1970-01-01 (Hinnant's
@@ -360,19 +468,40 @@ fn civil(days: i64) -> Option<(i64, i64, i64)> {
     let z = days.checked_add(719_468)?;
     // 400-year eras of 146,097 days; the day and year of the era are bounded by them.
     let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = doe.checked_sub(doe / 1460)?.checked_add(doe / 36_524)?.checked_sub(doe / 146_096)? / 365;
-    let doy = doe.checked_sub(yoe.checked_mul(365)?.checked_add(yoe / 4)?.checked_sub(yoe / 100)?)?;
+    let yoe = doe
+        .checked_sub(doe / 1460)?
+        .checked_add(doe / 36_524)?
+        .checked_sub(doe / 146_096)?
+        / 365;
+    let doy = doe.checked_sub(
+        yoe.checked_mul(365)?
+            .checked_add(yoe / 4)?
+            .checked_sub(yoe / 100)?,
+    )?;
     // Months from March, so February's leap day falls last.
     let mp = doy.checked_mul(5)?.checked_add(2)? / 153;
-    let day = doy.checked_sub(mp.checked_mul(153)?.checked_add(2)? / 5)?.checked_add(1)?;
-    let month = if mp < 10 { mp.checked_add(3)? } else { mp.checked_sub(9)? };
-    let year = era.checked_mul(400)?.checked_add(yoe)?.checked_add(i64::from(month <= 2))?;
+    let day = doy
+        .checked_sub(mp.checked_mul(153)?.checked_add(2)? / 5)?
+        .checked_add(1)?;
+    let month = if mp < 10 {
+        mp.checked_add(3)?
+    } else {
+        mp.checked_sub(9)?
+    };
+    let year = era
+        .checked_mul(400)?
+        .checked_add(yoe)?
+        .checked_add(i64::from(month <= 2))?;
     Some((year, month, day))
 }
 
 #[cfg(not(windows))]
 fn sh(cmd: &str) -> String {
-    std::process::Command::new("sh").args(["-c", cmd]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
+    std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
 }
 
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
@@ -392,14 +521,22 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             // A database of the benchmark's own on the server, made the first time.
             let name = format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_"));
             let mut server = postgres::Client::connect(&o.dsn, postgres::NoTls)?;
-            if server.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])?.is_none() {
+            if server
+                .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])?
+                .is_none()
+            {
                 server.batch_execute(&format!("CREATE DATABASE {name}"))?;
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
         // The scaling ladder's server engine (QT.6 lane qs6-12), a database of the benchmark's own.
-        "clickhouse-mt" => Box::new(ClickHouse::open(&o.clickhouse, &format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_")))?),
-        t => anyhow::bail!("--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt, postgres or clickhouse-mt, not {t}"),
+        "clickhouse-mt" => Box::new(ClickHouse::open(
+            &o.clickhouse,
+            &format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_")),
+        )?),
+        t => anyhow::bail!(
+            "--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt, postgres or clickhouse-mt, not {t}"
+        ),
     };
     if let (Some(weights), Some(amphora)) = (o.pin_weights, opened.amphora()) {
         amphora.pin_cost_weights(weights);
@@ -409,7 +546,9 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
 
 fn outcome_json(outcome: &Outcome, load: Option<f64>) -> serde_json::Value {
     match outcome {
-        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "search_ms": r.search_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
+        Outcome::Done(r) => {
+            serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "search_ms": r.search_ms, "ms": r.prepare_ms + r.exec_ms, "load": load })
+        }
         Outcome::TimedOut => serde_json::json!({ "status": "timed_out", "load": load }),
         Outcome::Failed(e) => serde_json::json!({ "status": "failed", "error": e, "load": load }),
     }
@@ -428,7 +567,13 @@ pub fn main() -> anyhow::Result<()> {
     // --resume: the queries and engines `--out` already holds a record of, run on this commit.
     let bench_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let git = |args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(bench_dir).args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(bench_dir)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default()
     };
     let commit = git(&["rev-parse", "HEAD"]);
     let mut done = std::collections::HashSet::new();
@@ -439,13 +584,19 @@ pub fn main() -> anyhow::Result<()> {
             match r["record"].as_str() {
                 Some("run") => same_commit = r["commit"].as_str() == Some(commit.as_str()),
                 Some("query") if same_commit => {
-                    done.insert((r["query"].as_str().unwrap_or_default().to_owned(), r["target"].as_str().unwrap_or_default().to_owned()));
+                    done.insert((
+                        r["query"].as_str().unwrap_or_default().to_owned(),
+                        r["target"].as_str().unwrap_or_default().to_owned(),
+                    ));
                 }
                 _ => {}
             }
         }
     }
-    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&o.out)?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&o.out)?;
     let mut write = |v: serde_json::Value| -> anyhow::Result<()> {
         writeln!(out, "{v}")?;
         out.flush()?;
@@ -465,19 +616,25 @@ pub fn main() -> anyhow::Result<()> {
             for (table, path) in &b.tables {
                 let began = Instant::now();
                 let rows = target.load(table, path, b.format)?;
-                write(serde_json::json!({ "record": "load", "target": target.name(), "table": table, "rows": rows, "s": began.elapsed().as_secs_f64() }))?;
+                write(
+                    serde_json::json!({ "record": "load", "target": target.name(), "table": table, "rows": rows, "s": began.elapsed().as_secs_f64() }),
+                )?;
             }
             let began = Instant::now();
             target.exec(&b.indexes)?;
             target.analyze()?;
             target.exec("CREATE TABLE bench_loaded (done INTEGER)")?;
             target.exec("INSERT INTO bench_loaded VALUES (1)")?;
-            write(serde_json::json!({ "record": "load", "target": target.name(), "table": "indexes and statistics", "s": began.elapsed().as_secs_f64() }))?;
+            write(
+                serde_json::json!({ "record": "load", "target": target.name(), "table": "indexes and statistics", "s": began.elapsed().as_secs_f64() }),
+            )?;
         }
         // Lane R1: AMPHORA_BENCH_CORES=n gives Amphora the ladder's setting at n cores for every
         // query, so --answers keeps an arm's answer at each worker count. It comes after the load
         // check: under it, `SELECT 1 FROM bench_loaded LIMIT 1` found no row and the bench reloaded.
-        let cores = std::env::var("AMPHORA_BENCH_CORES").ok().filter(|_| target.amphora().is_some());
+        let cores = std::env::var("AMPHORA_BENCH_CORES")
+            .ok()
+            .filter(|_| target.amphora().is_some());
         if let Some(n) = cores {
             target.set_cores(n.parse()?)?;
         }
@@ -521,22 +678,49 @@ pub fn main() -> anyhow::Result<()> {
     // --prepared: each query prepared once and run with qgen's parameters under each plan cache
     // mode (PL.12, AC-PL.12.1; prepared.rs).
     if let (Some(dir), Some(params)) = (&o.prepared, &o.params) {
-        let params_text = std::fs::read_to_string(params).map_err(|e| anyhow::anyhow!("{}: {e}", params.display()))?;
+        let params_text = std::fs::read_to_string(params)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", params.display()))?;
         for (name, _) in &b.queries {
             if !o.only.is_empty() && !o.only.contains(name) {
                 continue;
             }
             let path = dir.join(format!("{name}.sql"));
-            let sql = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            let sql = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let sql = for_dialect(sql.trim().trim_end_matches(';'), engines::Dialect::Lite);
             let sets = prepared::params(&params_text, name)?;
-            anyhow::ensure!(!sets.seeds.is_empty(), "{}: no parameters for {name}", params.display());
-            let Some(amphora) = targets.iter_mut().find_map(|t| t.amphora()) else { anyhow::bail!("--prepared runs on amphora") };
+            anyhow::ensure!(
+                !sets.seeds.is_empty(),
+                "{}: no parameters for {name}",
+                params.display()
+            );
+            let Some(amphora) = targets.iter_mut().find_map(|t| t.amphora()) else {
+                anyhow::bail!("--prepared runs on amphora")
+            };
             let load = quiet(o.max_load, o.load_wait);
-            let mut record = prepared::query(amphora, name, &sql, &sets, &o.plan_cache_modes, o.runs, o.timeout)?;
+            let mut record = prepared::query(
+                amphora,
+                name,
+                &sql,
+                &sets,
+                &o.plan_cache_modes,
+                o.runs,
+                o.timeout,
+            )?;
             record["load"] = load.into();
-            let total = |m: &str| record["modes"][m]["total_ms"].as_f64().map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"));
-            eprintln!("{name} prepared: generic {}, auto {} (auto/generic {}), custom plans {}, answers differ for seeds {}", total("generic"), total("auto"), record["auto_over_generic"], record["modes"]["auto"]["custom_plans"], record["differ"]);
+            let total = |m: &str| {
+                record["modes"][m]["total_ms"]
+                    .as_f64()
+                    .map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"))
+            };
+            eprintln!(
+                "{name} prepared: generic {}, auto {} (auto/generic {}), custom plans {}, answers differ for seeds {}",
+                total("generic"),
+                total("auto"),
+                record["auto_over_generic"],
+                record["modes"]["auto"]["custom_plans"],
+                record["differ"]
+            );
             write(record)?;
         }
         return Ok(());
@@ -551,7 +735,13 @@ pub fn main() -> anyhow::Result<()> {
                 let outcome = target.run(&sql, o.timeout, None);
                 let state = serde_json::json!({ "first_query_since_open": true, "server_started_s": server_started_s, "os_cache_dropped": o.os_cache_dropped, "page_cache_kib": page_cache_kib });
                 let record = serde_json::json!({ "record": "cold", "bench": o.bench, "query": name, "target": target.name(), "run": outcome_json(&outcome, load), "state": state });
-                eprintln!("{name} {} cold: {}", target.name(), record["run"]["ms"].as_f64().map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+                eprintln!(
+                    "{name} {} cold: {}",
+                    target.name(),
+                    record["run"]["ms"]
+                        .as_f64()
+                        .map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"))
+                );
                 write(record)?;
             }
         }
@@ -559,7 +749,13 @@ pub fn main() -> anyhow::Result<()> {
     }
     // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
     // record.sh names its benchmarks), and in it one for each query.
-    let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));
+    let answers_root = o.answers.as_ref().map(|dir| {
+        dir.join(if o.bench == "tpch" {
+            format!("tpch-sf{}", o.sf)
+        } else {
+            o.bench.clone()
+        })
+    });
     // AMPHORA_PROFILE=<prefix>: the queries' runs sampled (main.rs's profiler, a timer signal: no
     // perf events, so it works where perf_event_paranoid forbids samply), written as main.rs writes it.
     let profiler = match std::env::var("AMPHORA_PROFILE") {
@@ -571,18 +767,34 @@ pub fn main() -> anyhow::Result<()> {
     if std::env::var_os("AMPHORA_PLAN_TRACE").is_some() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let mut only = tracing_subscriber::filter::Targets::new().with_target("amphora::join_search", tracing_subscriber::filter::LevelFilter::DEBUG);
+        let mut only = tracing_subscriber::filter::Targets::new().with_target(
+            "amphora::join_search",
+            tracing_subscriber::filter::LevelFilter::DEBUG,
+        );
         // AMPHORA_SEEK_TRACE (lane T18): each cursor's seeks and their time, at each statement's end.
         if std::env::var_os("AMPHORA_SEEK_TRACE").is_some() {
-            only = only.with_target("amphora::seek_time", tracing_subscriber::filter::LevelFilter::DEBUG);
+            only = only.with_target(
+                "amphora::seek_time",
+                tracing_subscriber::filter::LevelFilter::DEBUG,
+            );
         }
-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false)).with(only).try_init()?;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false),
+            )
+            .with(only)
+            .try_init()?;
     }
     for (name, sql) in &b.queries {
         if !o.only.is_empty() && !o.only.contains(name) {
             continue;
         }
-        let answers_dir = answers_root.as_ref().map(|root| answers::query_dir(root, name, sql)).transpose()?;
+        let answers_dir = answers_root
+            .as_ref()
+            .map(|root| answers::query_dir(root, name, sql))
+            .transpose()?;
         for target in &mut targets {
             if done.contains(&(name.clone(), target.name())) {
                 continue;
@@ -591,7 +803,9 @@ pub fn main() -> anyhow::Result<()> {
             let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name(), "phase": "warm" });
             if let Some(amphora) = target.amphora() {
                 record["plan"] = match amphora.plan_json(&sql) {
-                    Ok(plan) => serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan)),
+                    Ok(plan) => {
+                        serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan))
+                    }
                     Err(e) => serde_json::json!({ "error": e.to_string() }),
                 };
                 let load = quiet(o.max_load, o.load_wait);
@@ -613,12 +827,18 @@ pub fn main() -> anyhow::Result<()> {
             let mut runs = Vec::new();
             for i in 0..o.runs {
                 // The plan this run prepares, read on its connection just before it.
-                let plan = target.amphora().map(|amphora| match amphora.plan_json(&sql) {
-                    Ok(plan) => serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan)),
-                    Err(e) => serde_json::json!({ "error": e.to_string() }),
-                });
+                let plan = target
+                    .amphora()
+                    .map(|amphora| match amphora.plan_json(&sql) {
+                        Ok(plan) => {
+                            serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan))
+                        }
+                        Err(e) => serde_json::json!({ "error": e.to_string() }),
+                    });
                 let load = quiet(o.max_load, o.load_wait);
-                let mut capture = answers_dir.as_ref().map(|_| Answer::new(answers::MAX_ROWS, answers::MAX_BYTES));
+                let mut capture = answers_dir
+                    .as_ref()
+                    .map(|_| Answer::new(answers::MAX_ROWS, answers::MAX_BYTES));
                 let outcome = target.run(&sql, o.timeout, capture.as_mut());
                 let stop = !matches!(outcome, Outcome::Done(_));
                 let mut run = outcome_json(&outcome, load);
@@ -630,11 +850,17 @@ pub fn main() -> anyhow::Result<()> {
                     if let Some(fields) = run.as_object_mut() {
                         fields.insert("captured".into(), true.into());
                     }
-                    let path = dir.join(if i == 0 { format!("{}.tsv", target.name()) } else { format!("{}-run{i}.tsv", target.name()) });
+                    let path = dir.join(if i == 0 {
+                        format!("{}.tsv", target.name())
+                    } else {
+                        format!("{}-run{i}.tsv", target.name())
+                    });
                     match &outcome {
                         Outcome::Done(_) => capture.write(&path)?,
                         Outcome::TimedOut => answers::write_refusal(&path, &Refusal::TimedOut)?,
-                        Outcome::Failed(e) => answers::write_refusal(&path, &Refusal::Failed(e.clone()))?,
+                        Outcome::Failed(e) => {
+                            answers::write_refusal(&path, &Refusal::Failed(e.clone()))?
+                        }
                     }
                 }
                 runs.push(run);
@@ -644,7 +870,14 @@ pub fn main() -> anyhow::Result<()> {
                 }
             }
             record["runs"] = serde_json::Value::Array(runs);
-            eprintln!("{name} {}: {}", target.name(), record["runs"].as_array().and_then(|r| r.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min)).map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+            eprintln!(
+                "{name} {}: {}",
+                target.name(),
+                record["runs"]
+                    .as_array()
+                    .and_then(|r| r.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min))
+                    .map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"))
+            );
             write(record)?;
         }
     }
@@ -659,7 +892,12 @@ pub fn main() -> anyhow::Result<()> {
 /// load average is under `--max-load`. The core counts go round the engines and queries in turn,
 /// so a drift in the machine falls on every engine alike. An engine that takes no core count is
 /// named once and left out.
-fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+fn scaling(
+    o: &Opts,
+    b: &Bench,
+    targets: &mut [Box<dyn Target>],
+    write: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut variants: Vec<(String, &str, String)> = Vec::new();
     for (name, sql) in &b.queries {
         if !o.only.is_empty() && !o.only.contains(name) {
@@ -667,7 +905,11 @@ fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut imp
         }
         let sql = sql.trim().trim_end_matches(';').to_owned();
         if let Some(n) = o.limit {
-            variants.push((name.clone(), "limit", format!("SELECT * FROM ({sql}) AS limited LIMIT {n}")));
+            variants.push((
+                name.clone(),
+                "limit",
+                format!("SELECT * FROM ({sql}) AS limited LIMIT {n}"),
+            ));
         }
         variants.push((name.clone(), "whole", sql));
     }
@@ -677,7 +919,9 @@ fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut imp
             for target in targets.iter_mut() {
                 if !target.set_cores(cores)? {
                     if skipped.insert(target.name()) {
-                        write(serde_json::json!({ "record": "scaling_skipped", "target": target.name(), "why": "it takes no core count" }))?;
+                        write(
+                            serde_json::json!({ "record": "scaling_skipped", "target": target.name(), "why": "it takes no core count" }),
+                        )?;
                     }
                     continue;
                 }
@@ -692,9 +936,18 @@ fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut imp
                         break;
                     }
                 }
-                let best = runs.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min);
-                eprintln!("{name} {variant} {} at {cores} cores: {}", target.name(), best.map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
-                write(serde_json::json!({ "record": "scaling", "bench": o.bench, "query": name, "variant": variant, "target": target.name(), "cores": cores, "best_ms": best, "runs": runs }))?;
+                let best = runs
+                    .iter()
+                    .filter_map(|r| r["ms"].as_f64())
+                    .reduce(f64::min);
+                eprintln!(
+                    "{name} {variant} {} at {cores} cores: {}",
+                    target.name(),
+                    best.map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"))
+                );
+                write(
+                    serde_json::json!({ "record": "scaling", "bench": o.bench, "query": name, "variant": variant, "target": target.name(), "cores": cores, "best_ms": best, "runs": runs }),
+                )?;
             }
         }
     }
@@ -734,15 +987,37 @@ mod tests {
     /// Expect: the eight fields as written, None for the nulls, and a refusal naming the field.
     #[test]
     fn pinned_weights_are_the_files_fields() -> anyhow::Result<()> {
-        let w = weights_json(r#"{"row_in_pages": 0.000224, "seek": 16.88, "hash_build": 657.9, "hash_probe": 161.0, "sort": 0.717, "bloom_probe": 6.37, "where_step": 11.05, "page_miss": 0.294}"#)?;
-        let want = amphora_engine::LearnedWeights { row_in_pages: Some(0.000224), seek: 16.88, hash_build: 657.9, hash_probe: 161.0, sort: 0.717, bloom_probe: 6.37, where_step: 11.05, page_miss: Some(0.294) };
+        let w = weights_json(
+            r#"{"row_in_pages": 0.000224, "seek": 16.88, "hash_build": 657.9, "hash_probe": 161.0, "sort": 0.717, "bloom_probe": 6.37, "where_step": 11.05, "page_miss": 0.294}"#,
+        )?;
+        let want = amphora_engine::LearnedWeights {
+            row_in_pages: Some(0.000224),
+            seek: 16.88,
+            hash_build: 657.9,
+            hash_probe: 161.0,
+            sort: 0.717,
+            bloom_probe: 6.37,
+            where_step: 11.05,
+            page_miss: Some(0.294),
+        };
         assert_eq!(w, want);
-        let w = weights_json(r#"{"row_in_pages": null, "seek": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#)?;
+        let w = weights_json(
+            r#"{"row_in_pages": null, "seek": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#,
+        )?;
         assert_eq!((w.row_in_pages, w.seek, w.page_miss), (None, 1.0, None));
-        let refused = |text: &str| weights_json(text).err().map(|e| e.to_string()).unwrap_or_default();
-        let misspelt = refused(r#"{"row_in_pages": null, "seeks": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        let refused = |text: &str| {
+            weights_json(text)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        let misspelt = refused(
+            r#"{"row_in_pages": null, "seeks": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#,
+        );
         assert!(misspelt.starts_with("seeks is not one of"), "{misspelt}");
-        let missing = refused(r#"{"row_in_pages": null, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        let missing = refused(
+            r#"{"row_in_pages": null, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#,
+        );
         assert_eq!(missing, "seek is a finite number");
         Ok(())
     }

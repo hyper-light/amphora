@@ -51,7 +51,9 @@ pub fn for_dialect(sql: &str, dialect: Dialect) -> String {
     };
     let mut out = sql.replace("{DEC}", dec).replace("{DATE}", date);
     while let Some(at) = out.find("YEAR(") {
-        let Some(close) = out[at..].find(')').map(|c| at + c) else { break };
+        let Some(close) = out[at..].find(')').map(|c| at + c) else {
+            break;
+        };
         let column = out[at + 5..close].to_owned();
         let year = match dialect {
             Dialect::Lite => format!("CAST(substr({column}, 1, 4) AS INTEGER)"),
@@ -115,7 +117,11 @@ fn kinds(types: &[String]) -> Vec<Kind> {
             let t = t.to_ascii_uppercase();
             if t.contains("INT") {
                 Kind::Int
-            } else if t.contains("REAL") || t.contains("DEC") || t.contains("FLOA") || t.contains("DOUB") {
+            } else if t.contains("REAL")
+                || t.contains("DEC")
+                || t.contains("FLOA")
+                || t.contains("DOUB")
+            {
                 Kind::Real
             } else {
                 Kind::Text
@@ -158,15 +164,28 @@ pub struct Count {
 }
 
 impl Amphora {
-    pub fn open(dir: &Path, cache_kib: i64, vectorized: bool, adaptive: bool) -> anyhow::Result<Self> {
-        use amphora_engine::{ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect};
+    pub fn open(
+        dir: &Path,
+        cache_kib: i64,
+        vectorized: bool,
+        adaptive: bool,
+    ) -> anyhow::Result<Self> {
+        use amphora_engine::{
+            ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
+        };
         std::fs::create_dir_all(dir)?;
-        let io: Arc<dyn amphora_engine::IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+        let io: Arc<dyn amphora_engine::IO> =
+            Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
         let path = dir.join("bench.db");
         let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
-        let db = Database::open(io.clone(), path.to_str().unwrap_or_default(), options).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let conn = db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let counted = db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let db = Database::open(io.clone(), path.to_str().unwrap_or_default(), options)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let conn = db
+            .connect(ConnectOpts::new())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let counted = db
+            .connect(ConnectOpts::new())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         counted.set_row_counters(true);
         conn.set_vectorized_scans(vectorized);
         counted.set_vectorized_scans(vectorized);
@@ -178,11 +197,21 @@ impl Amphora {
             Err(_) | Ok("serial") => amphora_engine::RealSums::Serial,
             Ok("exact") => amphora_engine::RealSums::Exact,
             Ok("roworder") => amphora_engine::RealSums::RowOrder,
-            Ok(other) => anyhow::bail!("AMPHORA_REAL_SUMS takes serial, exact or roworder, not {other}"),
+            Ok(other) => {
+                anyhow::bail!("AMPHORA_REAL_SUMS takes serial, exact or roworder, not {other}")
+            }
         };
         conn.set_real_sums(sums);
         counted.set_real_sums(sums);
-        let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized, adaptive };
+        let mut a = Self {
+            io,
+            _db: db,
+            conn,
+            counted,
+            cache_kib,
+            vectorized,
+            adaptive,
+        };
         for c in [a.conn.clone(), a.counted.clone()] {
             a.exec_on(&c, &format!("PRAGMA cache_size = -{cache_kib}"))?;
         }
@@ -198,7 +227,9 @@ impl Amphora {
 
     fn exec_on(&mut self, conn: &Arc<amphora_engine::Connection>, sql: &str) -> anyhow::Result<()> {
         for one in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let mut stmt = conn.prepare(one).map_err(|e| anyhow::anyhow!("{e} (in: {one})"))?;
+            let mut stmt = conn
+                .prepare(one)
+                .map_err(|e| anyhow::anyhow!("{e} (in: {one})"))?;
             self.drive(&mut stmt, None, |_| ())?;
         }
         Ok(())
@@ -223,11 +254,15 @@ impl Amphora {
                     }
                 }
                 Ok(StepResult::Done) => return Ok(true),
-                Ok(StepResult::IO | StepResult::Yield) => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                Ok(StepResult::IO | StepResult::Yield) => {
+                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                }
                 Ok(StepResult::Sleep { duration }) => {
                     // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
                     // no reason only steps again.
-                    std::thread::park_timeout(deadline.map_or(duration, |d| duration.min(d.saturating_duration_since(Instant::now()))));
+                    std::thread::park_timeout(deadline.map_or(duration, |d| {
+                        duration.min(d.saturating_duration_since(Instant::now()))
+                    }));
                     self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
                 Ok(StepResult::Interrupt) if late => return Ok(false),
@@ -240,8 +275,18 @@ impl Amphora {
     }
 
     /// One run, each row to `each` as well.
-    fn run_on(&mut self, counted: bool, sql: &str, deadline: Duration, mut each: impl FnMut(&amphora_engine::Row)) -> (Outcome, Vec<Count>) {
-        let conn = if counted { self.counted.clone() } else { self.conn.clone() };
+    fn run_on(
+        &mut self,
+        counted: bool,
+        sql: &str,
+        deadline: Duration,
+        mut each: impl FnMut(&amphora_engine::Row),
+    ) -> (Outcome, Vec<Count>) {
+        let conn = if counted {
+            self.counted.clone()
+        } else {
+            self.conn.clone()
+        };
         conn.set_query_timeout(deadline);
         let began = Instant::now();
         let searched = amphora_engine::join_search_ns();
@@ -279,7 +324,13 @@ impl Amphora {
             })
             .collect();
         let outcome = match ended {
-            Ok(true) => Outcome::Done(Run { rows, first, prepare_ms: ms(prepared - began), exec_ms: ms(done - prepared), search_ms: Some(search_ms) }),
+            Ok(true) => Outcome::Done(Run {
+                rows,
+                first,
+                prepare_ms: ms(prepared - began),
+                exec_ms: ms(done - prepared),
+                search_ms: Some(search_ms),
+            }),
             Ok(false) => Outcome::TimedOut,
             Err(e) => Outcome::Failed(e.to_string()),
         };
@@ -300,13 +351,24 @@ impl Amphora {
     /// PL.12: one run of `stmt`, prepared once, with `values` bound and the connection's plan
     /// cache mode `mode`, to its last row, then reset for its next run. `prepare_ms` is the
     /// binding: a run's planning, where it makes a custom plan, is in its `exec_ms`.
-    pub fn run_prepared(&mut self, stmt: &mut amphora_engine::Statement, values: &[amphora_engine::Value], mode: amphora_engine::PlanCacheMode, deadline: Duration) -> Outcome {
+    pub fn run_prepared(
+        &mut self,
+        stmt: &mut amphora_engine::Statement,
+        values: &[amphora_engine::Value],
+        mode: amphora_engine::PlanCacheMode,
+        deadline: Duration,
+    ) -> Outcome {
         let conn = self.conn.clone();
         conn.set_plan_cache_mode(mode);
         conn.set_query_timeout(deadline);
         let began = Instant::now();
         for (i, value) in values.iter().enumerate() {
-            let bound = NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0")).and_then(|n| stmt.bind_at(n, value.clone()).map_err(|e| anyhow::anyhow!("{e}")));
+            let bound = NonZero::new(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("parameter 0"))
+                .and_then(|n| {
+                    stmt.bind_at(n, value.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                });
             if let Err(e) = bound {
                 conn.set_query_timeout(Duration::ZERO);
                 return Outcome::Failed(e.to_string());
@@ -324,7 +386,13 @@ impl Amphora {
         conn.set_query_timeout(Duration::ZERO);
         let reset = stmt.reset().map_err(|e| anyhow::anyhow!("{e}"));
         match (ended, reset) {
-            (Ok(true), Ok(())) => Outcome::Done(Run { rows, first, prepare_ms: ms(bound - began), exec_ms: ms(done - bound), search_ms: None }),
+            (Ok(true), Ok(())) => Outcome::Done(Run {
+                rows,
+                first,
+                prepare_ms: ms(bound - began),
+                exec_ms: ms(done - bound),
+                search_ms: None,
+            }),
             (Ok(false), _) => Outcome::TimedOut,
             (Err(e), _) | (_, Err(e)) => Outcome::Failed(e.to_string()),
         }
@@ -332,7 +400,10 @@ impl Amphora {
 
     /// EXPLAIN QUERY PLAN FORMAT=JSON's plan of `sql`.
     pub fn plan_json(&mut self, sql: &str) -> anyhow::Result<String> {
-        let mut stmt = self.conn.prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = self
+            .conn
+            .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut out = String::new();
         self.drive(&mut stmt, None, |row| {
             for v in row.get_values() {
@@ -357,7 +428,9 @@ impl Target for Amphora {
     }
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized, "adaptive_joins": self.adaptive }))
+        Ok(
+            serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized, "adaptive_joins": self.adaptive }),
+        )
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
@@ -369,24 +442,56 @@ impl Target for Amphora {
         use amphora_engine::Value;
         let conn = self.conn.clone();
         let mut types = Vec::new();
-        let mut info = conn.prepare(format!("PRAGMA table_info({table})")).map_err(|e| anyhow::anyhow!("{e}"))?;
-        self.drive(&mut info, None, |row| types.push(row.get_values().nth(2).map(|v| v.to_string()).unwrap_or_default()))?;
+        let mut info = conn
+            .prepare(format!("PRAGMA table_info({table})"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.drive(&mut info, None, |row| {
+            types.push(
+                row.get_values()
+                    .nth(2)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        })?;
         let kinds = kinds(&types);
         let marks = vec!["?"; kinds.len()].join(", ");
-        let mut records = Records::new(BufReader::with_capacity(1 << 20, std::fs::File::open(path)?), format);
+        let mut records = Records::new(
+            BufReader::with_capacity(1 << 20, std::fs::File::open(path)?),
+            format,
+        );
         self.exec("BEGIN")?;
-        let mut insert = conn.prepare(format!("INSERT INTO {table} VALUES ({marks})")).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut insert = conn
+            .prepare(format!("INSERT INTO {table} VALUES ({marks})"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         while records.next()? {
-            anyhow::ensure!(records.fields.len() == kinds.len(), "{}: record {} has {} fields, {table} {} columns", path.display(), records.records, records.fields.len(), kinds.len());
+            anyhow::ensure!(
+                records.fields.len() == kinds.len(),
+                "{}: record {} has {} fields, {table} {} columns",
+                path.display(),
+                records.records,
+                records.fields.len(),
+                kinds.len()
+            );
             insert.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
             for (i, (field, kind)) in records.fields.iter_mut().zip(&kinds).enumerate() {
                 let value = match (field.take(), kind) {
                     (None, _) => Value::Null,
-                    (Some(f), Kind::Int) => f.parse::<i64>().map(Value::from_i64).unwrap_or_else(|_| Value::from_text(f)),
-                    (Some(f), Kind::Real) => f.parse::<f64>().map(Value::from_f64).unwrap_or_else(|_| Value::from_text(f)),
+                    (Some(f), Kind::Int) => f
+                        .parse::<i64>()
+                        .map(Value::from_i64)
+                        .unwrap_or_else(|_| Value::from_text(f)),
+                    (Some(f), Kind::Real) => f
+                        .parse::<f64>()
+                        .map(Value::from_f64)
+                        .unwrap_or_else(|_| Value::from_text(f)),
                     (Some(f), Kind::Text) => Value::from_text(f),
                 };
-                insert.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, value).map_err(|e| anyhow::anyhow!("{e}"))?;
+                insert
+                    .bind_at(
+                        NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                        value,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             self.drive(&mut insert, None, |_| ())?;
             if records.records % LOAD_BATCH == 0 {
@@ -407,7 +512,9 @@ impl Target for Amphora {
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
         let mut found = false;
-        let Ok(mut stmt) = conn.prepare(format!("SELECT 1 FROM {table} LIMIT 1")) else { return Ok(false) };
+        let Ok(mut stmt) = conn.prepare(format!("SELECT 1 FROM {table} LIMIT 1")) else {
+            return Ok(false);
+        };
         if self.drive(&mut stmt, None, |_| found = true).is_err() {
             return Ok(false);
         }
@@ -416,7 +523,10 @@ impl Target for Amphora {
 
     fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
         match answer {
-            Some(answer) => self.run_on(false, sql, deadline, |row| answer.amphora(row)).0,
+            Some(answer) => {
+                self.run_on(false, sql, deadline, |row| answer.amphora(row))
+                    .0
+            }
             None => self.run_on(false, sql, deadline, |_| ()).0,
         }
     }
@@ -428,9 +538,13 @@ impl Target for Amphora {
     fn set_cores(&mut self, cores: usize) -> anyhow::Result<bool> {
         // Morsel-driven parallel execution, a scan's LIMIT stopping its workers early too, at most
         // `cores` workers (the cost model picks how many up to them).
-        self.conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        self.conn
+            .set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
         self.conn.set_parallel_limit(true);
-        self.conn.set_parallel_cores(Some(std::num::NonZeroUsize::new(cores).ok_or_else(|| anyhow::anyhow!("--cores are at least 1"))?));
+        self.conn.set_parallel_cores(Some(
+            std::num::NonZeroUsize::new(cores)
+                .ok_or_else(|| anyhow::anyhow!("--cores are at least 1"))?,
+        ));
         Ok(true)
     }
 }
@@ -464,10 +578,14 @@ impl Target for Sqlite {
     }
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
-        let version: String = self.conn.query_row("SELECT sqlite_version()", [], |r| r.get(0))?;
+        let version: String = self
+            .conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))?;
         let mmap_size: i64 = self.conn.query_row("PRAGMA mmap_size", [], |r| r.get(0))?;
         let temp_store: i64 = self.conn.query_row("PRAGMA temp_store", [], |r| r.get(0))?;
-        Ok(serde_json::json!({ "engine": "sqlite", "version": version, "cache_kib": self.cache_kib, "threads": 1, "mmap_size": mmap_size, "temp_store": temp_store }))
+        Ok(
+            serde_json::json!({ "engine": "sqlite", "version": version, "cache_kib": self.cache_kib, "threads": 1, "mmap_size": mmap_size, "temp_store": temp_store }),
+        )
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
@@ -486,20 +604,35 @@ impl Target for Sqlite {
         }
         let kinds = kinds(&types);
         let marks = vec!["?"; kinds.len()].join(", ");
-        let mut records = Records::new(BufReader::with_capacity(1 << 20, std::fs::File::open(path)?), format);
+        let mut records = Records::new(
+            BufReader::with_capacity(1 << 20, std::fs::File::open(path)?),
+            format,
+        );
         self.conn.execute_batch("BEGIN")?;
         {
-            let mut insert = self.conn.prepare(&format!("INSERT INTO {table} VALUES ({marks})"))?;
+            let mut insert = self
+                .conn
+                .prepare(&format!("INSERT INTO {table} VALUES ({marks})"))?;
             while records.next()? {
-                anyhow::ensure!(records.fields.len() == kinds.len(), "{}: record {} has {} fields", path.display(), records.records, records.fields.len());
+                anyhow::ensure!(
+                    records.fields.len() == kinds.len(),
+                    "{}: record {} has {} fields",
+                    path.display(),
+                    records.records,
+                    records.fields.len()
+                );
                 let values: Vec<Value> = records
                     .fields
                     .iter_mut()
                     .zip(&kinds)
                     .map(|(field, kind)| match (field.take(), kind) {
                         (None, _) => Value::Null,
-                        (Some(f), Kind::Int) => f.parse().map(Value::Integer).unwrap_or(Value::Text(f)),
-                        (Some(f), Kind::Real) => f.parse().map(Value::Real).unwrap_or(Value::Text(f)),
+                        (Some(f), Kind::Int) => {
+                            f.parse().map(Value::Integer).unwrap_or(Value::Text(f))
+                        }
+                        (Some(f), Kind::Real) => {
+                            f.parse().map(Value::Real).unwrap_or(Value::Text(f))
+                        }
                         (Some(f), Kind::Text) => Value::Text(f),
                     })
                     .collect();
@@ -514,11 +647,16 @@ impl Target for Sqlite {
     }
 
     fn analyze(&mut self) -> anyhow::Result<()> {
-        Ok(self.conn.execute_batch("ANALYZE; PRAGMA wal_checkpoint(TRUNCATE)")?)
+        Ok(self
+            .conn
+            .execute_batch("ANALYZE; PRAGMA wal_checkpoint(TRUNCATE)")?)
     }
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
-        Ok(self.conn.query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(())).is_ok())
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(()))
+            .is_ok())
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
@@ -531,7 +669,12 @@ impl Target for Sqlite {
 
 impl Sqlite {
     /// One timed run, each row to `each` as well.
-    fn timed(&mut self, sql: &str, deadline: Duration, mut each: impl FnMut(&rusqlite::Row<'_>)) -> Outcome {
+    fn timed(
+        &mut self,
+        sql: &str,
+        deadline: Duration,
+        mut each: impl FnMut(&rusqlite::Row<'_>),
+    ) -> Outcome {
         let handle = self.conn.get_interrupt_handle();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
@@ -549,18 +692,30 @@ impl Sqlite {
             let (mut n, mut first) = (0u64, None);
             while let Some(r) = rows.next()? {
                 if n == 0 {
-                    first = Some(first_row((0..columns).map(|i| r.get_ref(i).map(|v| match v {
-                        rusqlite::types::ValueRef::Null => "NULL".to_owned(),
-                        rusqlite::types::ValueRef::Integer(i) => i.to_string(),
-                        rusqlite::types::ValueRef::Real(f) => f.to_string(),
-                        rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
-                        rusqlite::types::ValueRef::Blob(b) => format!("blob {}", b.len()),
-                    }).unwrap_or_default())));
+                    first = Some(first_row((0..columns).map(|i| {
+                        r.get_ref(i)
+                            .map(|v| match v {
+                                rusqlite::types::ValueRef::Null => "NULL".to_owned(),
+                                rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                                rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                                rusqlite::types::ValueRef::Text(t) => {
+                                    String::from_utf8_lossy(t).into_owned()
+                                }
+                                rusqlite::types::ValueRef::Blob(b) => format!("blob {}", b.len()),
+                            })
+                            .unwrap_or_default()
+                    })));
                 }
                 n += 1;
                 each(r);
             }
-            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()), search_ms: None })
+            Ok(Run {
+                rows: n,
+                first,
+                prepare_ms: ms(prepared - began),
+                exec_ms: ms(prepared.elapsed()),
+                search_ms: None,
+            })
         })();
         let _ = stop.send(());
         let _ = watchdog.join();
@@ -605,9 +760,19 @@ impl Target for Duck {
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
         let version: String = self.conn.query_row("SELECT version()", [], |r| r.get(0))?;
-        let threads: String = self.conn.query_row("SELECT current_setting('threads')::VARCHAR", [], |r| r.get(0))?;
-        let memory: String = self.conn.query_row("SELECT current_setting('memory_limit')::VARCHAR", [], |r| r.get(0))?;
-        Ok(serde_json::json!({ "engine": "duckdb", "version": version, "threads": threads, "memory_limit": memory }))
+        let threads: String =
+            self.conn
+                .query_row("SELECT current_setting('threads')::VARCHAR", [], |r| {
+                    r.get(0)
+                })?;
+        let memory: String =
+            self.conn
+                .query_row("SELECT current_setting('memory_limit')::VARCHAR", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(
+            serde_json::json!({ "engine": "duckdb", "version": version, "threads": threads, "memory_limit": memory }),
+        )
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
@@ -615,12 +780,17 @@ impl Target for Duck {
     }
 
     fn load(&mut self, table: &str, path: &Path, format: Format) -> anyhow::Result<u64> {
-        let file = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?.replace('\'', "''");
+        let file = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?
+            .replace('\'', "''");
         let options = match format {
             Format::Csv => "FORMAT csv, HEADER false, QUOTE '\"', ESCAPE '\\'",
             Format::Pipe => "FORMAT csv, HEADER false, DELIMITER '|', QUOTE ''",
         };
-        let n = self.conn.execute(&format!("COPY {table} FROM '{file}' ({options})"), [])?;
+        let n = self
+            .conn
+            .execute(&format!("COPY {table} FROM '{file}' ({options})"), [])?;
         Ok(n as u64)
     }
 
@@ -629,7 +799,10 @@ impl Target for Duck {
     }
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
-        Ok(self.conn.query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(())).is_ok())
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(()))
+            .is_ok())
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
@@ -651,7 +824,12 @@ impl Target for Duck {
 
 impl Duck {
     /// One timed run, each row to `each` as well.
-    fn timed(&mut self, sql: &str, deadline: Duration, mut each: impl FnMut(&duckdb::Row<'_>)) -> Outcome {
+    fn timed(
+        &mut self,
+        sql: &str,
+        deadline: Duration,
+        mut each: impl FnMut(&duckdb::Row<'_>),
+    ) -> Outcome {
         let sql = &quote_at(sql);
         let handle = self.conn.interrupt_handle();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
@@ -669,12 +847,22 @@ impl Duck {
             while let Some(r) = rows.next()? {
                 if n == 0 {
                     let columns = r.as_ref().column_count();
-                    first = Some(first_row((0..columns).map(|i| r.get_ref(i).map(|v| format!("{:?}", v.to_owned())).unwrap_or_default())));
+                    first = Some(first_row((0..columns).map(|i| {
+                        r.get_ref(i)
+                            .map(|v| format!("{:?}", v.to_owned()))
+                            .unwrap_or_default()
+                    })));
                 }
                 n += 1;
                 each(r);
             }
-            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()), search_ms: None })
+            Ok(Run {
+                rows: n,
+                first,
+                prepare_ms: ms(prepared - began),
+                exec_ms: ms(prepared.elapsed()),
+                search_ms: None,
+            })
         })();
         let late = began.elapsed() >= deadline;
         let _ = stop.send(());
@@ -693,7 +881,9 @@ impl Duck {
 fn quote_at(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
-    let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'"' || *b == b'\'');
+    let word = |b: Option<&u8>| {
+        b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'"' || *b == b'\'')
+    };
     let mut i = 0;
     let mut literal = false;
     while i < bytes.len() {
@@ -702,7 +892,12 @@ fn quote_at(sql: &str) -> String {
         if bytes.get(i) == Some(&b'\'') {
             literal = !literal;
         }
-        if !literal && here.len() >= 2 && here[..2].eq_ignore_ascii_case("at") && !word(i.checked_sub(1).and_then(|p| bytes.get(p))) && !word(bytes.get(i + 2)) {
+        if !literal
+            && here.len() >= 2
+            && here[..2].eq_ignore_ascii_case("at")
+            && !word(i.checked_sub(1).and_then(|p| bytes.get(p)))
+            && !word(bytes.get(i + 2))
+        {
             out.push_str("\"at\"");
             i += 2;
             continue;
@@ -722,7 +917,9 @@ mod tests {
     #[test]
     fn quote_at_quotes_the_alias_alone() {
         assert_eq!(
-            quote_at("SELECT MIN(at.title) FROM aka_title AS at WHERE at.movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"),
+            quote_at(
+                "SELECT MIN(at.title) FROM aka_title AS at WHERE at.movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"
+            ),
             "SELECT MIN(\"at\".title) FROM aka_title AS \"at\" WHERE \"at\".movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"
         );
     }
@@ -742,22 +939,49 @@ mod tests {
     /// step 1 (f)). Expect: each value as the writer writes it, the run's rows counted as without.
     #[test]
     fn amphora_writes_its_answer() {
-        use amphora_engine::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect};
+        use amphora_engine::{
+            ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect,
+        };
         let io: Arc<dyn amphora_engine::IO> = Arc::new(MemoryIO::new());
-        let db = Database::open(io.clone(), &format!("planner-answers-{}.db", std::process::id()), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).unwrap();
-        let (conn, counted) = (db.connect(ConnectOpts::new()).unwrap(), db.connect(ConnectOpts::new()).unwrap());
-        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0, vectorized: false, adaptive: false };
+        let db = Database::open(
+            io.clone(),
+            &format!("planner-answers-{}.db", std::process::id()),
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+        )
+        .unwrap();
+        let (conn, counted) = (
+            db.connect(ConnectOpts::new()).unwrap(),
+            db.connect(ConnectOpts::new()).unwrap(),
+        );
+        let mut amphora = Amphora {
+            io,
+            _db: db,
+            conn,
+            counted,
+            cache_kib: 0,
+            vectorized: false,
+            adaptive: false,
+        };
         let mut answer = writer();
-        assert!(matches!(amphora.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
+        assert!(matches!(
+            amphora.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)),
+            Outcome::Done(Run { rows: 1, .. })
+        ));
         assert_eq!(answer.finish(), LITE_ANSWER);
     }
 
     /// Do: run the same query on SQLite writing its answer. Expect: Amphora's answer.
     #[test]
     fn sqlite_writes_its_answer() {
-        let mut sqlite = Sqlite { conn: rusqlite::Connection::open_in_memory().unwrap(), cache_kib: 0 };
+        let mut sqlite = Sqlite {
+            conn: rusqlite::Connection::open_in_memory().unwrap(),
+            cache_kib: 0,
+        };
         let mut answer = writer();
-        assert!(matches!(sqlite.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
+        assert!(matches!(
+            sqlite.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)),
+            Outcome::Done(Run { rows: 1, .. })
+        ));
         assert_eq!(answer.finish(), LITE_ANSWER);
     }
 
@@ -767,14 +991,33 @@ mod tests {
     /// type's name.
     #[test]
     fn duckdb_writes_its_answer() {
-        let mut duck = Duck { conn: duckdb::Connection::open_in_memory().unwrap(), threads: Some(1) };
+        let mut duck = Duck {
+            conn: duckdb::Connection::open_in_memory().unwrap(),
+            threads: Some(1),
+        };
         let mut answer = writer();
         let sql = "SELECT CAST(406181.0111 AS DECIMAL(38, 4)), DATE '1995-03-05', SUM(x), CAST(0.1 AS DOUBLE) + CAST(0.2 AS DOUBLE), 'a' || chr(9) || 'b', CAST(NULL AS INTEGER) FROM (VALUES (1), (2)) AS t(x)";
-        assert!(matches!(duck.run(sql, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
-        assert_eq!(answer.finish(), b"406181.0111\t1995-03-05\t3\t0.30000000000000004\ta\\tb\t\\N\n");
+        assert!(matches!(
+            duck.run(sql, Duration::from_secs(60), Some(&mut answer)),
+            Outcome::Done(Run { rows: 1, .. })
+        ));
+        assert_eq!(
+            answer.finish(),
+            b"406181.0111\t1995-03-05\t3\t0.30000000000000004\ta\\tb\t\\N\n"
+        );
         let mut answer = writer();
-        assert!(matches!(duck.run("SELECT TIMESTAMP '1995-03-05 10:00:00'", Duration::from_secs(60), Some(&mut answer)), Outcome::Done(_)));
-        assert_eq!(answer.finish(), b"\\!unwritten_value a Timestamp value, which the answer writer has no text for\n");
+        assert!(matches!(
+            duck.run(
+                "SELECT TIMESTAMP '1995-03-05 10:00:00'",
+                Duration::from_secs(60),
+                Some(&mut answer)
+            ),
+            Outcome::Done(_)
+        ));
+        assert_eq!(
+            answer.finish(),
+            b"\\!unwritten_value a Timestamp value, which the answer writer has no text for\n"
+        );
     }
 }
 
@@ -823,7 +1066,9 @@ impl Target for Postgres {
             Format::Csv => "FORMAT csv, ESCAPE '\\'",
             Format::Pipe => "FORMAT csv, DELIMITER '|', QUOTE e'\\x01'",
         };
-        let mut writer = self.client.copy_in(&format!("COPY {table} FROM STDIN ({options})"))?;
+        let mut writer = self
+            .client
+            .copy_in(&format!("COPY {table} FROM STDIN ({options})"))?;
         let mut input = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
         loop {
             let buf = input.fill_buf()?;
@@ -844,15 +1089,29 @@ impl Target for Postgres {
     }
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
-        Ok(self.client.query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]).ok().flatten().is_some())
+        Ok(self
+            .client
+            .query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[])
+            .ok()
+            .flatten()
+            .is_some())
     }
 
     fn server_started_s(&mut self) -> Option<f64> {
-        self.client.query_one("SELECT extract(epoch FROM now() - pg_postmaster_start_time())::float8", &[]).ok().map(|row| row.get::<_, f64>(0))
+        self.client
+            .query_one(
+                "SELECT extract(epoch FROM now() - pg_postmaster_start_time())::float8",
+                &[],
+            )
+            .ok()
+            .map(|row| row.get::<_, f64>(0))
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, mut answer: Option<&mut Answer>) -> Outcome {
-        if let Err(e) = self.client.batch_execute(&format!("SET statement_timeout = {}", deadline.as_millis())) {
+        if let Err(e) = self
+            .client
+            .batch_execute(&format!("SET statement_timeout = {}", deadline.as_millis()))
+        {
             return Outcome::Failed(e.to_string());
         }
         let began = Instant::now();
@@ -865,7 +1124,9 @@ impl Target for Postgres {
                 for m in messages {
                     if let postgres::SimpleQueryMessage::Row(r) = m {
                         if n == 0 {
-                            first = Some(first_row((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_owned())));
+                            first = Some(first_row(
+                                (0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_owned()),
+                            ));
                         }
                         n += 1;
                         // Every row came before `took` was read: the answer costs the run nothing.
@@ -875,9 +1136,17 @@ impl Target for Postgres {
                     }
                 }
                 // The simple protocol plans and runs in one message: its time is all run.
-                Outcome::Done(Run { rows: n, first, prepare_ms: 0.0, exec_ms: ms(took), search_ms: None })
+                Outcome::Done(Run {
+                    rows: n,
+                    first,
+                    prepare_ms: 0.0,
+                    exec_ms: ms(took),
+                    search_ms: None,
+                })
             }
-            Err(e) if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) => Outcome::TimedOut,
+            Err(e) if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) => {
+                Outcome::TimedOut
+            }
             // The client's own words are "db error" for whatever the server said: its message too.
             Err(e) => Outcome::Failed(match e.as_db_error() {
                 Some(db) => format!("{e}: {} ({})", db.message(), db.code().code()),
@@ -901,8 +1170,16 @@ pub struct ClickHouse {
 
 impl ClickHouse {
     pub fn open(url: &str, database: &str) -> anyhow::Result<Self> {
-        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-        let ch = Self { agent, url: format!("{}/", url.trim_end_matches('/')), database: database.to_owned(), threads: None };
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let ch = Self {
+            agent,
+            url: format!("{}/", url.trim_end_matches('/')),
+            database: database.to_owned(),
+            threads: None,
+        };
         ch.post_text(&[], &format!("CREATE DATABASE IF NOT EXISTS {database}"))?;
         Ok(ch)
     }
@@ -910,7 +1187,13 @@ impl ClickHouse {
     /// Posts `body` (the query itself when `query` is none) with `settings` in the URL, in the
     /// bench's database but for the statement that makes it; the response's body once it
     /// succeeded.
-    fn post(&self, query: Option<&str>, in_database: bool, settings: &[(&str, String)], body: ureq::SendBody<'_>) -> anyhow::Result<String> {
+    fn post(
+        &self,
+        query: Option<&str>,
+        in_database: bool,
+        settings: &[(&str, String)],
+        body: ureq::SendBody<'_>,
+    ) -> anyhow::Result<String> {
         let mut request = self.agent.post(&self.url);
         if let Some(q) = query {
             request = request.query("query", q);
@@ -923,7 +1206,11 @@ impl ClickHouse {
         }
         let mut response = request.send(body)?;
         let status = response.status();
-        let text = response.body_mut().with_config().limit(u64::MAX).read_to_string()?;
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(u64::MAX)
+            .read_to_string()?;
         if !status.is_success() {
             anyhow::bail!("ClickHouse said {status}: {}", text.trim());
         }
@@ -933,7 +1220,12 @@ impl ClickHouse {
     /// Posts the statement `sql` as the body.
     fn post_text(&self, settings: &[(&str, String)], sql: &str) -> anyhow::Result<String> {
         let mut bytes = sql.as_bytes();
-        self.post(None, !sql.starts_with("CREATE DATABASE"), settings, ureq::SendBody::from_reader(&mut bytes))
+        self.post(
+            None,
+            !sql.starts_with("CREATE DATABASE"),
+            settings,
+            ureq::SendBody::from_reader(&mut bytes),
+        )
     }
 }
 
@@ -964,27 +1256,45 @@ fn clickhouse_table(stmt: &str) -> Option<String> {
     let mut columns = Vec::new();
     for part in parts {
         let words: Vec<&str> = part.split_whitespace().collect();
-        let (Some(column), Some(kind)) = (words.first(), words.get(1)) else { continue };
+        let (Some(column), Some(kind)) = (words.first(), words.get(1)) else {
+            continue;
+        };
         let upper = column.to_ascii_uppercase();
-        if matches!(upper.as_str(), "PRIMARY" | "FOREIGN" | "UNIQUE" | "CONSTRAINT" | "CHECK") {
+        if matches!(
+            upper.as_str(),
+            "PRIMARY" | "FOREIGN" | "UNIQUE" | "CONSTRAINT" | "CHECK"
+        ) {
             continue;
         }
         let kind = kind.to_ascii_lowercase();
-        let ty = if kind.starts_with("int") || kind.starts_with("bigint") || kind.starts_with("smallint") {
+        let ty = if kind.starts_with("int")
+            || kind.starts_with("bigint")
+            || kind.starts_with("smallint")
+        {
             "Int64"
         } else if kind.starts_with("decimal") || kind.starts_with("numeric") {
             "Decimal(15,2)"
         } else if kind == "date" {
             "Date"
-        } else if kind.starts_with("real") || kind.starts_with("double") || kind.starts_with("float") {
+        } else if kind.starts_with("real")
+            || kind.starts_with("double")
+            || kind.starts_with("float")
+        {
             "Float64"
         } else {
             "String"
         };
         let not_null = part.to_ascii_uppercase().contains("NOT NULL");
-        columns.push(if not_null { format!("{column} {ty}") } else { format!("{column} Nullable({ty})") });
+        columns.push(if not_null {
+            format!("{column} {ty}")
+        } else {
+            format!("{column} Nullable({ty})")
+        });
     }
-    Some(format!("CREATE TABLE {name} ({}) ENGINE = MergeTree ORDER BY tuple()", columns.join(", ")))
+    Some(format!(
+        "CREATE TABLE {name} ({}) ENGINE = MergeTree ORDER BY tuple()",
+        columns.join(", ")
+    ))
 }
 
 impl Target for ClickHouse {
@@ -998,17 +1308,29 @@ impl Target for ClickHouse {
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
         let version = self.post_text(&[], "SELECT version() FORMAT TSV")?;
-        Ok(serde_json::json!({ "engine": "clickhouse", "version": version.trim(), "client": "HTTP, ureq, one connection", "threads": self.threads }))
+        Ok(
+            serde_json::json!({ "engine": "clickhouse", "version": version.trim(), "client": "HTTP, ureq, one connection", "threads": self.threads }),
+        )
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
         for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let upper = stmt.to_ascii_uppercase();
             // MergeTree keeps no secondary index of this kind, and takes no statistics this way.
-            if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") || upper.starts_with("ANALYZE") || upper.starts_with("CHECKPOINT") {
+            if upper.starts_with("CREATE INDEX")
+                || upper.starts_with("CREATE UNIQUE INDEX")
+                || upper.starts_with("ANALYZE")
+                || upper.starts_with("CHECKPOINT")
+            {
                 continue;
             }
-            let stmt = if upper.starts_with("CREATE TABLE") { clickhouse_table(stmt).ok_or_else(|| anyhow::anyhow!("a CREATE TABLE ClickHouse's words can't say: {stmt}"))? } else { stmt.to_owned() };
+            let stmt = if upper.starts_with("CREATE TABLE") {
+                clickhouse_table(stmt).ok_or_else(|| {
+                    anyhow::anyhow!("a CREATE TABLE ClickHouse's words can't say: {stmt}")
+                })?
+            } else {
+                stmt.to_owned()
+            };
             self.post_text(&[], &stmt)?;
         }
         Ok(())
@@ -1018,9 +1340,18 @@ impl Target for ClickHouse {
         // ClickHouse's CSV reader takes no `\` escapes, and JOB's files escape with them (lane
         // qs6-13): each record is read by the reader Amphora's and SQLite's loads use, and sent
         // as ClickHouse's TabSeparated, whose escapes are exact.
-        let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        let mut rows = TabSeparated::new(Records::new(BufReader::with_capacity(1 << 20, file), format));
-        let sent = self.post(Some(&format!("INSERT INTO {table} FORMAT TabSeparated")), true, &[], ureq::SendBody::from_reader(&mut rows));
+        let file =
+            std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let mut rows = TabSeparated::new(Records::new(
+            BufReader::with_capacity(1 << 20, file),
+            format,
+        ));
+        let sent = self.post(
+            Some(&format!("INSERT INTO {table} FORMAT TabSeparated")),
+            true,
+            &[],
+            ureq::SendBody::from_reader(&mut rows),
+        );
         if let Some(e) = rows.failed.take() {
             return Err(e.context(format!("{}", path.display())));
         }
@@ -1034,7 +1365,9 @@ impl Target for ClickHouse {
     }
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
-        Ok(self.post_text(&[], &format!("SELECT 1 FROM {table} LIMIT 1 FORMAT TSV")).is_ok_and(|out| !out.trim().is_empty()))
+        Ok(self
+            .post_text(&[], &format!("SELECT 1 FROM {table} LIMIT 1 FORMAT TSV"))
+            .is_ok_and(|out| !out.trim().is_empty()))
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, _answer: Option<&mut Answer>) -> Outcome {
@@ -1047,9 +1380,17 @@ impl Target for ClickHouse {
             Ok(out) => {
                 let exec_ms = ms(began.elapsed());
                 let mut lines = out.lines();
-                let first = lines.next().map(|line| first_row(line.split('\t').map(str::to_owned)));
+                let first = lines
+                    .next()
+                    .map(|line| first_row(line.split('\t').map(str::to_owned)));
                 let rows = u64::from(first.is_some()) + lines.count() as u64;
-                Outcome::Done(Run { rows, first, prepare_ms: 0.0, exec_ms, search_ms: None })
+                Outcome::Done(Run {
+                    rows,
+                    first,
+                    prepare_ms: 0.0,
+                    exec_ms,
+                    search_ms: None,
+                })
             }
             Err(e) if e.to_string().contains("TIMEOUT_EXCEEDED") => Outcome::TimedOut,
             Err(e) => Outcome::Failed(e.to_string()),
@@ -1076,7 +1417,12 @@ struct TabSeparated<R> {
 
 impl<R: BufRead> TabSeparated<R> {
     fn new(records: Records<R>) -> Self {
-        Self { records, row: Vec::new(), at: 0, failed: None }
+        Self {
+            records,
+            row: Vec::new(),
+            at: 0,
+            failed: None,
+        }
     }
 
     /// The next record into `row`; false at the end of the file or on an error.
@@ -1123,7 +1469,9 @@ impl<R: BufRead> std::io::Read for TabSeparated<R> {
         }
         let rest = self.row.get(self.at..).unwrap_or_default();
         let n = rest.len().min(buf.len());
-        buf.get_mut(..n).unwrap_or_default().copy_from_slice(rest.get(..n).unwrap_or_default());
+        buf.get_mut(..n)
+            .unwrap_or_default()
+            .copy_from_slice(rest.get(..n).unwrap_or_default());
         self.at += n;
         Ok(n)
     }
@@ -1132,7 +1480,7 @@ impl<R: BufRead> std::io::Read for TabSeparated<R> {
 #[cfg(test)]
 mod clickhouse_tests {
     use super::super::data::{Format, Records};
-    use super::{clickhouse_table, TabSeparated};
+    use super::{TabSeparated, clickhouse_table};
     use std::io::Read;
 
     /// Do: send JOB rows as COPY wrote them (a NULL, an empty quoted string, a quote and a
@@ -1143,8 +1491,13 @@ mod clickhouse_tests {
     fn job_csv_with_backslashes_goes_to_clickhouse_as_tab_separated() {
         let csv = "1,,\"\",\"a \\\"b\\\" \\\\ c\"\n2,\"tab\there\nnext\",\"ends \\\\\",x\n";
         let mut out = String::new();
-        TabSeparated::new(Records::new(csv.as_bytes(), Format::Csv)).read_to_string(&mut out).unwrap();
-        assert_eq!(out, "1\t\\N\t\ta \"b\" \\\\ c\n2\ttab\\there\\nnext\tends \\\\\tx\n");
+        TabSeparated::new(Records::new(csv.as_bytes(), Format::Csv))
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(
+            out,
+            "1\t\\N\t\ta \"b\" \\\\ c\n2\ttab\\there\\nnext\tends \\\\\tx\n"
+        );
     }
 
     /// Do: a record the reader refuses (the file ends inside quotes). Expect: the stream ends

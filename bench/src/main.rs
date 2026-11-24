@@ -13,7 +13,17 @@
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
 // Tests may unwrap, assert and index (CLAUDE.md §1): clippy reads bench/clippy.toml here.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
 
 mod blink;
 mod cc;
@@ -45,10 +55,10 @@ mod vanilla;
 mod vitess;
 mod vlog;
 
-use std::collections::BinaryHeap;
-use std::sync::{Arc, Condvar, Mutex};
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// An event as the workload writes it: kiln's event row (kiln crates/kiln/src/convo/rows.rs).
@@ -137,7 +147,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--target" => o.target = v()?,
             "--dir" => o.dir = v()?,
@@ -179,8 +192,9 @@ impl Rng {
 }
 
 const WORDS: [&str; 24] = [
-    "the", "agent", "ran", "cargo", "test", "and", "read", "file", "then", "wrote", "patch", "store", "writer", "while", "feed", "waited", "build", "deploy", "review", "shard", "raft", "leader", "commit",
-    "quorum",
+    "the", "agent", "ran", "cargo", "test", "and", "read", "file", "then", "wrote", "patch",
+    "store", "writer", "while", "feed", "waited", "build", "deploy", "review", "shard", "raft",
+    "leader", "commit", "quorum",
 ];
 /// A word few events hold, and one none does: the searches that look at the most.
 const RARE: &str = "zephyr";
@@ -202,7 +216,9 @@ fn text(rng: &mut Rng, bytes: usize) -> String {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn event(rng: &mut Rng, session: usize, seq: u64, text_bytes: usize) -> Event {
@@ -210,7 +226,15 @@ fn event(rng: &mut Rng, session: usize, seq: u64, text_bytes: usize) -> Event {
     let kind = kinds[rng.below(kinds.len())];
     let text = text(rng, text_bytes);
     let body = serde_json::json!({ "kind": kind, "text": text, "n": seq }).to_string();
-    Event { session: format!("s-{session:06}"), id: format!("e-{seq}"), seq, at: now_ms(), kind, text, body }
+    Event {
+        session: format!("s-{session:06}"),
+        id: format!("e-{seq}"),
+        seq,
+        at: now_ms(),
+        kind,
+        text,
+        body,
+    }
 }
 
 /// The heap's bytes now and at most: what each database holds, apart from code, stacks and the
@@ -310,7 +334,14 @@ impl Driver for Null {
 /// `RssAnon`).
 fn rss_anon_mb() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kb: f64 = status.lines().find_map(|l| l.strip_prefix("RssAnon:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    let kb: f64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
     Some((kb / 1024.0 * 10.0).round() / 10.0)
 }
 
@@ -319,20 +350,39 @@ fn rss_anon_mb() -> Option<f64> {
 /// in-process stores write to their logs and files) and `/proc/self/stat` (`utime` and `stime`, in
 /// USER_HZ, 100 a second on Linux).
 fn written_and_cpu() -> (Option<u64>, Option<f64>) {
-    let written = std::fs::read_to_string("/proc/self/io").ok().and_then(|io| io.lines().find_map(|l| l.strip_prefix("write_bytes:")).and_then(|v| v.trim().parse().ok()));
-    let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
-        // After the command's closing parenthesis: the state, then utime and stime 11 and 12 on.
-        let fields: Vec<&str> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
-        let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
-        Some(ticks / 100.0)
-    });
+    let written = std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|io| {
+            io.lines()
+                .find_map(|l| l.strip_prefix("write_bytes:"))
+                .and_then(|v| v.trim().parse().ok())
+        });
+    let cpu = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            // After the command's closing parenthesis: the state, then utime and stime 11 and 12 on.
+            let fields: Vec<&str> = stat
+                .get(stat.rfind(')')? + 1..)?
+                .split_whitespace()
+                .collect();
+            let ticks =
+                fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+            Some(ticks / 100.0)
+        });
     (written, cpu)
 }
 
 /// This process's resident memory now, in MiB (Linux's `VmRSS`); none where the system doesn't say.
 fn rss_mb() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kb: f64 = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    let kb: f64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
     Some((kb / 1024.0 * 10.0).round() / 10.0)
 }
 
@@ -340,7 +390,14 @@ fn rss_mb() -> Option<f64> {
 /// where the system doesn't say (it's Linux's `VmHWM`).
 fn rss_max_mb() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kb: f64 = status.lines().find_map(|l| l.strip_prefix("VmHWM:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    let kb: f64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
     Some((kb / 1024.0 * 10.0).round() / 10.0)
 }
 
@@ -358,7 +415,11 @@ const SUB: u32 = 6;
 
 impl Hist {
     fn new() -> Self {
-        Self { counts: vec![0; ((64 - SUB as usize + 1) << SUB) + 1], n: 0, max: 0 }
+        Self {
+            counts: vec![0; ((64 - SUB as usize + 1) << SUB) + 1],
+            n: 0,
+            max: 0,
+        }
     }
 
     fn index(v: u64) -> usize {
@@ -399,7 +460,12 @@ impl Hist {
     /// counts by least value across runs gives the runs' merged histogram, so their quantiles pool
     /// (`bench/pool.py`).
     fn buckets(&self) -> serde_json::Value {
-        self.counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| serde_json::json!([Self::value(i), c])).collect()
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, c)| serde_json::json!([Self::value(i), c]))
+            .collect()
     }
 
     fn quantile(&self, q: f64) -> u64 {
@@ -424,7 +490,13 @@ struct Shared {
 
 impl Shared {
     fn new() -> Self {
-        Self { counts: (0..Hist::new().counts.len()).map(|_| AtomicU64::new(0)).collect(), n: AtomicU64::new(0), max: AtomicU64::new(0) }
+        Self {
+            counts: (0..Hist::new().counts.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            n: AtomicU64::new(0),
+            max: AtomicU64::new(0),
+        }
     }
 
     fn record(&self, us: u64) {
@@ -455,7 +527,8 @@ fn write_wait(driver: &Arc<dyn Driver>, events: Vec<Event>) -> anyhow::Result<()
             let _ = tx.send(r);
         }),
     )?;
-    rx.recv().map_err(|_| anyhow::anyhow!("a write was never answered"))?
+    rx.recv()
+        .map_err(|_| anyhow::anyhow!("a write was never answered"))?
 }
 
 /// The writers waiting to begin their next write, earliest first: who, and from when its latency
@@ -505,7 +578,10 @@ pub struct Stop {
 impl Stop {
     pub fn stop(&self) {
         // Under the lock: a waiter between its look and its wait can't miss the stop.
-        let _held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _held = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stopped.store(true, Ordering::SeqCst);
         self.told.notify_all();
     }
@@ -516,8 +592,15 @@ impl Stop {
 
     /// Waits for the stop, no later than `due`: whether it came.
     pub fn wait_until(&self, due: Instant) -> bool {
-        let held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(self.told.wait_timeout_while(held, due.saturating_duration_since(Instant::now()), |_| !self.stopped()));
+        let held = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.told.wait_timeout_while(
+            held,
+            due.saturating_duration_since(Instant::now()),
+            |_| !self.stopped(),
+        ));
         self.stopped()
     }
 }
@@ -542,7 +625,9 @@ thread_local! {
 /// The waker for the statements this thread steps: a busy one sleeps until the lock it found held
 /// is released (`park_timeout` with the engine's deadline), not on a schedule of its own.
 pub fn unpark_waker() -> std::task::Waker {
-    UNPARK.try_with(std::task::Waker::clone).unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))))
+    UNPARK
+        .try_with(std::task::Waker::clone)
+        .unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))))
 }
 
 /// Percentiles of latencies in ms.
@@ -636,21 +721,81 @@ fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);
     // A server's own port on this machine (bench/servers/<engine>.sh) unless --dsn names another.
-    let dsn = |local: &str| if std::env::args().any(|a| a == "--dsn") { o.dsn.clone() } else { local.to_owned() };
+    let dsn = |local: &str| {
+        if std::env::args().any(|a| a == "--dsn") {
+            o.dsn.clone()
+        } else {
+            local.to_owned()
+        }
+    };
     let driver: Arc<dyn Driver> = match o.target.as_str() {
         "amphora" => Arc::new(store::Amphora::open(&o.dir)?),
         "turso" => Arc::new(pool::Pooled::new(vanilla::Turso::open(&o.dir)?, k, q)?),
         "sqlite" => Arc::new(pool::Pooled::new(vanilla::Sqlite::open(&o.dir)?, k, q)?),
         "null" => Arc::new(Null),
-        "vitess" => Arc::new(pool::Pooled::new(vitess::Vitess::connect(&o.dsn, k + o.readers + 2)?, k, q)?),
-        "mysql" => Arc::new(pool::Pooled::new(mysql::MySql::connect(&dsn("mysql://root@127.0.0.1:33306/convo"), k + o.readers + 2)?, k, q)?),
-        "postgres" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres@127.0.0.1:55432/postgres"), pg::Engine::Postgres)?, k, q)?),
-        "orioledb" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres@127.0.0.1:55433/postgres"), pg::Engine::Orioledb)?, k, q)?),
-        "cedardb" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), pg::Engine::Cedardb)?, k, q)?),
-        "clickhouse" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), false, k + o.readers + 2)?, k, q)?),
-        "clickhouse-durable" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), true, k + o.readers + 2)?, k, q)?),
-        "amphora-serve" => Arc::new(pool::Pooled::new(serve::AmphoraServe::connect(&dsn(&serve::default_config()))?, k, q)?),
-        t => anyhow::bail!("unknown target {t} (amphora, turso, sqlite, vitess, mysql, postgres, orioledb, cedardb, clickhouse, clickhouse-durable, amphora-serve, null)"),
+        "vitess" => Arc::new(pool::Pooled::new(
+            vitess::Vitess::connect(&o.dsn, k + o.readers + 2)?,
+            k,
+            q,
+        )?),
+        "mysql" => Arc::new(pool::Pooled::new(
+            mysql::MySql::connect(
+                &dsn("mysql://root@127.0.0.1:33306/convo"),
+                k + o.readers + 2,
+            )?,
+            k,
+            q,
+        )?),
+        "postgres" => Arc::new(pool::Pooled::new(
+            pg::Pg::connect(
+                &dsn("postgres://postgres@127.0.0.1:55432/postgres"),
+                pg::Engine::Postgres,
+            )?,
+            k,
+            q,
+        )?),
+        "orioledb" => Arc::new(pool::Pooled::new(
+            pg::Pg::connect(
+                &dsn("postgres://postgres@127.0.0.1:55433/postgres"),
+                pg::Engine::Orioledb,
+            )?,
+            k,
+            q,
+        )?),
+        "cedardb" => Arc::new(pool::Pooled::new(
+            pg::Pg::connect(
+                &dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"),
+                pg::Engine::Cedardb,
+            )?,
+            k,
+            q,
+        )?),
+        "clickhouse" => Arc::new(pool::Pooled::new(
+            clickhouse::ClickHouse::connect(
+                &dsn("http://127.0.0.1:58123"),
+                false,
+                k + o.readers + 2,
+            )?,
+            k,
+            q,
+        )?),
+        "clickhouse-durable" => Arc::new(pool::Pooled::new(
+            clickhouse::ClickHouse::connect(
+                &dsn("http://127.0.0.1:58123"),
+                true,
+                k + o.readers + 2,
+            )?,
+            k,
+            q,
+        )?),
+        "amphora-serve" => Arc::new(pool::Pooled::new(
+            serve::AmphoraServe::connect(&dsn(&serve::default_config()))?,
+            k,
+            q,
+        )?),
+        t => anyhow::bail!(
+            "unknown target {t} (amphora, turso, sqlite, vitess, mysql, postgres, orioledb, cedardb, clickhouse, clickhouse-durable, amphora-serve, null)"
+        ),
     };
 
     // Preload: every session's history, a hundred events a write, writers side by side.
@@ -668,7 +813,16 @@ fn main() -> anyhow::Result<()> {
                     let mut left = o.preload;
                     while left > 0 {
                         let n = left.min(100);
-                        let batch: Vec<Event> = (0..n).map(|_| event(&mut rng, session, seqs[session].fetch_add(1, Ordering::Relaxed), o.text_bytes)).collect();
+                        let batch: Vec<Event> = (0..n)
+                            .map(|_| {
+                                event(
+                                    &mut rng,
+                                    session,
+                                    seqs[session].fetch_add(1, Ordering::Relaxed),
+                                    o.text_bytes,
+                                )
+                            })
+                            .collect();
                         write_wait(&driver, batch)?;
                         left -= n;
                     }
@@ -677,7 +831,8 @@ fn main() -> anyhow::Result<()> {
             }));
         }
         for h in handles {
-            h.join().map_err(|_| anyhow::anyhow!("a preload writer panicked"))??;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a preload writer panicked"))??;
         }
         Ok(())
     })?;
@@ -698,7 +853,11 @@ fn main() -> anyhow::Result<()> {
     let until = Duration::from_secs(o.seconds);
     // Each second's writes finished, and the longest of them (µs), by the second it finished in.
     let slots = usize::try_from(o.seconds).unwrap_or(0) + 2;
-    let per_second: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new((0..slots).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect());
+    let per_second: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new(
+        (0..slots)
+            .map(|_| (AtomicU64::new(0), AtomicU64::new(0)))
+            .collect(),
+    );
     let mixed = Instant::now();
     let (written_before, cpu_before) = written_and_cpu();
     let count_from = mixed + Duration::from_secs(o.warmup);
@@ -716,24 +875,59 @@ fn main() -> anyhow::Result<()> {
         })
     };
     let written = Arc::new(Shared::new());
-    let ready = Arc::new(Ready { heap: Mutex::new((0..o.writers).map(|w| Reverse((mixed, w))).collect()), wake: Condvar::new() });
+    let ready = Arc::new(Ready {
+        heap: Mutex::new((0..o.writers).map(|w| Reverse((mixed, w))).collect()),
+        wake: Condvar::new(),
+    });
     let inflight = Arc::new(AtomicU64::new(0));
     let drained = Arc::new((Mutex::new(()), Condvar::new()));
     let failures = Arc::new(AtomicU64::new(0));
     // Paced: each writer a write every writers/rate seconds, from when it was due (not when the last
     // was answered), so a slow answer can't hide its own wait.
-    let interval = (o.write_rate > 0).then(|| Duration::from_secs_f64(o.writers as f64 / o.write_rate as f64));
+    let interval =
+        (o.write_rate > 0).then(|| Duration::from_secs_f64(o.writers as f64 / o.write_rate as f64));
     let reads = std::thread::scope(|s| -> anyhow::Result<Hist> {
         let mut subs = Vec::new();
         for t in 0..o.submitters.max(1) {
-            let (driver, seqs, stop, o, per_second, ready, written, inflight, drained, failures) =
-                (driver.clone(), seqs.clone(), stop.clone(), &o, per_second.clone(), ready.clone(), written.clone(), inflight.clone(), drained.clone(), failures.clone());
+            let (driver, seqs, stop, o, per_second, ready, written, inflight, drained, failures) = (
+                driver.clone(),
+                seqs.clone(),
+                stop.clone(),
+                &o,
+                per_second.clone(),
+                ready.clone(),
+                written.clone(),
+                inflight.clone(),
+                drained.clone(),
+                failures.clone(),
+            );
             subs.push(s.spawn(move || -> anyhow::Result<()> {
                 let mut rng = Rng(0xd1b5_4a32_d192_ed03 ^ (t as u64 + 1));
                 while let Some((due, w)) = ready.pop(&stop) {
-                    let session = rng.below(if o.disjoint { o.sessions / 2 } else { o.sessions });
-                    let batch: Vec<Event> = (0..o.batch.max(1)).map(|_| event(&mut rng, session, seqs[session].fetch_add(1, Ordering::Relaxed), o.text_bytes)).collect();
-                    let (ready, written, per_second, stop, inflight, drained, failures) = (ready.clone(), written.clone(), per_second.clone(), stop.clone(), inflight.clone(), drained.clone(), failures.clone());
+                    let session = rng.below(if o.disjoint {
+                        o.sessions / 2
+                    } else {
+                        o.sessions
+                    });
+                    let batch: Vec<Event> = (0..o.batch.max(1))
+                        .map(|_| {
+                            event(
+                                &mut rng,
+                                session,
+                                seqs[session].fetch_add(1, Ordering::Relaxed),
+                                o.text_bytes,
+                            )
+                        })
+                        .collect();
+                    let (ready, written, per_second, stop, inflight, drained, failures) = (
+                        ready.clone(),
+                        written.clone(),
+                        per_second.clone(),
+                        stop.clone(),
+                        inflight.clone(),
+                        drained.clone(),
+                        failures.clone(),
+                    );
                     inflight.fetch_add(1, Ordering::Relaxed);
                     driver.write(
                         batch,
@@ -744,11 +938,15 @@ fn main() -> anyhow::Result<()> {
                             }
                             // From when the writer was due: its wait for a submitter and for room
                             // counts, as a client's would.
-                            let us = u64::try_from(now.saturating_duration_since(due).as_micros()).unwrap_or(u64::MAX);
+                            let us = u64::try_from(now.saturating_duration_since(due).as_micros())
+                                .unwrap_or(u64::MAX);
                             if now >= count_from {
                                 written.record(us);
                             }
-                            if let Some((n, most)) = per_second.get(usize::try_from(now.saturating_duration_since(mixed).as_secs()).unwrap_or(usize::MAX)) {
+                            if let Some((n, most)) = per_second.get(
+                                usize::try_from(now.saturating_duration_since(mixed).as_secs())
+                                    .unwrap_or(usize::MAX),
+                            ) {
                                 n.fetch_add(1, Ordering::Relaxed);
                                 most.fetch_max(us, Ordering::Relaxed);
                             }
@@ -759,7 +957,9 @@ fn main() -> anyhow::Result<()> {
                                 ready.push(interval.map_or(now, |i| (due + i).max(now)), w);
                             } else if last {
                                 let (lock, answered) = &*drained;
-                                let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let _held = lock
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 answered.notify_all();
                             }
                         }),
@@ -775,7 +975,14 @@ fn main() -> anyhow::Result<()> {
                 let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ (r as u64 + 1));
                 let mut lat = Hist::new();
                 while !stop.stopped() {
-                    let session = format!("s-{:06}", if o.disjoint { o.sessions / 2 + rng.below(o.sessions - o.sessions / 2) } else { rng.below(o.sessions) });
+                    let session = format!(
+                        "s-{:06}",
+                        if o.disjoint {
+                            o.sessions / 2 + rng.below(o.sessions - o.sessions / 2)
+                        } else {
+                            rng.below(o.sessions)
+                        }
+                    );
                     let t = Instant::now();
                     driver.history(&session, 50)?;
                     lat.record(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
@@ -787,11 +994,15 @@ fn main() -> anyhow::Result<()> {
         stop.stop();
         ready.wake.notify_all();
         for h in subs {
-            h.join().map_err(|_| anyhow::anyhow!("a submitter panicked"))??;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a submitter panicked"))??;
         }
         let mut reads = Hist::new();
         for h in rs {
-            reads.merge(&h.join().map_err(|_| anyhow::anyhow!("a reader panicked"))??);
+            reads.merge(
+                &h.join()
+                    .map_err(|_| anyhow::anyhow!("a reader panicked"))??,
+            );
         }
         Ok(reads)
     })?;
@@ -799,8 +1010,14 @@ fn main() -> anyhow::Result<()> {
     // last answer wakes this wait.
     {
         let (lock, answered) = &*drained;
-        let held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(answered.wait_timeout_while(held, Duration::from_secs(60), |_| inflight.load(Ordering::SeqCst) > 0));
+        let held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            answered.wait_timeout_while(held, Duration::from_secs(60), |_| {
+                inflight.load(Ordering::SeqCst) > 0
+            }),
+        );
     }
     let unanswered = inflight.load(Ordering::SeqCst);
     let _ = sampler.join();
@@ -833,14 +1050,23 @@ fn main() -> anyhow::Result<()> {
         for (session, written) in seqs.iter().enumerate() {
             let session = format!("s-{session:06}");
             let ids = driver.page(&session, 50)?;
-            writeln!(out, "{}", serde_json::json!({ "session": session, "written": written.load(Ordering::Relaxed), "ids": ids }))?;
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({ "session": session, "written": written.load(Ordering::Relaxed), "ids": ids })
+            )?;
         }
         out.flush()?;
     }
 
     let events_written = writes.n as usize * o.batch.max(1);
     // Throughput over the seconds counted (after the warmup, before the stop).
-    let counted: u64 = per_second.iter().skip(usize::try_from(o.warmup).unwrap_or(0)).take(usize::try_from(o.seconds.saturating_sub(o.warmup)).unwrap_or(0)).map(|(n, _)| n.load(Ordering::Relaxed)).sum();
+    let counted: u64 = per_second
+        .iter()
+        .skip(usize::try_from(o.warmup).unwrap_or(0))
+        .take(usize::try_from(o.seconds.saturating_sub(o.warmup)).unwrap_or(0))
+        .map(|(n, _)| n.load(Ordering::Relaxed))
+        .sum();
     let counted_s = o.seconds.saturating_sub(o.warmup).max(1) as f64;
     let report = serde_json::json!({
         "target": o.target,
@@ -893,7 +1119,10 @@ pub struct Profiler;
 /// Samples every thread 997 times a second until the profiler is dropped.
 #[cfg(unix)]
 pub fn profile_start() -> anyhow::Result<Profiler> {
-    Ok(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?)
+    Ok(pprof::ProfilerGuardBuilder::default()
+        .frequency(997)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()?)
 }
 
 #[cfg(not(unix))]
@@ -924,7 +1153,11 @@ pub fn write_profile(prefix: &str, guard: &Profiler) -> anyhow::Result<()> {
             }
             let count = usize::try_from(*count).unwrap_or(0);
             total += count;
-            let names: Vec<String> = frames.frames.iter().map(|f| f.iter().map(|s| s.name()).next().unwrap_or_default()).collect();
+            let names: Vec<String> = frames
+                .frames
+                .iter()
+                .map(|f| f.iter().map(|s| s.name()).next().unwrap_or_default())
+                .collect();
             if let Some(first) = names.first() {
                 *leaf.entry(first.clone()).or_default() += count;
             }
@@ -938,19 +1171,28 @@ pub fn write_profile(prefix: &str, guard: &Profiler) -> anyhow::Result<()> {
         (leaf, any, total)
     };
     for (frames, count) in &report.data {
-        *threads.entry(frames.thread_name.clone()).or_default() += usize::try_from(*count).unwrap_or(0);
+        *threads.entry(frames.thread_name.clone()).or_default() +=
+            usize::try_from(*count).unwrap_or(0);
     }
     let top = |m: Counts, total: usize, n: usize| {
         let mut v: Vec<(String, usize)> = m.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
-        v.into_iter().take(n).map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64)).collect::<Vec<_>>().join("\n")
+        v.into_iter()
+            .take(n)
+            .map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     let mut out = String::new();
     let all: usize = threads.values().sum();
     out.push_str(&format!("== threads ==\n{}\n\n", top(threads, all, 40)));
     for (title, only) in [("writer", Some("amphora-writer")), ("all", None)] {
         let (leaf, any, total) = tally(only);
-        out.push_str(&format!("== {title}: samples {total}, by leaf ==\n{}\n\n== {title}: inclusive ==\n{}\n\n", top(leaf, total, 60), top(any, total, 150)));
+        out.push_str(&format!(
+            "== {title}: samples {total}, by leaf ==\n{}\n\n== {title}: inclusive ==\n{}\n\n",
+            top(leaf, total, 60),
+            top(any, total, 150)
+        ));
     }
     std::fs::write(format!("{prefix}.txt"), out)?;
     // Every stack, root first, inlined frames each their own, for any tally after the run.
@@ -960,7 +1202,11 @@ pub fn write_profile(prefix: &str, guard: &Profiler) -> anyhow::Result<()> {
         for f in frames.frames.iter().rev() {
             names.extend(f.iter().rev().map(|s| s.name()));
         }
-        folded.push_str(&format!("{};{} {count}\n", frames.thread_name, names.join(";")));
+        folded.push_str(&format!(
+            "{};{} {count}\n",
+            frames.thread_name,
+            names.join(";")
+        ));
     }
     std::fs::write(format!("{prefix}.folded"), folded)?;
     Ok(())

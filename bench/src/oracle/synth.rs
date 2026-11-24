@@ -65,8 +65,19 @@ impl E {
             // a space after every unary operator: `- -1` stays an expression, `--1` would be a comment
             E::Un(op, a) => format!("({op} {})", a.sql()),
             E::Bin(op, a, b) => format!("({} {op} {})", a.sql(), b.sql()),
-            E::Fn(f, args) => format!("{f}({})", args.iter().map(E::sql).collect::<Vec<_>>().join(", ")),
-            E::Agg(f, distinct, args) => format!("{f}({}{})", if *distinct { "DISTINCT " } else { "" }, if args.is_empty() { "*".into() } else { args.iter().map(E::sql).collect::<Vec<_>>().join(", ") }),
+            E::Fn(f, args) => format!(
+                "{f}({})",
+                args.iter().map(E::sql).collect::<Vec<_>>().join(", ")
+            ),
+            E::Agg(f, distinct, args) => format!(
+                "{f}({}{})",
+                if *distinct { "DISTINCT " } else { "" },
+                if args.is_empty() {
+                    "*".into()
+                } else {
+                    args.iter().map(E::sql).collect::<Vec<_>>().join(", ")
+                }
+            ),
             E::Case(base, whens, els) => {
                 let mut s = String::from("(CASE");
                 if let Some(b) = base {
@@ -84,12 +95,30 @@ impl E {
             }
             E::Cast(a, t) => format!("CAST({} AS {t})", a.sql()),
             E::Collate(a, c) => format!("({} COLLATE {c})", a.sql()),
-            E::In(a, list, not) => format!("({} {}IN ({}))", a.sql(), if *not { "NOT " } else { "" }, list.iter().map(E::sql).collect::<Vec<_>>().join(", ")),
-            E::Between(a, lo, hi, not) => format!("({} {}BETWEEN {} AND {})", a.sql(), if *not { "NOT " } else { "" }, lo.sql(), hi.sql()),
+            E::In(a, list, not) => format!(
+                "({} {}IN ({}))",
+                a.sql(),
+                if *not { "NOT " } else { "" },
+                list.iter().map(E::sql).collect::<Vec<_>>().join(", ")
+            ),
+            E::Between(a, lo, hi, not) => format!(
+                "({} {}BETWEEN {} AND {})",
+                a.sql(),
+                if *not { "NOT " } else { "" },
+                lo.sql(),
+                hi.sql()
+            ),
             E::Null(a, not) => format!("({} {})", a.sql(), if *not { "NOTNULL" } else { "ISNULL" }),
-            E::Exists(s, not) => format!("({}EXISTS ({}))", if *not { "NOT " } else { "" }, s.sql()),
+            E::Exists(s, not) => {
+                format!("({}EXISTS ({}))", if *not { "NOT " } else { "" }, s.sql())
+            }
             E::Scalar(s) => format!("({})", s.sql()),
-            E::InSel(a, s, not) => format!("({} {}IN ({}))", a.sql(), if *not { "NOT " } else { "" }, s.sql()),
+            E::InSel(a, s, not) => format!(
+                "({} {}IN ({}))",
+                a.sql(),
+                if *not { "NOT " } else { "" },
+                s.sql()
+            ),
         }
     }
 
@@ -111,7 +140,9 @@ impl E {
     pub fn children(&self) -> Vec<&E> {
         match self {
             E::Col(..) | E::Lit(_) | E::Exists(..) | E::Scalar(_) => vec![],
-            E::Un(_, a) | E::Cast(a, _) | E::Collate(a, _) | E::Null(a, _) | E::InSel(a, _, _) => vec![a],
+            E::Un(_, a) | E::Cast(a, _) | E::Collate(a, _) | E::Null(a, _) | E::InSel(a, _, _) => {
+                vec![a]
+            }
             E::Bin(_, a, b) => vec![a, b],
             E::Fn(_, args) | E::Agg(_, _, args) => args.iter().collect(),
             E::Case(base, whens, els) => {
@@ -131,7 +162,9 @@ impl E {
     pub fn children_mut(&mut self) -> Vec<&mut E> {
         match self {
             E::Col(..) | E::Lit(_) | E::Exists(..) | E::Scalar(_) => vec![],
-            E::Un(_, a) | E::Cast(a, _) | E::Collate(a, _) | E::Null(a, _) | E::InSel(a, _, _) => vec![a],
+            E::Un(_, a) | E::Cast(a, _) | E::Collate(a, _) | E::Null(a, _) | E::InSel(a, _, _) => {
+                vec![a]
+            }
             E::Bin(_, a, b) => vec![a, b],
             E::Fn(_, args) | E::Agg(_, _, args) => args.iter_mut().collect(),
             E::Case(base, whens, els) => {
@@ -210,11 +243,15 @@ impl Sel {
                 E::Col(alias, _) => !inside || outer.contains(&alias.as_str()),
                 E::Exists(q, _) | E::Scalar(q) => sel_bare(q, grouped, outer),
                 E::InSel(a, q, _) => bare(a, grouped, outer, inside) || sel_bare(q, grouped, outer),
-                _ => e.children().into_iter().any(|c| bare(c, grouped, outer, inside)),
+                _ => e
+                    .children()
+                    .into_iter()
+                    .any(|c| bare(c, grouped, outer, inside)),
             }
         }
         fn sel_bare(q: &Sel, grouped: &[String], outer: &[&str]) -> bool {
-            q.cols.iter()
+            q.cols
+                .iter()
                 .chain(q.from.iter().filter_map(|f| f.on.as_ref()))
                 .chain(q.wh.iter())
                 .chain(q.group.iter())
@@ -222,7 +259,12 @@ impl Sel {
                 .chain(q.order.iter().map(|(e, _)| e))
                 .any(|e| bare(e, grouped, outer, true))
         }
-        !self.cols.iter().chain(self.having.iter()).chain(self.order.iter().map(|(e, _)| e)).any(|e| bare(e, &grouped, &outer, false))
+        !self
+            .cols
+            .iter()
+            .chain(self.having.iter())
+            .chain(self.order.iter().map(|(e, _)| e))
+            .any(|e| bare(e, &grouped, &outer, false))
     }
 
     pub fn sql(&self) -> String {
@@ -261,13 +303,23 @@ impl Sel {
             s.push_str(&format!(" WHERE {}", w.sql()));
         }
         if !self.group.is_empty() {
-            s.push_str(&format!(" GROUP BY {}", self.group.iter().map(E::sql).collect::<Vec<_>>().join(", ")));
+            s.push_str(&format!(
+                " GROUP BY {}",
+                self.group.iter().map(E::sql).collect::<Vec<_>>().join(", ")
+            ));
         }
         if let Some(h) = &self.having {
             s.push_str(&format!(" HAVING {}", h.sql()));
         }
         if !self.order.is_empty() {
-            s.push_str(&format!(" ORDER BY {}", self.order.iter().map(|(e, d)| format!("{}{}", e.sql(), if *d { " DESC" } else { "" })).collect::<Vec<_>>().join(", ")));
+            s.push_str(&format!(
+                " ORDER BY {}",
+                self.order
+                    .iter()
+                    .map(|(e, d)| format!("{}{}", e.sql(), if *d { " DESC" } else { "" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if let Some((l, o)) = self.limit {
             s.push_str(&format!(" LIMIT {l} OFFSET {o}"));
@@ -317,19 +369,56 @@ pub struct Func {
 /// Functions whose answer isn't the same each call, reads the connection's state, or depends on the
 /// order rows arrive in (concatenating aggregates without an ORDER BY of their own): no oracle can
 /// compare them. The date functions stay: given arguments (never none, which is now) they're fixed.
-const UNSTABLE: &[&str] = &["random", "randomblob", "changes", "total_changes", "last_insert_rowid", "sqlite_offset", "load_extension", "sqlite_compileoption_get", "sqlite_compileoption_used", "sqlite_source_id", "sqlite_version", "group_concat", "string_agg", "json_group_array", "json_group_object", "jsonb_group_array", "jsonb_group_object"];
+const UNSTABLE: &[&str] = &[
+    "random",
+    "randomblob",
+    "changes",
+    "total_changes",
+    "last_insert_rowid",
+    "sqlite_offset",
+    "load_extension",
+    "sqlite_compileoption_get",
+    "sqlite_compileoption_used",
+    "sqlite_source_id",
+    "sqlite_version",
+    "group_concat",
+    "string_agg",
+    "json_group_array",
+    "json_group_object",
+    "jsonb_group_array",
+    "jsonb_group_object",
+];
 
 /// The inventory's functions with the arities SQLite gives them (pragma_function_list), the ones
 /// whose answers aren't stable left out.
-pub fn functions(features: &serde_json::Value, sqlite: &mut super::engines::Sqlite) -> anyhow::Result<Vec<Func>> {
+pub fn functions(
+    features: &serde_json::Value,
+    sqlite: &mut super::engines::Sqlite,
+) -> anyhow::Result<Vec<Func>> {
     use super::engines::Engine;
-    let names: std::collections::HashSet<String> = features["features"].as_array().into_iter().flatten()
-        .filter(|f| f["kind"].as_str().is_some_and(|k| k.starts_with("function.") && k != "function.window"))
-        .filter_map(|f| f["name"].as_str().map(str::to_owned)).collect();
+    let names: std::collections::HashSet<String> = features["features"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| {
+            f["kind"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("function.") && k != "function.window")
+        })
+        .filter_map(|f| f["name"].as_str().map(str::to_owned))
+        .collect();
     let mut by: std::collections::BTreeMap<String, Func> = std::collections::BTreeMap::new();
-    let mut windows: std::collections::BTreeMap<String, Vec<i32>> = std::collections::BTreeMap::new();
-    for row in sqlite.run("SELECT name, type, narg FROM pragma_function_list").map_err(|e| anyhow::anyhow!(e))? {
-        let (Some(V::Text(name)), Some(V::Text(kind)), Some(V::Int(narg))) = (row.first(), row.get(1), row.get(2)) else { continue };
+    let mut windows: std::collections::BTreeMap<String, Vec<i32>> =
+        std::collections::BTreeMap::new();
+    for row in sqlite
+        .run("SELECT name, type, narg FROM pragma_function_list")
+        .map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (Some(V::Text(name)), Some(V::Text(kind)), Some(V::Int(narg))) =
+            (row.first(), row.get(1), row.get(2))
+        else {
+            continue;
+        };
         if !names.contains(name) || UNSTABLE.contains(&name.as_str()) {
             continue;
         }
@@ -338,7 +427,12 @@ pub fn functions(features: &serde_json::Value, sqlite: &mut super::engines::Sqli
             windows.entry(name.clone()).or_default().push(narg);
             continue;
         }
-        let f = by.entry(name.clone()).or_insert(Func { name: name.clone(), nargs: vec![], aggregate: kind == "a", agg_nargs: vec![] });
+        let f = by.entry(name.clone()).or_insert(Func {
+            name: name.clone(),
+            nargs: vec![],
+            aggregate: kind == "a",
+            agg_nargs: vec![],
+        });
         if !f.nargs.contains(&narg) {
             f.nargs.push(narg);
         }
@@ -349,7 +443,19 @@ pub fn functions(features: &serde_json::Value, sqlite: &mut super::engines::Sqli
     Ok(by.into_values().collect())
 }
 
-const DECLS: &[&str] = &["INTEGER", "INT", "TEXT", "VARCHAR(10)", "REAL", "DOUBLE", "NUMERIC", "DECIMAL(10,2)", "BLOB", "", "BOOLEAN"];
+const DECLS: &[&str] = &[
+    "INTEGER",
+    "INT",
+    "TEXT",
+    "VARCHAR(10)",
+    "REAL",
+    "DOUBLE",
+    "NUMERIC",
+    "DECIMAL(10,2)",
+    "BLOB",
+    "",
+    "BOOLEAN",
+];
 const COLLATIONS: &[&str] = &["BINARY", "NOCASE", "RTRIM"];
 
 /// Values of every storage class and their edges: what affinity, comparison and collation decide.
@@ -358,10 +464,39 @@ const COLLATIONS: &[&str] = &["BINARY", "NOCASE", "RTRIM"];
 pub fn literal(r: &mut Rng) -> V {
     match r.below(10) {
         0 => V::Null,
-        1..=3 => V::Int(*r.pick(&[0, 1, -1, 2, 3, 7, 10, 100, -100, 255, i64::MAX, i64::MIN, 9_007_199_254_740_993])),
+        1..=3 => V::Int(*r.pick(&[
+            0,
+            1,
+            -1,
+            2,
+            3,
+            7,
+            10,
+            100,
+            -100,
+            255,
+            i64::MAX,
+            i64::MIN,
+            9_007_199_254_740_993,
+        ])),
         4 | 5 => V::Real(*r.pick(&[0.0, 0.5, 1.5, -2.5, 3.0, 1e15, 1e308, -1e-308, 2.0, 0.1])),
-        6..=8 => V::Text(r.pick(&["", " ", "a", "A", "abc", "ABC", "0", "1", "1.5", "10", "-1", "a ", " a", "%", "_", "true", "1e3", "x", "é", "0x10"]).to_string()),
-        _ => V::Blob(r.pick(&[&[][..], &[0u8][..], &[0x41][..], &[0xc3, 0xbf][..], &[1, 2][..]]).to_vec()),
+        6..=8 => V::Text(
+            r.pick(&[
+                "", " ", "a", "A", "abc", "ABC", "0", "1", "1.5", "10", "-1", "a ", " a", "%", "_",
+                "true", "1e3", "x", "é", "0x10",
+            ])
+            .to_string(),
+        ),
+        _ => V::Blob(
+            r.pick(&[
+                &[][..],
+                &[0u8][..],
+                &[0x41][..],
+                &[0xc3, 0xbf][..],
+                &[1, 2][..],
+            ])
+            .to_vec(),
+        ),
     }
 }
 
@@ -376,7 +511,15 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
         let mut defs = Vec::new();
         let pk = r.below(ncols + 2);
         for c in 0..ncols {
-            let col = Col { name: format!("c{c}"), decl: *r.pick(DECLS), collate: if r.chance(0.3) { Some(*r.pick(COLLATIONS)) } else { None } };
+            let col = Col {
+                name: format!("c{c}"),
+                decl: *r.pick(DECLS),
+                collate: if r.chance(0.3) {
+                    Some(*r.pick(COLLATIONS))
+                } else {
+                    None
+                },
+            };
             let mut def = format!("{} {}", col.name, col.decl);
             if let Some(co) = col.collate {
                 def.push_str(&format!(" COLLATE {co}"));
@@ -397,14 +540,30 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
             let n = 1 + r.below(3);
             // the rowid's alias (an INTEGER PRIMARY KEY) never takes the largest rowid: a NULL after it
             // gets a rowid chosen at random, a different one in each engine
-            let alias = if pk < ncols && cols[pk].decl == "INTEGER" { Some(pk) } else { None };
+            let alias = if pk < ncols && cols[pk].decl == "INTEGER" {
+                Some(pk)
+            } else {
+                None
+            };
             let rows: Vec<String> = (0..n)
-                .map(|_| format!("({})", (0..ncols).map(|c| match literal(r) {
-                    V::Int(i64::MAX) if Some(c) == alias => V::Int(5).sql(),
-                    v => v.sql(),
-                }).collect::<Vec<_>>().join(", ")))
+                .map(|_| {
+                    format!(
+                        "({})",
+                        (0..ncols)
+                            .map(|c| match literal(r) {
+                                V::Int(i64::MAX) if Some(c) == alias => V::Int(5).sql(),
+                                v => v.sql(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
                 .collect();
-            stmts.push(format!("INSERT {}INTO {name} VALUES {}", if r.chance(0.5) { "OR IGNORE " } else { "" }, rows.join(", ")));
+            stmts.push(format!(
+                "INSERT {}INTO {name} VALUES {}",
+                if r.chance(0.5) { "OR IGNORE " } else { "" },
+                rows.join(", ")
+            ));
         }
         schema.tables.push(Table { name, cols });
     }
@@ -413,7 +572,11 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
         let mut terms = Vec::new();
         for _ in 0..1 + r.below(2.min(t.cols.len())) {
             let c = r.pick(&t.cols).name.clone();
-            let mut term = if r.chance(0.2) { format!("({c} + 1)") } else { c };
+            let mut term = if r.chance(0.2) {
+                format!("({c} + 1)")
+            } else {
+                c
+            };
             if r.chance(0.2) {
                 term.push_str(&format!(" COLLATE {}", r.pick(COLLATIONS)));
             }
@@ -423,17 +586,37 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
             terms.push(term);
         }
         let name = format!("i{i}");
-        let partial = if r.chance(0.2) { format!(" WHERE {} IS NOT NULL", r.pick(&t.cols).name) } else { String::new() };
-        stmts.push(format!("CREATE {}INDEX {name} ON {}({}){partial}", if r.chance(0.2) { "UNIQUE " } else { "" }, t.name, terms.join(", ")));
+        let partial = if r.chance(0.2) {
+            format!(" WHERE {} IS NOT NULL", r.pick(&t.cols).name)
+        } else {
+            String::new()
+        };
+        stmts.push(format!(
+            "CREATE {}INDEX {name} ON {}({}){partial}",
+            if r.chance(0.2) { "UNIQUE " } else { "" },
+            t.name,
+            terms.join(", ")
+        ));
         schema.indexes.push((name, t.name.clone()));
     }
     if r.chance(0.3) {
         let t = schema.tables[r.below(schema.tables.len())].clone();
-        stmts.push(format!("UPDATE {} SET {} = {} WHERE {} IS NOT NULL", t.name, r.pick(&t.cols).name, literal(r).sql(), r.pick(&t.cols).name));
+        stmts.push(format!(
+            "UPDATE {} SET {} = {} WHERE {} IS NOT NULL",
+            t.name,
+            r.pick(&t.cols).name,
+            literal(r).sql(),
+            r.pick(&t.cols).name
+        ));
     }
     if r.chance(0.2) {
         let t = schema.tables[r.below(schema.tables.len())].clone();
-        stmts.push(format!("DELETE FROM {} WHERE {} = {}", t.name, r.pick(&t.cols).name, literal(r).sql()));
+        stmts.push(format!(
+            "DELETE FROM {} WHERE {} = {}",
+            t.name,
+            r.pick(&t.cols).name,
+            literal(r).sql()
+        ));
     }
     if r.chance(0.3) {
         stmts.push("ANALYZE".into());
@@ -444,7 +627,20 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
 // ---------------------------------------------------------------- expressions
 
 const ARITH: &[&str] = &["+", "-", "*", "/", "%", "&", "|", "<<", ">>", "||"];
-const COMPARE: &[&str] = &["=", "==", "<>", "!=", "<", "<=", ">", ">=", "IS", "IS NOT", "IS DISTINCT FROM", "IS NOT DISTINCT FROM"];
+const COMPARE: &[&str] = &[
+    "=",
+    "==",
+    "<>",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "IS",
+    "IS NOT",
+    "IS DISTINCT FROM",
+    "IS NOT DISTINCT FROM",
+];
 const TYPES: &[&str] = &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"];
 
 /// What an expression may read: the FROM's tables (alias, table) and the functions.
@@ -475,18 +671,41 @@ impl Scope<'_> {
         }
         let d = depth - 1;
         match r.below(14) {
-            0 | 1 => E::Bin(r.pick(ARITH), Box::new(self.expr(r, d)), Box::new(self.expr(r, d))),
+            0 | 1 => E::Bin(
+                r.pick(ARITH),
+                Box::new(self.expr(r, d)),
+                Box::new(self.expr(r, d)),
+            ),
             2 => E::Un(r.pick(&["-", "+", "~"]), Box::new(self.expr(r, d))),
             3..=5 => self.call(r, d),
             6 => E::Case(
-                if r.chance(0.3) { Some(Box::new(self.expr(r, d))) } else { None },
-                (0..1 + r.below(2)).map(|_| (self.pred(r, d), self.expr(r, d))).collect(),
-                if r.chance(0.7) { Some(Box::new(self.expr(r, d))) } else { None },
+                if r.chance(0.3) {
+                    Some(Box::new(self.expr(r, d)))
+                } else {
+                    None
+                },
+                (0..1 + r.below(2))
+                    .map(|_| (self.pred(r, d), self.expr(r, d)))
+                    .collect(),
+                if r.chance(0.7) {
+                    Some(Box::new(self.expr(r, d)))
+                } else {
+                    None
+                },
             ),
             7 => E::Cast(Box::new(self.expr(r, d)), r.pick(TYPES)),
             8 => E::Collate(Box::new(self.expr(r, d)), r.pick(COLLATIONS)),
             9 if self.aggs => self.aggregate(r, d),
-            10 => E::Fn("json_extract".into(), vec![E::Lit(V::Text(r.pick(&["{\"a\":1,\"b\":[2,3]}", "[1,2,3]", "{\"a\":null}", "\"x\""]).to_string())), E::Lit(V::Text(r.pick(&["$.a", "$.b[1]", "$[0]", "$"]).to_string()))]),
+            10 => E::Fn(
+                "json_extract".into(),
+                vec![
+                    E::Lit(V::Text(
+                        r.pick(&["{\"a\":1,\"b\":[2,3]}", "[1,2,3]", "{\"a\":null}", "\"x\""])
+                            .to_string(),
+                    )),
+                    E::Lit(V::Text(r.pick(&["$.a", "$.b[1]", "$[0]", "$"]).to_string())),
+                ],
+            ),
             _ => self.pred(r, d),
         }
     }
@@ -502,7 +721,11 @@ impl Scope<'_> {
             n if n < -1 => (n.unsigned_abs() - 2) as usize + r.below(3),
             n => n.max(0) as usize,
         };
-        let n = if f.agg_nargs.contains(&(n as i32)) { n + 1 } else { n };
+        let n = if f.agg_nargs.contains(&(n as i32)) {
+            n + 1
+        } else {
+            n
+        };
         let mut args: Vec<E> = (0..n).map(|_| self.expr(r, d)).collect();
         // likelihood's second argument is a REAL literal from 0.0 to 1.0, or SQLite refuses the call
         if f.name == "likelihood" {
@@ -529,22 +752,59 @@ impl Scope<'_> {
             n => n.max(1) as usize,
         };
         // an aggregate's own arguments read rows, not aggregates
-        let inner = Scope { schema: self.schema, tables: self.tables.clone(), funcs: self.funcs, aggs: false };
-        E::Agg(f.name.clone(), n == 1 && r.chance(0.2), (0..n).map(|i| if i == 0 { inner.expr(r, d) } else { E::Lit(literal(r)) }).collect())
+        let inner = Scope {
+            schema: self.schema,
+            tables: self.tables.clone(),
+            funcs: self.funcs,
+            aggs: false,
+        };
+        E::Agg(
+            f.name.clone(),
+            n == 1 && r.chance(0.2),
+            (0..n)
+                .map(|i| {
+                    if i == 0 {
+                        inner.expr(r, d)
+                    } else {
+                        E::Lit(literal(r))
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// A predicate: what WHERE, ON, HAVING and CASE WHEN read the truth of.
     pub fn pred(&self, r: &mut Rng, depth: u32) -> E {
         let d = depth.saturating_sub(1);
         match r.below(12) {
-            0..=3 => E::Bin(r.pick(COMPARE), Box::new(self.expr(r, d)), Box::new(self.expr(r, d))),
+            0..=3 => E::Bin(
+                r.pick(COMPARE),
+                Box::new(self.expr(r, d)),
+                Box::new(self.expr(r, d)),
+            ),
             4 if depth > 0 => E::Bin("AND", Box::new(self.pred(r, d)), Box::new(self.pred(r, d))),
             5 if depth > 0 => E::Bin("OR", Box::new(self.pred(r, d)), Box::new(self.pred(r, d))),
             6 => E::Un("NOT", Box::new(self.pred(r, d))),
-            7 => E::In(Box::new(self.expr(r, d)), (0..1 + r.below(3)).map(|_| self.expr(r, d)).collect(), r.chance(0.3)),
-            8 => E::Between(Box::new(self.expr(r, d)), Box::new(self.expr(r, d)), Box::new(self.expr(r, d)), r.chance(0.3)),
+            7 => E::In(
+                Box::new(self.expr(r, d)),
+                (0..1 + r.below(3)).map(|_| self.expr(r, d)).collect(),
+                r.chance(0.3),
+            ),
+            8 => E::Between(
+                Box::new(self.expr(r, d)),
+                Box::new(self.expr(r, d)),
+                Box::new(self.expr(r, d)),
+                r.chance(0.3),
+            ),
             9 => E::Null(Box::new(self.expr(r, d)), r.chance(0.5)),
-            10 => E::Bin(r.pick(&["LIKE", "NOT LIKE", "GLOB", "NOT GLOB"]), Box::new(self.expr(r, d)), Box::new(E::Lit(V::Text(r.pick(&["a%", "%a", "_", "%", "A%", "a*", "*", "[a-z]*", "abc"]).to_string())))),
+            10 => E::Bin(
+                r.pick(&["LIKE", "NOT LIKE", "GLOB", "NOT GLOB"]),
+                Box::new(self.expr(r, d)),
+                Box::new(E::Lit(V::Text(
+                    r.pick(&["a%", "%a", "_", "%", "A%", "a*", "*", "[a-z]*", "abc"])
+                        .to_string(),
+                ))),
+            ),
             _ if depth > 0 && !self.schema.tables.is_empty() => self.subquery(r, d),
             _ => self.expr(r, d),
         }
@@ -558,12 +818,27 @@ impl Scope<'_> {
         if r.chance(0.5) {
             tables.extend(self.tables.iter().cloned());
         }
-        let inner = Scope { schema: self.schema, tables, funcs: self.funcs, aggs: false };
+        let inner = Scope {
+            schema: self.schema,
+            tables,
+            funcs: self.funcs,
+            aggs: false,
+        };
         let sel = |cols: Vec<E>, r: &mut Rng| Sel {
             distinct: false,
             cols,
-            from: vec![From { table: t.name.clone(), alias: alias.clone(), join: Join::First, on: None, hint: Hint::None }],
-            wh: if r.chance(0.8) { Some(inner.pred(r, d)) } else { None },
+            from: vec![From {
+                table: t.name.clone(),
+                alias: alias.clone(),
+                join: Join::First,
+                on: None,
+                hint: Hint::None,
+            }],
+            wh: if r.chance(0.8) {
+                Some(inner.pred(r, d))
+            } else {
+                None
+            },
             group: vec![],
             having: None,
             order: vec![],
@@ -572,8 +847,19 @@ impl Scope<'_> {
         let col = E::Col(alias.clone(), r.pick(&t.cols).name.clone());
         match r.below(3) {
             0 => E::Exists(Box::new(sel(vec![E::Lit(V::Int(1))], r)), r.chance(0.3)),
-            1 => E::InSel(Box::new(self.expr(r, d)), Box::new(sel(vec![col], r)), r.chance(0.3)),
-            _ => E::Scalar(Box::new(sel(vec![E::Agg(r.pick(&["count", "max", "min", "sum"]).to_string(), false, vec![col])], r))),
+            1 => E::InSel(
+                Box::new(self.expr(r, d)),
+                Box::new(sel(vec![col], r)),
+                r.chance(0.3),
+            ),
+            _ => E::Scalar(Box::new(sel(
+                vec![E::Agg(
+                    r.pick(&["count", "max", "min", "sum"]).to_string(),
+                    false,
+                    vec![col],
+                )],
+                r,
+            ))),
         }
     }
 }
@@ -586,22 +872,55 @@ pub fn from(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Vec<From> {
         let t = r.pick(&schema.tables).name.clone();
         let alias = format!("a{i}");
         scope.push((alias.clone(), t.clone()));
-        let join = if i == 0 { Join::First } else { r.pick(&[Join::Inner, Join::Inner, Join::Left, Join::Left, Join::Right, Join::Full, Join::Cross, Join::Comma]).clone() };
+        let join = if i == 0 {
+            Join::First
+        } else {
+            r.pick(&[
+                Join::Inner,
+                Join::Inner,
+                Join::Left,
+                Join::Left,
+                Join::Right,
+                Join::Full,
+                Join::Cross,
+                Join::Comma,
+            ])
+            .clone()
+        };
         let on = match join {
             Join::Inner | Join::Left | Join::Right | Join::Full if r.chance(0.9) => {
-                let s = Scope { schema, tables: scope.clone(), funcs, aggs: false };
+                let s = Scope {
+                    schema,
+                    tables: scope.clone(),
+                    funcs,
+                    aggs: false,
+                };
                 Some(s.pred(r, 2))
             }
             _ => None,
         };
-        items.push(From { table: t, alias, join, on, hint: Hint::None });
+        items.push(From {
+            table: t,
+            alias,
+            join,
+            on,
+            hint: Hint::None,
+        });
     }
     items
 }
 
 /// The scope a FROM gives its query's expressions.
 pub fn scope<'a>(schema: &'a Schema, from: &[From], funcs: &'a [Func], aggs: bool) -> Scope<'a> {
-    Scope { schema, tables: from.iter().map(|f| (f.alias.clone(), f.table.clone())).collect(), funcs, aggs }
+    Scope {
+        schema,
+        tables: from
+            .iter()
+            .map(|f| (f.alias.clone(), f.table.clone()))
+            .collect(),
+        funcs,
+        aggs,
+    }
 }
 
 /// A plain query: columns of the FROM, a WHERE, no grouping; what TLP, NoREC, DQP, EET and CERT
@@ -610,8 +929,21 @@ pub fn plain(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     let from = from(r, schema, funcs);
     let s = scope(schema, &from, funcs, false);
     let cols = (0..1 + r.below(3)).map(|_| s.expr(r, 2)).collect();
-    let wh = if r.chance(0.7) { Some(s.pred(r, 3)) } else { None };
-    Sel { distinct: r.chance(0.1), cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
+    let wh = if r.chance(0.7) {
+        Some(s.pred(r, 3))
+    } else {
+        None
+    };
+    Sel {
+        distinct: r.chance(0.1),
+        cols,
+        from,
+        wh,
+        group: vec![],
+        having: None,
+        order: vec![],
+        limit: None,
+    }
 }
 
 /// An inner join of two to four tables (a table may come twice), each joined by JOIN with an ON
@@ -623,14 +955,47 @@ pub fn inner_join(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         let t = r.pick(&schema.tables).name.clone();
         let alias = format!("a{i}");
         tables.push((alias.clone(), t.clone()));
-        let join = if i == 0 { Join::First } else if r.chance(0.7) { Join::Inner } else { Join::Comma };
-        let on = (join == Join::Inner && r.chance(0.9)).then(|| Scope { schema, tables: tables.clone(), funcs, aggs: false }.pred(r, 2));
-        from.push(From { table: t, alias, join, on, hint: Hint::None });
+        let join = if i == 0 {
+            Join::First
+        } else if r.chance(0.7) {
+            Join::Inner
+        } else {
+            Join::Comma
+        };
+        let on = (join == Join::Inner && r.chance(0.9)).then(|| {
+            Scope {
+                schema,
+                tables: tables.clone(),
+                funcs,
+                aggs: false,
+            }
+            .pred(r, 2)
+        });
+        from.push(From {
+            table: t,
+            alias,
+            join,
+            on,
+            hint: Hint::None,
+        });
     }
     let s = scope(schema, &from, funcs, false);
     let cols = (0..1 + r.below(3)).map(|_| s.expr(r, 2)).collect();
-    let wh = if r.chance(0.8) { Some(s.pred(r, 3)) } else { None };
-    Sel { distinct: false, cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
+    let wh = if r.chance(0.8) {
+        Some(s.pred(r, 3))
+    } else {
+        None
+    };
+    Sel {
+        distinct: false,
+        cols,
+        from,
+        wh,
+        group: vec![],
+        having: None,
+        order: vec![],
+        limit: None,
+    }
 }
 
 /// Whether SQLite reads `e` as a result column's number in GROUP BY or ORDER BY: an integer
@@ -651,7 +1016,16 @@ pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         // GROUP BY's terms read rows, not aggregates, and an integer there is a column's number
         // to SQLite, so one is cast: the same value, read as a value
         let rows = scope(schema, &q.from, funcs, false);
-        q.group = (0..1 + r.below(2)).map(|_| rows.expr(r, 1)).map(|e| if column_number(&e) { E::Cast(Box::new(e), "INTEGER") } else { e }).collect();
+        q.group = (0..1 + r.below(2))
+            .map(|_| rows.expr(r, 1))
+            .map(|e| {
+                if column_number(&e) {
+                    E::Cast(Box::new(e), "INTEGER")
+                } else {
+                    e
+                }
+            })
+            .collect();
         q.cols = q.group.clone();
         q.cols.push(s.aggregate(r, 1));
         if r.chance(0.4) {
@@ -668,7 +1042,17 @@ pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         // (an integer column, the same in every row, orders nothing, and SQLite would read it as
         // a column's number)
         let desc = r.chance(0.5);
-        q.order = q.cols.iter().filter(|c| !column_number(c)).flat_map(|c| [(E::Collate(Box::new(c.clone()), "BINARY"), desc), (E::Fn("typeof".into(), vec![c.clone()]), desc)]).collect();
+        q.order = q
+            .cols
+            .iter()
+            .filter(|c| !column_number(c))
+            .flat_map(|c| {
+                [
+                    (E::Collate(Box::new(c.clone()), "BINARY"), desc),
+                    (E::Fn("typeof".into(), vec![c.clone()]), desc),
+                ]
+            })
+            .collect();
         q.limit = Some((r.below(5) as i64, r.below(3) as i64));
     }
     q

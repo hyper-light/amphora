@@ -1867,12 +1867,16 @@ mod inproc {
         /// (Database::call_session).
         fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<Mark> {
             self.leader(g)?
-                .call_session(Instant::now() + self.deadline, AnswerMax::fixed(), move |c| {
-                    for (sql, args) in rows {
-                        c.prepare_cached(&sql)?.execute(args)?;
-                    }
-                    Ok(())
-                })
+                .call_session(
+                    Instant::now() + self.deadline,
+                    AnswerMax::fixed(),
+                    move |c| {
+                        for (sql, args) in rows {
+                            c.prepare_cached(&sql)?.execute(args)?;
+                        }
+                        Ok(())
+                    },
+                )
                 .map(|((), token)| token)
                 .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))
         }
@@ -2129,7 +2133,9 @@ mod inproc {
                             m
                         }
                     };
-                    let refused = match member.call(until, AnswerMax::fixed(), |c| Ok(c.execute_batch(EVENTS)?)) {
+                    let refused = match member
+                        .call(until, AnswerMax::fixed(), |c| Ok(c.execute_batch(EVENTS)?))
+                    {
                         Ok(()) => break,
                         Err(e) => e,
                     };
@@ -2289,7 +2295,11 @@ mod served {
                 .members
                 .get(node)
                 .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
-            Link::connect(addr, &amphora::serve::Keys::plain(secret.clone()), self.deadline)
+            Link::connect(
+                addr,
+                &amphora::serve::Keys::plain(secret.clone()),
+                self.deadline,
+            )
         }
 
         /// The node that leads, as node `via` names it.
@@ -2894,7 +2904,10 @@ pub mod sql {
                                 Instant::now() < until,
                                 "TiDB's placement wasn't scheduled within --deadline-s: {states:?}"
                             );
-                            #[expect(clippy::disallowed_methods, reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period")]
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period"
+                            )]
                             std::thread::sleep(patrol);
                         }
                     }
@@ -3201,7 +3214,10 @@ pub mod sql {
                     Instant::now() < until,
                     "Region {region}'s {what:?} operation didn't take effect within --deadline-s"
                 );
-                #[expect(clippy::disallowed_methods, reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period")]
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period"
+                )]
                 std::thread::sleep(patrol);
             }
         }
