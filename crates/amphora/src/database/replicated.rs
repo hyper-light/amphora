@@ -47,6 +47,19 @@ const READ_BARRIER: u8 = 1;
 fn reads(context: &[u8]) -> bool {
     context.get(CONTEXT_BYTES..) == Some([READ_BARRIER].as_slice())
 }
+/// Format: the byte a write's barrier context carries past the request identity, then the time
+/// left to its write's deadline as it was sent, in nanoseconds, a little-endian `u64` (CP-T1.8,
+/// lane V14). Its leader ends the write's slot by time at that end, which bounds a lost forward;
+/// before it, only the holder's forward or close, or the host's detector, ends it. A leader before
+/// it takes the barrier as a write's, as any context but a read's, and echoes it unread. The
+/// write's entry carries the request identity alone.
+const WRITE_DEADLINE: u8 = 2;
+/// The time a write's barrier `context` says its write has left ([`WRITE_DEADLINE`]), if it says.
+fn stated_deadline(context: &[u8]) -> Option<Duration> {
+    let (&mark, left) = context.get(CONTEXT_BYTES..)?.split_first()?;
+    let left: [u8; 8] = left.try_into().ok()?;
+    (mark == WRITE_DEADLINE).then(|| Duration::from_nanos(u64::from_le_bytes(left)))
+}
 /// Format: the framing a wire record adds past the command its one entry carries (QB.1, lane
 /// constants-19): the record's, the entry's fixed bytes (hyper-raft `ENTRY_FIXED_BYTES`), its
 /// context, and what a prepared transaction's encoding adds to its pages
@@ -971,6 +984,8 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // preparation waits on a slot.
     slots: super::slot::Slots<(Message, Reservation)>,
     slot_deferred: bool,
+    // The close a follower's write owes its slot's leader, by the barrier's term and leader.
+    closing: Option<(u64, u64)>,
     serial: u64,
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
     clock: Clock,
@@ -2614,6 +2629,7 @@ fn open_on<F: BlockFile + 'static>(
         waiting: waiting::Waiting::new(),
         slots,
         slot_deferred: false,
+        closing: None,
         serial: 0,
         transferred: None,
         spacing: log_bound::Spacing::default(),
@@ -3278,6 +3294,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         self.decide()?;
         self.expire();
+        self.close()?;
         self.expire_change();
         self.settle_change();
         self.settle_transfer();
@@ -3680,8 +3697,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             return;
         };
         match &pending.phase {
-            Phase::Barrier(_) => {
+            Phase::Barrier(operation) => {
                 if expired {
+                    // A follower's write barrier asked for a slot its forward would end: its
+                    // close ends it now (CP-T1.8, lane V14).
+                    if !changed_term
+                        && !self.replica.is_leader()
+                        && operation.as_ref().is_some_and(Operation::writes)
+                    {
+                        self.closing = Some((pending.term, pending.leader));
+                    }
                     if let Some(response) = pending.response.take() {
                         answer(response, Err(Refusal::Timeout));
                     }
@@ -3978,7 +4003,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     }
                 } else {
                     let context = if operation.writes() {
-                        self.context()
+                        self.write_context(until)
                     } else {
                         self.read_context()
                     };
@@ -4391,8 +4416,13 @@ impl<F: BlockFile + 'static> Actor<F> {
                     let read = if marked {
                         self.slots.pass(from, self.at, (message, reservation))
                     } else {
+                        let stated = message
+                            .entries
+                            .first()
+                            .and_then(|entry| stated_deadline(&entry.data));
                         self.slots.ask(from);
-                        self.slots.read(from, self.at, (message, reservation))
+                        self.slots
+                            .read(from, self.at, (message, reservation), stated)
                     };
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
@@ -5073,6 +5103,31 @@ impl<F: BlockFile + 'static> Actor<F> {
         context.push(READ_BARRIER);
         Ok(context)
     }
+    /// The request identity of a write ending at `until`, its barrier stating the time it has
+    /// left ([`WRITE_DEADLINE`]).
+    fn write_context(&mut self, until: Instant) -> Result<Vec<u8>, Refusal> {
+        let mut context = self.context()?;
+        let left = until.saturating_duration_since(self.at).as_nanos();
+        context.push(WRITE_DEADLINE);
+        context.extend_from_slice(&u64::try_from(left).unwrap_or(u64::MAX).to_le_bytes());
+        Ok(context)
+    }
+    /// Sends the close a follower's write owes its slot once its deadline ended it at its
+    /// barrier (`expire`), while the barrier's leader leads its term (lane P14's rule): a barrier
+    /// marked a read's, which ends the slot at that leader at once (CP-T1.8, lane V14).
+    fn close(&mut self) -> Result<(), Refusal> {
+        let Some((term, leader)) = self.closing.take() else {
+            return Ok(());
+        };
+        if term != self.replica.term()
+            || leader != self.replica.leader()
+            || self.replica.is_leader()
+        {
+            return Ok(());
+        }
+        let context = self.read_context()?;
+        self.replica.read(context).map_err(raft_error)
+    }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
         if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {
             return Ok(());
@@ -5738,6 +5793,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     } else if moved {
                         Err(not_leader(self.replica.leader()))
                     } else {
+                        pending.context.truncate(CONTEXT_BYTES);
                         match entry
                             .and_then(|stamped| self.propose_stamped(&pending.context, stamped))
                         {
@@ -19181,6 +19237,107 @@ mod tests {
             stale.iter().all(|(n, _)| *n == 0),
             "stale-base refusals: {stale:?}"
         );
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V14): a slow but live holder keeps its write slot past the
+    /// leader's election timeout, as on real time. Lane V13's r1942 found the replicated class's
+    /// last stale-base refusals were slots ended by time while their holders, answering
+    /// heartbeats, still prepared: on real time the election timeout follows the owner's pace (28
+    /// to 49 ms), while a driven round holds every clock still. Do, in each class: owner 2 leads;
+    /// member 1 writes, and its preparation moves the leader's clock two election timeouts on, as
+    /// a slow holder takes on real time; the leader's own write waits on that slot. Expect: both
+    /// writes answered Ok, neither refused for a stale base, and both rows on every replica.
+    #[test]
+    fn v14_a_slow_live_holder_keeps_its_slot_past_the_election_timeout() {
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 2, 1);
+            assert_eq!(leader, 2, "{durability:?}: owner 2 did not lead");
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let ticks = driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .config()
+                .election_tick;
+            let election = driven.period(leader) * u32::try_from(ticks).unwrap();
+            let clock = driven.clock(leader);
+            let slow = submit(&clients[0], driven.until(), move |db| {
+                clock.fetch_add(
+                    u64::try_from((2 * election).as_nanos()).unwrap(),
+                    Ordering::AcqRel,
+                );
+                db.exec("INSERT INTO events VALUES (1)")?;
+                Ok(Vec::new())
+            });
+            let mut rounds = 0;
+            while !driven.owner(leader).slots.holds() {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 1's write held no slot"
+                );
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            let own = submit(&clients[leader], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (2)")?;
+                Ok(Vec::new())
+            });
+            let mut pending = [("member 1", Some(slow)), ("the leader", Some(own))];
+            let mut answered = Vec::new();
+            while pending.iter().any(|(_, answer)| answer.is_some()) {
+                assert!(rounds < ROUNDS, "{durability:?}: unanswered, {answered:?}");
+                for (who, slot) in &mut pending {
+                    let Some(answer) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(result) => answered.push((*who, result.map(|_| ()))),
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            assert!(
+                answered.iter().all(|(_, result)| result.is_ok()),
+                "{durability:?}: {answered:?}"
+            );
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(row.get::<i64>(0)?);
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(ids, vec![1, 2], "{durability:?}: owner {owner}");
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+        }
     }
 
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
