@@ -250,10 +250,19 @@ mod tests {
     use amphora_pg_catalog::Catalog;
 
     fn open(path: &str) -> (Arc<Database>, Arc<Connection>) {
+        open_with(path, Arc::new(PostgresDialect::new()))
+    }
+
+    fn open_with(path: &str, dialect: Arc<PostgresDialect>) -> (Arc<Database>, Arc<Connection>) {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, path, Arc::new(PostgresDialect::new())).unwrap();
+        let db = Database::open_file(io, path, dialect).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         (db, conn)
+    }
+
+    /// The `pg_class` OID of the table named `name`.
+    fn oid(conn: &Arc<Connection>, name: &str) -> i64 {
+        int(field(&PG_CLASS, &class_row(conn, name), "oid"))
     }
 
     fn query(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -426,6 +435,165 @@ mod tests {
         assert!(
             third > first.max(second),
             "{third} is past every OID the reopened database holds"
+        );
+    }
+
+    /// T-PG.7.6: the OID counter is durable (section 7): a table created after a dropped table
+    /// and a reopen takes the OID after the dropped one's, never the dropped one's, as PostgreSQL
+    /// keeps `nextOid` across restarts (REL_19_0 src/backend/access/transam/xlog.c:7280).
+    #[test]
+    fn t_pg_7_6_a_dropped_tables_oid_is_not_given_again_after_a_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dropped.db");
+        let path = path.to_str().unwrap();
+        let dropped = {
+            let (_db, conn) = open(path);
+            conn.execute("CREATE TABLE gone (a int4)").unwrap();
+            let dropped = oid(&conn, "gone");
+            conn.execute("DROP TABLE gone").unwrap();
+            dropped
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE next (b int4)").unwrap();
+        let next = oid(&conn, "next");
+        assert_ne!(next, dropped, "the dropped table's OID is not given again");
+        assert_eq!(
+            next,
+            dropped + 1,
+            "the counter continues from its stored value"
+        );
+    }
+
+    /// T-PG.7.7: two CREATE TABLEs in one transaction take distinct OIDs, and the transaction
+    /// stores the counter past both: after the later table is dropped and the database reopened,
+    /// a new table takes neither.
+    #[test]
+    fn t_pg_7_7_two_creates_in_one_transaction_take_distinct_oids_stored_past_both() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("one-transaction.db");
+        let path = path.to_str().unwrap();
+        let (first, second) = {
+            let (_db, conn) = open(path);
+            conn.execute("BEGIN").unwrap();
+            conn.execute("CREATE TABLE first (a int4)").unwrap();
+            conn.execute("CREATE TABLE second (b int4)").unwrap();
+            conn.execute("COMMIT").unwrap();
+            let first = oid(&conn, "first");
+            let second = oid(&conn, "second");
+            assert_ne!(first, second, "one transaction's tables take distinct OIDs");
+            conn.execute("DROP TABLE second").unwrap();
+            (first, second)
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE third (c int4)").unwrap();
+        let third = oid(&conn, "third");
+        assert!(
+            third != first && third != second,
+            "{third} is neither {first} nor {second}"
+        );
+        assert_eq!(third, first.max(second) + 1);
+    }
+
+    /// T-PG.7.9: a rolled-back CREATE TABLE spends its OID: the counter is outside the transaction,
+    /// as PostgreSQL's `nextOid` is (varsup.c:554-613), so the next table takes the OID after it.
+    #[test]
+    fn t_pg_7_9_a_rolled_back_create_table_spends_its_oid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rolled-back.db");
+        let (_db, conn) = open(path.to_str().unwrap());
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE undone (a int4)").unwrap();
+        let undone = oid(&conn, "undone");
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("CREATE TABLE kept (a int4)").unwrap();
+        assert_eq!(oid(&conn, "kept"), undone + 1);
+    }
+
+    /// T-PG.7.8 (red run on main): past 4294967295 the counter starts again at
+    /// FirstNormalObjectId and passes over an OID a live table holds.
+    #[test]
+    fn t_pg_7_8_the_oid_counter_wraps_past_reserved_and_live_oids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wrap.db");
+        let path = path.to_str().unwrap();
+        {
+            let dialect = Arc::new(PostgresDialect::new());
+            let (_db, conn) = open_with(path, dialect.clone());
+            conn.execute("CREATE TABLE low (a int4)").unwrap();
+            assert_eq!(oid(&conn, "low"), 16384);
+            // As `pg_resetwal -o 4294967294` sets PostgreSQL's next OID.
+            dialect
+                .next_oid
+                .store(u32::MAX - 1, crate::sync::atomic::Ordering::Relaxed);
+            conn.execute("CREATE TABLE top (a int4)").unwrap();
+            conn.execute("CREATE TABLE last (a int4)").unwrap();
+            conn.execute("CREATE TABLE wrapped (a int4)").unwrap();
+            assert_eq!(oid(&conn, "top"), 4294967294);
+            assert_eq!(oid(&conn, "last"), 4294967295, "the largest OID is given");
+            assert_eq!(
+                oid(&conn, "wrapped"),
+                16385,
+                "past the wrap: not 0, nor below FirstNormalObjectId, nor low's 16384"
+            );
+        }
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE after (a int4)").unwrap();
+        assert_eq!(
+            oid(&conn, "after"),
+            16386,
+            "a reopen continues after the wrap"
+        );
+    }
+
+    /// T-PG.7.10 (red run on main).
+    #[test]
+    fn t_pg_7_10_the_counter_survives_mvcc_checkpoint_and_recovery() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's MVCC store, its log and its checkpoint",
+        ) {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mvcc.db");
+        let path = path.to_str().unwrap();
+        {
+            let (_db, conn) = open(path);
+            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            let internal = query(
+                &conn,
+                "SELECT relname FROM pg_class WHERE relname = '__turso_internal_mvcc_meta'",
+            );
+            assert!(internal.is_empty(), "pg_class shows the engine's own table");
+            conn.execute("CREATE TABLE kept (a int4)").unwrap();
+            conn.execute("CREATE TABLE gone (a int4)").unwrap();
+            assert_eq!(oid(&conn, "kept"), 16384, "the first table's OID");
+            assert_eq!(oid(&conn, "gone"), 16385);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("DROP TABLE gone").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        {
+            let (_db, conn) = open(path);
+            conn.execute("CREATE TABLE checkpointed (a int4)").unwrap();
+            assert_eq!(
+                oid(&conn, "checkpointed"),
+                16386,
+                "from the page: past gone's 16385"
+            );
+            conn.execute("DROP TABLE checkpointed").unwrap();
+            conn.close().unwrap();
+        }
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE recovered (a int4)").unwrap();
+        assert_eq!(oid(&conn, "kept"), 16384);
+        assert_eq!(
+            oid(&conn, "recovered"),
+            16387,
+            "gone took 16385 and checkpointed 16386, so neither comes back"
         );
     }
 }
