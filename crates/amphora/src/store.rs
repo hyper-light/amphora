@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::memory::Charge;
@@ -954,9 +954,6 @@ struct Readers<R> {
     /// The checkpointer: a connection of its own copying the log into the file, never in a
     /// commit's way. It goes and comes back with the readers.
     checkpointer: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
-    /// Held by each read and checkpoint as it runs, and by the writer alone while it starts the log
-    /// again.
-    gate: Arc<RwLock<()>>,
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
@@ -989,7 +986,6 @@ impl<R: Send + 'static> Readers<R> {
             returned: Condvar::new(),
             most: most.max(1),
             checkpointer: Mutex::new(None),
-            gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
             slots: match checkout {
@@ -1011,8 +1007,7 @@ impl<R: Send + 'static> Readers<R> {
         let checkpointer = match open() {
             Ok(mut reader) => {
                 let (tx, rx) = mpsc::channel::<()>();
-                let (gate, restart, meter) =
-                    (self.gate.clone(), self.restart.clone(), self.meter.clone());
+                let (restart, meter) = (self.restart.clone(), self.meter.clone());
                 let thread = std::thread::Builder::new()
                     .name("amphora-checkpoint".into())
                     .spawn(move || {
@@ -1051,7 +1046,6 @@ impl<R: Send + 'static> Readers<R> {
                             {
                                 continue;
                             }
-                            let _copying = gate.read().unwrap_or_else(PoisonError::into_inner);
                             let began = Instant::now();
                             let copied = copy(&mut reader);
                             meter.checkpointed(began.elapsed());
@@ -1117,20 +1111,15 @@ impl<R: Send + 'static> Readers<R> {
         }
     }
 
-    /// Starts the log again with `restart`, if the checkpointer asked, holding the readers and the
-    /// checkpointer back meanwhile (each finishes what it is doing first).
+    /// Starts the log again with `restart`, if the checkpointer asked: the writer's switch to the
+    /// log's free segment, which waits for no read and no pass (decision 45).
     fn restart_if_asked(&self, restart: impl FnOnce() -> anyhow::Result<bool>) {
         if !self.restart.swap(false, Ordering::Relaxed) {
             return;
         }
-        let asked = Instant::now();
-        let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
-        // Slot readers hold no gate: holding every slot holds them back.
-        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
         let began = Instant::now();
         let restarted = restart();
-        self.meter
-            .restarted(began.saturating_duration_since(asked), began.elapsed());
+        self.meter.restarted(Duration::ZERO, began.elapsed());
         match restarted {
             Ok(true) => {}
             Ok(false) => self.restart.store(true, Ordering::Relaxed),
@@ -1181,10 +1170,7 @@ impl<R: Send + 'static> Readers<R> {
                     .0;
             }
         };
-        let answer = {
-            let _reading = self.gate.read().unwrap_or_else(PoisonError::into_inner);
-            f(&mut reader)
-        };
+        let answer = f(&mut reader);
         self.give_back(Some(reader), generation);
         Some(answer)
     }
