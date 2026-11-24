@@ -579,8 +579,7 @@ impl Checker {
             _ => Path::new("."),
         };
         let pages = self.reader.pages()?.saturating_mul(PAGE_BYTES);
-        let _ = pages;
-        let mut restore = file_len(&self.source)?;
+        let mut restore = file_len(&self.source)?.max(pages);
         let mut log_headroom = 0u64;
         for segment in log_paths(&self.source) {
             restore = restore.saturating_add(file_len(&segment)?);
@@ -725,7 +724,8 @@ impl Checker {
 /// Removes a check's scratch database and its log, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
     let [first, second] = log_paths(scratch);
-    for file in [scratch, &first, &second, &suffixed(scratch, "-shm")] {
+    let _ = second;
+    for file in [scratch, &first, &suffixed(scratch, "-shm")] {
         match std::fs::remove_file(file) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
