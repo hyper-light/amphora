@@ -1,6 +1,7 @@
 use crate::sync::Arc;
+use crate::types::{IOCompletions, IOResultOr};
 use crate::util::{escape_sql_string_literal, quote_identifier};
-use crate::{Connection, LimboError, Statement, StepResult, Value};
+use crate::{Completion, Connection, IOResult, LimboError, Statement, StepResult, Value};
 use amphora_engine_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
 use amphora_engine_parser::ast::PragmaName;
 use bitflags::bitflags;
@@ -319,6 +320,7 @@ impl PragmaVirtualTable {
             pos: 0,
             conn,
             stmt: None,
+            filtering: false,
             arg: None,
             visible_column_count: self.visible_column_count,
             max_arg_count: self.max_arg_count,
@@ -385,6 +387,8 @@ pub struct PragmaVirtualTableCursor {
     pos: usize,
     conn: Arc<Connection>,
     stmt: Option<Statement>,
+    /// A filter has prepared `stmt` and waits on the I/O of its first row.
+    filtering: bool,
     arg: Option<String>,
     visible_column_count: usize,
     max_arg_count: usize,
@@ -396,18 +400,27 @@ impl PragmaVirtualTableCursor {
         self.pos as i64
     }
 
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    /// Steps the pragma's statement to its next row. What it waits on is the caller's to wait on:
+    /// only a row is a row.
+    pub(crate) fn next(&mut self) -> IOResultOr<bool> {
         let stmt = self
             .stmt
             .as_mut()
             .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
-        let result = stmt.step()?;
-        match result {
-            StepResult::Done => Ok(false),
-            _ => {
+        match stmt.step()? {
+            StepResult::Row => {
                 self.pos += 1;
-                Ok(true)
+                Ok(IOResult::Done(true))
             }
+            StepResult::Done => Ok(IOResult::Done(false)),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                let io = stmt
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                Ok(IOResult::IO(io))
+            }
+            StepResult::Interrupt => Err(LimboError::Interrupt.into()),
+            StepResult::Busy => Err(LimboError::Busy.into()),
         }
     }
 
@@ -434,7 +447,19 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
-    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
+    /// Starts the scan. A filter that waits on I/O is called again with the same arguments, and
+    /// goes on with the statement it prepared.
+    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> IOResultOr<bool> {
+        if !self.filtering {
+            self.prepare(&args)?;
+            self.filtering = true;
+        }
+        let row = self.next();
+        self.filtering = matches!(row, Ok(IOResult::IO(_)));
+        row
+    }
+
+    fn prepare(&mut self, args: &[Value]) -> crate::Result<()> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
@@ -445,7 +470,7 @@ impl PragmaVirtualTableCursor {
         }
 
         let to_text = |v: &Value| v.to_text().map(str::to_owned);
-        let (arg, schema) = match args.as_slice() {
+        let (arg, schema) = match args {
             [arg0] if self.has_pragma_arg => (to_text(arg0), None),
             [arg0] => (None, to_text(arg0)),
             [arg0, arg1] => (to_text(arg0), to_text(arg1)),
@@ -483,8 +508,7 @@ impl PragmaVirtualTableCursor {
         // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
         // The helper must stay nested so it does not disturb the parent's transaction state.
         self.stmt = Some(self.conn.prepare_internal(sql)?);
-
-        self.next()
+        Ok(())
     }
 }
 
@@ -492,6 +516,14 @@ impl PragmaVirtualTableCursor {
 mod tests {
     use super::*;
     use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
+
+    /// Whether the cursor stands on a row, which this pragma answers without waiting.
+    fn on_a_row(answer: IOResultOr<bool>) -> bool {
+        match answer.unwrap() {
+            IOResult::Done(row) => row,
+            IOResult::IO(_) => panic!("the pragma waits on I/O"),
+        }
+    }
 
     #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
@@ -510,17 +542,17 @@ mod tests {
         };
         let mut cursor = pragma_vtab.open(conn).unwrap();
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(on_a_row(
+            cursor.filter(crate::alloc::vec![Value::from_text("scan_target")])
+        ));
         assert_eq!(cursor.rowid(), 1);
-        assert!(cursor.next().unwrap());
+        assert!(on_a_row(cursor.next()));
         assert_eq!(cursor.rowid(), 2);
-        assert!(!cursor.next().unwrap());
+        assert!(!on_a_row(cursor.next()));
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(on_a_row(
+            cursor.filter(crate::alloc::vec![Value::from_text("scan_target")])
+        ));
         assert_eq!(cursor.rowid(), 1);
     }
 

@@ -8,7 +8,9 @@ use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
-use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
+use crate::translate::emitter::{
+    check_constraints_of_update, emit_check_constraints, emit_make_record, UpdateRowSource,
+};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
@@ -726,11 +728,13 @@ fn rewrite_excluded(
 /// 3. Copy CURRENT into NEW, then evaluate SET expressions into NEW,
 ///    with all references to the target table columns rewritten to read from
 ///    the CURRENT registers (per SQLite semantics).
-/// 4. Enforce NOT NULL constraints and (if STRICT) type checks on NEW.
-/// 5. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
-/// 6. Rewrite the table row payload at the same rowid with NEW.
-/// 7. Emit CDC rows and RETURNING output if requested.
-/// 8. Jump to `row_done_label`.
+/// 4. Convert NEW to its columns' types (if STRICT, check them), and run the BEFORE UPDATE
+///    triggers, which see it.
+/// 5. Enforce NOT NULL and CHECK constraints on the NEW the triggers left.
+/// 6. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
+/// 7. Rewrite the table row payload at the same rowid with NEW.
+/// 8. Emit CDC rows and RETURNING output if requested.
+/// 9. Jump to `row_done_label`.
 ///
 /// Semantics reference: https://sqlite.org/lang_upsert.html
 /// Column references in the DO UPDATE expressions refer to the original
@@ -962,14 +966,6 @@ pub fn emit_upsert(
             );
             program.target_union_type = prev_union;
             translate_result?;
-            if col.notnull() && !col.is_rowid_alias() {
-                program.emit_insn(Insn::HaltIfNull {
-                    target_reg: layout.to_register(new_start, *col_idx),
-                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    on_error: None,
-                    description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                });
-            }
             if col.is_rowid_alias() {
                 // Must be integer; remember the NEW rowid value
                 let r = program.alloc_register();
@@ -987,6 +983,31 @@ pub fn emit_upsert(
         }
         Ok(())
     })?;
+
+    let upsert_database_id = ctx.database_id;
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    let table_btree = table.btree();
+    let before_update_triggers = match table_btree.as_deref() {
+        Some(btree) => get_triggers_including_temp(
+            resolver,
+            upsert_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_positions.clone()),
+            btree,
+        ),
+        None => Vec::new(),
+    };
+
+    // The order SQLite checks the new row in (sqlite3Update, sqlite3GenerateConstraintChecks): the
+    // types before the BEFORE UPDATE triggers, which see the values converted, then NOT NULL and
+    // CHECK on what the triggers left; NOT NULL before the types where there are no triggers.
+    if before_update_triggers.is_empty() {
+        emit_set_not_null_checks(program, table, &updated_positions, new_start, &layout);
+    }
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -1059,35 +1080,11 @@ pub fn emit_upsert(
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         }
-
-        // Evaluate CHECK constraints on the new values
-        emit_check_constraints(
-            program,
-            &bt.check_constraints,
-            resolver,
-            &bt.name,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
-                col.name
-                    .as_deref()
-                    .map(|n| (n, layout.to_register(new_start, idx)))
-            }),
-            connection,
-            ast::ResolveType::Abort,
-            ctx.loop_labels.row_done,
-            Some(table_references),
-        )?;
     }
 
     let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
-    let upsert_database_id = ctx.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
-    let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
             affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
@@ -1107,20 +1104,12 @@ pub fn emit_upsert(
         )
     });
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
-        let relevant_before_update_triggers = get_triggers_including_temp(
-            resolver,
-            upsert_database_id,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(updated_positions.clone()),
-            &btree_table,
-        );
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
             .map(|i| layout.to_register(current_start, i))
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
-        if !relevant_before_update_triggers.is_empty() {
+        if !before_update_triggers.is_empty() {
             // NEW row values are in new_start registers. At this point they are
             // encoded (post-encode for STRICT custom types). Mark new_encoded=true
             // so fire_trigger's decode_trigger_registers will decode them.
@@ -1140,7 +1129,7 @@ pub fn emit_upsert(
                 ast::ResolveType::Abort,
             );
 
-            for trigger in relevant_before_update_triggers {
+            for trigger in before_update_triggers {
                 fire_trigger(
                     program,
                     resolver,
@@ -1204,6 +1193,7 @@ pub fn emit_upsert(
                 &layout,
                 resolver,
             )?;
+            emit_set_not_null_checks(program, table, &updated_positions, new_start, &layout);
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1248,6 +1238,26 @@ pub fn emit_upsert(
     } else {
         None
     };
+    if let Some(bt) = table.btree() {
+        let affected_columns = bt.columns_affected_by_update(&updated_positions)?;
+        emit_check_constraints(
+            program,
+            &check_constraints_of_update(&bt, &affected_columns, rowid_changed),
+            resolver,
+            &bt.name,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
+                col.name
+                    .as_deref()
+                    .map(|n| (n, layout.to_register(new_start, idx)))
+            }),
+            connection,
+            ast::ResolveType::Abort,
+            ctx.loop_labels.row_done,
+            Some(table_references),
+        )?;
+    }
+
     let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs
         .iter()
@@ -1263,56 +1273,6 @@ pub fn emit_upsert(
     } else {
         None
     };
-    if let Some(bt) = table.btree() {
-        if connection.foreign_keys_enabled() {
-            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-
-            // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
-                emit_fk_child_update_counters(
-                    program,
-                    &bt,
-                    table.get_name(),
-                    ctx.cursor_id,
-                    new_start,
-                    rowid_new_reg,
-                    &directly_changed_cols,
-                    upsert_database_id,
-                    resolver,
-                    &layout,
-                )?;
-            }
-            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
-            });
-            let affected_upsert_indices: Vec<_> = upsert_indices
-                .iter()
-                .filter_map(|idx| {
-                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
-                        .map(|affected| affected.then_some(idx))
-                        .transpose()
-                })
-                .collect::<crate::Result<_>>()?;
-            if has_parent_fk_checks {
-                let _ = emit_fk_update_parent_actions(
-                    program,
-                    &bt,
-                    &affected_parent_fks,
-                    affected_upsert_indices.into_iter(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                    new_start,
-                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                    rowid_set_clause_reg,
-                    &updated_positions,
-                    ParentKeyNewProbeMode::BeforeWrite,
-                    upsert_database_id,
-                    resolver,
-                )?;
-            }
-        }
-    }
-
     // Index maintenance (DELETE old key, INSERT new key), honoring
     // partial-index WHEREs. Mirroring SQLite, every UNIQUE constraint (the
     // rowid first, then each unique index) is verified against the NEW row
@@ -1367,9 +1327,8 @@ pub fn emit_upsert(
         record_reg: usize,
     }
 
+    let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
     if let Some(before) = before_start {
-        let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
-
         // Pass 1: compute the NEW key for every affected index and probe the
         // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
@@ -1515,7 +1474,69 @@ pub fn emit_upsert(
                 record_reg: rec,
             });
         }
+    }
 
+    // SQLite judges the foreign keys of a row whose other constraints hold (sqlite3FkCheck follows
+    // sqlite3GenerateConstraintChecks).
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled() {
+            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            if new_rowid_reg.is_some() {
+                // The probe for the new rowid moved the cursor.
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: ctx.cursor_id,
+                    src_reg: ctx.conflict_rowid_reg,
+                    target_pc: ctx.loop_labels.row_done,
+                });
+            }
+
+            // Child-side checks
+            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+                emit_fk_child_update_counters(
+                    program,
+                    &bt,
+                    table.get_name(),
+                    ctx.cursor_id,
+                    new_start,
+                    rowid_new_reg,
+                    &directly_changed_cols,
+                    upsert_database_id,
+                    resolver,
+                    &layout,
+                )?;
+            }
+            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
+                s.get_indices(table.get_name()).cloned().collect()
+            });
+            let affected_upsert_indices: Vec<_> = upsert_indices
+                .iter()
+                .filter_map(|idx| {
+                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
+                        .map(|affected| affected.then_some(idx))
+                        .transpose()
+                })
+                .collect::<crate::Result<_>>()?;
+            if has_parent_fk_checks {
+                let _ = emit_fk_update_parent_actions(
+                    program,
+                    &bt,
+                    &affected_parent_fks,
+                    affected_upsert_indices.into_iter(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    rowid_set_clause_reg,
+                    &updated_positions,
+                    ParentKeyNewProbeMode::BeforeWrite,
+                    upsert_database_id,
+                    resolver,
+                )?;
+            }
+        }
+    }
+
+    if let Some(before) = before_start {
         // Pass 2: every UNIQUE constraint holds, so the index mutations can
         // no longer be interrupted by a constraint failure.
         for pending in pending_rebuilds {
@@ -1848,6 +1869,31 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+/// Refuses a NULL that `DO UPDATE` sets in a NOT NULL column: the table's first, as SQLite does.
+fn emit_set_not_null_checks(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    set_columns: &ColumnMask,
+    new_start: usize,
+    layout: &ColumnLayout,
+) {
+    for (idx, column) in table.columns().iter().enumerate() {
+        if !set_columns.get(idx) || !column.notnull() || column.is_rowid_alias() {
+            continue;
+        }
+        program.emit_insn(Insn::HaltIfNull {
+            target_reg: layout.to_register(new_start, idx),
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            on_error: None,
+            description: format!(
+                "{}.{}",
+                table.get_name(),
+                column.name.as_deref().unwrap_or_default()
+            ),
+        });
+    }
 }
 
 fn compute_new_row_virtual_columns(

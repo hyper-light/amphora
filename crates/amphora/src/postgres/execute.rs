@@ -4,7 +4,7 @@
 //! CommandComplete, under 19's transaction rules. The extended protocol's messages (unit 10) are
 //! [`super::portal`]'s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,18 +18,20 @@ use amphora_engine::{
 };
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
+use amphora_pg_analysis::utility::{Effect, Utility};
 use amphora_pg_analysis::{
-    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, lower, output,
-    utility,
+    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, fields, lower,
+    output, utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
 use amphora_pg_catalog::{Datum, SearchPath};
 use amphora_pg_parser::gram;
 use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree, Val};
 
+use super::copy::{CopyIn, Then};
 use super::extended::{Formats, Message};
 use super::portal::{Portal, Prepared, collect, setting_field};
-use super::session::{Flow, Statements, TxStatus, WaitLimits};
+use super::session::{Copy, Flow, Statements, TxStatus, WaitLimits};
 use super::settings::{Settings, Transactional};
 use super::wire::{self, PgError, Severity, SqlState};
 use crate::memory::{Budget, Charge, Use};
@@ -212,6 +214,17 @@ impl Relations for Catalog {
         }
         columns
     }
+
+    fn index(&self, relation: u32, name: &str) -> bool {
+        let Some((_, table)) = self.name(relation) else {
+            return false;
+        };
+        self.first(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND tbl_name = ?2",
+            &[Value::build_text(name.to_owned()), Value::build_text(table)],
+        )
+        .is_some()
+    }
 }
 
 /// The transaction block a session is in between two statements, as far as xact.c's `TBlockState` tells
@@ -267,14 +280,19 @@ pub struct Executor {
     pub(super) pipelining: bool,
     /// What the statements and portals are charged to: none bounds them by the client's messages alone.
     budget: Option<Arc<Budget>>,
+    /// The COPY under way, and what goes on once it ended.
+    pub(super) copying: Option<(Box<CopyIn>, Then)>,
+    /// The tables the open transaction made or emptied, by OID (`rd_createSubid` and
+    /// `rd_newRelfilelocatorSubid`, src/include/utils/rel.h): what COPY FREEZE asks for.
+    fresh: BTreeSet<u32>,
 }
 
 /// A Query's statements, the next one to run at `at`.
-struct Query {
+pub(super) struct Query {
     sql: String,
     tree: Tree,
     statements: Vec<NodeId>,
-    at: usize,
+    pub(super) at: usize,
 }
 
 struct Stopped {
@@ -308,11 +326,13 @@ pub(super) enum Stop {
         holder: u64,
         running: Option<Box<Running>>,
     },
+    /// A COPY FROM STDIN began: its data is to come.
+    Copy(Box<CopyIn>),
 }
 
 /// How far a statement's step got: to its end, with how many rows it changed, or to a row of the open
 /// transaction named.
-enum Ran {
+pub(super) enum Ran {
     Done(i64),
     Waits(u64),
 }
@@ -369,6 +389,8 @@ impl Executor {
             portals: BTreeMap::new(),
             pipelining: false,
             budget: None,
+            copying: None,
+            fresh: BTreeSet::new(),
         }
         .at_level(Level::ReadCommitted)
     }
@@ -509,6 +531,21 @@ impl Executor {
             }
             _ => {}
         }
+        if let Node::VacuumStmt {
+            is_vacuumcmd: true, ..
+        } = top
+            && !matches!(self.block, Block::None | Block::Started)
+        {
+            // PreventInTransactionBlock (REL_19_0 src/backend/access/transam/xact.c:3745).
+            return Err(PgError::error(
+                SqlState::new("25001"),
+                "VACUUM cannot run inside a transaction block",
+            )
+            .into());
+        }
+        if let Node::CopyStmt { .. } = top {
+            return Err(Stop::copy(self.copy_begin(sql, tree, id, out)?));
+        }
         if self.block != Block::None {
             self.take_snapshot()?;
         }
@@ -518,23 +555,109 @@ impl Executor {
             self.began
         };
         let lowered = {
-            let session = self.analysis(Some(now));
-            if let Some(utility) = utility(tree, id, &session).map_err(|e| refusal(e, sql))? {
+            let utility = {
+                let session = self.analysis(Some(now));
+                utility(tree, id, &session).map_err(|e| refusal(e, sql))?
+            };
+            if let Some(utility) = utility {
                 self.ensure_transaction()?;
-                self.change_schema(&utility.sql)?;
-                return Ok(complete(out, utility.tag)?);
+                return Ok(self.run_utility(&utility, out)?);
             }
+            let session = self.analysis(Some(now));
             let query = analyze(tree, id, &session, &[]).map_err(|e| refusal(e, sql))?;
             if !query.params.is_empty() {
                 return Err(
                     PgError::error(SqlState::new("42P02"), "there is no parameter $1").into(),
                 );
             }
-            let lowered = lower(&query, &session, &[]).map_err(|e| refusal(e, sql))?;
+            let lowered = match lower(&query, &session, &[]) {
+                Ok(lowered) => lowered,
+                // Raised as the statement runs, behind its RowDescription.
+                Err(error) if error.runs && query.command == Command::Select => {
+                    let columns = fields(&query).map_err(|e| refusal(e, sql))?;
+                    row_description(out, &columns, &Formats::default())?;
+                    return Err(refusal(error, sql).into());
+                }
+                Err(error) => return Err(refusal(error, sql).into()),
+            };
             (query.command, lowered)
         };
         let (command, lowered) = lowered;
         self.run(command, lowered, out)
+    }
+
+    /// Runs a utility statement's parts, all or none, and its notices and tag.
+    fn run_utility(&mut self, utility: &Utility, out: &mut Vec<u8>) -> Result<(), PgError> {
+        for text in &utility.notices {
+            wire::notice_response(out, "NOTICE", "00000", text)?;
+        }
+        // Outside a block the parts are one transaction.
+        let own = self.block == Block::None && utility.sql.len() > 1;
+        if own {
+            self.conn.execute("BEGIN").map_err(engine)?;
+        }
+        let mut ran = Ok(());
+        for sql in &utility.sql {
+            ran = self.change_schema(sql);
+            if ran.is_err() {
+                break;
+            }
+        }
+        if own && ran.is_ok() {
+            ran = self.conn.execute("COMMIT").map_err(engine);
+        }
+        if let Err(error) = ran {
+            if own && !self.conn.get_auto_commit() {
+                // A refused ROLLBACK has nothing more to undo: the engine's own refusal is logged.
+                if let Err(error) = self.conn.execute("ROLLBACK") {
+                    tracing::warn!(target: "amphora.postgres.execute", event = "rollback_failed", %error);
+                }
+            }
+            return Err(match &utility.effect {
+                Effect::Keyed(index) if error.code == SqlState::new("23505") => PgError::error(
+                    SqlState::new("23505"),
+                    format!("could not create unique index \"{index}\""),
+                ),
+                _ => error,
+            });
+        }
+        if self.block != Block::None {
+            match &utility.effect {
+                Effect::Created(table) => {
+                    let public = self.catalog.namespace("public");
+                    if let Some(oid) = public.and_then(|ns| self.catalog.relation(ns, table)) {
+                        self.fresh.insert(oid);
+                    }
+                }
+                Effect::Emptied(oids) => self.fresh.extend(oids),
+                Effect::None | Effect::Keyed(_) => {}
+            }
+        }
+        complete(out, utility.tag)
+    }
+
+    /// Whether the open transaction made or emptied the table (copyfrom.c's check for COPY FREEZE).
+    pub(super) fn made_or_emptied(&self, relation: u32) -> bool {
+        self.fresh.contains(&relation)
+    }
+
+    /// `ThereAreNoReadyPortals` (src/backend/utils/mmgr/portalmem.c): whether one bound, or stopped partway, waits.
+    pub(super) fn holds_a_ready_portal(&self) -> bool {
+        self.portals.values().any(Portal::is_ready)
+    }
+
+    /// A statement of the engine's for a COPY's rows.
+    pub(super) fn prepare(&self, sql: &str) -> Result<Statement, PgError> {
+        self.conn.prepare(sql).map_err(engine)
+    }
+
+    /// Commits the transaction a COPY began for itself.
+    pub(super) fn conn_commit(&mut self) -> Result<(), PgError> {
+        let result = self.conn.execute("COMMIT").map_err(engine);
+        if result.is_err() {
+            self.abandon();
+        }
+        result
     }
 
     /// Runs a statement that changes the catalog, whose transaction is validated in full from here on
@@ -660,7 +783,7 @@ impl Executor {
         Ok((command, lowered))
     }
 
-    fn step(&self, statement: &mut Statement) -> Result<Ran, LimboError> {
+    pub(super) fn step(&self, statement: &mut Statement) -> Result<Ran, LimboError> {
         loop {
             match statement.step()? {
                 StepResult::Done => return Ok(Ran::Done(statement.n_change())),
@@ -909,7 +1032,7 @@ impl Executor {
         result
     }
 
-    fn begin(&mut self) -> Result<(), PgError> {
+    pub(super) fn begin(&mut self) -> Result<(), PgError> {
         self.began = (self.clock)();
         self.queried = false;
         self.conn.execute("BEGIN").map_err(engine)
@@ -917,7 +1040,7 @@ impl Executor {
 
     /// Leaves the block, without the writes of the engine's transaction if one is open: its portals go
     /// with it (`AtCleanup_Portals`, REL_19_0 src/backend/utils/mmgr/portalmem.c).
-    fn end(&mut self) {
+    pub(super) fn end(&mut self) {
         self.block = Block::None;
         self.portals.clear();
         self.abandon();
@@ -939,7 +1062,7 @@ impl Executor {
 
     /// Answers with `error`, and ends what it ends: the transaction, at once
     /// (`AbortCurrentTransaction`), and the block but for END.
-    fn refused(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError> {
+    pub(super) fn refused(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError> {
         match self.block {
             Block::None | Block::Started | Block::Implicit => self.end(),
             Block::Explicit | Block::Failed => {
@@ -985,7 +1108,7 @@ impl Executor {
 
     /// Runs the rest of a Query, from `running` where a statement of it is under way: stopped where a
     /// statement waits, else answered to its end.
-    fn run_query(
+    pub(super) fn run_query(
         &mut self,
         mut query: Query,
         running: Option<Box<Running>>,
@@ -1000,6 +1123,10 @@ impl Executor {
                     running,
                 });
                 Ok(Flow::Waiting)
+            }
+            Err(Stop::Copy(copy)) => {
+                self.copying = Some((copy, Then::Query(query)));
+                Ok(Flow::CopyIn)
             }
             Err(Stop::Refused(error)) => {
                 self.refused(&error, out)?;
@@ -1024,6 +1151,10 @@ impl Executor {
                     running,
                 });
                 Ok(Flow::Waiting)
+            }
+            Err(Stop::Copy(copy)) => {
+                self.copying = Some((copy, Then::Execute));
+                Ok(Flow::CopyIn)
             }
             Err(Stop::Refused(error)) => {
                 self.refused(&error, out)?;
@@ -1123,6 +1254,10 @@ impl Statements for Executor {
 
     fn refuse(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError> {
         self.refused(error, out)
+    }
+
+    fn copy(&mut self, message: Copy<'_>, out: &mut Vec<u8>) -> Result<Flow, PgError> {
+        self.copy_message(message, out)
     }
 
     fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -1316,7 +1451,8 @@ pub(super) fn engine(error: LimboError) -> PgError {
         LimboError::Postgres { sqlstate, message } => {
             PgError::error(SqlState::new(sqlstate), message)
         }
-        LimboError::Constraint(message) | LimboError::ForeignKeyConstraint(message) => {
+        LimboError::Constraint(message) => constraint(message),
+        LimboError::ForeignKeyConstraint(message) => {
             PgError::error(SqlState::new("23000"), message)
         }
         LimboError::Busy
@@ -1329,6 +1465,31 @@ pub(super) fn engine(error: LimboError) -> PgError {
         ),
         error => PgError::error(SqlState::INTERNAL_ERROR, error.to_string()),
     }
+}
+
+/// A constraint the engine refused: a key's is 19's of the table's `<table>_pkey` (its only index), and a NOT NULL's is
+/// 19's own (`_bt_check_unique`, src/backend/access/nbtree/nbtinsert.c; `ReportNotNullViolationError`,
+/// src/backend/executor/execMain.c).
+fn constraint(message: String) -> PgError {
+    let column = |prefix: &str| {
+        let (table, column) = message.strip_prefix(prefix)?.split_once('.')?;
+        Some((table.to_owned(), column.to_owned()))
+    };
+    if let Some((table, _)) = column("UNIQUE constraint failed: ") {
+        return PgError::error(
+            SqlState::new("23505"),
+            format!("duplicate key value violates unique constraint \"{table}_pkey\""),
+        );
+    }
+    if let Some((table, column)) = column("NOT NULL constraint failed: ") {
+        return PgError::error(
+            SqlState::new("23502"),
+            format!(
+                "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint"
+            ),
+        );
+    }
+    PgError::error(SqlState::new("23000"), message)
 }
 
 /// `pg_type.typlen`.

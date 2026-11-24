@@ -1,13 +1,15 @@
 //! Utility statements as the engine runs them: CREATE TABLE of plain columns (`transformCreateStmt`,
-//! REL_19_0 src/backend/parser/parse_utilcmd.c; `DefineRelation`, src/backend/commands/tablecmds.c) and
-//! ALTER TABLE ADD PRIMARY KEY (`transformIndexConstraint`, parse_utilcmd.c). Every other clause of
-//! them refuses `0A000`.
+//! REL_19_0 src/backend/parser/parse_utilcmd.c; `DefineRelation`, src/backend/commands/tablecmds.c),
+//! ALTER TABLE ADD PRIMARY KEY (`transformIndexConstraint`, parse_utilcmd.c), DROP TABLE IF EXISTS
+//! (`RemoveRelations`, tablecmds.c), TRUNCATE (`ExecuteTruncate`, tablecmds.c) and VACUUM (`ExecVacuum`,
+//! src/backend/commands/vacuum.c). Every other clause of them refuses `0A000`.
 
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Kind, TypeError, column_type};
 use amphora_pg_parser::tree::{ColumnDef, Constraint, CreateStmt, Node, NodeId, Tree, Val};
 
 use crate::lower::quoted;
+use crate::reloptions;
 use crate::{Error, Session, sqlstate};
 
 /// parsenodes.h's CONSTR_NOTNULL and CONSTR_PRIMARY, AT_AddConstraint and OBJECT_TABLE, as the grammar
@@ -20,15 +22,39 @@ const TABLE: i32 = 42;
 /// The longest name, in bytes: `NAMEDATALEN - 1` (src/include/pg_config_manual.h:39).
 const NAME_MAX: usize = 63;
 
-/// The bounds of a heap's `fillfactor` (src/backend/access/common/reloptions.c:175,
-/// `HEAP_MIN_FILLFACTOR` and 100). It places rows on pages, and no statement's answer turns on it.
-const FILLFACTOR: std::ops::RangeInclusive<i32> = 10..=100;
+/// What a utility statement leaves of the tables it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    None,
+    /// A table made in `public`: its name.
+    Created(String),
+    /// Tables emptied, by OID.
+    Emptied(Vec<u32>),
+    /// A unique index built: its name.
+    Keyed(String),
+}
 
 /// A utility statement as the engine runs it, and its command tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utility {
-    pub sql: String,
+    /// The engine's statements, in order, all of them or none.
+    pub sql: Vec<String>,
+    /// What the client is told before the tag, each a NOTICE's text.
+    pub notices: Vec<String>,
     pub tag: &'static str,
+    pub effect: Effect,
+}
+
+impl Utility {
+    /// The engine's one statement of it.
+    fn of(sql: String, tag: &'static str, effect: Effect) -> Self {
+        Self {
+            sql: vec![sql],
+            notices: Vec::new(),
+            tag,
+            effect,
+        }
+    }
 }
 
 /// The engine's statement of a raw utility statement: `None` for a statement [`crate::analyze`] types.
@@ -51,12 +77,26 @@ pub fn utility(
             objtype: TABLE,
             missing_ok: false,
         } => add_primary_key(tree, *relation, cmds, session).map(Some),
+        Node::DropStmt {
+            objects,
+            remove_type: TABLE,
+            behavior: _,
+            missing_ok: true,
+            concurrent: false,
+        } => drop_tables(tree, objects, session).map(Some),
+        Node::DropStmt { .. } => Err(Error::unsupported("this DROP")),
+        Node::TruncateStmt { relations, .. } => truncate(tree, relations, session).map(Some),
+        Node::VacuumStmt {
+            options,
+            rels,
+            is_vacuumcmd: true,
+        } => vacuum(tree, options, rels, session).map(Some),
         _ => Ok(None),
     }
 }
 
 /// The name a RangeVar gives a table, in no schema: the parser's ported rules read no other.
-fn table_name(tree: &Tree, relation: Option<NodeId>) -> Result<&str, Error> {
+pub(crate) fn table_name(tree: &Tree, relation: Option<NodeId>) -> Result<&str, Error> {
     match relation.map(|id| tree.get(id)).transpose()? {
         Some(Node::RangeVar {
             catalogname: None,
@@ -81,9 +121,7 @@ fn create_table(tree: &Tree, s: &CreateStmt, session: &Session<'_>) -> Result<Ut
     if plain != *s {
         return Err(Error::unsupported("a clause of this CREATE TABLE"));
     }
-    for option in &s.options {
-        storage_parameter(tree, *option)?;
-    }
+    reloptions::heap(tree, &s.options)?;
     let table = table_name(tree, s.relation)?;
     // RangeVarGetCreationNamespace: the path's first schema but pg_catalog, which is `public` where no
     // schema can be made (section 7).
@@ -116,10 +154,11 @@ fn create_table(tree: &Tree, s: &CreateStmt, session: &Session<'_>) -> Result<Ut
         ));
     }
     let definitions: Vec<&str> = columns.iter().map(|(_, text)| text.as_str()).collect();
-    Ok(Utility {
-        sql: format!("CREATE TABLE {}({})", quoted(table), definitions.join(", ")),
-        tag: "CREATE TABLE",
-    })
+    Ok(Utility::of(
+        format!("CREATE TABLE {}({})", quoted(table), definitions.join(", ")),
+        "CREATE TABLE",
+        Effect::Created(table.to_owned()),
+    ))
 }
 
 /// A column's name, and its definition in the engine's text.
@@ -230,24 +269,6 @@ fn type_text(tree: &Tree, id: NodeId) -> Result<String, Error> {
     }
 }
 
-/// A heap's storage parameter, of which only `fillfactor` is taken.
-fn storage_parameter(tree: &Tree, id: NodeId) -> Result<(), Error> {
-    if let Node::DefElem {
-        defnamespace: None,
-        defname,
-        arg: Some(arg),
-        defaction: 0,
-        ..
-    } = tree.get(id)?
-        && defname == "fillfactor"
-        && let Node::Integer(percent) = tree.get(*arg)?
-        && FILLFACTOR.contains(percent)
-    {
-        return Ok(());
-    }
-    Err(Error::unsupported("this storage parameter"))
-}
-
 fn add_primary_key(
     tree: &Tree,
     relation: Option<NodeId>,
@@ -318,14 +339,170 @@ fn add_primary_key(
     if index.len() > NAME_MAX {
         return Err(Error::unsupported("a primary key's name this long"));
     }
-    Ok(Utility {
-        sql: format!(
+    // index_check_primary_key (src/backend/catalog/index.c): a key's index is the one the key named.
+    if session.relations.index(oid, &index) {
+        return Err(Error::new(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            format!("multiple primary keys for table \"{table}\" are not allowed"),
+        ));
+    }
+    Ok(Utility::of(
+        format!(
             "CREATE UNIQUE INDEX {} ON {}({})",
             quoted(&index),
             quoted(table),
             quoted(key)
         ),
-        tag: "ALTER TABLE",
+        "ALTER TABLE",
+        Effect::Keyed(index),
+    ))
+}
+
+/// A relation a statement names: the OID it resolves to, none where there is none. A catalog's refuses as 19's
+/// (`RangeVarCallbackForTruncate`, tablecmds.c; `CheckDropPermissions`).
+pub(crate) fn user_table(
+    session: &Session<'_>,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<u32>, Error> {
+    let relations = session.relations;
+    let found = match schema {
+        Some(schema) => relations
+            .namespace(schema)
+            .and_then(|ns| relations.relation(ns, name)),
+        None => session
+            .path
+            .resolve(Kind::Relation, |ns| relations.relation(ns, name)),
+    };
+    if let Some(oid) = found
+        && let Some((namespace, _)) = relations.name(oid)
+        && relations.namespace("public") != Some(namespace)
+    {
+        return Err(Error::new(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            format!("permission denied: \"{name}\" is a system catalog"),
+        ));
+    }
+    Ok(found)
+}
+
+pub(crate) fn undefined_relation(name: &str) -> Error {
+    Error::new(
+        sqlstate::UNDEFINED_TABLE,
+        format!("relation \"{name}\" does not exist"),
+    )
+}
+
+/// `RemoveRelations` (tablecmds.c) of an IF EXISTS list: the tables there are, and a notice of each there isn't
+/// (`DropErrorMsgNonExistent`).
+fn drop_tables(tree: &Tree, objects: &[NodeId], session: &Session<'_>) -> Result<Utility, Error> {
+    let mut sql = Vec::with_capacity(objects.len());
+    let mut notices = Vec::new();
+    let mut dropped: Vec<u32> = Vec::with_capacity(objects.len());
+    for object in objects {
+        let Node::List(parts) = tree.get(*object)? else {
+            return Err(Error::unsupported("this DROP"));
+        };
+        let mut names = Vec::with_capacity(parts.len());
+        for part in parts.iter().flatten() {
+            match tree.get(*part)? {
+                Node::String(name) => names.push(name.as_str()),
+                _ => return Err(Error::unsupported("this DROP")),
+            }
+        }
+        let (schema, table) = match names.as_slice() {
+            [table] => (None, *table),
+            [schema, table] => (Some(*schema), *table),
+            _ => return Err(Error::unsupported("a name of this many parts")),
+        };
+        if let Some(schema) = schema
+            && session.relations.namespace(schema).is_none()
+        {
+            notices.push(format!("schema \"{schema}\" does not exist, skipping"));
+            continue;
+        }
+        match user_table(session, schema, table)? {
+            None => notices.push(format!("table \"{table}\" does not exist, skipping")),
+            Some(oid) if dropped.contains(&oid) => {}
+            Some(oid) => {
+                dropped.push(oid);
+                sql.push(format!("DROP TABLE {}", quoted(table)));
+            }
+        }
+    }
+    Ok(Utility {
+        sql,
+        notices,
+        tag: "DROP TABLE",
+        effect: Effect::None,
+    })
+}
+
+/// `ExecuteTruncate` (tablecmds.c): every row of the tables deleted. RESTART IDENTITY and CASCADE change nothing
+/// here: no column has a sequence, and no key refers to a table.
+fn truncate(tree: &Tree, relations: &[NodeId], session: &Session<'_>) -> Result<Utility, Error> {
+    let mut sql = Vec::with_capacity(relations.len());
+    let mut emptied: Vec<u32> = Vec::with_capacity(relations.len());
+    for relation in relations {
+        let table = table_name(tree, Some(*relation))?;
+        let oid = user_table(session, None, table)?.ok_or_else(|| undefined_relation(table))?;
+        if !emptied.contains(&oid) {
+            emptied.push(oid);
+            sql.push(format!("DELETE FROM {}", quoted(table)));
+        }
+    }
+    Ok(Utility {
+        sql,
+        notices: Vec::new(),
+        tag: "TRUNCATE TABLE",
+        effect: Effect::Emptied(emptied),
+    })
+}
+
+/// VACUUM, or VACUUM ANALYZE, of tables (`ExecVacuum`, src/backend/commands/vacuum.c): the tables are looked up, and
+/// nothing is done: the versioned storage reclaims its own dead versions, and no statistics are kept that ANALYZE
+/// would write.
+fn vacuum(
+    tree: &Tree,
+    options: &[NodeId],
+    rels: &[NodeId],
+    session: &Session<'_>,
+) -> Result<Utility, Error> {
+    for option in options {
+        match tree.get(*option)? {
+            Node::DefElem {
+                defnamespace: None,
+                defname,
+                arg: None,
+                defaction: 0,
+                ..
+            } if defname == "analyze" => {}
+            _ => return Err(Error::unsupported("this VACUUM option")),
+        }
+    }
+    if rels.is_empty() {
+        return Err(Error::unsupported("VACUUM of every table"));
+    }
+    for rel in rels {
+        let Node::VacuumRelation {
+            relation,
+            oid: 0,
+            va_cols,
+        } = tree.get(*rel)?
+        else {
+            return Err(Error::unsupported("this VACUUM"));
+        };
+        if !va_cols.is_empty() {
+            return Err(Error::unsupported("VACUUM of a list of columns"));
+        }
+        let table = table_name(tree, *relation)?;
+        user_table(session, None, table)?.ok_or_else(|| undefined_relation(table))?;
+    }
+    Ok(Utility {
+        sql: Vec::new(),
+        notices: Vec::new(),
+        tag: "VACUUM",
+        effect: Effect::None,
     })
 }
 
@@ -392,17 +569,19 @@ mod tests {
     fn t_pg_9_3_pgbench_tables_and_keys_lower_to_the_engines() {
         assert_eq!(
             lowered("create table pgbench_tellers(tid int not null,bid int,mtime timestamp,filler char(84)) with (fillfactor=100)").unwrap(),
-            Some(Utility {
-                sql: "CREATE TABLE \"pgbench_tellers\"(\"tid\" int4 NOT NULL, \"bid\" int4, \"mtime\" timestamp, \"filler\" bpchar(84))".to_owned(),
-                tag: "CREATE TABLE",
-            })
+            Some(Utility::of(
+                "CREATE TABLE \"pgbench_tellers\"(\"tid\" int4 NOT NULL, \"bid\" int4, \"mtime\" timestamp, \"filler\" bpchar(84))".to_owned(),
+                "CREATE TABLE",
+                Effect::Created("pgbench_tellers".to_owned()),
+            ))
         );
         assert_eq!(
             lowered("alter table t add primary key (aid)").unwrap(),
-            Some(Utility {
-                sql: "CREATE UNIQUE INDEX \"t_pkey\" ON \"t\"(\"aid\")".to_owned(),
-                tag: "ALTER TABLE",
-            })
+            Some(Utility::of(
+                "CREATE UNIQUE INDEX \"t_pkey\" ON \"t\"(\"aid\")".to_owned(),
+                "ALTER TABLE",
+                Effect::Keyed("t_pkey".to_owned()),
+            ))
         );
         assert_eq!(lowered("SELECT 1").unwrap(), None);
     }
@@ -422,12 +601,18 @@ mod tests {
             ("create table u(a uuid)", sqlstate::FEATURE_NOT_SUPPORTED),
             (
                 "create table u(a int) with (fillfactor=5)",
-                sqlstate::FEATURE_NOT_SUPPORTED,
+                sqlstate::INVALID_PARAMETER_VALUE,
             ),
             (
-                "create table u(a int) with (autovacuum_enabled=1)",
-                sqlstate::FEATURE_NOT_SUPPORTED,
+                "create table u(a int) with (fillfactor=100, fillfactor=90)",
+                sqlstate::INVALID_PARAMETER_VALUE,
             ),
+            (
+                "create table u(a int) with (nosuch=1)",
+                sqlstate::INVALID_PARAMETER_VALUE,
+            ),
+            ("vacuum analyze u", sqlstate::UNDEFINED_TABLE),
+            ("truncate table t, u", sqlstate::UNDEFINED_TABLE),
             (
                 "alter table u add primary key (aid)",
                 sqlstate::UNDEFINED_TABLE,

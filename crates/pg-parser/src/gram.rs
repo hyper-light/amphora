@@ -370,8 +370,12 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         390 => (0x1f11_a14d_e2c2_31b7, |r| Ok(r.take(2))),
         // reloption_list: reloption_elem
         393 => (0xeff5_8133_d35b_3656, list1),
+        // reloption_list: reloption_list ',' reloption_elem
+        394 => (0xfede_40a2_0cf3_8a13, append),
         // reloption_elem: ColLabel '=' def_arg
         395 => (0x7594_b8cb_e382_1389, |r| def_elem(r, 3)),
+        // reloption_elem: ColLabel
+        396 => (0x1fbd_2483_69fc_6fe1, |r| def_elem_named(r, None, None)),
         // CopyStmt: COPY opt_binary qualified_name opt_column_list
         425 => (0x14df_021f_ed0f_64e0, copy_stmt),
         // copy_from: FROM
@@ -396,8 +400,17 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         457 => (0x6f70_ddc5_f44b_ac02, null),
         // copy_generic_opt_list: copy_generic_opt_elem
         460 => (0x8674_90cb_f11d_4ff3, list1),
+        // copy_generic_opt_list: copy_generic_opt_list ',' copy_generic_opt_elem
+        461 => (0x9819_927b_0c58_6e18, append),
         // copy_generic_opt_elem: ColLabel copy_generic_opt_arg
         462 => (0x85bf_7c1b_879a_9e76, |r| def_elem(r, 2)),
+        // copy_generic_opt_elem: FORMAT_LA copy_generic_opt_arg
+        463 => (0xe73c_d016_326e_623c, |r| {
+            let arg = r.node(2)?;
+            def_elem_named(r, Some("format"), arg)
+        }),
+        // copy_generic_opt_arg: /* EMPTY */
+        469 => (0xcc68_207a_5bd2_3fdc, null),
         // copy_generic_opt_arg: opt_boolean_or_string
         464 => (0xdd4e_0b68_a2ec_ef61, make_string),
         // CreateStmt: CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
@@ -435,9 +448,13 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         // opt_without_overlaps: /* EMPTY */
         571 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
         // opt_column_list: /* EMPTY */
+        // opt_column_list: '(' columnList ')'
+        572 => (0xd2b3_15b0_9702_83d7, |r| Ok(Value::List(r.list(2)?))),
         573 => (0x1e2a_fd0a_a524_9ce8, nil),
         // columnList: columnElem
         574 => (0x41fd_9d1b_bdab_ed5c, list1),
+        // columnList: columnList ',' columnElem
+        575 => (0x6976_767c_5e07_8201, append),
         // columnElem: ColId
         580 => (0x7baf_b980_ab5f_c89c, make_string),
         // opt_c_include: /* EMPTY */
@@ -516,6 +533,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1590 => (0x250c_65d1_45e2_42d6, vacuum_stmt),
         // opt_analyze: analyze_keyword
         1596 => (0x4ab8_280b_bc3a_91b9, |_| Ok(Value::Bool(true))),
+        // opt_analyze: /*EMPTY*/
+        1597 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
         // opt_verbose: /* EMPTY */
         1599 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
         // opt_full: /* EMPTY */
@@ -827,7 +846,13 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         // ColLabel: IDENT
         2514 => (0xa007_892c_3e21_a49b, top),
         // ColLabel: type_func_name_keyword
+        // ColLabel: unreserved_keyword
+        2515 => (0x1d4d_f16c_54a7_2564, top),
+        // ColLabel: col_name_keyword
+        2516 => (0x0f87_a177_22a9_8584, top),
         2517 => (0x1d4d_f16c_54a7_2564, top),
+        // ColLabel: reserved_keyword
+        2518 => (0x0f87_a177_22a9_8584, top),
         _ => return None,
     })
 }
@@ -1865,6 +1890,26 @@ fn def_elem(r: &mut Reduce<'_>, arg: usize) -> Result<Value, Refusal> {
     })
 }
 
+/// makeDefElem(name, arg, @1): the name its own token, where none is given.
+fn def_elem_named(
+    r: &mut Reduce<'_>,
+    name: Option<&str>,
+    arg: Option<NodeId>,
+) -> Result<Value, Refusal> {
+    let defname = match name {
+        Some(name) => name.to_owned(),
+        None => r.string(1)?,
+    };
+    let location = r.at(1)?;
+    r.make(Node::DefElem {
+        defnamespace: None,
+        defname,
+        arg,
+        defaction: 0,
+        location,
+    })
+}
+
 /// `vacuum_relation: relation_expr opt_name_list`: makeVacuumRelation($1, InvalidOid, $2).
 fn vacuum_relation(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let relation = r.node(1)?;
@@ -2393,7 +2438,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 282);
+        assert_eq!(n, 293);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of

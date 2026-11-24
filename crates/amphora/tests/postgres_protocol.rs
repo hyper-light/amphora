@@ -1263,13 +1263,15 @@ fn exactly(tag: u8, body: &[u8]) -> String {
     }
 }
 
-/// T-PG.10.1: the extended protocol's messages (pgbench's `-M extended` and `-M prepared` flows, its relkind
-/// query, parameters and columns of each type in text and in binary, portals stopped and gone on with, what
-/// each message refuses, one transaction to each Sync, a failed block's, Flush, and messages malformed
-/// inside), each step's sent at once to the wire core, are answered as a PostgreSQL 19.0 server answered
-/// them (scripts/postgres-extended-answers.sh), message by message.
-#[test]
-fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
+/// Each step of `steps` sent at once, on its session, as `answers` have it, and its answer held to what a PostgreSQL
+/// 19.0 server sent (scripts/postgres-extended-answers.sh), message by message, with `checked` as what is told of
+/// each; `compared` counts every type of message a server sent.
+fn answers_as_a_19_server(
+    steps: &str,
+    answers: &str,
+    sessions: &[&str],
+    compared: &mut std::collections::BTreeMap<char, i32>,
+) {
     for pace in [Pace::Frames, Pace::Bytes] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("postgres.db");
@@ -1282,25 +1284,24 @@ fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
             name: "ada",
             superuser: true,
         };
-        let mut sessions = std::collections::BTreeMap::new();
-        for (name, process_id) in [("s1", 1001), ("s2", 1002)] {
+        let mut open = std::collections::BTreeMap::new();
+        for (name, process_id) in sessions.iter().zip(1001..) {
             let executor = database.session(role, "UTC", process_id).unwrap();
-            sessions.insert(name.to_owned(), log_in(Box::new(executor)));
+            open.insert((*name).to_owned(), log_in(Box::new(executor)));
         }
-        let answers = tpcb::answers(include_str!("extended/answers.txt"));
-        let steps: Vec<&str> = include_str!("extended/steps.txt")
+        let answers = tpcb::answers(answers);
+        let steps: Vec<&str> = steps
             .lines()
             .filter(|line| !line.starts_with('#') && !line.is_empty())
             .collect();
         assert_eq!(answers.len(), steps.len());
         let mut wrong = Vec::new();
-        let mut compared = std::collections::BTreeMap::new();
         for ((name, step, answer), line) in answers.iter().zip(steps) {
             assert_eq!(line, format!("{name}: {step}"));
             let ((b'>', sent), theirs) = answer.split_first().unwrap() else {
                 panic!("{line}: the bytes sent come first");
             };
-            let session = sessions.get_mut(name).unwrap();
+            let session = open.get_mut(name).unwrap();
             let (out, next) = drive(session, roles(), sent, pace);
             assert_eq!(next, None, "{line}");
             let told = |messages: &[(u8, Vec<u8>)]| -> Vec<String> {
@@ -1323,13 +1324,49 @@ fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
             wrong.len(),
             wrong.join("\n")
         );
-        for tag in [
-            '1', '2', '3', 't', 'T', 'n', 'D', 'C', 's', 'I', 'E', 'N', 'Z',
-        ] {
-            assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
-        }
-        assert!(compared.values().sum::<i32>() > 1000, "{compared:?}");
     }
+}
+
+/// T-PG.10.1: the extended protocol's messages (pgbench's `-M extended` and `-M prepared` flows, its relkind
+/// query, parameters and columns of each type in text and in binary, portals stopped and gone on with, what
+/// each message refuses, one transaction to each Sync, a failed block's, Flush, and messages malformed
+/// inside), each step's sent at once to the wire core, are answered as a PostgreSQL 19.0 server answered
+/// them (scripts/postgres-extended-answers.sh), message by message.
+#[test]
+fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
+    let mut compared = std::collections::BTreeMap::new();
+    answers_as_a_19_server(
+        include_str!("extended/steps.txt"),
+        include_str!("extended/answers.txt"),
+        &["s1", "s2"],
+        &mut compared,
+    );
+    for tag in [
+        '1', '2', '3', 't', 'T', 'n', 'D', 'C', 's', 'I', 'E', 'N', 'Z',
+    ] {
+        assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
+    }
+    assert!(compared.values().sum::<i32>() > 1000, "{compared:?}");
+}
+
+/// T-PG.11.1: `pgbench -i`'s statements (DROP TABLE IF EXISTS and its notices, CREATE TABLE WITH, TRUNCATE, COPY FROM
+/// STDIN with FREEZE, VACUUM ANALYZE, ALTER TABLE ADD PRIMARY KEY, generate_series in FROM, both of its steps `g` and
+/// `G`), COPY's data in each of its forms, an error in the middle of it, CopyFail, CopyDone and what follows a COPY in a
+/// Query, its refusals with their SQLSTATEs and CONTEXTs, and COPY of the extended protocol, each step's sent at once
+/// to the wire core, are answered as a PostgreSQL 19.0 server answered them, message by message.
+#[test]
+fn t_pg_11_1_pgbench_i_and_copy_answer_as_a_19_server_does() {
+    let mut compared = std::collections::BTreeMap::new();
+    answers_as_a_19_server(
+        include_str!("copy/steps.txt"),
+        include_str!("copy/answers.txt"),
+        &["s1"],
+        &mut compared,
+    );
+    for tag in ['1', '2', 'C', 'D', 'E', 'G', 'N', 'T', 'Z'] {
+        assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
+    }
+    assert!(compared.values().sum::<i32>() > 600, "{compared:?}");
 }
 
 /// T-PG.10.4: each message of T-PG.10.1's steps cut at each byte, a byte longer, and (but for a Parse's, whose
