@@ -1653,7 +1653,7 @@ avg10 24 to 26%.
   dialect, pg_catalog_vtab, alter.rs, execute.rs): clippy clean (the log compiles amphora-engine, 55 s); the same tests
   70 of 70, the new test and the learned-cost suite among them. Pushed to main from this tree.
 
-# Lane T21 (tpch), 2026-11-24 04:58Z to 05:40Z: T19's fix across the 22 TPC-H queries; arm C (only the filters the join search priced) kept and merged
+# Lane T21 (tpch), 2026-11-24 04:58Z to 05:45Z: T19's fix across the 22 TPC-H queries; arm C (only the filters the join search priced) kept and merged
 
 Losses first:
 - Times settle nothing between B and C. On queries whose plan, star-filter set and every counted-run operator row count
@@ -1788,6 +1788,11 @@ Kept (arm C, e23ab4b6): the filter step under `StarFilters::ByCost` keeps only t
   optimizer::lip` 72 of 72 (T19's q03 test passes on C).
 - r409 (adacachy2, C, 7d19a8fa): `cargo test -p amphora-engine --test star_filters` 5 of 5 (1 ignored, the coordinator's).
 - The branch merged with main 1f4a8e88 (wal.rs, sqlite3_ondisk.rs, schema.rs, vacuum.rs, execute.rs, insn.rs; none of it
-  in the optimizer) is d67c880a: `cargo fmt --all --check` clean, clippy clean (`Checking amphora-engine`, 45.6 s), the
-  lib tests 72 of 72 (T19's q03 test ok), star_filters 5 of 5 (r426). Pushed to main from it with this record.
+  in the optimizer), d67c880a, r426 (adacachy2, load 39 to 47, 05:31 to 05:34Z): `cargo fmt --all --check` clean, clippy clean (`Checking
+  amphora-engine`, 45.6 s), the lib tests 72 of 72 (T19's q03 test ok), star_filters 5 of 5. Main then moved to 15dd57d8 (connection.rs,
+  mvcc/database/mod.rs, portable_logical.rs in crates/engine): merged, ec24ad7c, the same four checks green again
+  (r445, adacachy2, load 43 to 55, 05:36 to 05:39Z: fmt clean, clippy clean `Checking amphora-engine` 46.6 s, 72 of 72, 5 of 5).
+- Main moved once more to 731240ed before the push, only in crates/amphora (replicated.rs), docs and records. amphora-engine
+  does not depend on crate `amphora` (`cargo tree -p amphora-engine -i amphora`: no match), so it was merged
+  (d4915c23) without a re-run, under rule 6 (lane A17). Pushed to main with this record.
 - The red test (section 2) was on the arm A plus the test tree; clippy was not run on it (a throwaway).
