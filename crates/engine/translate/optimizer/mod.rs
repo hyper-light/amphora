@@ -2422,6 +2422,10 @@ fn base_row_estimate(
             }
             _ => RowCountEstimate::hardcoded_fallback(params),
         },
+        // Each recursive CTE step pops a single row into the RecursiveCteInput pseudo-cursor
+        // (`translate/recursive_cte.rs`); matching `access_method.rs`'s 1-row estimate keeps the
+        // recursive frontier outer so inner base tables use indexes instead of full scans.
+        Table::RecursiveCteInput(_) => RowCountEstimate::HardcodedFallback(1.0),
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }

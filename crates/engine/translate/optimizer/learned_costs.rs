@@ -1070,6 +1070,8 @@ pub(crate) struct LearnedCosts {
     /// each read of the epoch under way took (`observe_page_read`).
     page: Sampling,
     page_costs: Mutex<Vec<f64>>,
+    #[cfg(test)]
+    rowid_seek_accepted: AtomicU64,
 }
 
 /// Amphora (QT.5, step 3a): which runs of one operation are timed, one in `every`, and the spread
@@ -1226,6 +1228,8 @@ impl LearnedCosts {
             search: super::search_budget::SearchRate::default(),
             page: Sampling::new(rates.page.epoch),
             page_costs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            rowid_seek_accepted: AtomicU64::new(0),
         }
     }
 
@@ -1391,6 +1395,8 @@ impl LearnedCosts {
         if !(nanos.is_finite() && nanos >= 0.0) {
             return;
         }
+        #[cfg(test)]
+        self.rowid_seek_accepted.fetch_add(1, Ordering::Relaxed);
         if self.batch_means.load(Ordering::Relaxed) {
             if let Some(mut closed) = self.rowid_seek.try_push_batch(nanos) {
                 self.rowid_seek
@@ -3315,5 +3321,190 @@ mod ab_tests {
             );
             assert!(costs.weights().is_some());
         }
+    }
+
+    /// Review P2 regression (T-QT.5.5): rowid seek learning must (1) discard lookups that perform
+    /// zero physical B-tree seeks (e.g. nonnumeric text key against INTEGER PRIMARY KEY), and
+    /// (2) check contention on and publish samples to the cursor's own database rather than the
+    /// main database when seeking an attached database.
+    #[cfg(feature = "fs")]
+    #[test]
+    fn review_p2_seek_sampling_discards_non_seeks_and_isolates_attached_dbs() {
+        use crate::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let aux_path = dir.path().join("aux.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let dialect: Arc<dyn crate::Dialect> = Arc::new(crate::SqliteDialect);
+
+        let main_opts = crate::OpenOptions::new(dialect.clone())
+            .db_opts(crate::DatabaseOpts::new().with_attach(true));
+        let main_db =
+            crate::Database::open(io.clone(), main_path.to_str().unwrap(), main_opts).unwrap();
+        let main_conn = main_db.connect(crate::ConnectOpts::new()).unwrap();
+        main_conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        main_conn
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=16i64 {
+            main_conn
+                .execute(format!("INSERT INTO t VALUES ({id}, 'main-{id}')"))
+                .unwrap();
+        }
+
+        // Create and populate the attached database on disk.
+        let aux_opts =
+            crate::OpenOptions::new(dialect).db_opts(crate::DatabaseOpts::new().with_attach(true));
+        let aux_db =
+            crate::Database::open(io.clone(), aux_path.to_str().unwrap(), aux_opts).unwrap();
+        let aux_setup = aux_db.connect(crate::ConnectOpts::new()).unwrap();
+        aux_setup.execute("PRAGMA journal_mode = WAL").unwrap();
+        aux_setup
+            .execute("CREATE TABLE aux_t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=16i64 {
+            aux_setup
+                .execute(format!("INSERT INTO aux_t VALUES ({id}, 'aux-{id}')"))
+                .unwrap();
+        }
+        drop(aux_setup);
+
+        main_conn
+            .execute(format!("ATTACH DATABASE '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let attached_db = main_conn
+            .attached_databases()
+            .read()
+            .get_database_by_index(crate::FIRST_ATTACHED_DB_ID)
+            .expect("attached database registered");
+
+        let run_eight = |sql: &str, key: crate::Value| -> u64 {
+            let mut stmt = main_conn.prepare(sql).unwrap();
+            for _ in 0..8 {
+                stmt.reset().unwrap();
+                stmt.bind_at(std::num::NonZero::new(1).unwrap(), key.clone())
+                    .unwrap();
+                let _ = stmt.run_collect_rows().unwrap();
+            }
+            stmt.metrics().btree_seeks
+        };
+
+        // Warm both pagers' caches so subsequent lookups hit the connection's PageCache cleanly.
+        let _ = run_eight("SELECT v FROM t WHERE id = ?1", crate::Value::from_i64(1));
+        let _ = run_eight(
+            "SELECT v FROM aux.aux_t WHERE id = ?1",
+            crate::Value::from_i64(1),
+        );
+
+        // Force 1-in-1 sampling on both databases so every eligible seek is observed.
+        main_db
+            .learned_costs
+            .rowid_seek
+            .every
+            .store(1, Ordering::Relaxed);
+        attached_db
+            .learned_costs
+            .rowid_seek
+            .every
+            .store(1, Ordering::Relaxed);
+
+        let main_before = || {
+            main_db
+                .learned_costs
+                .rowid_seek_accepted
+                .load(Ordering::Relaxed)
+        };
+        let aux_before = || {
+            attached_db
+                .learned_costs
+                .rowid_seek_accepted
+                .load(Ordering::Relaxed)
+        };
+
+        // Case 1: valid integer key on main DB, single reader -> 8 physical seeks, 8 accepted.
+        let m0 = main_before();
+        let seeks = run_eight("SELECT v FROM t WHERE id = ?1", crate::Value::from_i64(1));
+        assert_eq!(seeks, 8);
+        assert_eq!(main_before() - m0, 8);
+
+        // Case 2: nonnumeric text key -> 0 physical seeks, 0 samples accepted.
+        let m0 = main_before();
+        let seeks = run_eight(
+            "SELECT v FROM t WHERE id = ?1",
+            crate::Value::from_text("not-an-int".to_string()),
+        );
+        assert_eq!(seeks, 0);
+        assert_eq!(main_before() - m0, 0);
+
+        // Case 3: valid integer key on main DB while a second reader holds a WAL read tx on main.
+        let main_reader2 = main_db.connect(crate::ConnectOpts::new()).unwrap();
+        main_reader2.execute("BEGIN").unwrap();
+        let _ = main_reader2
+            .query("SELECT COUNT(*) FROM t")
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let m0 = main_before();
+        let seeks = run_eight("SELECT v FROM t WHERE id = ?1", crate::Value::from_i64(2));
+        assert_eq!(seeks, 8);
+        assert_eq!(main_before() - m0, 0);
+        main_reader2.execute("COMMIT").unwrap();
+
+        // Case 4: valid key on attached DB while a second reader holds a WAL read tx on attached
+        // DB (main DB has only 1 reader) -> 8 physical seeks, 0 accepted on BOTH main and aux.
+        let aux_reader2 = attached_db.connect(crate::ConnectOpts::new()).unwrap();
+        aux_reader2.execute("BEGIN").unwrap();
+        let _ = aux_reader2
+            .query("SELECT COUNT(*) FROM aux_t")
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let (m0, a0) = (main_before(), aux_before());
+        let seeks = run_eight(
+            "SELECT v FROM aux.aux_t WHERE id = ?1",
+            crate::Value::from_i64(2),
+        );
+        assert_eq!(seeks, 8);
+        assert_eq!(
+            main_before() - m0,
+            0,
+            "attached seek must never publish to main DB"
+        );
+        assert_eq!(
+            aux_before() - a0,
+            0,
+            "attached seek must respect second reader active on attached DB"
+        );
+        aux_reader2.execute("COMMIT").unwrap();
+
+        // Case 5: valid key on attached DB with single reader on aux (even while main has a
+        // second reader) -> 8 physical seeks, 0 on main, 8 on attached DB!
+        main_reader2.execute("BEGIN").unwrap();
+        let _ = main_reader2
+            .query("SELECT COUNT(*) FROM t")
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let (m0, a0) = (main_before(), aux_before());
+        let seeks = run_eight(
+            "SELECT v FROM aux.aux_t WHERE id = ?1",
+            crate::Value::from_i64(3),
+        );
+        assert_eq!(seeks, 8);
+        assert_eq!(
+            main_before() - m0,
+            0,
+            "attached seek must never publish to main DB"
+        );
+        assert_eq!(
+            aux_before() - a0,
+            8,
+            "attached seek must publish to attached DB's own estimator"
+        );
+        main_reader2.execute("COMMIT").unwrap();
     }
 }

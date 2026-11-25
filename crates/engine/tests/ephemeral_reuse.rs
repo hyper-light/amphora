@@ -106,3 +106,66 @@ fn each_run_of_an_in_subquery_reads_only_its_own_rows() {
         );
     }
 }
+
+/// Compound queries (`UNION`, `INTERSECT`, `EXCEPT`) and `WITH RECURSIVE` emit `Insn::Close` on
+/// their ephemeral cursors before halting. Reusing small ephemeral cursors across `Close` must
+/// clear prior-run rows so every re-execution returns exact results for its own bound parameters.
+#[test]
+fn compound_and_recursive_cte_reuse_ephemeral_cursors_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path(), 500);
+    conn.execute("CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_nodes_parent ON nodes(parent_id)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO nodes VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 4), (10, NULL), (11, 10)",
+    )
+    .unwrap();
+
+    let mut intersect = conn
+        .prepare(
+            "SELECT id FROM t WHERE id <= ? INTERSECT SELECT id FROM t WHERE id >= ? ORDER BY id",
+        )
+        .unwrap();
+    for ((hi, lo), want) in [
+        ((5, 3), vec![3, 4, 5]),
+        ((2, 10), vec![]),
+        ((102, 100), vec![100, 101, 102]),
+        ((1, 1), vec![1]),
+    ] {
+        intersect.reset().unwrap();
+        intersect
+            .bind_at(NonZero::new(1).unwrap(), Value::from_i64(hi))
+            .unwrap();
+        intersect
+            .bind_at(NonZero::new(2).unwrap(), Value::from_i64(lo))
+            .unwrap();
+        assert_eq!(
+            ints(intersect.run_collect_rows().unwrap()),
+            want,
+            "intersect ({hi}, {lo})"
+        );
+    }
+
+    let mut rec = conn
+        .prepare(
+            "WITH RECURSIVE tree(id) AS ( \
+                SELECT id FROM nodes WHERE id = ? \
+                UNION ALL \
+                SELECT n.id FROM nodes n JOIN tree tr ON n.parent_id = tr.id \
+             ) SELECT id FROM tree ORDER BY id",
+        )
+        .unwrap();
+    for (root, want) in [
+        (1, vec![1, 2, 3, 4, 5]),
+        (10, vec![10, 11]),
+        (999, vec![]),
+        (2, vec![2, 4, 5]),
+    ] {
+        rec.reset().unwrap();
+        rec.bind_at(NonZero::new(1).unwrap(), Value::from_i64(root))
+            .unwrap();
+        assert_eq!(ints(rec.run_collect_rows().unwrap()), want, "root {root}");
+    }
+}

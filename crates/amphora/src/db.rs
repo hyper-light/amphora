@@ -15,8 +15,8 @@ use amphora_engine::io::FileSyncType;
 use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
-    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PagePath, PlatformIO, Row,
-    SqliteDialect, Statement, StepResult, Value,
+    DatabaseOpts, Dialect, IO, IOExt, LimboError, OpenFlags, OpenOptions, PagePath, PlatformIO,
+    PostgresDialect, Row, SqliteDialect, Statement, StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
@@ -372,6 +372,23 @@ impl Db {
         Self::open_made(path, sharing)
     }
 
+    /// Opens a PostgreSQL-dialect database (`PostgresDialect`, validating PostgreSQL 19 column
+    /// types, assigning `pg_class` OIDs, and serving live `pg_catalog` views), its connections
+    /// reading through `sharing`'s pages.
+    pub fn open_postgres_sharing(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        in_place(path);
+        in_place(&wal_path(path));
+        Self::open_with_dialect(
+            path,
+            Arc::new(PlatformIO::new().map_err(fail)?),
+            sharing,
+            Arc::new(PostgresDialect::new()),
+        )
+    }
+
     /// [`Db::open_sharing`] in a directory that exists: it makes none.
     pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
@@ -392,6 +409,17 @@ impl Db {
         io: Arc<dyn IO>,
         sharing: &Sharing,
     ) -> anyhow::Result<Self> {
+        Self::open_with_dialect(path, io, sharing, Arc::new(SqliteDialect))
+    }
+
+    /// Opens the database at `path` on `io` with an explicit SQL [`Dialect`] (`SqliteDialect` or
+    /// `PostgresDialect`) and page-sharing policy.
+    pub fn open_with_dialect(
+        path: &Path,
+        io: Arc<dyn IO>,
+        sharing: &Sharing,
+        dialect: Arc<dyn Dialect>,
+    ) -> anyhow::Result<Self> {
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the path isn't UTF-8: {}", path.display()))?;
@@ -402,7 +430,7 @@ impl Db {
             match Database::open(
                 io.clone(),
                 name,
-                OpenOptions::new(Arc::new(SqliteDialect))
+                OpenOptions::new(Arc::clone(&dialect))
                     .db_opts(DatabaseOpts::new().with_without_rowid(true)),
             ) {
                 Err(LimboError::LockingError(_)) if Instant::now() < until => {
@@ -519,6 +547,12 @@ impl Db {
             db: self.db.clone(),
             owner: self.owner.clone(),
         };
+        type CachedWal = (
+            SegmentId,
+            amphora_engine::WalPrefix,
+            Arc<dyn amphora_engine::File>,
+        );
+        let cached: std::sync::Mutex<Option<CachedWal>> = std::sync::Mutex::new(None);
         Box::new(move || {
             // The whole of `held` is captured, so its fields drop in their declared order.
             let EngineHandles { io, db, .. } = &held;
@@ -528,22 +562,45 @@ impl Db {
             if prefix.is_durable() {
                 return Ok(());
             }
-            // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
-            // log may have been made again. No log: everything is in the file, which the checkpoint
-            // that emptied the log flushed.
-            // The segment the prefix is in: a switch flushes the one it closes (decision 45).
-            let wal = segment_path(&path, db.wal_segment());
-            let file = match io.open_file(&wal, OpenFlags::NoLock, false) {
-                Ok(file) => file,
-                Err(LimboError::CompletionError(CompletionError::IOError(
-                    std::io::ErrorKind::NotFound,
-                    _,
-                ))) => return Ok(()),
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            // Cache the open WAL file handle per (segment, header-cell, generation) so repeated
+            // flushes skip open(2)+close(2) while still reopening on segment switch, restart,
+            // external restore, or sync error.
+            let segment = db.wal_segment();
+            let cached_file = cached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|(seg, prev, file)| {
+                    (*seg == segment && prev.same_log_file(&prefix)).then(|| Arc::clone(file))
+                });
+            let file = match cached_file {
+                Some(file) => file,
+                None => {
+                    let wal = segment_path(&path, segment);
+                    let opened = match io.open_file(&wal, OpenFlags::NoLock, false) {
+                        Ok(file) => file,
+                        Err(LimboError::CompletionError(CompletionError::IOError(
+                            std::io::ErrorKind::NotFound,
+                            _,
+                        ))) => return Ok(()),
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    };
+                    *cached
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((segment, prefix.clone(), Arc::clone(&opened)));
+                    opened
+                }
             };
-            file.sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
-                .and_then(|c| io.wait_for_completion(c))
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let synced = file
+                .sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
+                .and_then(|c| io.wait_for_completion(c));
+            if let Err(e) = synced {
+                *cached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return Err(std::io::Error::other(e.to_string()));
+            }
             db.wal_prefix_durable(prefix);
             Ok(())
         })

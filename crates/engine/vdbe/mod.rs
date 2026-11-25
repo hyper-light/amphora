@@ -906,7 +906,7 @@ pub struct SequenceInnerTxState {
 /// Amphora: pages an ephemeral table may hold in its pager's cache and still be kept from one run of
 /// its statement to the next (64 KiB of 4 KiB pages): an IN list or a small materialized subquery
 /// is a page or two, and a large one is not worth the memory between runs.
-const KEPT_EPHEMERAL_PAGES: usize = 16;
+pub(crate) const KEPT_EPHEMERAL_PAGES: usize = 16;
 
 /// Byte ceiling for idle statement-reuse spares (`spare_sorters`, `spare_hash_tables`,
 /// `spare_group_tables`, `register_spares`), derived directly from [`KEPT_EPHEMERAL_PAGES`] so
@@ -1361,7 +1361,10 @@ impl ProgramState {
             match cursor.take() {
                 Some(Cursor::BTree(btree, info))
                     if keep_ephemeral
-                        && self.ephemeral_temp_files.contains_key(&cursor_id)
+                        && self
+                            .ephemeral_temp_files
+                            .get(&cursor_id)
+                            .is_some_and(|tf| !tf.has_open_disk_fd())
                         && btree.pager.cached_pages() <= KEPT_EPHEMERAL_PAGES =>
                 {
                     self.ephemeral_kept

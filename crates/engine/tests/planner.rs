@@ -956,3 +956,62 @@ fn three_table_rowid_join_survives_secondary_index_and_concurrent_warmup() {
         "expected PK seek on regions (not hash join), got: {steps:?}"
     );
 }
+
+/// Regression: in a `WITH RECURSIVE` join (`FROM child JOIN tree ON child.parent_id = tree.id`),
+/// the 1-row `RecursiveCteInput` pseudo-cursor must stay outer so the inner table uses its
+/// secondary index instead of full-scanning the base table on every recursive step.
+#[test]
+fn recursive_cte_keeps_working_frontier_outer_and_uses_inner_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db_path = dir.path().join("rec_cte.db");
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, db_path.to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute(
+        "CREATE TABLE spans (id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for first in (1..=2_000i64).step_by(200) {
+        let rows: Vec<String> = (first..first + 200)
+            .map(|id| {
+                if id <= 10 || id % 5 == 0 {
+                    format!("({id}, NULL, 'root-{id}')")
+                } else {
+                    format!("({id}, {}, 'child-{id}')", id - 1)
+                }
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO spans VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("CREATE INDEX idx_spans_parent ON spans (parent_id)")
+        .unwrap();
+    conn.execute("ANALYZE").unwrap();
+
+    let steps = plan(
+        &conn,
+        "WITH RECURSIVE tree(id, depth) AS ( \
+            SELECT id, 0 FROM spans WHERE id = 1 \
+            UNION ALL \
+            SELECT c.id, t.depth + 1 FROM spans c JOIN tree t ON c.parent_id = t.id WHERE t.depth < 6 \
+         ) SELECT id, depth FROM tree",
+    );
+    let rec_pos = steps
+        .iter()
+        .position(|s| s == "RECURSIVE STEP")
+        .expect("expected RECURSIVE STEP in EXPLAIN QUERY PLAN");
+    let after_rec = &steps[rec_pos + 1..];
+    assert!(
+        after_rec
+            .iter()
+            .any(|s| s.contains("SEARCH c USING") && s.contains("INDEX idx_spans_parent")),
+        "recursive step must use index on inner table instead of full scan: {steps:?}"
+    );
+    assert!(
+        !after_rec.iter().any(|s| s == "SCAN spans AS c"),
+        "recursive step regressed to full table scan of base table: {steps:?}"
+    );
+}

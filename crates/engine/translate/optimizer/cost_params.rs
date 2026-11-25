@@ -431,9 +431,16 @@ impl CostModelParams {
             return self.clone();
         };
         let row = f.in_pages(Term::Row, self.cpu_cost_per_row, self.cpu_cost_per_row);
+        let cached_page = if f.nanos(Term::Row).is_some() {
+            row
+        } else {
+            self.cached_page_cost
+        };
         Self {
             cpu_cost_per_row: row,
             cpu_cost_per_seek: f.in_pages(Term::Seek, self.cpu_cost_per_seek, row),
+            cpu_cost_per_rowid_seek: f.in_pages(Term::Seek, self.cpu_cost_per_rowid_seek, row),
+            cached_page_cost: cached_page,
             hash_insert_cost: f.in_pages(Term::HashBuild, self.hash_insert_cost, row),
             hash_lookup_cost: f.in_pages(Term::HashProbe, self.hash_lookup_cost, row),
             sort_cpu_per_row: f.in_pages(Term::Sort, self.sort_cpu_per_row, row),

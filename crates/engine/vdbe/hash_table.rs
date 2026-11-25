@@ -969,6 +969,19 @@ impl Default for HashTableConfig {
     }
 }
 
+/// Opens a spill temp file for hash join build/probe partitions. Mirrors `Sorter::open_temp_file`:
+/// under `TempStore::Default`, falls back to in-memory temp storage if creating a disk temp file
+/// fails (e.g. `EMFILE`, full `TMPDIR`), while `TempStore::File` strictly propagates I/O errors.
+fn open_spill_temp_file(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<TempFile> {
+    match TempFile::with_temp_store(io, temp_store) {
+        Ok(tf) => Ok(tf),
+        Err(_) if matches!(temp_store, crate::TempStore::Default) => {
+            TempFile::with_temp_store(io, crate::TempStore::Memory)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 struct SpillState {
     /// In-memory partition buffers for grace hash join.
     /// When spilling is triggered, entries are partitioned by hash before writing.
@@ -995,7 +1008,7 @@ impl SpillState {
                 .try_collect()?,
             partitions: vec![],
             next_spill_offset: 0,
-            temp_file: TempFile::with_temp_store(io, temp_store)?,
+            temp_file: open_spill_temp_file(io, temp_store)?,
             partitioning,
         })
     }
@@ -1045,7 +1058,7 @@ impl ProbeSpillState {
                 .try_collect()?,
             partitions: vec![],
             next_spill_offset: 0,
-            temp_file: TempFile::with_temp_store(io, temp_store)?,
+            temp_file: open_spill_temp_file(io, temp_store)?,
             partitioning,
             mem_used: 0,
             mem_budget,

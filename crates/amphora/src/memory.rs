@@ -9,6 +9,8 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
@@ -189,6 +191,7 @@ pub enum Use {
 }
 
 impl Use {
+    #[cfg(test)]
     const ALL: [Self; 5] = [
         Self::Queues,
         Self::Images,
@@ -220,396 +223,338 @@ pub trait Readings: Send + Sync {
     fn read(&self) -> Reading;
 }
 
-/// Strictly linearizable two-phase single-flight coalescer for [`Readings`] (`AC-MB.1.1`).
+/// Strictly linearizable, zero-`Arc`, zero-mutex single-flight coalescer for [`Readings`]
+/// (`AC-MB.1.1`).
 ///
 /// Every caller receives a fresh reading whose `R::read()` **started after** the caller entered
 /// `SingleFlight::read()` and **finished before** it returned. When a reading is already in flight,
 /// arriving callers never reuse the previous completed sample (which could predate a memory limit
-/// reduction); instead they coalesce onto the next flight, which one designated leader executes
-/// once the current flight finishes.
+/// reduction); instead they coalesce onto the next wave executed by one elected leader once the
+/// current wave finishes.
 ///
-/// Fast path: uncontended callers transition `fast_busy` `0 -> 1 -> 0` with zero mutex locks or
-/// condvar notifications. Contended callers escalate `fast_busy` to `2` under `state`, designate a
-/// single next-generation leader on `next_leader_cv`, and park all other batch followers on a
-/// generation-parity condvar (`done_even` / `done_odd`) so followers never wake up until their
-/// target generation has actually completed (zero thundering herd).
-struct FlightState {
-    in_flight: bool,
-    active_gen: u64,
-    completed_gen: u64,
-    next_leader_gen: Option<u64>,
-    leader_waiters_even: usize,
-    leader_waiters_odd: usize,
-    batch_waiters_even: usize,
-    batch_waiters_odd: usize,
-    last: Reading,
-    #[cfg(test)]
-    waiters: usize,
-}
+/// All state lives inline in `SingleFlight<R>` and is accessed solely through `&self` (zero `Arc`,
+/// zero heap allocation, zero `Mutex`, zero `Condvar`, zero `unsafe`):
+/// - Two alternating [`amphora_engine::FastRwLock<()>`] phases (`phases[epoch & 1]`) coordinate
+///   sleeping and parallel fan-out waking: a wave leader acquires `phases[epoch & 1].write()`
+///   *before* publishing its state, and all followers park on `phases[epoch & 1].read()` so every
+///   follower wakes in parallel once the write guard drops.
+/// - A 4-mode monotonic generation word (`state = (epoch << 2) | mode`) prevents both fast-reader
+///   starvation and lock-order inversions: when wave `g` finishes with wave `g + 1` queued, wave
+///   `g` transitions to `MODE_HANDING_OFF(g)` and drops `phases[g & 1].write()`. No wave `g + 2`
+///   can claim `phases[g & 1].write()` until wave `g + 1`'s leader has woken, dropped its
+///   `phases[g & 1].read()`, and published `MODE_ACTIVE(g + 1)` — sealing wave `g + 1` before
+///   calling `inner.read()`. Callers arriving during `MODE_HANDING_OFF(g)` coalesce onto wave
+///   `g + 1` as followers.
+/// - Completed readings are published through a single-writer lock-free seqlock
+///   ([`LatestReading`]) tagged with the full 62-bit wave generation, eliminating mod-2 parity
+///   aliasing. If a leader panics inside `inner.read()`, its drop guard advances `state` without
+///   publishing a reading and drops its write guard, waking every waiting follower and next-wave
+///   leader cleanly.
+const MODE_MASK: u64 = 0b11;
+const MODE_IDLE: u64 = 0;
+const MODE_ACTIVE: u64 = 1;
+const MODE_QUEUED: u64 = 2;
+const MODE_HANDING_OFF: u64 = 3;
 
-impl Default for FlightState {
-    fn default() -> Self {
-        Self {
-            in_flight: false,
-            active_gen: 0,
-            completed_gen: 0,
-            next_leader_gen: None,
-            leader_waiters_even: 0,
-            leader_waiters_odd: 0,
-            batch_waiters_even: 0,
-            batch_waiters_odd: 0,
-            last: Reading {
-                limit: None,
-                resident: None,
-            },
-            #[cfg(test)]
-            waiters: 0,
-        }
-    }
-}
-
-impl FlightState {
-    #[inline]
-    fn leader_waiters(&self, generation: u64) -> usize {
-        if generation & 1 == 0 {
-            self.leader_waiters_even
-        } else {
-            self.leader_waiters_odd
-        }
-    }
-
-    #[inline]
-    fn leader_waiters_mut(&mut self, generation: u64) -> &mut usize {
-        if generation & 1 == 0 {
-            &mut self.leader_waiters_even
-        } else {
-            &mut self.leader_waiters_odd
-        }
-    }
-
-    #[inline]
-    fn batch_waiters(&self, generation: u64) -> usize {
-        if generation & 1 == 0 {
-            self.batch_waiters_even
-        } else {
-            self.batch_waiters_odd
-        }
-    }
-
-    #[inline]
-    fn batch_waiters_mut(&mut self, generation: u64) -> &mut usize {
-        if generation & 1 == 0 {
-            &mut self.batch_waiters_even
-        } else {
-            &mut self.batch_waiters_odd
-        }
-    }
-
-    #[inline]
-    fn is_idle(&self) -> bool {
-        !self.in_flight
-            && self.leader_waiters_even == 0
-            && self.leader_waiters_odd == 0
-            && self.batch_waiters_even == 0
-            && self.batch_waiters_odd == 0
-    }
+#[inline]
+const fn pack_state(epoch: u64, mode: u64) -> u64 {
+    (epoch << 2) | (mode & MODE_MASK)
 }
 
 #[inline]
-fn gen_reached(completed: u64, target: u64) -> bool {
-    completed.wrapping_sub(target) < (1u64 << 63)
+const fn state_epoch(packed: u64) -> u64 {
+    packed >> 2
 }
 
-const FAST_IDLE: u64 = 0;
-const FAST_IN_FLIGHT: u64 = 1;
-const FAST_SLOW_PATH: u64 = 2;
+#[inline]
+const fn state_mode(packed: u64) -> u64 {
+    packed & MODE_MASK
+}
+
+struct LatestReading {
+    /// Even when stable, odd while the unique active flight leader is updating the fields below.
+    seq: AtomicU64,
+    epoch: AtomicU64,
+    has_limit: AtomicU64,
+    limit: AtomicU64,
+    has_resident: AtomicU64,
+    resident: AtomicU64,
+}
+
+impl LatestReading {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            has_limit: AtomicU64::new(0),
+            limit: AtomicU64::new(0),
+            has_resident: AtomicU64::new(0),
+            resident: AtomicU64::new(0),
+        }
+    }
+
+    /// Publishes `(epoch, reading)`. Called exclusively by the active flight leader while it holds
+    /// its wave's write guard, so there is at most one writer at a time.
+    fn publish(&self, epoch: u64, reading: Reading) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Release);
+        fence(Ordering::SeqCst);
+        self.epoch.store(epoch, Ordering::Relaxed);
+        self.has_limit
+            .store(u64::from(reading.limit.is_some()), Ordering::Relaxed);
+        self.limit
+            .store(reading.limit.unwrap_or(0), Ordering::Relaxed);
+        self.has_resident
+            .store(u64::from(reading.resident.is_some()), Ordering::Relaxed);
+        self.resident
+            .store(reading.resident.unwrap_or(0), Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Lock-free read of the latest completed reading if its wave generation reached `target`.
+    fn read_at_least(&self, target: u64) -> Option<Reading> {
+        loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let epoch = self.epoch.load(Ordering::Relaxed);
+            let has_limit = self.has_limit.load(Ordering::Relaxed);
+            let limit = self.limit.load(Ordering::Relaxed);
+            let has_resident = self.has_resident.load(Ordering::Relaxed);
+            let resident = self.resident.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            let s2 = self.seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                return if epoch >= target {
+                    Some(Reading {
+                        limit: if has_limit != 0 { Some(limit) } else { None },
+                        resident: if has_resident != 0 {
+                            Some(resident)
+                        } else {
+                            None
+                        },
+                    })
+                } else {
+                    None
+                };
+            }
+        }
+    }
+}
 
 struct SingleFlight<R> {
     inner: R,
-    fast_busy: AtomicU64,
-    state: Mutex<FlightState>,
-    leader_even: Condvar,
-    leader_odd: Condvar,
-    done_even: Condvar,
-    done_odd: Condvar,
+    state: AtomicU64,
+    phases: [amphora_engine::FastRwLock<()>; 2],
+    latest: LatestReading,
+    #[cfg(test)]
+    waiters: AtomicUsize,
 }
 
 impl<R> SingleFlight<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            fast_busy: AtomicU64::new(FAST_IDLE),
-            state: Mutex::new(FlightState::default()),
-            leader_even: Condvar::new(),
-            leader_odd: Condvar::new(),
-            done_even: Condvar::new(),
-            done_odd: Condvar::new(),
+            state: AtomicU64::new(pack_state(0, MODE_IDLE)),
+            phases: [
+                amphora_engine::FastRwLock::new(()),
+                amphora_engine::FastRwLock::new(()),
+            ],
+            latest: LatestReading::new(),
+            #[cfg(test)]
+            waiters: AtomicUsize::new(0),
         }
     }
 
     #[inline]
-    fn leader_cv(&self, generation: u64) -> &Condvar {
-        if generation & 1 == 0 {
-            &self.leader_even
-        } else {
-            &self.leader_odd
-        }
+    fn phase(&self, epoch: u64) -> &amphora_engine::FastRwLock<()> {
+        let [even, odd] = &self.phases;
+        if epoch & 1 == 0 { even } else { odd }
     }
 
-    #[inline]
-    fn done_cv(&self, generation: u64) -> &Condvar {
-        if generation & 1 == 0 {
-            &self.done_even
-        } else {
-            &self.done_odd
-        }
-    }
-
-    #[inline]
-    fn maybe_reset_fast(&self, state: &FlightState) {
-        if state.is_idle() {
-            self.fast_busy.store(FAST_IDLE, Ordering::Release);
-        }
-    }
-
-    fn finish_flight(&self, my_gen: Option<u64>, reading: Reading) {
-        let (completed_gen, wake_cur, wake_cur_leader, wake_next_leader, wake_orphan_next) = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let completed_gen = my_gen.unwrap_or(state.active_gen);
-            let next_gen = completed_gen.wrapping_add(1);
-            state.last = reading;
-            state.completed_gen = completed_gen;
-            state.in_flight = false;
-            let wake_cur = state.batch_waiters(completed_gen) > 0;
-            let wake_cur_leader = state.leader_waiters(completed_gen) > 0;
-            let wake_next_leader = state.leader_waiters(next_gen) > 0;
-            if wake_next_leader && state.next_leader_gen == Some(next_gen) {
-                state.next_leader_gen = None;
-            }
-            let wake_orphan_next = !wake_next_leader && state.batch_waiters(next_gen) > 0;
-            self.maybe_reset_fast(&state);
-            (
-                completed_gen,
-                wake_cur,
-                wake_cur_leader,
-                wake_next_leader,
-                wake_orphan_next,
+    /// Transitions `state` at the end of wave `epoch` while the caller still holds
+    /// `phases[epoch & 1].write()`, so any newly woken follower or next-wave leader sees the final
+    /// state as soon as the write guard drops.
+    fn release_wave(&self, epoch: u64) {
+        if self
+            .state
+            .compare_exchange(
+                pack_state(epoch, MODE_ACTIVE),
+                pack_state(epoch, MODE_IDLE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
-        };
-        let next_gen = completed_gen.wrapping_add(1);
-        if wake_cur {
-            self.done_cv(completed_gen).notify_all();
-        }
-        if wake_cur_leader {
-            self.leader_cv(completed_gen).notify_all();
-        }
-        if wake_next_leader {
-            self.leader_cv(next_gen).notify_all();
-        } else if wake_orphan_next {
-            self.done_cv(next_gen).notify_all();
+            .is_err()
+        {
+            // A leader for wave `epoch + 1` is already queued (holding
+            // `phases[(epoch + 1) & 1].write()` and waiting on `phases[epoch & 1].read()`). Hand
+            // off directly without exposing `IDLE`.
+            self.state
+                .store(pack_state(epoch, MODE_HANDING_OFF), Ordering::Release);
         }
     }
 
-    fn finish_panic(&self) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.in_flight = false;
-            state.next_leader_gen = None;
-            self.maybe_reset_fast(&state);
+    /// Executes `inner.read()` as the unique leader of wave `epoch`, holding `write_guard` until
+    /// `latest` and `state` are updated (or, on panic, until `state` has been transitioned so
+    /// waiting followers and any queued next leader wake cleanly).
+    fn run_wave(&self, epoch: u64, write_guard: impl Drop) -> Reading
+    where
+        R: Readings,
+    {
+        struct ActiveGuard<'a, R> {
+            sf: &'a SingleFlight<R>,
+            epoch: u64,
+            finished: bool,
         }
-        self.leader_even.notify_all();
-        self.leader_odd.notify_all();
-        self.done_even.notify_all();
-        self.done_odd.notify_all();
+        impl<R> Drop for ActiveGuard<'_, R> {
+            fn drop(&mut self) {
+                if !self.finished {
+                    self.sf.release_wave(self.epoch);
+                }
+            }
+        }
+        // `write_guard` is declared *before* `guard`, so on both normal return and unwind `guard`
+        // drops FIRST (updating `state`) and `write_guard` drops SECOND (waking followers and any
+        // queued next-wave leader).
+        let _write_guard = write_guard;
+        let mut guard = ActiveGuard {
+            sf: self,
+            epoch,
+            finished: false,
+        };
+        let reading = self.inner.read();
+        guard.finished = true;
+        self.latest.publish(epoch, reading);
+        self.release_wave(epoch);
+        reading
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        state_mode(self.state.load(Ordering::Acquire)) == MODE_IDLE
+            && self.waiters.load(Ordering::Acquire) == 0
     }
 }
 
 impl<R: Readings> Readings for SingleFlight<R> {
     fn read(&self) -> Reading {
-        // Zero-mutex uncontended fast path.
-        if self
-            .fast_busy
-            .compare_exchange(
-                FAST_IDLE,
-                FAST_IN_FLIGHT,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            struct FastGuard<'a, R> {
-                sf: &'a SingleFlight<R>,
-                finished: bool,
+        #[cfg(test)]
+        struct WaiterGuard<'a>(&'a AtomicUsize);
+        #[cfg(test)]
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
             }
-            impl<R> Drop for FastGuard<'_, R> {
-                fn drop(&mut self) {
-                    if !self.finished
-                        && self
-                            .sf
-                            .fast_busy
-                            .compare_exchange(
-                                FAST_IN_FLIGHT,
-                                FAST_IDLE,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
-                    {
-                        self.sf.finish_panic();
-                    }
-                }
-            }
-            let mut guard = FastGuard {
-                sf: self,
-                finished: false,
-            };
-            let reading = self.inner.read();
-            guard.finished = true;
-            if self
-                .fast_busy
-                .compare_exchange(
-                    FAST_IN_FLIGHT,
-                    FAST_IDLE,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                self.finish_flight(None, reading);
-            }
-            return reading;
         }
 
-        let my_gen = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            // Escalate `fast_busy` to `FAST_SLOW_PATH` while holding `state` so no new caller
-            // enters the fast path until `state` drains idle, and any in-flight fast caller is
-            // guaranteed to hand off through `finish_flight`.
-            loop {
-                match self.fast_busy.load(Ordering::Acquire) {
-                    FAST_SLOW_PATH => break,
-                    FAST_IDLE => {
+        loop {
+            let cur = self.state.load(Ordering::SeqCst);
+            let epoch = state_epoch(cur);
+            match state_mode(cur) {
+                MODE_IDLE => {
+                    let next = epoch.wrapping_add(1);
+                    if let Some(write_guard) = self.phase(next).try_write() {
                         if self
-                            .fast_busy
+                            .state
                             .compare_exchange(
-                                FAST_IDLE,
-                                FAST_SLOW_PATH,
-                                Ordering::AcqRel,
+                                cur,
+                                pack_state(next, MODE_ACTIVE),
+                                Ordering::SeqCst,
                                 Ordering::Acquire,
                             )
                             .is_ok()
                         {
-                            break;
+                            return self.run_wave(next, write_guard);
                         }
+                        drop(write_guard);
+                        // Another thread won `next` strictly after our `SeqCst` load of `IDLE`;
+                        // if it already finished, its reading is linearizable for us.
+                        if let Some(reading) = self.latest.read_at_least(next) {
+                            return reading;
+                        }
+                        continue;
                     }
-                    _ => {
+                    // Either a peer just grabbed `phases[next & 1].write()` for wave `next` or a
+                    // straggling follower of `epoch - 1` is mid-drop of `read()`. If wave `next`
+                    // is already active, coalesce onto it as a follower without spinning.
+                    if self.state.load(Ordering::SeqCst) == pack_state(next, MODE_ACTIVE) {
+                        {
+                            #[cfg(test)]
+                            let _waiter = {
+                                self.waiters.fetch_add(1, Ordering::AcqRel);
+                                WaiterGuard(&self.waiters)
+                            };
+                            drop(self.phase(next).read());
+                        }
+                        if let Some(reading) = self.latest.read_at_least(next) {
+                            return reading;
+                        }
+                        continue;
+                    }
+                    std::thread::yield_now();
+                }
+                MODE_ACTIVE => {
+                    let next = epoch.wrapping_add(1);
+                    if let Some(next_guard) = self.phase(next).try_write() {
                         if self
-                            .fast_busy
+                            .state
                             .compare_exchange(
-                                FAST_IN_FLIGHT,
-                                FAST_SLOW_PATH,
-                                Ordering::AcqRel,
+                                cur,
+                                pack_state(epoch, MODE_QUEUED),
+                                Ordering::SeqCst,
                                 Ordering::Acquire,
                             )
                             .is_ok()
                         {
-                            let fast_gen = state.completed_gen.wrapping_add(1);
-                            state.in_flight = true;
-                            state.active_gen = fast_gen;
-                            break;
+                            // We are the sole leader of wave `next`, already holding
+                            // `phases[next & 1].write()`. Wait for wave `epoch` to drop
+                            // `phases[epoch & 1].write()`, release our read guard, then seal wave
+                            // `next` (`MODE_ACTIVE(next)`) before invoking `inner.read()`.
+                            {
+                                #[cfg(test)]
+                                let _waiter = {
+                                    self.waiters.fetch_add(1, Ordering::AcqRel);
+                                    WaiterGuard(&self.waiters)
+                                };
+                                drop(self.phase(epoch).read());
+                            }
+                            self.state
+                                .store(pack_state(next, MODE_ACTIVE), Ordering::SeqCst);
+                            return self.run_wave(next, next_guard);
                         }
+                        drop(next_guard);
+                        continue;
+                    }
+                    // Another contender already holds `phases[next & 1].write()` (or a straggler
+                    // from `epoch - 1` is dropping `read()`). Re-check state; if `QUEUED` or
+                    // `HANDING_OFF`, the next loop iteration parks as a shared follower.
+                    if state_mode(self.state.load(Ordering::Acquire)) == MODE_ACTIVE {
+                        std::thread::yield_now();
                     }
                 }
-            }
-
-            if state.in_flight {
-                let target_gen = state.active_gen.wrapping_add(1);
-                loop {
-                    if gen_reached(state.completed_gen, target_gen) {
-                        let reading = state.last;
-                        self.maybe_reset_fast(&state);
+                MODE_QUEUED | MODE_HANDING_OFF => {
+                    // Wave `next` has a leader holding `phases[next & 1].write()` and has NOT
+                    // yet sealed `MODE_ACTIVE(next)` or started `inner.read()`. Park as a shared
+                    // follower on `phases[next & 1].read()` (zero write contention!).
+                    let next = epoch.wrapping_add(1);
+                    {
+                        #[cfg(test)]
+                        let _waiter = {
+                            self.waiters.fetch_add(1, Ordering::AcqRel);
+                            WaiterGuard(&self.waiters)
+                        };
+                        drop(self.phase(next).read());
+                    }
+                    if let Some(reading) = self.latest.read_at_least(next) {
                         return reading;
                     }
-                    if !state.in_flight {
-                        let next_gen = state.completed_gen.wrapping_add(1);
-                        state.in_flight = true;
-                        state.active_gen = next_gen;
-                        break next_gen;
-                    }
-                    if state.active_gen != target_gen && state.next_leader_gen != Some(target_gen) {
-                        state.next_leader_gen = Some(target_gen);
-                        let leaders = state.leader_waiters_mut(target_gen);
-                        *leaders = leaders.saturating_add(1);
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_add(1);
-                        }
-                        while state.in_flight
-                            && state.active_gen != target_gen
-                            && !gen_reached(state.completed_gen, target_gen)
-                        {
-                            state = self
-                                .leader_cv(target_gen)
-                                .wait(state)
-                                .unwrap_or_else(PoisonError::into_inner);
-                        }
-                        let leaders = state.leader_waiters_mut(target_gen);
-                        *leaders = leaders.saturating_sub(1);
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_sub(1);
-                        }
-                        if state.next_leader_gen == Some(target_gen) {
-                            state.next_leader_gen = None;
-                        }
-                    } else {
-                        let slot = state.batch_waiters_mut(target_gen);
-                        *slot = slot.saturating_add(1);
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_add(1);
-                        }
-                        while state.in_flight && !gen_reached(state.completed_gen, target_gen) {
-                            state = self
-                                .done_cv(target_gen)
-                                .wait(state)
-                                .unwrap_or_else(PoisonError::into_inner);
-                        }
-                        let slot = state.batch_waiters_mut(target_gen);
-                        *slot = slot.saturating_sub(1);
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_sub(1);
-                        }
-                    }
+                    // Wave `next`'s leader panicked before publishing; retry cleanly.
                 }
-            } else {
-                let next_gen = state.completed_gen.wrapping_add(1);
-                state.in_flight = true;
-                state.active_gen = next_gen;
-                next_gen
-            }
-        };
-
-        struct FlightGuard<'a, R> {
-            sf: &'a SingleFlight<R>,
-            finished: bool,
-        }
-        impl<R> Drop for FlightGuard<'_, R> {
-            fn drop(&mut self) {
-                if !self.finished {
-                    self.sf.finish_panic();
-                }
+                _ => {}
             }
         }
-        let mut guard = FlightGuard {
-            sf: self,
-            finished: false,
-        };
-        let reading = self.inner.read();
-        guard.finished = true;
-        self.finish_flight(Some(my_gen), reading);
-        reading
     }
 }
 
@@ -853,6 +798,10 @@ impl Opened {
 pub struct Budget {
     readings: Box<dyn Readings>,
     held: [AtomicU64; 5],
+    /// Sum of reserved bytes across all five [`Use`] categories, updated atomically before each
+    /// per-use slot on reserve and after each per-use slot on release so concurrent takes across
+    /// distinct categories can never overshoot the process limit.
+    total_held: AtomicU64,
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 5],
     /// The holders waiting for room now ([`Budget::take_until`]): a charge given back with none
@@ -947,6 +896,7 @@ impl Budget {
         Arc::new(Self {
             readings,
             held: Default::default(),
+            total_held: AtomicU64::new(0),
             streams: Default::default(),
             waiting: AtomicU64::new(0),
             given: (Mutex::new(0), Condvar::new()),
@@ -1010,11 +960,10 @@ impl Budget {
     fn room_and_limit(&self, used: Use) -> Result<(u64, u64), Refusal> {
         let reading = self.readings.read();
         let limit = reading.limit.ok_or_else(|| unread("memory limit"))?;
-        let charged = Use::ALL
-            .iter()
-            .fold(0u64, |sum, each| sum.saturating_add(self.held(*each)));
+        let own = self.held(used);
+        let charged = self.total_held.load(Ordering::Acquire).max(own);
         let resident = reading.resident.unwrap_or(charged);
-        let others = resident.max(charged).saturating_sub(self.held(used));
+        let others = resident.max(charged).saturating_sub(own);
         Ok((limit.saturating_sub(others), limit))
     }
 
@@ -1036,23 +985,73 @@ impl Budget {
         })
     }
 
-    fn hold_with_limit(&self, used: Use, bytes: u64) -> Result<(), (Refusal, Option<u64>)> {
-        let (room, whole_limit) = self
-            .room_and_limit(used)
-            .map_err(|refusal| (refusal, None))?;
-        self.slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(bytes).filter(|after| *after <= room)
+    fn hold_with_limit_until(
+        &self,
+        used: Use,
+        bytes: u64,
+        until: Option<Instant>,
+    ) -> Result<(), (Refusal, Option<u64>)> {
+        let reading = self.readings.read();
+        let limit = reading
+            .limit
+            .ok_or_else(|| (unread("memory limit"), None))?;
+        let room_for = |total: u64, own: u64| {
+            let charged = total.max(own);
+            let resident = reading.resident.unwrap_or(charged);
+            let others = resident.max(charged).saturating_sub(own);
+            limit.saturating_sub(others)
+        };
+        if bytes > limit {
+            let own = self.held(used);
+            let room = room_for(self.total_held.load(Ordering::Acquire), own);
+            return Err((
+                Refusal::TooLarge {
+                    what: format!("memory for {}", used.name()),
+                    size: usize::try_from(own.saturating_add(bytes)).unwrap_or(usize::MAX),
+                    limit: usize::try_from(room).unwrap_or(usize::MAX),
+                },
+                Some(limit),
+            ));
+        }
+        // Check deadline *after* `readings.read()` and *before* committing any reservation so a
+        // slow system reading cannot grant admission past `until`.
+        if until.is_some_and(|deadline| Instant::now() >= deadline) {
+            let own = self.held(used);
+            let room = room_for(self.total_held.load(Ordering::Acquire), own);
+            return Err((
+                Refusal::Full {
+                    limit: usize::try_from(room).unwrap_or(usize::MAX),
+                },
+                Some(limit),
+            ));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        // Reserve atomically against the process-wide `total_held` counter first so concurrent
+        // reservations across distinct `Use` categories cannot collectively exceed `limit`.
+        self.total_held
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |total| {
+                let after = total.checked_add(bytes)?;
+                let effective = reading.resident.unwrap_or(total).max(total);
+                effective
+                    .checked_add(bytes)
+                    .filter(|used_after| *used_after <= limit)
+                    .map(|_| after)
             })
-            .map(|_| ())
-            .map_err(|held| {
+            .map(|_| {
+                self.slot(used).fetch_add(bytes, Ordering::AcqRel);
+            })
+            .map_err(|total| {
+                let own = self.held(used);
+                let room = room_for(total, own);
                 (
                     Refusal::TooLarge {
                         what: format!("memory for {}", used.name()),
-                        size: usize::try_from(held.saturating_add(bytes)).unwrap_or(usize::MAX),
+                        size: usize::try_from(own.saturating_add(bytes)).unwrap_or(usize::MAX),
                         limit: usize::try_from(room).unwrap_or(usize::MAX),
                     },
-                    Some(whole_limit),
+                    Some(limit),
                 )
             })
     }
@@ -1061,7 +1060,7 @@ impl Budget {
     /// gives them back with [`Budget::give`] (the engine's versioned storage, which takes a run of
     /// frames or a step of its versions' reservation at a time).
     pub fn hold(&self, used: Use, bytes: u64) -> Result<(), Refusal> {
-        self.hold_with_limit(used, bytes)
+        self.hold_with_limit_until(used, bytes, None)
             .map_err(|(refusal, _)| refusal)
     }
 
@@ -1080,7 +1079,7 @@ impl Budget {
     ) -> Result<Charge, Refusal> {
         // Room found takes no lock, as Linux's `wait_event` looks before it joins the queue
         // (include/linux/wait.h); the look under the lock below is the one a give can't slip past.
-        match self.hold_with_limit(used, bytes) {
+        match self.hold_with_limit_until(used, bytes, Some(until)) {
             Ok(()) => {
                 return Ok(Charge {
                     budget: Arc::clone(self),
@@ -1106,7 +1105,7 @@ impl Budget {
         fence(Ordering::SeqCst);
         let held = 'look: loop {
             let seen = *given;
-            let (room, whole_limit) = match self.hold_with_limit(used, bytes) {
+            let (room, whole_limit) = match self.hold_with_limit_until(used, bytes, Some(until)) {
                 Ok(()) => break Ok(()),
                 Err((Refusal::TooLarge { limit, .. }, whole_limit)) => (limit, whole_limit),
                 Err((other, _)) => break Err(other),
@@ -1155,11 +1154,20 @@ impl Budget {
     /// `bytes` held by `used` ([`Budget::hold`]) given back, and the holders waiting for room
     /// ([`Budget::take_until`]) woken to look again.
     pub fn give(&self, used: Use, bytes: u64) {
+        let mut removed = 0u64;
         let _ = self
             .slot(used)
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                removed = held.min(bytes);
                 Some(held.saturating_sub(bytes))
             });
+        if removed > 0 {
+            let _ = self
+                .total_held
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |total| {
+                    Some(total.saturating_sub(removed))
+                });
+        }
         if self.waiting.load(Ordering::SeqCst) > 0 {
             let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
             *given = given.wrapping_add(1);
@@ -1584,7 +1592,7 @@ pub(crate) mod tests {
 
         // Wait deterministically until all 4 followers are parked on the next flight, then release
         // call #2 so all 4 coalesce onto one fresh reading started strictly after the reduction.
-        while sf.state.lock().unwrap().waiters < 4 {
+        while sf.waiters.load(Ordering::Acquire) < 4 {
             std::thread::yield_now();
         }
         {
@@ -1660,8 +1668,7 @@ pub(crate) mod tests {
                 });
             }
         });
-        assert_eq!(sf.fast_busy.load(Ordering::Acquire), FAST_IDLE);
-        assert!(sf.state.lock().unwrap().is_idle());
+        assert!(sf.is_idle());
 
         // Wave 2: inject a panic mid-flight while 16 threads are contending; surviving threads
         // must never deadlock and must observe strictly fresh readings.
@@ -1688,7 +1695,281 @@ pub(crate) mod tests {
             }
         });
         assert!(panicked <= 1, "at most the one panicking leader fails");
-        assert_eq!(sf.fast_busy.load(Ordering::Acquire), FAST_IDLE);
-        assert!(sf.state.lock().unwrap().is_idle());
+        assert!(sf.is_idle());
+    }
+
+    /// Review P1 regression: under a controlled panic-and-retry schedule across consecutive waves,
+    /// a panicking leader must wake every follower in its wave and hand off cleanly so no caller
+    /// is ever stranded asleep after all other threads finish.
+    #[test]
+    fn review_p1_single_flight_panic_recovery_never_strands_follower() {
+        struct ScriptedSampler {
+            call: AtomicUsize,
+            entered: (Mutex<usize>, Condvar),
+            release_call: (Mutex<usize>, Condvar),
+        }
+
+        impl ScriptedSampler {
+            fn wait_entered(&self, target: usize) {
+                let mut n = self.entered.0.lock().unwrap();
+                while *n < target {
+                    n = self.entered.1.wait(n).unwrap();
+                }
+            }
+
+            fn release_up_to(&self, target: usize) {
+                let mut g = self.release_call.0.lock().unwrap();
+                *g = (*g).max(target);
+                self.release_call.1.notify_all();
+            }
+        }
+
+        impl Readings for ScriptedSampler {
+            fn read(&self) -> Reading {
+                let n = self.call.fetch_add(1, Ordering::SeqCst) + 1;
+                {
+                    let mut entered = self.entered.0.lock().unwrap();
+                    *entered = (*entered).max(n);
+                    self.entered.1.notify_all();
+                }
+                {
+                    let mut released = self.release_call.0.lock().unwrap();
+                    while *released < n {
+                        released = self.release_call.1.wait(released).unwrap();
+                    }
+                }
+                if n == 2 {
+                    panic!("injected panic on wave 2");
+                }
+                Reading {
+                    limit: Some(n as u64 * 100),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let sf = Arc::new(SingleFlight::new(ScriptedSampler {
+            call: AtomicUsize::new(0),
+            entered: (Mutex::new(0), Condvar::new()),
+            release_call: (Mutex::new(0), Condvar::new()),
+        }));
+
+        // Flight 1 (fast path): pauses inside sampler.
+        let sf1 = Arc::clone(&sf);
+        let t1 = std::thread::spawn(move || sf1.read());
+        sf.inner.wait_entered(1);
+
+        // Wave 2: leader (t2) + follower (t3) both park while flight 1 is active.
+        let sf2 = Arc::clone(&sf);
+        let t2 = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sf2.read()))
+        });
+        let sf3 = Arc::clone(&sf);
+        let t3 = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sf3.read()))
+        });
+        while sf.waiters.load(Ordering::Acquire) < 2 {
+            std::thread::yield_now();
+        }
+
+        // Release flight 1 -> hands off to wave 2 leader, which enters call #2 and pauses.
+        sf.inner.release_up_to(1);
+        assert_eq!(t1.join().unwrap().limit, Some(100));
+        sf.inner.wait_entered(2);
+
+        // While wave 2 is active, wave 3 leader (t4) and follower (t5) arrive and park.
+        let sf4 = Arc::clone(&sf);
+        let t4 = std::thread::spawn(move || sf4.read());
+        let sf5 = Arc::clone(&sf);
+        let t5 = std::thread::spawn(move || sf5.read());
+        while sf.waiters.load(Ordering::Acquire) < 3 {
+            std::thread::yield_now();
+        }
+
+        // Release call #2 (panics!) and allow all subsequent retries to complete.
+        // No additional external caller arrives — every surviving thread must finish on its own.
+        sf.inner.release_up_to(10);
+
+        let r2 = t2.join().unwrap();
+        let r3 = t3.join().unwrap();
+        // Exactly one of (t2, t3) was the leader that panicked; the other retried and succeeded.
+        assert_eq!(
+            usize::from(r2.is_err()) + usize::from(r3.is_err()),
+            1,
+            "exactly the panicking leader should fail; follower must retry"
+        );
+        let survivor = r2.or(r3).unwrap();
+        assert!(survivor.limit.unwrap() >= 300);
+        assert!(t4.join().unwrap().limit.unwrap() >= 300);
+        assert!(t5.join().unwrap().limit.unwrap() >= 300);
+        assert!(sf.is_idle());
+    }
+
+    /// Review P2 regression: continuous fast-path readers must never starve a contended caller
+    /// waiting to acquire the flight gate (no mutex and no unbounded CAS escalation loop).
+    #[test]
+    fn review_p2_single_flight_fast_readers_cannot_starve_contended_caller() {
+        use std::sync::atomic::AtomicBool;
+
+        struct PauseFirst {
+            calls: AtomicUsize,
+            entered_first: (Mutex<bool>, Condvar),
+            release_first: (Mutex<bool>, Condvar),
+        }
+
+        impl Readings for PauseFirst {
+            fn read(&self) -> Reading {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    {
+                        let mut f = self.entered_first.0.lock().unwrap();
+                        *f = true;
+                        self.entered_first.1.notify_all();
+                    }
+                    let mut g = self.release_first.0.lock().unwrap();
+                    while !*g {
+                        g = self.release_first.1.wait(g).unwrap();
+                    }
+                }
+                Reading {
+                    limit: Some(n as u64),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let sf = Arc::new(SingleFlight::new(PauseFirst {
+            calls: AtomicUsize::new(0),
+            entered_first: (Mutex::new(false), Condvar::new()),
+            release_first: (Mutex::new(false), Condvar::new()),
+        }));
+
+        // First reader holds the gate in-flight.
+        let sf1 = Arc::clone(&sf);
+        let t1 = std::thread::spawn(move || sf1.read());
+        {
+            let mut f = sf.inner.entered_first.0.lock().unwrap();
+            while !*f {
+                f = sf.inner.entered_first.1.wait(f).unwrap();
+            }
+        }
+
+        // Contended caller enrolls as next wave leader (`MODE_QUEUED`).
+        let sf_contended = Arc::clone(&sf);
+        let t_contended = std::thread::spawn(move || sf_contended.read());
+        while sf.waiters.load(Ordering::Acquire) < 1 {
+            std::thread::yield_now();
+        }
+        assert_eq!(state_mode(sf.state.load(Ordering::Acquire)), MODE_QUEUED);
+
+        // Start a swarm of fast-path hammer threads right before releasing t1.
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammers: Vec<_> = (0..4)
+            .map(|_| {
+                let sf_h = Arc::clone(&sf);
+                let stop_h = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop_h.load(Ordering::Relaxed) {
+                        let _ = sf_h.read();
+                    }
+                })
+            })
+            .collect();
+
+        {
+            let mut g = sf.inner.release_first.0.lock().unwrap();
+            *g = true;
+            sf.inner.release_first.1.notify_all();
+        }
+
+        assert_eq!(t1.join().unwrap().limit, Some(1));
+        // Because `release_active()` transfers `GATE_ACTIVE` directly to the waiting leader
+        // without exposing `GATE_IDLE`, the contended caller MUST execute immediately as call #2!
+        assert_eq!(
+            t_contended.join().unwrap().limit,
+            Some(2),
+            "contended caller must receive direct handoff as call #2, never starved by fast readers"
+        );
+        stop.store(true, Ordering::Relaxed);
+        for h in hammers {
+            h.join().unwrap();
+        }
+        assert!(sf.is_idle());
+    }
+
+    /// Review P1 regression: concurrent reservations across all five `Use` categories must never
+    /// collectively exceed the process memory limit.
+    #[test]
+    fn review_p1_budget_concurrent_categories_never_exceed_limit() {
+        let fed = Fed::new(Some(100), Some(0));
+        let budget = Budget::new(Box::new(fed));
+        let barrier = Arc::new(std::sync::Barrier::new(Use::ALL.len()));
+
+        for round in 0..256 {
+            let charges: Vec<Option<Charge>> = std::thread::scope(|s| {
+                let handles: Vec<_> = Use::ALL
+                    .into_iter()
+                    .map(|used| {
+                        let b = Arc::clone(&budget);
+                        let bar = Arc::clone(&barrier);
+                        s.spawn(move || {
+                            bar.wait();
+                            b.take(used, 80).ok()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let granted: u64 = charges.iter().flatten().map(Charge::bytes).sum();
+            let reported_total: u64 = Use::ALL.iter().map(|u| budget.held(*u)).sum();
+            assert!(
+                granted <= 100 && reported_total <= 100,
+                "round {round}: concurrent reservations overshot 100-byte limit: granted={granted}, reported={reported_total}"
+            );
+            assert_eq!(
+                granted, 80,
+                "round {round}: exactly one 80-byte take must win"
+            );
+            drop(charges);
+            assert_eq!(budget.total_held.load(Ordering::Acquire), 0);
+        }
+    }
+
+    /// Review P2 regression: `Budget::take_until` must not grant a charge if `readings.read()`
+    /// takes longer than the caller's deadline.
+    #[test]
+    fn review_p2_budget_take_until_rejects_expired_deadline_after_slow_read() {
+        struct SlowReadings {
+            gate: (Mutex<bool>, Condvar),
+        }
+        impl Readings for SlowReadings {
+            fn read(&self) -> Reading {
+                let guard = self.gate.0.lock().unwrap();
+                let _ = self
+                    .gate
+                    .1
+                    .wait_timeout(guard, std::time::Duration::from_millis(25))
+                    .unwrap();
+                Reading {
+                    limit: Some(1 << 20),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let budget = Budget::new(Box::new(SlowReadings {
+            gate: (Mutex::new(false), Condvar::new()),
+        }));
+        let deadline = Instant::now() + std::time::Duration::from_millis(2);
+        let mut waits = 0usize;
+        let res = budget.take_until(Use::Queues, 64, deadline, || waits += 1);
+        assert!(
+            matches!(res, Err(Refusal::Full { .. })),
+            "expected Refusal::Full after deadline expired during reading, got {:?}",
+            res.err()
+        );
+        assert_eq!(waits, 0);
+        assert_eq!(budget.held(Use::Queues), 0);
+        assert_eq!(budget.total_held.load(Ordering::Acquire), 0);
     }
 }

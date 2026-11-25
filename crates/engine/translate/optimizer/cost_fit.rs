@@ -982,15 +982,21 @@ mod tests {
         nanos[Term::PageRead.slot()] = Some(1000.0);
         let with_page = base.with_fitted(Some(FittedWeights { nanos }));
         assert!((with_page.cpu_cost_per_row - 0.005).abs() < 1e-12);
+        assert!((with_page.cached_page_cost - 0.005).abs() < 1e-12);
         assert!((with_page.cpu_cost_per_seek - 0.05).abs() < 1e-12);
+        assert!((with_page.cpu_cost_per_rowid_seek - 0.05).abs() < 1e-12);
         assert_eq!(with_page.sort_cpu_per_row, base.sort_cpu_per_row);
         assert_eq!(with_page.hash_insert_cost, base.hash_insert_cost);
         nanos[Term::PageRead.slot()] = None;
         let without_page = base.with_fitted(Some(FittedWeights { nanos }));
         assert_eq!(without_page.cpu_cost_per_row, base.cpu_cost_per_row);
         assert!((without_page.cpu_cost_per_seek - base.cpu_cost_per_row * 10.0).abs() < 1e-12);
+        assert!(
+            (without_page.cpu_cost_per_rowid_seek - base.cpu_cost_per_row * 10.0).abs() < 1e-12
+        );
         let none = base.with_fitted(None);
         assert_eq!(none.cpu_cost_per_seek, base.cpu_cost_per_seek);
+        assert_eq!(none.cpu_cost_per_rowid_seek, base.cpu_cost_per_rowid_seek);
         assert_eq!(none.cpu_cost_per_row, base.cpu_cost_per_row);
     }
 

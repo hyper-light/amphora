@@ -6790,9 +6790,13 @@ pub fn op_seek_rowid(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = timed_run_rowid_seek(program, pager, || {
+    let result = if let Insn::SeekRowid { cursor_id, .. } = insn {
+        timed_seek_rowid(program, state, *cursor_id, pager, |state| {
+            seek_rowid_run(program, state, insn, pager)
+        })
+    } else {
         seek_rowid_run(program, state, insn, pager)
-    });
+    };
     seek_trace_end(state, traced, &result);
     result
 }
@@ -6987,31 +6991,43 @@ pub fn op_seek(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let is_rowid = matches!(
-        insn,
+    let result = match insn {
         Insn::SeekGE {
-            is_index: false,
-            ..
-        } | Insn::SeekLE {
-            is_index: false,
-            ..
-        } | Insn::SeekGT {
-            is_index: false,
-            ..
-        } | Insn::SeekLT {
-            is_index: false,
+            cursor_id,
+            is_index,
             ..
         }
-    );
-    let result = if is_rowid {
-        timed_run_rowid_seek(program, pager, || seek_run(program, state, insn, pager))
-    } else {
-        timed_run(
-            program,
-            pager,
-            crate::translate::optimizer::learned_costs::Work::Seek,
-            || seek_run(program, state, insn, pager),
-        )
+        | Insn::SeekLE {
+            cursor_id,
+            is_index,
+            ..
+        }
+        | Insn::SeekGT {
+            cursor_id,
+            is_index,
+            ..
+        }
+        | Insn::SeekLT {
+            cursor_id,
+            is_index,
+            ..
+        } => {
+            if !*is_index {
+                timed_seek_rowid(program, state, *cursor_id, pager, |state| {
+                    seek_run(program, state, insn, pager)
+                })
+            } else {
+                timed_seek(
+                    program,
+                    state,
+                    *cursor_id,
+                    pager,
+                    crate::translate::optimizer::learned_costs::Work::Seek,
+                    |state| seek_run(program, state, insn, pager),
+                )
+            }
+        }
+        _ => seek_run(program, state, insn, pager),
     };
     seek_trace_end(state, traced, &result);
     result
@@ -7118,6 +7134,37 @@ fn star_trace_write(program: &Program, state: &mut ProgramState) {
     tracing::debug!(target: "amphora::seek_time", probes, rejects, passed = probes.saturating_sub(rejects), filters = ?filters, "T19: the star filters' rows this run");
 }
 
+/// Borrows the pager and per-database `LearnedCosts` owning `cursor_id`'s B-tree directly from
+/// `state.cursors` without cloning any `Arc`. Main, attached, and temp database pagers each carry
+/// their own `LearnedCosts` so learning stays strictly per-database; ephemeral B-tree cursors
+/// (statement autoindexes created by `op_open_ephemeral` with no database of their own) fall back
+/// to the statement's `program.connection.db.learned_costs` while checking `main_pager` for
+/// multi-reader contention.
+#[inline]
+fn cursor_pager_and_costs<'a>(
+    program: &'a Program,
+    state: &'a ProgramState,
+    cursor_id: usize,
+) -> Option<(
+    &'a Pager,
+    &'a crate::translate::optimizer::learned_costs::LearnedCosts,
+    bool,
+)> {
+    let pager = state
+        .cursors
+        .get(cursor_id)
+        .and_then(|c| c.as_ref())
+        .and_then(Cursor::btree_pager)?;
+    match pager.learned_costs() {
+        Some(costs) => Some((pager.as_ref(), costs.as_ref(), false)),
+        None => Some((
+            pager.as_ref(),
+            program.connection.db.learned_costs.as_ref(),
+            true,
+        )),
+    }
+}
+
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
 /// estimator samples this one (`LearnedCosts::sampled`). Excludes runs that touch disk
 /// (`page_file_reads`), miss the connection's `PageCache` into `SharedPages` (`page_cache_misses`),
@@ -7139,21 +7186,91 @@ fn timed_run(
     )
 }
 
-/// Amphora (QT.5): runs `run`, one table-rowid (`INTEGER PRIMARY KEY`) seek, timing it separately
-/// from secondary-index record seeks (`LearnedCosts::observe_sampled_rowid_seek`).
-fn timed_run_rowid_seek(
+/// Amphora (QT.5): times a secondary-index seek on `cursor_id`'s own database pager (zero `Arc`
+/// cloning via borrowed lifetimes) and publishes only to that database's `LearnedCosts` when a
+/// physical B-tree seek actually ran.
+fn timed_seek(
     program: &Program,
-    pager: &Pager,
-    run: impl FnOnce() -> InsnResult,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    main_pager: &Pager,
+    work: crate::translate::optimizer::learned_costs::Work,
+    run: impl FnOnce(&mut ProgramState) -> InsnResult,
 ) -> InsnResult {
-    let costs = &program.connection.db.learned_costs;
-    let sampled = costs.sampled_rowid_seek(&program.connection.cost_runs);
-    timed_run_with(
-        pager,
-        sampled,
-        |nanos| costs.observe_sampled_rowid_seek(nanos),
+    timed_seek_with(
+        program,
+        state,
+        cursor_id,
+        main_pager,
+        |costs| costs.sampled(work, &program.connection.cost_runs),
+        |costs, nanos| costs.observe_sampled(work, nanos),
         run,
     )
+}
+
+/// Amphora (QT.5): runs `run`, one table-rowid (`INTEGER PRIMARY KEY`) seek on `cursor_id`'s own
+/// database pager (zero `Arc` cloning via borrowed lifetimes), timing it separately from
+/// secondary-index record seeks (`LearnedCosts::observe_sampled_rowid_seek`) and publishing only
+/// when a physical seek ran.
+fn timed_seek_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    main_pager: &Pager,
+    run: impl FnOnce(&mut ProgramState) -> InsnResult,
+) -> InsnResult {
+    timed_seek_with(
+        program,
+        state,
+        cursor_id,
+        main_pager,
+        |costs| costs.sampled_rowid_seek(&program.connection.cost_runs),
+        |costs, nanos| costs.observe_sampled_rowid_seek(nanos),
+        run,
+    )
+}
+
+fn timed_seek_with(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    main_pager: &Pager,
+    should_sample: impl FnOnce(&crate::translate::optimizer::learned_costs::LearnedCosts) -> bool,
+    observe: impl FnOnce(&crate::translate::optimizer::learned_costs::LearnedCosts, f64),
+    run: impl FnOnce(&mut ProgramState) -> InsnResult,
+) -> InsnResult {
+    let Some((reads_before, misses_before)) = cursor_pager_and_costs(program, state, cursor_id)
+        .and_then(|(pager, costs, is_ephemeral)| {
+            let reader_pager = if is_ephemeral { main_pager } else { pager };
+            if !should_sample(costs) || reader_pager.concurrent_readers() > 1 {
+                return None;
+            }
+            Some((pager.page_file_reads(), pager.page_cache_misses()))
+        })
+    else {
+        return run(state);
+    };
+    let seeks_before = state.metrics.btree_seeks;
+    let started = std::time::Instant::now();
+    let result = run(state);
+    // Stop the timer immediately after the seek, before inspecting pager/WAL counters.
+    let elapsed = started.elapsed().as_nanos() as f64;
+    if matches!(result, Ok(InsnFunctionStepResult::Step))
+        && state.metrics.btree_seeks != seeks_before
+    {
+        if let Some((pager, costs, is_ephemeral)) =
+            cursor_pager_and_costs(program, state, cursor_id)
+        {
+            let reader_pager = if is_ephemeral { main_pager } else { pager };
+            if pager.page_file_reads() == reads_before
+                && pager.page_cache_misses() == misses_before
+                && reader_pager.concurrent_readers() <= 1
+            {
+                observe(costs, elapsed);
+            }
+        }
+    }
+    result
 }
 
 fn timed_run_with(
@@ -7169,12 +7286,14 @@ fn timed_run_with(
     let misses_before = pager.page_cache_misses();
     let started = std::time::Instant::now();
     let result = run();
+    // Stop the timer immediately after the operation, before inspecting pager/WAL counters.
+    let elapsed = started.elapsed().as_nanos() as f64;
     if matches!(result, Ok(InsnFunctionStepResult::Step))
         && pager.page_file_reads() == reads_before
         && pager.page_cache_misses() == misses_before
         && pager.concurrent_readers() <= 1
     {
-        observe(started.elapsed().as_nanos() as f64);
+        observe(elapsed);
     }
     result
 }
@@ -16651,16 +16770,38 @@ pub fn op_close(
             .expect("index-method context checked above");
         state.closed_index_method_cursors.push((cursor, context));
     }
-    let cursors = &mut state.cursors;
-    cursors
+    let closed = state
+        .cursors
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
-    state.ephemeral_temp_files.remove(cursor_id);
-    state.ephemeral_kept.remove(cursor_id);
+    match closed {
+        Some(Cursor::BTree(btree, info))
+            if state
+                .ephemeral_temp_files
+                .get(cursor_id)
+                .is_some_and(|tf| !tf.has_open_disk_fd())
+                && btree.pager.cached_pages() <= crate::vdbe::KEPT_EPHEMERAL_PAGES =>
+        {
+            state
+                .ephemeral_kept
+                .insert(*cursor_id, Cursor::BTree(btree, info));
+        }
+        other => {
+            match other {
+                Some(Cursor::BTree(cursor, ..)) => {
+                    crate::storage::btree::CursorTrait::recycle(cursor)
+                }
+                Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
+                _ => {}
+            }
+            state.ephemeral_temp_files.remove(cursor_id);
+            state.ephemeral_kept.remove(cursor_id);
+        }
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -17730,21 +17871,23 @@ pub fn op_open_ephemeral(
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
             let temp_store = conn.get_temp_store();
-            let temp_file = TempFile::with_temp_store(&io, temp_store)?;
+            let temp_file = TempFile::lazy_with_temp_store(&io, temp_store)?;
             let db_file: Arc<dyn DatabaseStorage> =
                 Arc::new(DatabaseFile::new(temp_file.file.clone()));
             let db_file_io: Arc<dyn crate::IO> = io;
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
-            let pager = Arc::new(Pager::new(
+            let mut pager = Pager::new(
                 db_file,
                 None,
                 db_file_io,
                 PageCache::default(),
                 buffer_pool,
                 Arc::new(SharedPagerState::new(Some(default_page1(None)))),
-            )?);
+            )?;
+            pager.set_ephemeral();
+            let pager = Arc::new(pager);
 
             pager.set_initial_page_size(page_size)?;
 

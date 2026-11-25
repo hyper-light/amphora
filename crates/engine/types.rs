@@ -3008,9 +3008,23 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_payload_generic()` with `skip=1`
 #[inline(always)]
+const fn int_serial_type_len(serial_type: u64) -> Option<usize> {
+    match serial_type {
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(6),
+        6 => Some(8),
+        8 | 9 => Some(0),
+        _ => None,
+    }
+}
+
+#[inline(always)]
 fn compare_payload_int<V, I>(
     left_packed: &[u8],
-    right_unpacked: I,
+    mut right_unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
     rhs_int: i64,
@@ -3034,36 +3048,85 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&left_packed[offset_1st_serialtype..])?;
-
-    let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
-    if !serialtype_is_integer {
+    let Some(first_hdr_slice) = left_packed.get(offset_1st_serialtype..) else {
         return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
-    }
+    };
+    let (first_serial_type, first_st_len) = read_varint(first_hdr_slice)?;
 
-    let data_start = header_size;
+    let Some(first_data_len) = int_serial_type_len(first_serial_type) else {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+    };
 
-    let lhs_int = read_integer(&left_packed[data_start..], first_serial_type as u8)?;
+    let Some(first_data_slice) = left_packed.get(header_size..) else {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+    };
+    let lhs_int = read_integer(first_data_slice, first_serial_type as u8)?;
     let comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => lhs_int.cmp(&rhs_int),
         SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
     };
-    match comparison {
-        std::cmp::Ordering::Equal => {
-            // First fields equal, compare remaining fields if any
-            if right_unpacked.len() > 1 {
-                return compare_payload_generic(
-                    left_packed,
-                    right_unpacked,
-                    index_info,
-                    1,
-                    tie_breaker,
-                );
-            }
-            Ok(tie_breaker)
-        }
-        other => Ok(other),
+    if comparison != std::cmp::Ordering::Equal {
+        return Ok(comparison);
     }
+
+    let field_limit = right_unpacked.len().min(index_info.key_info.len());
+    if field_limit <= 1 {
+        return Ok(tie_breaker);
+    }
+
+    // Consume field 0 (already compared via `rhs_int`) and continue directly through consecutive
+    // integer key columns without re-parsing the record header from column 0.
+    let _ = right_unpacked.next();
+    let mut header_pos = offset_1st_serialtype.saturating_add(first_st_len);
+    let mut data_pos = header_size.saturating_add(first_data_len);
+    let mut field_idx: usize = 1;
+
+    while field_idx < field_limit && header_pos < header_size {
+        let Some(rhs_item) = right_unpacked.next() else {
+            break;
+        };
+        let rhs_ref = rhs_item.as_value_ref();
+        if let ValueRef::Numeric(Numeric::Integer(rhs_col_int)) = rhs_ref {
+            let Some(hdr_slice) = left_packed.get(header_pos..) else {
+                break;
+            };
+            let (st_raw, st_len) = read_varint(hdr_slice)?;
+            if let Some(val_len) = int_serial_type_len(st_raw) {
+                let Some(val_slice) = left_packed.get(data_pos..) else {
+                    break;
+                };
+                let st_u8 = u8::try_from(st_raw).unwrap_or(0);
+                let lhs_col_int = read_integer(val_slice, st_u8)?;
+                let Some(key_info) = index_info.key_info.get(field_idx) else {
+                    break;
+                };
+                let cmp = match key_info.sort_order {
+                    SortOrder::Asc => lhs_col_int.cmp(&rhs_col_int),
+                    SortOrder::Desc => lhs_col_int.cmp(&rhs_col_int).reverse(),
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return Ok(cmp);
+                }
+                header_pos = header_pos.saturating_add(st_len);
+                data_pos = data_pos.saturating_add(val_len);
+                field_idx = field_idx.saturating_add(1);
+                continue;
+            }
+        }
+        return compare_payload_generic_from(
+            left_packed,
+            header_pos,
+            header_size,
+            data_pos,
+            field_idx,
+            field_limit,
+            std::iter::once(rhs_item).chain(right_unpacked),
+            index_info,
+            tie_breaker,
+        );
+    }
+
+    Ok(tie_breaker)
 }
 
 /// This function is an optimized version of `compare_payload_generic()` for the
@@ -3261,7 +3324,36 @@ where
     let field_limit = right_unpacked.len().min(index_info.key_info.len());
 
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for (field_idx, rhs_value) in (skip..).zip(right_unpacked.skip(skip)) {
+    compare_payload_generic_from(
+        left_packed,
+        header_pos,
+        header_end,
+        data_pos,
+        skip,
+        field_limit,
+        right_unpacked.skip(skip),
+        index_info,
+        tie_breaker,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_payload_generic_from<V, I>(
+    left_packed: &[u8],
+    mut header_pos: usize,
+    header_end: usize,
+    mut data_pos: usize,
+    start_field: usize,
+    field_limit: usize,
+    right_unpacked: I,
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: Iterator<Item = V>,
+{
+    for (field_idx, rhs_value) in (start_field..).zip(right_unpacked) {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
@@ -3666,6 +3758,13 @@ impl Cursor {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
             }
+        }
+    }
+
+    pub(crate) fn btree_pager(&self) -> Option<&Arc<crate::storage::pager::Pager>> {
+        match self {
+            Self::BTree(cursor, _) => Some(&cursor.pager),
+            _ => None,
         }
     }
 

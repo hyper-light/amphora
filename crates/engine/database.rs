@@ -697,7 +697,7 @@ impl Drop for ScopedRegistration {
 
 /// A committed WAL prefix captured by [`Database::wal_prefix`]. Its identity is opaque: an
 /// external restore or generation restart can make an old prefix inapplicable to the current log.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WalPrefix {
     header: Arc<storage::wal::HeaderCell>,
     generation: u32,
@@ -711,6 +711,13 @@ impl WalPrefix {
     #[must_use]
     pub fn is_durable(&self) -> bool {
         self.already_durable
+    }
+
+    /// Whether `other` refers to the same WAL header cell and checkpoint generation (no log
+    /// segment switch, restart, or external restore occurred between them).
+    #[must_use]
+    pub fn same_log_file(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.header, &other.header) && self.generation == other.generation
     }
 }
 

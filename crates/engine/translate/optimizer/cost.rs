@@ -212,7 +212,8 @@ pub(super) fn estimate_scan_cost(
     // CPU cost for processing all rows on each scan
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
     let disk_reads = file_reads(io_cost, table_pages, params.cache_pages, params.page_miss);
-    let cached_fetches = (io_cost - disk_reads).max(0.0);
+    let total_page_visits = num_scans * table_pages;
+    let cached_fetches = (total_page_visits - disk_reads).max(0.0);
 
     Cost(disk_reads + cached_fetches * params.cached_page_cost + cpu_cost)
 }
@@ -441,7 +442,14 @@ pub fn estimate_index_cost(
     };
 
     let index_disk_reads = file_reads(index_io, index_pages, params.cache_pages, params.page_miss);
-    let index_cached_fetches = (index_io - index_disk_reads).max(0.0);
+    // Repeated full index scans revisit every page on each pass; point/range seeks already pay
+    // their per-seek B-tree descent in `cpu_cost_per_seek` / `cpu_cost_per_rowid_seek`.
+    let index_page_visits = if is_full_scan {
+        input_cardinality * (tree_depth + index_leaf_pages_count)
+    } else {
+        index_io
+    };
+    let index_cached_fetches = (index_page_visits - index_disk_reads).max(0.0);
     let io_cost =
         index_disk_reads + index_cached_fetches * params.cached_page_cost + table_lookup_cost;
 
@@ -1148,6 +1156,39 @@ mod tests {
         assert!(
             estimate_scan_cost(30_000.0, 1.0, &many).0
                 > estimate_scan_cost(30_000.0, 1.0, &few).0 + 9_000.0
+        );
+    }
+
+    /// Review P2 regression: repeated scans of a resident table must charge `cached_page_cost`
+    /// on every pass, not only the first pass after `rescan_reads` removes repeat disk visits.
+    #[test]
+    fn review_p2_repeated_cached_scans_charge_every_pass() {
+        let params = CostModelParams {
+            rows_per_table_page: 100.0,
+            cache_pages: 2_000.0,
+            page_miss: 0.0,
+            cpu_cost_per_row: 0.0,
+            cpu_cost_per_seek: 0.0,
+            cpu_cost_per_rowid_seek: 0.0,
+            cached_page_cost: 1.0,
+            ..CostModelParams::default()
+        };
+        // 10,000 rows / 100 rows per page = 100 resident pages, 0 disk reads.
+        let one_pass = estimate_scan_cost(10_000.0, 1.0, &params).0;
+        let thousand_passes = estimate_scan_cost(10_000.0, 1_000.0, &params).0;
+        assert!((one_pass - 100.0).abs() < 1e-9, "one_pass={one_pass}");
+        assert!(
+            (thousand_passes - 100_000.0).abs() < 1e-6,
+            "thousand_passes={thousand_passes}"
+        );
+
+        // Same for a repeated full scan of a resident covering index.
+        let idx = covering_index();
+        let idx_one = estimate_index_cost(10_000.0, 3.0, idx, 1.0, 10_000.0, &params).0;
+        let idx_thousand = estimate_index_cost(10_000.0, 3.0, idx, 1_000.0, 10_000.0, &params).0;
+        assert!(
+            (idx_thousand - idx_one * 1_000.0).abs() < 1e-6,
+            "idx_one={idx_one}, idx_thousand={idx_thousand}"
         );
     }
 }

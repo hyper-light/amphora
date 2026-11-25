@@ -1995,6 +1995,10 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Arc<dyn Wal>>,
+    /// True for statement-scoped ephemeral B-trees (`op_open_ephemeral`). Ephemeral pagers keep
+    /// page 1 dirty in `page_cache` instead of eagerly writing it to disk on `allocate_page1`,
+    /// so small ephemeral tables never open an OS file descriptor unless they spill past cache.
+    ephemeral: bool,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
@@ -2390,6 +2394,7 @@ impl Pager {
         Ok(Self {
             db_file,
             wal,
+            ephemeral: false,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             learned_costs: std::sync::OnceLock::new(),
@@ -2450,6 +2455,12 @@ impl Pager {
             record_pool: Mutex::new(Vec::new()),
             cursor_allocations: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Marks this pager as backing a statement-scoped ephemeral B-tree so `allocate_page1`
+    /// keeps page 1 in `page_cache` (dirty) until the cache actually needs to spill.
+    pub(crate) fn set_ephemeral(&mut self) {
+        self.ephemeral = true;
     }
 
     /// An allocation retired by an earlier b-tree cursor on this pager, if any.
@@ -4607,6 +4618,14 @@ impl Pager {
         costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
     ) {
         let _ = self.learned_costs.set(costs);
+    }
+
+    /// Amphora (QT.5): the database's cost estimator owning this pager, if any (unset for
+    /// ephemeral pagers).
+    pub(crate) fn learned_costs(
+        &self,
+    ) -> Option<&Arc<crate::translate::optimizer::learned_costs::LearnedCosts>> {
+        self.learned_costs.get()
     }
 
     /// Insert a page into the cache, with spilling support.
@@ -6940,6 +6959,14 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                if self.ephemeral {
+                    page1.pin();
+                    let done = self.finish_allocate_page1(page1)?;
+                    if let IOResult::Done(ref page) = done {
+                        self.add_dirty(page)?;
+                    }
+                    return Ok(done);
+                }
                 let c = begin_write_btree_page(self, &page1, None)?;
 
                 // Pin page1 to prevent eviction while stored in state machine

@@ -319,10 +319,174 @@ pub trait File: Send + Sync {
             "shared WAL coordination memory mapping is not supported for this file".into(),
         ))
     }
+
+    /// Returns `true` when this handle currently holds an open OS file descriptor.
+    /// `LazyTempFile` overrides this to report `false` until a disk spill actually opens a file.
+    fn is_open_disk_file(&self) -> bool {
+        true
+    }
+}
+
+/// File wrapper for ephemeral B-trees that defers creating a temporary directory and opening an OS
+/// file descriptor until the first write/non-zero truncate (when pages actually spill past the
+/// ephemeral `PageCache`). Small in-memory ephemeral tables (`IN`, `UNION`, `WITH RECURSIVE`,
+/// small autoindexes) therefore consume zero OS file descriptors and execute zero `mkdir`/`open`
+/// syscalls even when kept alive across runs in `ProgramState::ephemeral_kept` across hundreds of
+/// concurrent reader connections.
+#[cfg(all(not(target_family = "wasm"), feature = "fs"))]
+struct LazyTempOpened {
+    // Declared before `_temp_dir` so the file closes before Windows removes its directory.
+    file: Arc<dyn File>,
+    #[allow(dead_code, reason = "held for its Drop side effect")]
+    _temp_dir: Option<tempfile::TempDir>,
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "fs"))]
+struct LazyTempFile {
+    io: Arc<dyn IO>,
+    allow_memory_fallback: bool,
+    opened: std::sync::OnceLock<LazyTempOpened>,
+    init_lock: crate::sync::Mutex<()>,
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "fs"))]
+impl LazyTempFile {
+    fn new(io: Arc<dyn IO>, allow_memory_fallback: bool) -> Self {
+        Self {
+            io,
+            allow_memory_fallback,
+            opened: std::sync::OnceLock::new(),
+            init_lock: crate::sync::Mutex::new(()),
+        }
+    }
+
+    fn open_disk(&self) -> Result<LazyTempOpened> {
+        let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+        let path = temp_dir.as_ref().join("tursodb_temp_file");
+        let path_str = path.to_str().ok_or_else(|| {
+            crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+        })?;
+        let file = self.io.open_file(path_str, OpenFlags::Create, false)?;
+        Ok(LazyTempOpened {
+            file,
+            _temp_dir: Some(temp_dir),
+        })
+    }
+
+    fn ensure_open(&self) -> Result<&Arc<dyn File>> {
+        if let Some(opened) = self.opened.get() {
+            return Ok(&opened.file);
+        }
+        let _guard = self.init_lock.lock();
+        if let Some(opened) = self.opened.get() {
+            return Ok(&opened.file);
+        }
+        let opened = match self.open_disk() {
+            Ok(disk) => disk,
+            Err(_) if self.allow_memory_fallback => {
+                let memory_io = Arc::new(MemoryIO::new());
+                let file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+                LazyTempOpened {
+                    file,
+                    _temp_dir: None,
+                }
+            }
+            Err(err) => return Err(err),
+        };
+        let _ = self.opened.set(opened);
+        self.opened
+            .get()
+            .map(|o| &o.file)
+            .ok_or_else(|| crate::LimboError::InternalError("lazy temp file init failed".into()))
+    }
+
+    #[cfg(test)]
+    fn is_opened(&self) -> bool {
+        self.opened.get().is_some()
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "fs"))]
+impl File for LazyTempFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        match self.opened.get() {
+            Some(opened) => opened.file.lock_file(exclusive),
+            None => Ok(()),
+        }
+    }
+
+    fn unlock_file(&self) -> Result<()> {
+        match self.opened.get() {
+            Some(opened) => opened.file.unlock_file(),
+            None => Ok(()),
+        }
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        match self.opened.get() {
+            Some(opened) => opened.file.pread(pos, c),
+            None => {
+                c.complete(0);
+                Ok(c)
+            }
+        }
+    }
+
+    fn pread_inline(&self, pos: u64, dest: &mut [u8]) -> Result<Option<usize>> {
+        match self.opened.get() {
+            Some(opened) => opened.file.pread_inline(pos, dest),
+            None => Ok(Some(0)),
+        }
+    }
+
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        self.ensure_open()?.pwrite(pos, buffer, c)
+    }
+
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        if buffers.is_empty() && self.opened.get().is_none() {
+            c.complete(0);
+            return Ok(c);
+        }
+        self.ensure_open()?.pwritev(pos, buffers, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        match self.opened.get() {
+            Some(opened) => opened.file.sync(c, sync_type),
+            None => {
+                c.complete(0);
+                Ok(c)
+            }
+        }
+    }
+
+    fn size(&self) -> Result<u64> {
+        match self.opened.get() {
+            Some(opened) => opened.file.size(),
+            None => Ok(0),
+        }
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        if len == 0 && self.opened.get().is_none() {
+            c.complete(0);
+            return Ok(c);
+        }
+        self.ensure_open()?.truncate(len, c)
+    }
+
+    fn is_open_disk_file(&self) -> bool {
+        self.opened
+            .get()
+            .is_some_and(|opened| opened._temp_dir.is_some())
+    }
 }
 
 pub struct TempFile {
     pub(crate) file: Arc<dyn File>,
+    /// True when backed by (or lazily backed by) a filesystem temp file rather than `MemoryIO`.
+    disk_backed: bool,
     /// When temp_dir is dropped the folder is deleted
     /// set to None if tempfile allocated in memory (for example, in case of WASM target)
     /// Declared after `file` so the file closes before Windows removes its directory.
@@ -332,7 +496,12 @@ pub struct TempFile {
 
 impl TempFile {
     pub(crate) fn is_disk_backed(&self) -> bool {
-        self.temp_dir.is_some()
+        self.disk_backed
+    }
+
+    /// True when this temp file currently holds an open OS file descriptor on disk.
+    pub(crate) fn has_open_disk_fd(&self) -> bool {
+        self.disk_backed && self.file.is_open_disk_file()
     }
 
     pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
@@ -345,6 +514,7 @@ impl TempFile {
             })?;
             let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
             Ok(TempFile {
+                disk_backed: true,
                 temp_dir: Some(temp_dir),
                 file: chunk_file.clone(),
             })
@@ -358,6 +528,7 @@ impl TempFile {
             let memory_io = Arc::new(MemoryIO::new());
             let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
             Ok(TempFile {
+                disk_backed: false,
                 temp_dir: None,
                 file: memory_file,
             })
@@ -378,6 +549,7 @@ impl TempFile {
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                 Ok(TempFile {
+                    disk_backed: false,
                     temp_dir: None,
                     file: memory_file,
                 })
@@ -389,6 +561,7 @@ impl TempFile {
                     let memory_file =
                         memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                     return Ok(TempFile {
+                        disk_backed: false,
                         temp_dir: None,
                         file: memory_file,
                     });
@@ -403,6 +576,104 @@ impl TempFile {
             let _ = temp_store;
             Self::new(io)
         }
+    }
+
+    /// Creates a `TempFile` for ephemeral B-trees that only creates the OS temp directory and file
+    /// descriptor on the first disk spill write. Prevents `EMFILE` under high concurrency and
+    /// avoids `mkdir`/`open`/`unlink` syscalls for ephemeral tables that stay within `PageCache`.
+    pub fn lazy_with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
+        #[cfg(all(not(target_family = "wasm"), feature = "fs"))]
+        {
+            if !matches!(temp_store, crate::TempStore::Memory) {
+                let allow_memory_fallback = matches!(temp_store, crate::TempStore::Default);
+                return Ok(TempFile {
+                    file: Arc::new(LazyTempFile::new(Arc::clone(io), allow_memory_fallback)),
+                    disk_backed: true,
+                    temp_dir: None,
+                });
+            }
+        }
+        Self::with_temp_store(io, temp_store)
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm"), feature = "fs"))]
+mod lazy_temp_file_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_temp_file_uses_zero_fds_until_first_write_then_spills_cleanly() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        // Opening 512 lazy temp files must succeed even under macOS's 256-FD soft limit.
+        let handles: Vec<Arc<LazyTempFile>> = (0..512)
+            .map(|_| Arc::new(LazyTempFile::new(Arc::clone(&io), true)))
+            .collect();
+        for h in &handles {
+            assert!(!h.is_opened());
+            assert!(!h.is_open_disk_file());
+            assert_eq!(h.size().unwrap(), 0);
+            let mut buf = [0u8; 16];
+            assert_eq!(h.pread_inline(0, &mut buf).unwrap(), Some(0));
+            assert!(!h.is_opened());
+        }
+        // First write lazily creates and opens the backing file on disk and reads back identically.
+        let target = &handles[0];
+        let payload = b"amphora-lazy-spill-check";
+        let write_buf = Arc::new(Buffer::new_temporary(payload.len()));
+        write_buf.as_mut_slice().copy_from_slice(payload);
+        let wc = target
+            .pwrite(0, write_buf, Completion::new_write(|_| {}))
+            .unwrap();
+        io.wait_for_completion(wc).unwrap();
+        assert!(target.is_opened());
+        assert!(target.is_open_disk_file());
+        assert_eq!(target.size().unwrap(), payload.len() as u64);
+
+        let read_buf = Arc::new(Buffer::new_temporary(payload.len()));
+        let rc = target
+            .pread(0, Completion::new_read(read_buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(rc).unwrap();
+        assert_eq!(read_buf.as_slice(), payload);
+    }
+
+    #[test]
+    fn ephemeral_btree_queries_open_zero_disk_fds_until_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ephemeral_fd_check.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = crate::Database::open_file(
+            Arc::clone(&io),
+            db_path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (1, 40)")
+            .unwrap();
+
+        // Prepare and run 300 distinct statements that allocate ephemeral B-trees (UNION,
+        // COUNT(DISTINCT), WITH RECURSIVE) and keep them alive simultaneously — exceeds macOS's
+        // default 256-FD soft limit if any ephemeral B-tree eagerly writes page 1 to disk.
+        let mut kept = Vec::with_capacity(300);
+        for i in 0..300 {
+            let sql = format!(
+                "SELECT a FROM t WHERE a >= {min_a} UNION SELECT b / 10 FROM t WHERE b >= {min_b}",
+                min_a = i % 2,
+                min_b = (i % 3) * 10
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut rows = 0usize;
+            while let crate::StepResult::Row = stmt.step().unwrap() {
+                rows += 1;
+            }
+            assert!(rows > 0);
+            stmt.reset().unwrap();
+            kept.push(stmt);
+        }
+        assert_eq!(kept.len(), 300);
     }
 }
 
