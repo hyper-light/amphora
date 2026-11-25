@@ -32,6 +32,7 @@ mod cluster;
 mod colcopy;
 mod columns;
 mod eqp;
+mod gauntlet;
 mod mysql;
 mod oracle;
 mod pg;
@@ -643,6 +644,11 @@ fn main() -> anyhow::Result<()> {
     // The comprehensive suite: every kind of statement, each on its own (`suite.rs`).
     if std::env::args().any(|a| a == "--suite") {
         return suite::main();
+    }
+    // The Meta-scale end-user gauntlet: 43 tables, 360 named ops, 1,024+ parametric queries,
+    // 5 anti-gaming oracles, and 6 billions-of-agents chaos workloads (`gauntlet/`).
+    if std::env::args().any(|a| a == "--gauntlet") {
+        return gauntlet::main();
     }
     // A statement on a database a suite run left behind: plans and times (`query.rs`).
     if std::env::args().any(|a| a == "--query") {

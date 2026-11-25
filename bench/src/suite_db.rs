@@ -116,11 +116,12 @@ pub fn open(
 ) -> anyhow::Result<Arc<dyn Target>> {
     let dsn = |local: &str| dsn.unwrap_or(local).to_owned();
     anyhow::ensure!(
-        !reuse || matches!(target, "amphora" | "turso" | "sqlite"),
-        "--reuse opens a file database a run left behind: amphora, turso or sqlite, not {target}"
+        !reuse || matches!(target, "amphora" | "amphora-pg" | "turso" | "sqlite"),
+        "--reuse opens a file database a run left behind: amphora, amphora-pg, turso or sqlite, not {target}"
     );
     Ok(match target {
         "amphora" => Arc::new(Amphora::open(dir, clients, reuse)?),
+        "amphora-pg" => Arc::new(Amphora::open_postgres(dir, clients, reuse)?),
         "turso" => Arc::new(Turso::open(dir, reuse)?),
         "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir)?),
         "sqlite" => Arc::new(Sqlite::open(dir, reuse)?),
@@ -145,7 +146,7 @@ pub fn open(
             clients + 4,
         )?),
         t => anyhow::bail!(
-            "the suite has no target {t} (amphora, mvcc, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"
+            "the suite has no target {t} (amphora, amphora-pg, mvcc, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"
         ),
     })
 }
@@ -188,9 +189,11 @@ mod amphora_target {
     }
 
     const HOLDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS __suite_holding(one INTEGER PRIMARY KEY, holding BLOB NOT NULL)";
+    const HOLDING_TABLE_PG: &str = "CREATE TABLE IF NOT EXISTS __suite_holding(one INTEGER PRIMARY KEY, holding BYTEA NOT NULL)";
 
     pub struct SqlEngine {
         db: Db,
+        dialect: Dialect,
         reader_pages: Option<i64>,
     }
 
@@ -236,7 +239,11 @@ mod amphora_target {
     /// (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks every engine
     /// for it, and a run stops at open without it.
     pub fn holding(db: &mut Db) -> anyhow::Result<Option<Vec<u8>>> {
-        db.exec(HOLDING_TABLE)?;
+        holding_sql(db, HOLDING_TABLE)
+    }
+
+    fn holding_sql(db: &mut Db, create_table: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        db.exec(create_table)?;
         let mut kept = None;
         db.query(
             "SELECT holding FROM __suite_holding WHERE one = 0",
@@ -251,9 +258,13 @@ mod amphora_target {
 
     /// Keeps `holding` in place of the one kept before, durable before it returns.
     pub fn keep_holding(db: &mut Db, holding: &[u8]) -> anyhow::Result<()> {
+        keep_holding_sql(db, HOLDING_TABLE, holding)
+    }
+
+    fn keep_holding_sql(db: &mut Db, create_table: &str, holding: &[u8]) -> anyhow::Result<()> {
         let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
         db.transaction(|db| {
-            db.exec(HOLDING_TABLE)?;
+            db.exec(create_table)?;
             db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
         })?;
         (db.flusher())()?;
@@ -341,11 +352,21 @@ mod amphora_target {
         }
 
         fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-            holding(&mut self.db)
+            let table = if self.dialect == Dialect::AmphoraPostgres {
+                HOLDING_TABLE_PG
+            } else {
+                HOLDING_TABLE
+            };
+            holding_sql(&mut self.db, table)
         }
 
         fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
-            keep_holding(&mut self.db, holding)
+            let table = if self.dialect == Dialect::AmphoraPostgres {
+                HOLDING_TABLE_PG
+            } else {
+                HOLDING_TABLE
+            };
+            keep_holding_sql(&mut self.db, table, holding)
         }
 
         fn opener(&self) -> Option<Opener<Db>> {
@@ -376,6 +397,7 @@ mod amphora_target {
     }
 
     pub struct Amphora {
+        dialect: Dialect,
         loader: Mutex<Option<Db>>,
         groups: OnceLock<Arc<Groups<SqlEngine>>>,
         /// Statements made `'static` once each (the engine's statement cache keeps them by
@@ -402,6 +424,19 @@ mod amphora_target {
 
     impl Amphora {
         pub fn open(dir: &str, clients: usize, reuse: bool) -> anyhow::Result<Self> {
+            Self::open_dialect(dir, clients, reuse, Dialect::Sqlite)
+        }
+
+        pub fn open_postgres(dir: &str, clients: usize, reuse: bool) -> anyhow::Result<Self> {
+            Self::open_dialect(dir, clients, reuse, Dialect::AmphoraPostgres)
+        }
+
+        fn open_dialect(
+            dir: &str,
+            clients: usize,
+            reuse: bool,
+            dialect: Dialect,
+        ) -> anyhow::Result<Self> {
             let path = suite_db(dir, reuse)?;
             let sharing = amphora_sharing()?;
             let pool = match &sharing {
@@ -409,7 +444,11 @@ mod amphora_target {
                 amphora::db::Sharing::Pool(pool) => Some(pool.clone()),
                 amphora::db::Sharing::Off => None,
             };
-            let db = Db::open_sharing(&path, &sharing)?;
+            let db = if dialect == Dialect::AmphoraPostgres {
+                Db::open_postgres_sharing(&path, &sharing)?
+            } else {
+                Db::open_sharing(&path, &sharing)?
+            };
             if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
                 db.log_format(amphora::db::LogFormat::Packed)?;
             }
@@ -430,6 +469,7 @@ mod amphora_target {
                 .and_then(|v| v.parse().ok());
             let retired = path.with_file_name("suite.retired");
             Ok(Self {
+                dialect,
                 loader: Mutex::new(Some(db)),
                 groups: OnceLock::new(),
                 sql: Arc::new(Mutex::new(HashMap::new())),
@@ -444,7 +484,7 @@ mod amphora_target {
 
     impl Target for Amphora {
         fn dialect(&self) -> Dialect {
-            Dialect::Sqlite
+            self.dialect
         }
 
         fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
@@ -492,6 +532,7 @@ mod amphora_target {
                 .ok_or_else(|| anyhow::anyhow!("started twice"))?;
             let mut slot = Some(SqlEngine {
                 db,
+                dialect: self.dialect,
                 reader_pages: self.reader_pages,
             });
             // As many readers as clients: a read never waits for another's reader.
@@ -557,7 +598,12 @@ mod amphora_target {
         ) -> anyhow::Result<usize> {
             let at = stmts.as_ptr() as usize;
             let leaked = match self.known.get(&at) {
-                Some(l) if l.len() == stmts.len() => l.clone(),
+                Some(l)
+                    if l.len() == stmts.len()
+                        && l.iter().zip(stmts).all(|(a, b)| *a == b.as_str()) =>
+                {
+                    l.clone()
+                }
                 _ => {
                     let l = Arc::new(
                         stmts
@@ -581,7 +627,7 @@ mod amphora_target {
                         move |e: &mut SqlEngine| read_all(&mut e.db, &s2, &p2),
                     )
                 }
-                Kind::Write => {
+                Kind::Write | Kind::Ddl => {
                     let ticket = self.groups.put_wait(
                         vec![SqlRow {
                             stmts: leaked,
@@ -928,7 +974,7 @@ mod mvcc_target {
             params: &[Vec<P>],
         ) -> anyhow::Result<usize> {
             match kind {
-                Kind::Write => {
+                Kind::Write | Kind::Ddl => {
                     self.transaction("BEGIN CONCURRENT", stmts, params)?;
                     Ok(0)
                 }
@@ -1174,7 +1220,7 @@ impl Session for TursoSession {
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         match (kind, stmts) {
-            (Kind::Write, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
+            (Kind::Write | Kind::Ddl, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
             _ => {
                 let mut rows = 0;
                 for (s, p) in stmts.iter().zip(params) {
@@ -1308,6 +1354,38 @@ impl Session for SqliteSession {
     }
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
+        if kind == Kind::Ddl {
+            if stmts.len() > 1 {
+                let tx = self
+                    .c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                for (s, p) in stmts.iter().zip(params) {
+                    let mut stmt = tx.prepare(s)?;
+                    let columns = stmt.column_count();
+                    let mut rows =
+                        stmt.query(rusqlite::params_from_iter(p.iter().map(sqlite_value)))?;
+                    while let Some(r) = rows.next()? {
+                        for i in 0..columns {
+                            std::hint::black_box(r.get_ref(i)?);
+                        }
+                    }
+                }
+                tx.commit()?;
+            } else {
+                for (s, p) in stmts.iter().zip(params) {
+                    let mut stmt = self.c.prepare(s)?;
+                    let columns = stmt.column_count();
+                    let mut rows =
+                        stmt.query(rusqlite::params_from_iter(p.iter().map(sqlite_value)))?;
+                    while let Some(r) = rows.next()? {
+                        for i in 0..columns {
+                            std::hint::black_box(r.get_ref(i)?);
+                        }
+                    }
+                }
+            }
+            return Ok(0);
+        }
         if kind == Kind::Write && stmts.len() > 1 {
             let tx = self
                 .c
@@ -1610,6 +1688,17 @@ impl Session for PgSession {
     }
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
+        if kind == Kind::Ddl {
+            let mut tx = self.c.transaction()?;
+            for (s, p) in stmts.iter().zip(params) {
+                let owned = pg_params(p);
+                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    owned.iter().map(|b| b.as_ref()).collect();
+                pg_rows(&tx.query(s.as_str(), &refs)?)?;
+            }
+            tx.commit()?;
+            return Ok(0);
+        }
         let prepared: Vec<postgres::Statement> = stmts
             .iter()
             .map(|s| self.statement(s))
@@ -1737,7 +1826,7 @@ impl Session for MySqlSession {
     }
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
-        if kind == Kind::Write && stmts.len() > 1 {
+        if matches!(kind, Kind::Write | Kind::Ddl) && stmts.len() > 1 {
             let mut tx = self.c.start_transaction(mysql::TxOpts::default())?;
             for (s, p) in stmts.iter().zip(params) {
                 mysql_rows(&mut tx, s, p)?;

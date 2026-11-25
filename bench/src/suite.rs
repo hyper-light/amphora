@@ -51,8 +51,11 @@ pub enum P {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dialect {
-    /// Amphora, Turso and SQLite.
+    /// Amphora (SQLite dialect), Turso and SQLite.
     Sqlite,
+    /// Amphora's PostgreSQL dialect (`PostgresDialect`: PostgreSQL 19 column types, `pg_class`
+    /// OIDs and live `pg_catalog` views, canonical SQL placeholders).
+    AmphoraPostgres,
     /// PostgreSQL, OrioleDB and CedarDB.
     Postgres,
     MySql,
@@ -63,6 +66,7 @@ pub enum Dialect {
 pub enum Kind {
     Read,
     Write,
+    Ddl,
 }
 
 /// The data's size, and the id the next inserted row takes.
@@ -88,9 +92,12 @@ impl Shape {
         1 + (rng.next() % (self.items.max(1) as u64)) as i64
     }
 
-    /// The first id of a range of `len` ids the load wrote.
-    fn range(&self, rng: &mut Rng, len: i64) -> i64 {
-        1 + (rng.next() % ((self.items - len).max(1) as u64)) as i64
+    /// The first id of a range of `len` ids the load wrote (clamped when the dataset is smaller
+    /// than `len`, so small-dataset runs never underflow).
+    fn range(&self, rng: &mut Rng, len: i64) -> (i64, i64) {
+        let len = len.min(self.items).max(1);
+        let a = 1 + (rng.next() % ((self.items - len + 1).max(1) as u64)) as i64;
+        (a, a + len - 1)
     }
 
     /// The ids client `c` of `n` writes: a slice of its own, so no two clients write a row at once
@@ -99,7 +106,7 @@ impl Shape {
         let n = n.max(1) as i64;
         let per = (self.items / n).max(1);
         let first = 1 + per * (c as i64 % n);
-        (first, first + per - 1)
+        (first, (first + per - 1).min(self.items.max(1)))
     }
 
     /// An id of client `c`'s slice, and the first of `len` there.
@@ -108,9 +115,11 @@ impl Shape {
         first + (rng.next() % ((last - first + 1).max(1) as u64)) as i64
     }
 
-    fn own_range(&self, rng: &mut Rng, c: (usize, usize), len: i64) -> i64 {
+    fn own_range(&self, rng: &mut Rng, c: (usize, usize), len: i64) -> (i64, i64) {
         let (first, last) = self.slice(c.0, c.1);
-        first + (rng.next() % ((last - first + 1 - len).max(1) as u64)) as i64
+        let span = len.min((last - first + 1).max(1));
+        let a = first + (rng.next() % ((last - first + 1 - span + 1).max(1) as u64)) as i64;
+        (a, a + span - 1)
     }
 }
 
@@ -211,6 +220,11 @@ pub fn tables(d: Dialect, cedar: bool) -> Vec<String> {
             "CREATE TABLE owners (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region INTEGER NOT NULL, score REAL NOT NULL)".into(),
             "CREATE TABLE items (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, grp INTEGER NOT NULL, owner INTEGER NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL, flag INTEGER NOT NULL, created INTEGER NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, data BLOB NOT NULL, doc TEXT NOT NULL, note TEXT)".into(),
         ],
+        Dialect::AmphoraPostgres => vec![
+            "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+            "CREATE TABLE owners (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL)".into(),
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, k BIGINT NOT NULL, grp BIGINT NOT NULL, owner BIGINT NOT NULL, price DOUBLE PRECISION NOT NULL, qty BIGINT NOT NULL, flag BOOLEAN NOT NULL, created BIGINT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, data BYTEA NOT NULL, doc JSONB NOT NULL, note TEXT)".into(),
+        ],
         Dialect::Postgres => vec![
             format!("CREATE TABLE regions (id BIGINT PRIMARY KEY, name TEXT{c} NOT NULL)"),
             format!("CREATE TABLE owners (id BIGINT PRIMARY KEY, name TEXT{c} NOT NULL, region BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL)"),
@@ -250,7 +264,7 @@ pub fn indexes(d: Dialect) -> Vec<String> {
         ],
     };
     s.extend(match d {
-        Dialect::Sqlite => vec!["ANALYZE".to_owned()],
+        Dialect::Sqlite | Dialect::AmphoraPostgres => vec!["ANALYZE".to_owned()],
         Dialect::Postgres => vec!["VACUUM ANALYZE".to_owned()],
         Dialect::MySql => vec!["ANALYZE TABLE items, owners, regions".to_owned()],
         Dialect::ClickHouse => vec![],
@@ -354,6 +368,14 @@ const fn w(name: &'static str, what: &'static str) -> Op {
     }
 }
 
+const fn ddl(name: &'static str, what: &'static str) -> Op {
+    Op {
+        name,
+        kind: Kind::Ddl,
+        what,
+    }
+}
+
 /// Every statement of the suite, reads first.
 pub const OPS: &[Op] = &[
     r("point_pk", "a row by primary key, every column"),
@@ -442,6 +464,51 @@ pub const OPS: &[Op] = &[
     r("text_read", "400 bytes of text by primary key"),
     r("table_group_by", "GROUP BY over the whole table"),
     r("table_count", "COUNT(*) of the whole table"),
+    // Challenging / slow analytical & complex queries across scales.
+    r(
+        "sort_wide_unindexed",
+        "ORDER BY unindexed float + text with wide 400B body over 20,000 rows, LIMIT 50",
+    ),
+    r(
+        "group_by_high_card",
+        "high-cardinality GROUP BY owner over the whole table",
+    ),
+    r(
+        "distinct_wide_text",
+        "COUNT(DISTINCT name) on variable-length text over 20,000 rows",
+    ),
+    r(
+        "join_skewed_having",
+        "3-table join with non-PK filter, 2-key GROUP BY, HAVING, ORDER BY aggregate, LIMIT 20",
+    ),
+    r(
+        "left_join_agg",
+        "LEFT JOIN with COUNT, COALESCE(SUM), GROUP BY and ORDER BY",
+    ),
+    r(
+        "window_running_sum",
+        "SUM() OVER (PARTITION BY grp ORDER BY created ROWS UNBOUNDED PRECEDING) over 2,000 rows",
+    ),
+    r(
+        "cte_recursive",
+        "WITH RECURSIVE sequence joined to regions and LEFT JOIN owners, grouped",
+    ),
+    r(
+        "subquery_exists_not_exists",
+        "compound correlated EXISTS and NOT EXISTS over owners and items",
+    ),
+    r(
+        "union_distinct",
+        "UNION deduplication across two overlapping 2,000-row ranges",
+    ),
+    r(
+        "agg_multi_bucket",
+        "multi-accumulator conditional GROUP BY over 25,000 rows",
+    ),
+    r(
+        "catalog_introspect",
+        "system catalog introspection (sqlite_schema or pg_class/pg_attribute/pg_type)",
+    ),
     w("insert_one", "one row, every type"),
     w("insert_batch_100", "a hundred rows in one statement"),
     w("update_plain", "a real and an integer of a row by key"),
@@ -449,6 +516,10 @@ pub const OPS: &[Op] = &[
     w("update_text", "400 bytes of text of a row by key"),
     w("update_json", "a JSON document of a row by key"),
     w("update_range", "a boolean of ten rows by a key range"),
+    w(
+        "update_subquery",
+        "correlated scalar-subquery UPDATE over a ten-row key range",
+    ),
     w(
         "upsert",
         "INSERT ... ON CONFLICT DO UPDATE on an existing key",
@@ -462,8 +533,36 @@ pub const OPS: &[Op] = &[
         "ten rows deleted by range and put back, one transaction",
     ),
     w(
+        "delete_filtered_reinsert",
+        "ten rows deleted by range + filter and put back, one transaction",
+    ),
+    w(
         "txn_read_write",
         "a transaction that reads two rows, updates them and inserts one",
+    ),
+    w(
+        "txn_mixed_heavy",
+        "a transaction mixing range read, aggregate, plain/indexed updates, delete and re-insert",
+    ),
+    ddl(
+        "ddl_create_drop_table",
+        "CREATE TABLE, multi-row INSERT, SELECT aggregate and DROP TABLE",
+    ),
+    ddl(
+        "ddl_create_drop_index",
+        "CREATE TABLE, INSERT, CREATE INDEX, indexed range SELECT, DROP INDEX and DROP TABLE",
+    ),
+    ddl(
+        "ddl_alter_rename_table",
+        "CREATE TABLE, INSERT, ALTER TABLE RENAME TO, SELECT and DROP TABLE",
+    ),
+    ddl(
+        "ddl_alter_add_column",
+        "CREATE TABLE, INSERT, ALTER TABLE ADD COLUMN, UPDATE, SELECT and DROP TABLE",
+    ),
+    ddl(
+        "ddl_analyze_stats",
+        "ANALYZE regions and verify row count",
     ),
 ];
 
@@ -493,7 +592,7 @@ pub fn placeholders(d: Dialect, sql: &str) -> String {
 /// A JSON document's field as an integer and as text, in `d`'s dialect.
 fn json_int(d: Dialect, field: &str) -> String {
     match d {
-        Dialect::Sqlite => format!("json_extract(doc, '$.{field}')"),
+        Dialect::Sqlite | Dialect::AmphoraPostgres => format!("json_extract(doc, '$.{field}')"),
         Dialect::Postgres => format!("(doc->>'{field}')::bigint"),
         Dialect::MySql => format!("CAST(JSON_EXTRACT(doc, '$.{field}') AS SIGNED)"),
         Dialect::ClickHouse => format!("JSONExtractInt(doc, '{field}')"),
@@ -502,7 +601,7 @@ fn json_int(d: Dialect, field: &str) -> String {
 
 fn json_text(d: Dialect, field: &str) -> String {
     match d {
-        Dialect::Sqlite => format!("json_extract(doc, '$.{field}')"),
+        Dialect::Sqlite | Dialect::AmphoraPostgres => format!("json_extract(doc, '$.{field}')"),
         Dialect::Postgres => format!("doc->>'{field}'"),
         Dialect::MySql => format!("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.{field}'))"),
         Dialect::ClickHouse => format!("JSONExtractString(doc, '{field}')"),
@@ -515,7 +614,7 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
     let ch = d == ClickHouse;
     let substr = if ch { "substring" } else { "SUBSTR" };
     let month = match d {
-        Sqlite => "strftime('%Y-%m', created / 1000000, 'unixepoch')",
+        Sqlite | AmphoraPostgres => "strftime('%Y-%m', created / 1000000, 'unixepoch')",
         Postgres => "to_char(to_timestamp(created / 1000000.0), 'YYYY-MM')",
         MySql => "DATE_FORMAT(FROM_UNIXTIME(created DIV 1000000), '%Y-%m')",
         ClickHouse => "formatDateTime(toDateTime(intDiv(created, 1000000)), '%Y-%m')",
@@ -534,7 +633,7 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
         "filter_is_null" => "SELECT id FROM items WHERE grp = ? AND note IS NULL LIMIT 100".into(),
         // LIKE ignores case in SQLite's dialect, the others' (binary collations) heed it: GLOB is
         // the same match there.
-        "like_prefix" if d == Dialect::Sqlite => "SELECT id, name FROM items WHERE name GLOB ? LIMIT 50".into(),
+        "like_prefix" if matches!(d, Dialect::Sqlite | Dialect::AmphoraPostgres) => "SELECT id, name FROM items WHERE name GLOB ? LIMIT 50".into(),
         "like_prefix" => "SELECT id, name FROM items WHERE name LIKE ? LIMIT 50".into(),
         "like_substring" => "SELECT id FROM items WHERE body LIKE ? LIMIT 20".into(),
         "order_by_index" => "SELECT id, price, created FROM items WHERE grp = ? ORDER BY created DESC LIMIT 20".into(),
@@ -566,6 +665,22 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
         "text_read" => "SELECT body FROM items WHERE id = ?".into(),
         "table_group_by" => "SELECT grp, COUNT(*), AVG(price), MAX(qty) FROM items GROUP BY grp".into(),
         "table_count" => "SELECT COUNT(*) FROM items".into(),
+        "sort_wide_unindexed" => "SELECT id, price, name, body FROM items WHERE id BETWEEN ? AND ? ORDER BY price DESC, name ASC LIMIT 50".into(),
+        "group_by_high_card" => "SELECT owner, COUNT(*), SUM(price), AVG(qty) FROM items GROUP BY owner".into(),
+        "distinct_wide_text" => "SELECT COUNT(DISTINCT name) FROM items WHERE id BETWEEN ? AND ?".into(),
+        "join_skewed_having" => "SELECT r.name, o.name, COUNT(*), SUM(i.price) FROM items i JOIN owners o ON o.id = i.owner JOIN regions r ON r.id = o.region WHERE o.score > ? GROUP BY r.name, o.name HAVING COUNT(*) >= 10 ORDER BY SUM(i.price) DESC, o.name ASC LIMIT 20".into(),
+        "left_join_agg" => "SELECT o.id, o.name, COUNT(i.id), COALESCE(SUM(i.price), 0) FROM owners o LEFT JOIN items i ON i.owner = o.id AND i.grp = ? WHERE o.region = ? GROUP BY o.id, o.name ORDER BY o.id LIMIT 50".into(),
+        "window_running_sum" => "SELECT id, grp, price, SUM(price) OVER (PARTITION BY grp ORDER BY created ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM items WHERE id BETWEEN ? AND ?".into(),
+        "cte_recursive" if !ch => "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?) SELECT r.id, r.name, COUNT(o.id) FROM seq s JOIN regions r ON r.id = s.n LEFT JOIN owners o ON o.region = r.id GROUP BY r.id, r.name ORDER BY r.id".into(),
+        "subquery_exists_not_exists" if !ch => "SELECT o.id, o.name FROM owners o WHERE EXISTS (SELECT 1 FROM items i WHERE i.owner = o.id AND i.qty > ?) AND NOT EXISTS (SELECT 1 FROM items i2 WHERE i2.owner = o.id AND i2.note IS NULL AND i2.grp = ?) ORDER BY o.id LIMIT 25".into(),
+        "union_distinct" => "SELECT id, grp FROM items WHERE id BETWEEN ? AND ? UNION SELECT id, grp FROM items WHERE id BETWEEN ? AND ?".into(),
+        "agg_multi_bucket" => "SELECT grp, COUNT(*), SUM(CASE WHEN flag THEN price ELSE 0 END), MIN(price), MAX(price), AVG(qty) FROM items WHERE id BETWEEN ? AND ? GROUP BY grp ORDER BY grp".into(),
+        "catalog_introspect" => match d {
+            Sqlite => "SELECT type, name, tbl_name FROM sqlite_schema WHERE type IN ('table', 'index') AND tbl_name IN ('items', 'owners', 'regions') ORDER BY type, name".into(),
+            Postgres | AmphoraPostgres => "SELECT c.relname, a.attname, t.typname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid JOIN pg_type t ON t.oid = a.atttypid WHERE c.relkind = 'r' AND a.attnum > 0 AND c.relname IN ('items', 'owners', 'regions') ORDER BY c.relname, a.attnum".into(),
+            MySql => "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('items', 'owners', 'regions') ORDER BY table_name, ordinal_position".into(),
+            ClickHouse => return None,
+        },
         "insert_one" => insert_items(d, 1),
         "insert_batch_100" => insert_items(d, 100),
         "update_plain" if !ch => "UPDATE items SET price = ?, qty = qty + 1 WHERE id = ?".into(),
@@ -576,13 +691,15 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
             _ => "UPDATE items SET doc = ? WHERE id = ?".into(),
         },
         "update_range" if !ch => "UPDATE items SET flag = NOT flag WHERE id BETWEEN ? AND ?".into(),
+        "update_subquery" if !ch => "UPDATE items SET price = price + COALESCE((SELECT o.score FROM owners o WHERE o.id = items.owner), 0) * 0.001 WHERE id BETWEEN ? AND ?".into(),
         "upsert" => match d {
-            Sqlite | Postgres => format!("{} ON CONFLICT (id) DO UPDATE SET price = excluded.price, qty = excluded.qty", insert_items(d, 1)),
+            Sqlite | AmphoraPostgres | Postgres => format!("{} ON CONFLICT (id) DO UPDATE SET price = excluded.price, qty = excluded.qty", insert_items(d, 1)),
             MySql => format!("{} AS new ON DUPLICATE KEY UPDATE price = new.price, qty = new.qty", insert_items(d, 1)),
             ClickHouse => return None,
         },
         "delete_insert" if !ch => return Some(vec!["DELETE FROM items WHERE id = ?".into(), insert_items(d, 1)]),
         "delete_range_insert" if !ch => return Some(vec!["DELETE FROM items WHERE id BETWEEN ? AND ?".into(), insert_items(d, 10)]),
+        "delete_filtered_reinsert" if !ch => return Some(vec!["DELETE FROM items WHERE id BETWEEN ? AND ? AND qty >= 0".into(), insert_items(d, 10)]),
         "txn_read_write" if !ch => {
             return Some(vec![
                 "SELECT qty FROM items WHERE id = ?".into(),
@@ -590,6 +707,66 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
                 "SELECT price FROM items WHERE id = ?".into(),
                 "UPDATE items SET price = price + 0.01 WHERE id = ?".into(),
                 insert_items(d, 1),
+            ])
+        }
+        "txn_mixed_heavy" if !ch => {
+            return Some(vec![
+                "SELECT id, price FROM items WHERE id BETWEEN ? AND ?".into(),
+                "SELECT COUNT(*), SUM(price) FROM items WHERE grp = ?".into(),
+                "UPDATE items SET price = ?, qty = qty + 1 WHERE id = ?".into(),
+                "UPDATE items SET k = ? WHERE id = ?".into(),
+                "DELETE FROM items WHERE id = ?".into(),
+                insert_items(d, 1),
+            ])
+        }
+        "ddl_create_drop_table" if !ch => {
+            return Some(vec![
+                "CREATE TABLE ddl_scratch (id INTEGER PRIMARY KEY, k BIGINT NOT NULL, label TEXT NOT NULL, val DOUBLE PRECISION NOT NULL)".into(),
+                "INSERT INTO ddl_scratch (id, k, label, val) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)".into(),
+                "SELECT COUNT(*), SUM(val) FROM ddl_scratch WHERE k >= ?".into(),
+                "DROP TABLE ddl_scratch".into(),
+            ])
+        }
+        "ddl_create_drop_index" if !ch => {
+            return Some(vec![
+                "CREATE TABLE ddl_idx_t (id INTEGER PRIMARY KEY, k BIGINT NOT NULL, label TEXT NOT NULL)".into(),
+                "INSERT INTO ddl_idx_t (id, k, label) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?)".into(),
+                "CREATE INDEX ddl_idx_k ON ddl_idx_t (k)".into(),
+                "SELECT id, label FROM ddl_idx_t WHERE k BETWEEN ? AND ? ORDER BY k".into(),
+                match d {
+                    MySql => "DROP INDEX ddl_idx_k ON ddl_idx_t".into(),
+                    _ => "DROP INDEX ddl_idx_k".into(),
+                },
+                "DROP TABLE ddl_idx_t".into(),
+            ])
+        }
+        "ddl_alter_rename_table" if !ch => {
+            return Some(vec![
+                "CREATE TABLE ddl_ren_a (id INTEGER PRIMARY KEY, label TEXT NOT NULL)".into(),
+                "INSERT INTO ddl_ren_a (id, label) VALUES (?, ?), (?, ?)".into(),
+                "ALTER TABLE ddl_ren_a RENAME TO ddl_ren_b".into(),
+                "SELECT COUNT(*) FROM ddl_ren_b".into(),
+                "DROP TABLE ddl_ren_b".into(),
+            ])
+        }
+        // PostgresDialect does not support ALTER TABLE ADD COLUMN yet (crates/engine/dialect/postgres.rs:282).
+        "ddl_alter_add_column" if matches!(d, Sqlite | Postgres | MySql) => {
+            return Some(vec![
+                "CREATE TABLE ddl_alt_t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)".into(),
+                "INSERT INTO ddl_alt_t (id, label) VALUES (?, ?), (?, ?)".into(),
+                "ALTER TABLE ddl_alt_t ADD COLUMN extra BIGINT DEFAULT 0".into(),
+                "UPDATE ddl_alt_t SET extra = id * 10".into(),
+                "SELECT SUM(extra) FROM ddl_alt_t".into(),
+                "DROP TABLE ddl_alt_t".into(),
+            ])
+        }
+        "ddl_analyze_stats" if !ch => {
+            return Some(vec![
+                match d {
+                    MySql => "ANALYZE TABLE regions".into(),
+                    _ => "ANALYZE regions".into(),
+                },
+                "SELECT COUNT(*) FROM regions".into(),
             ])
         }
         _ => return None,
@@ -627,8 +804,8 @@ pub fn params(
         "point_text" => one(vec![P::T(name_of(id))]),
         "in_list_10" => one((0..10).map(|_| P::I(shape.id(rng))).collect()),
         "range_pk_100" => {
-            let a = shape.range(rng, 100);
-            one(vec![P::I(a), P::I(a + 99)])
+            let (a, b) = shape.range(rng, 100);
+            one(vec![P::I(a), P::I(b)])
         }
         "range_secondary_100" => {
             let a = k_of(id);
@@ -642,44 +819,75 @@ pub fn params(
         "filter_is_null" | "order_by_index" | "order_by_sort" | "count_distinct" | "cte"
         | "group_by_having" => one(vec![grp()]),
         "like_prefix" => {
-            let wildcard = if d == Dialect::Sqlite { '*' } else { '%' };
+            let wildcard = if matches!(d, Dialect::Sqlite | Dialect::AmphoraPostgres) {
+                '*'
+            } else {
+                '%'
+            };
             one(vec![P::T(format!(
                 "{word}-{:x}{wildcard}",
                 rng.next() % 16
             ))])
         }
         "like_substring" => one(vec![P::T("%zephyr%".into())]),
-        "offset_deep" => one(vec![P::I(shape.range(rng, 20) - 1)]),
+        "offset_deep" => {
+            let (a, _) = shape.range(rng, 20);
+            one(vec![P::I(a - 1)])
+        }
         "count_range" => {
-            let a = shape.range(rng, 10_000);
+            let (a, b) = shape.range(rng, 10_000);
             one(vec![
                 P::I(BASE_US + a * 1_000_000),
-                P::I(BASE_US + (a + 9_999) * 1_000_000),
+                P::I(BASE_US + b * 1_000_000),
             ])
         }
         "aggregates_range" | "join_three" | "case_aggregate" | "window_row_number" => {
-            let a = shape.range(rng, 1000);
-            one(vec![P::I(a), P::I(a + 999)])
+            let (a, b) = shape.range(rng, 1000);
+            one(vec![P::I(a), P::I(b)])
         }
         "group_by_range" | "distinct_range" | "date_bucket" => {
-            let a = shape.range(rng, 10_000);
-            one(vec![P::I(a), P::I(a + 9_999)])
+            let (a, b) = shape.range(rng, 10_000);
+            one(vec![P::I(a), P::I(b)])
         }
+        "sort_wide_unindexed" | "distinct_wide_text" => {
+            let (a, b) = shape.range(rng, 20_000);
+            one(vec![P::I(a), P::I(b)])
+        }
+        "window_running_sum" => {
+            let (a, b) = shape.range(rng, 2_000);
+            one(vec![P::I(a), P::I(b)])
+        }
+        "agg_multi_bucket" => {
+            let (a, b) = shape.range(rng, 25_000);
+            one(vec![P::I(a), P::I(b)])
+        }
+        "union_distinct" => {
+            let (a, b) = shape.range(rng, 2_000);
+            let half = ((b - a + 1) / 2).max(1);
+            let c0 = (a + half).min(shape.items.max(1));
+            let c1 = (c0 + (b - a)).min(shape.items.max(1));
+            one(vec![P::I(a), P::I(b), P::I(c0), P::I(c1)])
+        }
+        "join_skewed_having" => one(vec![P::F(50.0 + (rng.next() % 30) as f64)]),
+        "cte_recursive" => one(vec![P::I(shape.regions)]),
+        "subquery_exists_not_exists" => one(vec![P::I(80 + (rng.next() % 15) as i64), grp()]),
         "join_pk" => {
-            let a = shape.range(rng, 20);
-            one(vec![P::I(a), P::I(a + 19)])
+            let (a, b) = shape.range(rng, 20);
+            one(vec![P::I(a), P::I(b)])
         }
         "string_functions" => {
-            let a = shape.range(rng, 100);
-            one(vec![P::I(a), P::I(a + 99)])
+            let (a, b) = shape.range(rng, 100);
+            one(vec![P::I(a), P::I(b)])
         }
         "join_group" => one(vec![P::I(region)]),
-        "left_join_anti" | "subquery_in" => one(vec![grp(), P::I(region)]),
+        "left_join_anti" | "left_join_agg" | "subquery_in" => one(vec![grp(), P::I(region)]),
         "exists_subquery" => one(vec![P::I(region), P::I(90 + (rng.next() % 10) as i64)]),
         "group_correlated" | "group_correlated_row" => one(vec![P::I(region)]),
         "union_all" => one(vec![P::I(k_of(id)), P::T(name_of(shape.id(rng)))]),
         "json_filter" => one(vec![grp(), P::I((rng.next() % 100) as i64)]),
-        "table_group_by" | "table_count" => one(vec![]),
+        "table_group_by" | "table_count" | "group_by_high_card" | "catalog_introspect" => {
+            one(vec![])
+        }
         "insert_one" => one(item_params(new_id(), shape.owners)),
         "insert_batch_100" => {
             let first = shape.next.fetch_add(100, Ordering::Relaxed);
@@ -715,9 +923,9 @@ pub fn params(
             )),
             P::I(id),
         ]),
-        "update_range" => {
-            let a = shape.own_range(rng, c, 10);
-            one(vec![P::I(a), P::I(a + 9)])
+        "update_range" | "update_subquery" => {
+            let (a, b) = shape.own_range(rng, c, 10);
+            one(vec![P::I(a), P::I(b)])
         }
         "upsert" => {
             let mut p = item_params(id, shape.owners);
@@ -725,14 +933,19 @@ pub fn params(
             one(p)
         }
         "delete_insert" => vec![vec![P::I(id)], item_params(id, shape.owners)],
-        "delete_range_insert" => {
-            let a = shape.own_range(rng, c, 10);
-            vec![
-                vec![P::I(a), P::I(a + 9)],
-                (a..a + 10)
-                    .flat_map(|i| item_params(i, shape.owners))
-                    .collect(),
-            ]
+        "delete_range_insert" | "delete_filtered_reinsert" => {
+            let (a, b) = shape.own_range(rng, c, 10);
+            let mut inserted = Vec::new();
+            for i in a..=b {
+                inserted.extend(item_params(i, shape.owners));
+            }
+            // Pad if slice was smaller than 10 on tiny datasets so placeholder count matches 10.
+            let mut extra = (b - a + 1) as usize;
+            while extra < 10 {
+                inserted.extend(item_params(new_id(), shape.owners));
+                extra += 1;
+            }
+            vec![vec![P::I(a), P::I(b)], inserted]
         }
         "txn_read_write" => {
             let b = shape.own(rng, c);
@@ -744,6 +957,62 @@ pub fn params(
                 item_params(new_id(), shape.owners),
             ]
         }
+        "txn_mixed_heavy" => {
+            let (a, b) = shape.own_range(rng, c, 10);
+            let upd = shape.own(rng, c);
+            vec![
+                vec![P::I(a), P::I(b)],
+                vec![grp()],
+                vec![P::F((rng.next() % 1_000_000) as f64 / 100.0), P::I(upd)],
+                vec![P::I((rng.next() >> 1) as i64), P::I(upd)],
+                vec![P::I(id)],
+                item_params(id, shape.owners),
+            ]
+        }
+        "ddl_create_drop_table" => {
+            let base = (rng.next() % 1_000) as i64;
+            let mut ins = Vec::with_capacity(20);
+            for i in 1..=5i64 {
+                ins.push(P::I(i));
+                ins.push(P::I(base + i * 10));
+                ins.push(P::T(format!("row-{i}")));
+                ins.push(P::F(i as f64 * 1.5));
+            }
+            vec![vec![], ins, vec![P::I(base + 20)], vec![]]
+        }
+        "ddl_create_drop_index" => {
+            let base = (rng.next() % 1_000) as i64;
+            let mut ins = Vec::with_capacity(30);
+            for i in 1..=10i64 {
+                ins.push(P::I(i));
+                ins.push(P::I(base + (11 - i) * 5));
+                ins.push(P::T(format!("idx-{i}")));
+            }
+            vec![
+                vec![],
+                ins,
+                vec![],
+                vec![P::I(base + 10), P::I(base + 40)],
+                vec![],
+                vec![],
+            ]
+        }
+        "ddl_alter_rename_table" => vec![
+            vec![],
+            vec![P::I(1), P::T("a".into()), P::I(2), P::T("b".into())],
+            vec![],
+            vec![],
+            vec![],
+        ],
+        "ddl_alter_add_column" => vec![
+            vec![],
+            vec![P::I(1), P::T("a".into()), P::I(2), P::T("b".into())],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ],
+        "ddl_analyze_stats" => vec![vec![], vec![]],
         _ => vec![],
     }
 }
@@ -1220,7 +1489,17 @@ pub fn main() -> anyhow::Result<()> {
         };
         let stmts = Arc::new(stmts.iter().map(|s| placeholders(d, s)).collect::<Vec<_>>());
         for &clients in &o.clients {
-            eprintln!("== {} {} clients={clients}", o.target, op.name);
+            // Schema-changing DDL ops create/drop a fixed scratch table; run them serialized on a
+            // single client so concurrent sessions don't collide on DDL names.
+            let run_clients = if op.kind == Kind::Ddl {
+                if clients > 1 && o.clients.contains(&1) {
+                    continue;
+                }
+                1
+            } else {
+                clients
+            };
+            eprintln!("== {} {} clients={run_clients}", o.target, op.name);
             // AMPHORA_PROFILE=<prefix>: each statement's run sampled 997 times a second, written as
             // <prefix>-<target>-<statement>-<clients>.{svg,txt,folded} (main.rs, write_profile).
             let profile = std::env::var("AMPHORA_PROFILE").ok();
@@ -1228,10 +1507,10 @@ pub fn main() -> anyhow::Result<()> {
                 Some(_) => Some(crate::profile_start()?),
                 None => None,
             };
-            let out = run_op(&target, op, &stmts, &shape, clients, o.warmup, o.seconds);
+            let out = run_op(&target, op, &stmts, &shape, run_clients, o.warmup, o.seconds);
             if let (Some(prefix), Some(guard)) = (&profile, profiler) {
                 crate::write_profile(
-                    &format!("{prefix}-{}-{}-{clients}", o.target, op.name),
+                    &format!("{prefix}-{}-{}-{run_clients}", o.target, op.name),
                     &guard,
                 )?;
             }
@@ -1240,7 +1519,7 @@ pub fn main() -> anyhow::Result<()> {
                 "op": op.name,
                 "kind": format!("{:?}", op.kind),
                 "what": op.what,
-                "clients": clients,
+                "clients": run_clients,
                 "ops_per_s": n as f64 / o.seconds,
                 "rows_per_op": if n == 0 { 0.0 } else { out.rows as f64 / n as f64 },
                 "ms": summary(out.hist),

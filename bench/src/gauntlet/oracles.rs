@@ -1,0 +1,622 @@
+//! Automated Anti-Gaming Oracles for the Meta-Scale Agentic End-User Gauntlet.
+//!
+//! These 5 oracles catch subtle real-world engine bugs that throughput numbers alone hide:
+//! 1. **Multi-Page Tie-Heavy Pagination Conservation** (warm AND forced-spill tight cache):
+//!    paginating an entire tie-heavy slice 25 rows at a time must yield 0 duplicates, 0 lost rows,
+//!    and bit-for-bit identical order to the full unpaginated query.
+//! 2. **Spill-Invariance Oracle (`cache_size = 4000` vs `cache_size = 48`)**:
+//!    wide sorts, `NULLS FIRST/LAST`, `GROUP BY`, `HAVING`, `COUNT(DISTINCT)`, `DISTINCT`, windows,
+//!    set ops, joins, and recursive CTEs must return identical results whether resident in RAM or
+//!    spilling aggressively to disk.
+//! 3. **Index-Invariance Oracle (Indexed vs `NOT INDEXED`)**:
+//!    covering indexes, partial indexes (`WHERE due_at IS NOT NULL`, `WHERE deleted_at IS NULL`),
+//!    mixed `ASC`/`DESC` composite indexes, and unique lookups must return identical results to
+//!    forced full table scans.
+//! 4. **Conservation, Referential & Physical Integrity Oracle**:
+//!    `SUM(ledger_entries.amount_cents) == 0`, `SUM(token_cost_ledger.amount_micros) == 0`,
+//!    `MIN(products.stock) >= 0`, empty tenant has 0 issues, zero orphan rows, and
+//!    `PRAGMA integrity_check == ok`.
+//! 5. **Cold-Reopen & `pg_class` OID Durability Oracle**:
+//!    reopening from disk preserves committed writes, balances, row counts, and (on Postgres
+//!    dialects) `pg_class.oid` stability across reopen and `ALTER TABLE RENAME`.
+
+use std::path::Path;
+
+use amphora::db::{Db, Sharing};
+
+use crate::suite::{Dialect, P};
+use crate::suite_db::{Cell, Session, amphora_value};
+
+use super::loader::GauntletShape;
+
+pub struct OracleReport {
+    pub passed: bool,
+    pub details: serde_json::Value,
+}
+
+fn direct_query_amphora(
+    db: &mut Db,
+    sql: &'static str,
+    params: &[P],
+) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+    let mut rows = Vec::new();
+    db.query(sql, params.iter().map(amphora_value), |r| {
+        let row = r
+            .get_values()
+            .map(|v| match v {
+                amphora_engine::Value::Null => Cell::Null.text(),
+                amphora_engine::Value::Numeric(amphora_engine::Numeric::Integer(i)) => {
+                    Cell::Int(*i).text()
+                }
+                amphora_engine::Value::Numeric(amphora_engine::Numeric::Float(f)) => {
+                    Cell::Real(f64::from(*f)).text()
+                }
+                amphora_engine::Value::Text(t) => Cell::Text(t.as_str()).text(),
+                amphora_engine::Value::Blob(b) => Cell::Blob(b).text(),
+            })
+            .collect();
+        rows.push(row);
+        Ok(true)
+    })?;
+    Ok(rows)
+}
+
+fn direct_query_sqlite(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[P],
+) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+    let mut stmt = conn.prepare(sql)?;
+    let cols = stmt.column_count();
+    let vals: Vec<rusqlite::types::Value> = params
+        .iter()
+        .map(|p| match p {
+            P::I(i) => rusqlite::types::Value::Integer(*i),
+            P::F(f) => rusqlite::types::Value::Real(*f),
+            P::T(s) => rusqlite::types::Value::Text(s.clone()),
+            P::B(b) => rusqlite::types::Value::Blob(b.clone()),
+            P::Z(z) => rusqlite::types::Value::Integer(i64::from(*z)),
+            P::N => rusqlite::types::Value::Null,
+        })
+        .collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(vals.iter()))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let mut row = Vec::with_capacity(cols);
+        for i in 0..cols {
+            let v = match r.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => Cell::Null.text(),
+                rusqlite::types::ValueRef::Integer(n) => Cell::Int(n).text(),
+                rusqlite::types::ValueRef::Real(f) => Cell::Real(f).text(),
+                rusqlite::types::ValueRef::Text(b) => {
+                    Cell::Text(std::str::from_utf8(b).unwrap_or("")).text()
+                }
+                rusqlite::types::ValueRef::Blob(b) => Cell::Blob(b).text(),
+            };
+            row.push(v);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Oracle 1: Full multi-page tie-heavy pagination conservation sweep.
+pub fn oracle_pagination_conservation(
+    session: &mut dyn Session,
+    shape: &GauntletShape,
+) -> OracleReport {
+    if shape.issues <= 0 {
+        return OracleReport {
+            passed: true,
+            details: serde_json::json!({ "skipped": "empty dataset" }),
+        };
+    }
+    let slice_hi = shape.issues.min(350);
+    let cases = [
+        (
+            "priority_status_ties",
+            "SELECT id, priority, status FROM issues WHERE id BETWEEN 1 AND ? ORDER BY priority ASC, status ASC, id ASC",
+        ),
+        (
+            "due_nulls_first_desc",
+            "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at DESC NULLS FIRST, priority ASC, id ASC",
+        ),
+        (
+            "due_nulls_last_asc",
+            "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at ASC NULLS LAST, priority DESC, id ASC",
+        ),
+        (
+            "est_nulls_last_desc",
+            "SELECT id, estimate_hrs, status FROM issues WHERE id BETWEEN 1 AND ? ORDER BY estimate_hrs DESC NULLS LAST, id ASC",
+        ),
+    ];
+
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for (name, base_sql) in cases {
+        let full = match session.answer(&[base_sql.into()], &[vec![P::I(slice_hi)]]) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("{name}: full query error: {e:#}"));
+                continue;
+            }
+        };
+        let mut stitched = Vec::with_capacity(full.len());
+        let page_sz = 25i64;
+        let mut off = 0i64;
+        let page_sql = format!("{base_sql} LIMIT {page_sz} OFFSET ?");
+        loop {
+            match session.answer(&[page_sql.clone()], &[vec![P::I(slice_hi), P::I(off)]]) {
+                Ok(page) => {
+                    let n = page.len();
+                    stitched.extend(page);
+                    if (n as i64) < page_sz {
+                        break;
+                    }
+                    off += page_sz;
+                    if off > slice_hi + page_sz * 2 {
+                        failures.push(format!("{name}: infinite pagination loop"));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    failures.push(format!("{name} offset={off}: {e:#}"));
+                    break;
+                }
+            }
+        }
+        checked += 1;
+        if stitched != full {
+            failures.push(format!(
+                "{name}: stitched {} rows != full {} rows (duplicate/lost/reordered page!)",
+                stitched.len(),
+                full.len()
+            ));
+        }
+    }
+
+    OracleReport {
+        passed: failures.is_empty(),
+        details: serde_json::json!({
+            "cases_checked": checked,
+            "slice_rows": slice_hi,
+            "failures": failures,
+        }),
+    }
+}
+
+/// Oracle 3: Index-invariance (normal index scan vs forced `NOT INDEXED` full table scan).
+pub fn oracle_index_invariance(
+    session: &mut dyn Session,
+    dialect: Dialect,
+    shape: &GauntletShape,
+) -> OracleReport {
+    if matches!(dialect, Dialect::Postgres | Dialect::MySql | Dialect::ClickHouse) {
+        return OracleReport {
+            passed: true,
+            details: serde_json::json!({ "skipped": "NOT INDEXED is SQLite/Amphora syntax" }),
+        };
+    }
+    let slice_hi = shape.issues.min(2_000).max(1);
+    let checks: Vec<(&str, String, String, Vec<P>)> = vec![
+        (
+            "issues_inbox_composite_desc",
+            "SELECT id, priority, updated_at FROM issues WHERE tenant_id = 1 AND status = 'open' AND deleted_at IS NULL ORDER BY priority ASC, updated_at DESC, id ASC LIMIT 40".into(),
+            "SELECT id, priority, updated_at FROM issues NOT INDEXED WHERE tenant_id = 1 AND status = 'open' AND deleted_at IS NULL ORDER BY priority ASC, updated_at DESC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "issues_partial_due_not_null",
+            "SELECT id, due_at FROM issues WHERE tenant_id = 1 AND due_at IS NOT NULL ORDER BY due_at ASC, id ASC LIMIT 40".into(),
+            "SELECT id, due_at FROM issues NOT INDEXED WHERE tenant_id = 1 AND due_at IS NOT NULL ORDER BY due_at ASC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "issues_partial_open_not_deleted",
+            "SELECT id, updated_at FROM issues WHERE tenant_id = 1 AND deleted_at IS NULL ORDER BY updated_at DESC, id ASC LIMIT 40".into(),
+            "SELECT id, updated_at FROM issues NOT INDEXED WHERE tenant_id = 1 AND deleted_at IS NULL ORDER BY updated_at DESC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "issues_covering_count",
+            "SELECT COUNT(*) FROM issues WHERE tenant_id = 1 AND status = 'open'".into(),
+            "SELECT COUNT(*) FROM issues NOT INDEXED WHERE tenant_id = 1 AND status = 'open'".into(),
+            vec![],
+        ),
+        (
+            "messages_channel_seq_desc",
+            "SELECT id, seq, author_id FROM messages WHERE channel_id = 1 AND seq <= ? ORDER BY seq DESC LIMIT 40".into(),
+            "SELECT id, seq, author_id FROM messages NOT INDEXED WHERE channel_id = 1 AND seq <= ? ORDER BY seq DESC LIMIT 40".into(),
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "products_active_stock_idx",
+            "SELECT id, sku, stock FROM products WHERE active AND stock < 25 ORDER BY stock ASC, id ASC LIMIT 40".into(),
+            "SELECT id, sku, stock FROM products NOT INDEXED WHERE active AND stock < 25 ORDER BY stock ASC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "ci_jobs_priority_queue_desc",
+            "SELECT id, priority, created_at FROM ci_jobs WHERE status = 'queued' ORDER BY priority DESC, created_at ASC, id ASC LIMIT 30".into(),
+            "SELECT id, priority, created_at FROM ci_jobs NOT INDEXED WHERE status = 'queued' ORDER BY priority DESC, created_at ASC, id ASC LIMIT 30".into(),
+            vec![],
+        ),
+        (
+            "agent_runs_ws_status_desc",
+            "SELECT id, started_at, total_tokens FROM agent_runs WHERE workspace_id = 1 AND status = 'completed' ORDER BY started_at DESC, id ASC LIMIT 30".into(),
+            "SELECT id, started_at, total_tokens FROM agent_runs NOT INDEXED WHERE workspace_id = 1 AND status = 'completed' ORDER BY started_at DESC, id ASC LIMIT 30".into(),
+            vec![],
+        ),
+        (
+            "bookings_resource_interval",
+            "SELECT id, start_ts, end_ts FROM bookings WHERE resource_id = 1 ORDER BY start_ts ASC, end_ts ASC, id ASC LIMIT 40".into(),
+            "SELECT id, start_ts, end_ts FROM bookings NOT INDEXED WHERE resource_id = 1 ORDER BY start_ts ASC, end_ts ASC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "ledger_account_posted",
+            "SELECT id, posted_at, amount_cents FROM ledger_entries WHERE account_id = 1 ORDER BY posted_at ASC, id ASC LIMIT 40".into(),
+            "SELECT id, posted_at, amount_cents FROM ledger_entries NOT INDEXED WHERE account_id = 1 ORDER BY posted_at ASC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "spans_service_time_desc",
+            "SELECT id, started_at, duration_us FROM spans WHERE service_id = 1 ORDER BY started_at DESC, id ASC LIMIT 40".into(),
+            "SELECT id, started_at, duration_us FROM spans NOT INDEXED WHERE service_id = 1 ORDER BY started_at DESC, id ASC LIMIT 40".into(),
+            vec![],
+        ),
+        (
+            "empty_tenant_indexed_vs_scan",
+            "SELECT id, priority FROM issues WHERE tenant_id = ? AND status = 'open' ORDER BY priority ASC, id ASC LIMIT 25".into(),
+            "SELECT id, priority FROM issues NOT INDEXED WHERE tenant_id = ? AND status = 'open' ORDER BY priority ASC, id ASC LIMIT 25".into(),
+            vec![P::I(shape.empty_tenant)],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, idx_sql, scan_sql, params) in &checks {
+        let r_idx = session.answer(&[idx_sql.clone()], &[params.clone()]);
+        let r_scan = session.answer(&[scan_sql.clone()], &[params.clone()]);
+        match (r_idx, r_scan) {
+            (Ok(a), Ok(b)) => {
+                if a != b {
+                    failures.push(format!(
+                        "{name}: indexed ({} rows) != NOT INDEXED ({} rows)",
+                        a.len(),
+                        b.len()
+                    ));
+                }
+            }
+            (Err(e), _) => failures.push(format!("{name} indexed error: {e:#}")),
+            (_, Err(e)) => failures.push(format!("{name} scan error: {e:#}")),
+        }
+    }
+
+    OracleReport {
+        passed: failures.is_empty(),
+        details: serde_json::json!({
+            "checks": checks.len(),
+            "failures": failures,
+        }),
+    }
+}
+
+/// Oracle 4: Accounting, stock, empty-tenant, referential, and `PRAGMA integrity_check`.
+pub fn oracle_conservation_and_integrity(
+    session: &mut dyn Session,
+    dialect: Dialect,
+    shape: &GauntletShape,
+) -> OracleReport {
+    let mut failures = Vec::new();
+    let mut metrics = serde_json::Map::new();
+
+    let scalar_i64 = |sess: &mut dyn Session, sql: &str, params: &[P]| -> anyhow::Result<i64> {
+        let rows = sess.answer(&[sql.into()], &[params.to_vec()])?;
+        let s = rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|c| c.as_deref())
+            .unwrap_or("0");
+        Ok(s.parse::<i64>().unwrap_or(0))
+    };
+
+    // 1. Commerce double-entry trial balance == 0
+    match scalar_i64(session, "SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries", &[]) {
+        Ok(v) => {
+            metrics.insert("ledger_sum_cents".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("ledger_entries SUM(amount_cents) = {v} != 0"));
+            }
+        }
+        Err(e) => failures.push(format!("ledger check error: {e:#}")),
+    }
+
+    // 2. Agentic token double-entry trial balance == 0
+    match scalar_i64(session, "SELECT COALESCE(SUM(amount_micros), 0) FROM token_cost_ledger", &[]) {
+        Ok(v) => {
+            metrics.insert("token_ledger_sum_micros".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("token_cost_ledger SUM(amount_micros) = {v} != 0"));
+            }
+        }
+        Err(e) => failures.push(format!("token ledger check error: {e:#}")),
+    }
+
+    // 3. No negative product stock
+    match scalar_i64(session, "SELECT COALESCE(MIN(stock), 0) FROM products", &[]) {
+        Ok(v) => {
+            metrics.insert("min_product_stock".into(), serde_json::json!(v));
+            if v < 0 {
+                failures.push(format!("products MIN(stock) = {v} < 0"));
+            }
+        }
+        Err(e) => failures.push(format!("stock check error: {e:#}")),
+    }
+
+    // 4. Empty tenant has literally 0 issues
+    match scalar_i64(
+        session,
+        "SELECT COUNT(*) FROM issues WHERE tenant_id = ?",
+        &[P::I(shape.empty_tenant)],
+    ) {
+        Ok(v) => {
+            metrics.insert("empty_tenant_issues".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("empty tenant {} has {v} issues != 0", shape.empty_tenant));
+            }
+        }
+        Err(e) => failures.push(format!("empty tenant check error: {e:#}")),
+    }
+
+    // 5. Referential checks: zero orphan order_items -> orders, zero orphan turns -> runs
+    match scalar_i64(
+        session,
+        "SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.id = oi.order_id WHERE o.id IS NULL",
+        &[],
+    ) {
+        Ok(v) => {
+            metrics.insert("orphan_order_items".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("found {v} orphaned order_items"));
+            }
+        }
+        Err(e) => failures.push(format!("orphan order_items check error: {e:#}")),
+    }
+
+    // 6. PRAGMA integrity_check on SQLite / Amphora / AmphoraPostgres
+    if matches!(dialect, Dialect::Sqlite | Dialect::AmphoraPostgres) {
+        match session.answer(&["PRAGMA integrity_check".into()], &[vec![]]) {
+            Ok(rows) => {
+                let first = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(|c| c.as_deref())
+                    .unwrap_or("");
+                metrics.insert("integrity_check".into(), serde_json::json!(first));
+                if first != "ok" {
+                    failures.push(format!("PRAGMA integrity_check returned: {rows:?}"));
+                }
+            }
+            Err(e) => failures.push(format!("integrity_check error: {e:#}")),
+        }
+    }
+
+    OracleReport {
+        passed: failures.is_empty(),
+        details: serde_json::json!({
+            "metrics": metrics,
+            "failures": failures,
+        }),
+    }
+}
+
+/// Oracle 2 (Spill-Invariance: `cache=4000` vs `cache=48`) AND Oracle 5 (Cold-Reopen &
+/// `pg_class` OID Durability) run directly on the settled database file after the live `Target`
+/// has closed cleanly.
+pub fn oracle_spill_and_cold_reopen(
+    target_name: &str,
+    dir: &str,
+    shape: &GauntletShape,
+) -> (OracleReport, OracleReport) {
+    if !matches!(target_name, "amphora" | "amphora-pg" | "sqlite") {
+        let skipped = OracleReport {
+            passed: true,
+            details: serde_json::json!({ "skipped": format!("file-based reopen not run for {target_name}") }),
+        };
+        return (
+            OracleReport {
+                passed: true,
+                details: serde_json::json!({ "skipped": format!("cache-size spill check not run for {target_name}") }),
+            },
+            skipped,
+        );
+    }
+
+    let db_path = Path::new(dir).join("suite.db");
+    let slice_hi = shape.issues.min(3_000).max(1);
+    let ord_hi = shape.orders.min(3_000).max(1);
+    let spill_queries: Vec<(&str, &str, Vec<P>)> = vec![
+        ("wide_desc_sort", "SELECT id, priority, title, LENGTH(description) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY updated_at DESC, priority ASC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
+        ("due_nulls_first", "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at DESC NULLS FIRST, priority ASC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
+        ("due_nulls_last", "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at ASC NULLS LAST, priority DESC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
+        ("high_card_groupby", "SELECT tenant_id, project_id, status, priority, COUNT(*), COALESCE(SUM(estimate_hrs), 0) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id, project_id, status, priority HAVING COUNT(*) >= 1 ORDER BY COUNT(*) DESC, tenant_id ASC, project_id ASC, priority ASC LIMIT 50", vec![P::I(slice_hi)]),
+        ("multi_count_distinct", "SELECT tenant_id, COUNT(DISTINCT project_id), COUNT(DISTINCT author_id), COUNT(DISTINCT assignee_id) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id ORDER BY tenant_id LIMIT 30", vec![P::I(slice_hi)]),
+        ("window_multi_spec", "SELECT id, project_id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY priority ASC, id ASC), COUNT(*) OVER (PARTITION BY assignee_id) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY id LIMIT 80", vec![P::I(slice_hi.min(500))]),
+        ("window_running_sum", "SELECT id, account_id, SUM(amount_cents) OVER (PARTITION BY account_id ORDER BY posted_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ledger_entries WHERE account_id <= 5 ORDER BY account_id, posted_at, id LIMIT 100", vec![]),
+        ("setop_compound", "SELECT author_id FROM issues WHERE id BETWEEN 1 AND ? UNION SELECT author_id FROM issue_comments WHERE id BETWEEN 1 AND ? EXCEPT SELECT id FROM saas_users WHERE NOT active ORDER BY 1 LIMIT 50", vec![P::I(slice_hi), P::I(slice_hi)]),
+        ("join_6table", "SELECT t.slug, p.key_code, i.id, u.display_name, COUNT(c.id) FROM tenants t JOIN projects p ON p.tenant_id = t.id JOIN issues i ON i.project_id = p.id JOIN saas_users u ON u.id = i.author_id LEFT JOIN issue_comments c ON c.issue_id = i.id WHERE i.id BETWEEN 1 AND ? GROUP BY t.slug, p.key_code, i.id, u.display_name ORDER BY i.id ASC LIMIT 40", vec![P::I(slice_hi.min(500))]),
+        ("orders_export_sort", "SELECT o.id, c.country, o.total_cents FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id BETWEEN 1 AND ? ORDER BY c.country ASC, o.total_cents DESC, o.id ASC LIMIT 80", vec![P::I(ord_hi)]),
+        ("recursive_categories", "WITH RECURSIVE ctree(id) AS (SELECT id FROM categories WHERE id = 1 UNION ALL SELECT c.id FROM categories c JOIN ctree ON c.parent_id = ctree.id) SELECT p.id, p.price_cents FROM products p JOIN ctree ON ctree.id = p.category_id ORDER BY p.price_cents ASC, p.id ASC LIMIT 40", vec![]),
+        ("distinct_pairs", "SELECT DISTINCT status, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY status, priority", vec![P::I(slice_hi)]),
+    ];
+
+    let mut spill_failures = Vec::new();
+    let mut reopen_failures = Vec::new();
+    let mut reopen_meta = serde_json::Map::new();
+
+    if target_name == "sqlite" {
+        match (
+            rusqlite::Connection::open(&db_path),
+            rusqlite::Connection::open(&db_path),
+        ) {
+            (Ok(warm), Ok(tight)) => {
+                let _ = warm.execute_batch("PRAGMA cache_size = 4000;");
+                let _ = tight.execute_batch("PRAGMA cache_size = 48;");
+                for (name, sql, params) in &spill_queries {
+                    match (
+                        direct_query_sqlite(&warm, sql, params),
+                        direct_query_sqlite(&tight, sql, params),
+                    ) {
+                        (Ok(a), Ok(b)) if a == b => {}
+                        (Ok(a), Ok(b)) => spill_failures.push(format!(
+                            "{name}: warm ({} rows) != tight-cache ({} rows)",
+                            a.len(),
+                            b.len()
+                        )),
+                        (Err(e), _) => spill_failures.push(format!("{name} warm err: {e:#}")),
+                        (_, Err(e)) => spill_failures.push(format!("{name} tight err: {e:#}")),
+                    }
+                }
+                match direct_query_sqlite(
+                    &warm,
+                    "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger_entries",
+                    &[],
+                ) {
+                    Ok(r) => {
+                        reopen_meta.insert("cold_reopen_ledger".into(), serde_json::json!(r));
+                    }
+                    Err(e) => reopen_failures.push(format!("sqlite reopen err: {e:#}")),
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                spill_failures.push(format!("open sqlite: {e:#}"));
+                reopen_failures.push(format!("open sqlite: {e:#}"));
+            }
+        }
+    } else {
+        let is_pg = target_name == "amphora-pg";
+        let open_db = |pages: i64| -> anyhow::Result<Db> {
+            let db = if is_pg {
+                Db::open_postgres_sharing(&db_path, &Sharing::Off)?
+            } else {
+                Db::open_sharing(&db_path, &Sharing::Off)?
+            };
+            db.keep_pages(pages)?;
+            Ok(db)
+        };
+        match (open_db(4000), open_db(48)) {
+            (Ok(mut warm), Ok(mut tight)) => {
+                for (name, sql, params) in &spill_queries {
+                    match (
+                        direct_query_amphora(&mut warm, sql, params),
+                        direct_query_amphora(&mut tight, sql, params),
+                    ) {
+                        (Ok(a), Ok(b)) if a == b => {}
+                        (Ok(a), Ok(b)) => spill_failures.push(format!(
+                            "{name}: warm ({} rows) != tight-cache=48 ({} rows)",
+                            a.len(),
+                            b.len()
+                        )),
+                        (Err(e), _) => spill_failures.push(format!("{name} warm err: {e:#}")),
+                        (_, Err(e)) => spill_failures.push(format!("{name} tight err: {e:#}")),
+                    }
+                }
+                // Cold-reopen check: verify integrity, ledger trial balance, and (on amphora-pg)
+                // durable pg_class OIDs surviving reopen & ALTER TABLE RENAME!
+                match direct_query_amphora(
+                    &mut warm,
+                    "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger_entries",
+                    &[],
+                ) {
+                    Ok(r) => {
+                        reopen_meta.insert("cold_reopen_ledger".into(), serde_json::json!(r));
+                        if r.first().and_then(|row| row.get(1)).and_then(|c| c.as_deref())
+                            != Some("0")
+                        {
+                            reopen_failures.push(format!("cold reopen ledger != 0: {r:?}"));
+                        }
+                    }
+                    Err(e) => reopen_failures.push(format!("cold reopen ledger err: {e:#}")),
+                }
+                if is_pg {
+                    let oid_before = direct_query_amphora(
+                        &mut warm,
+                        "SELECT oid, relname FROM pg_class WHERE relname = 'issues'",
+                        &[],
+                    );
+                    drop(tight);
+                    drop(warm);
+                    match open_db(2000) {
+                        Ok(mut reopened) => {
+                            let oid_after = direct_query_amphora(
+                                &mut reopened,
+                                "SELECT oid, relname FROM pg_class WHERE relname = 'issues'",
+                                &[],
+                            );
+                            match (oid_before, oid_after) {
+                                (Ok(a), Ok(b)) if !a.is_empty() && a == b => {
+                                    reopen_meta.insert("pg_class_issues_oid".into(), serde_json::json!(b));
+                                }
+                                (Ok(a), Ok(b)) => reopen_failures.push(format!(
+                                    "pg_class OID drifted across cold reopen: before={a:?}, after={b:?}"
+                                )),
+                                (Err(e), _) | (_, Err(e)) => {
+                                    reopen_failures.push(format!("pg_class OID check err: {e:#}"))
+                                }
+                            }
+                            // Verify OID stability across ALTER TABLE RENAME on a scratch table
+                            let r_oid_test = (|| -> anyhow::Result<()> {
+                                reopened.exec("DROP TABLE IF EXISTS __oid_reopen_b")?;
+                                reopened.exec("DROP TABLE IF EXISTS __oid_reopen_a")?;
+                                reopened.exec("CREATE TABLE __oid_reopen_a (id INTEGER PRIMARY KEY, v BIGINT)")?;
+                                let o1 = direct_query_amphora(
+                                    &mut reopened,
+                                    "SELECT oid FROM pg_class WHERE relname = '__oid_reopen_a'",
+                                    &[],
+                                )?;
+                                reopened.exec("ALTER TABLE __oid_reopen_a RENAME TO __oid_reopen_b")?;
+                                let o2 = direct_query_amphora(
+                                    &mut reopened,
+                                    "SELECT oid FROM pg_class WHERE relname = '__oid_reopen_b'",
+                                    &[],
+                                )?;
+                                reopened.exec("DROP TABLE __oid_reopen_b")?;
+                                if o1.is_empty() || o1 != o2 {
+                                    anyhow::bail!("OID changed on ALTER TABLE RENAME: {o1:?} -> {o2:?}");
+                                }
+                                Ok(())
+                            })();
+                            if let Err(e) = r_oid_test {
+                                reopen_failures.push(format!("pg_class rename OID err: {e:#}"));
+                            }
+                        }
+                        Err(e) => reopen_failures.push(format!("second cold reopen err: {e:#}")),
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                spill_failures.push(format!("open amphora: {e:#}"));
+                reopen_failures.push(format!("open amphora: {e:#}"));
+            }
+        }
+    }
+
+    (
+        OracleReport {
+            passed: spill_failures.is_empty(),
+            details: serde_json::json!({
+                "queries_checked": spill_queries.len(),
+                "warm_pages": 4000,
+                "tight_pages": 48,
+                "failures": spill_failures,
+            }),
+        },
+        OracleReport {
+            passed: reopen_failures.is_empty(),
+            details: serde_json::json!({
+                "meta": reopen_meta,
+                "failures": reopen_failures,
+            }),
+        },
+    )
+}

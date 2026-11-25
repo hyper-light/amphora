@@ -16,7 +16,8 @@ import re
 import sys
 from decimal import Decimal, InvalidOperation
 
-SQLITE_DIALECT = {"amphora", "turso", "sqlite", "mvcc"}
+SQLITE_DIALECT = {"amphora", "amphora-pg", "turso", "sqlite", "mvcc"}
+DIALECT_SPECIFIC_OPS = {"catalog_introspect"}
 
 
 def number(v):
@@ -58,8 +59,8 @@ def main():
             r = json.loads(line)
         except ValueError:
             continue
-        rep = r.get("report")
-        if isinstance(rep, dict) and isinstance(rep.get("answers"), list):
+        rep = r.get("report") if isinstance(r.get("report"), dict) else r
+        if isinstance(rep, dict) and isinstance(rep.get("answers"), list) and "target" in rep:
             reports[rep["target"]] = rep
     if ref_name not in reports:
         print(f"no answers from the reference {ref_name} (targets with answers: {sorted(reports)})")
@@ -71,8 +72,22 @@ def main():
             continue
         cross = (name in SQLITE_DIALECT) != (ref_name in SQLITE_DIALECT)
         compared = differ = 0
+        unsupported_ops = {
+            r.get("op")
+            for r in rep.get("results", [])
+            if isinstance(r, dict) and r.get("unsupported")
+        }
+        seen_keys = set()
         for a in rep["answers"]:
-            r = ref.get((a["op"], json.dumps(a["params"])))
+            if a["op"] in DIALECT_SPECIFIC_OPS and name != ref_name:
+                # Catalog views intentionally differ between sqlite_schema and pg_catalog.
+                if (name in {"amphora-pg", "postgres", "orioledb", "cedardb"}) != (
+                    ref_name in {"amphora-pg", "postgres", "orioledb", "cedardb"}
+                ):
+                    continue
+            key_pair = (a["op"], json.dumps(a["params"]))
+            seen_keys.add(key_pair)
+            r = ref.get(key_pair)
             if r is None:
                 continue
             compared += 1
@@ -94,8 +109,19 @@ def main():
             print(f"  params: {json.dumps(a['params'])}")
             print(f"  {name} ({len(x)} rows): {show(x)}")
             print(f"  {ref_name} ({len(y)} rows): {show(y)}")
+        for (op, params_json), r in ref.items():
+            if (op, params_json) in seen_keys or op in unsupported_ops:
+                continue
+            if op in DIALECT_SPECIFIC_OPS and name != ref_name:
+                if (name in {"amphora-pg", "postgres", "orioledb", "cedardb"}) != (
+                    ref_name in {"amphora-pg", "postgres", "orioledb", "cedardb"}
+                ):
+                    continue
+            compared += 1
+            differ += 1
+            print(f"MISSING {name} vs {ref_name}: {op} params {params_json}: {name} produced no answer")
         missing = len(rep["answers"]) - compared
-        print(f"{name} vs {ref_name}: {compared} answers compared, {differ} differ or failed" + (f", {missing} with no {ref_name} answer to compare" if missing else ""))
+        print(f"{name} vs {ref_name}: {compared} answers compared, {differ} differ or failed" + (f", {missing} with no {ref_name} answer to compare" if missing > 0 else ""))
         bad += differ
     return 1 if bad else 0
 
