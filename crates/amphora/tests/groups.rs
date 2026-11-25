@@ -1504,3 +1504,107 @@ fn move_under_writes(channel: Channel) -> u64 {
     }
     lost
 }
+
+/// Review regression: `Do::Retire` must drop the removed group (and its final `Store` handle)
+/// outside `self.route.write_all(...)` so joining the store's notify thread cannot deadlock with
+/// an in-flight `put_then` durability callback that looks up a route (`groups.holding_of` /
+/// `groups.group`).
+#[test]
+fn review_group_retire_does_not_deadlock_with_durability_callback_route_lookup() {
+    use amphora::reshard::driver::{Do, Out, Reply};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let directory = amphora::groups::even(NodeId(0), 2).unwrap();
+    let groups = Arc::new(
+        Groups::on(
+            NodeId(0),
+            &directory,
+            Config::default(),
+            &dir.path().join("retired"),
+            |g| events(dir.path(), &g.0.to_string()),
+        )
+        .unwrap(),
+    );
+    let target = GroupId(1);
+    let key = (0u64..)
+        .map(|n| format!("retire-key-{n}"))
+        .find(|k| groups.group(k) == Some(target))
+        .expect("a key routed to GroupId(1)");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let groups_cb = Arc::clone(&groups);
+    let key_cb = key.clone();
+
+    let _ = groups
+        .put_then(
+            vec![Row {
+                key: key.clone(),
+                seq: 1,
+            }],
+            soon(),
+            move |res| {
+                assert!(res.is_ok(), "put_then callback failed: {res:?}");
+                let _ = entered_tx.send(());
+                let _ = go_rx.recv_timeout(Duration::from_secs(10));
+                // Give `Do::Retire` time to enter `write_all` and remove `target`.
+                std::thread::park_timeout(Duration::from_millis(50));
+                // Reading the route here deadlocks if `Store` is dropped inside `write_all`.
+                let _ = groups_cb.holding_of(target);
+                let _ = groups_cb.group(&key_cb);
+                let _ = done_tx.send(());
+            },
+        )
+        .unwrap();
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("durability callback should fire on notify thread");
+
+    // Drive a real Merge of GroupId(1) into GroupId(0), releasing the callback right as
+    // `Do::Retire { group: GroupId(1) }` runs.
+    let (mut driver, _) = Driver::recover(directory, 1).unwrap();
+    let out = driver
+        .begin(&Proposal::Merge {
+            from: target,
+            into: GroupId(0),
+        })
+        .unwrap();
+    let mut pending: VecDeque<Out> = out.into();
+    let mut retired_seen = false;
+    while let Some(o) = pending.pop_front() {
+        match o {
+            Out::Commit(_) => groups.route(driver.directory()).unwrap(),
+            Out::Send(a) => {
+                if matches!(a.what, Do::Retire { group } if group == target) {
+                    retired_seen = true;
+                    let _ = go_tx.send(());
+                }
+                let reply = groups
+                    .carry(&a, soon(), &Alone, |g| events(dir.path(), &g.0.to_string()))
+                    .unwrap();
+                if matches!(a.what, Do::Retire { group } if group == target) {
+                    assert_eq!(reply, Reply::Retired);
+                }
+                pending.extend(
+                    driver
+                        .answer(Answer {
+                            ask: a.ask,
+                            op: a.op,
+                            reply,
+                        })
+                        .unwrap(),
+                );
+            }
+            Out::Ended(e) => assert!(e.done),
+        }
+    }
+    assert!(retired_seen, "Merge must execute Do::Retire for GroupId(1)");
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("durability callback must complete without deadlocking on route lock");
+    assert!(groups.holding_of(target).is_none());
+}

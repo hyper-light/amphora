@@ -2398,3 +2398,202 @@ fn t_t1_12_m3_a_backlog_of_marks_ships_over_sends() {
     .unwrap();
     assert_eq!(rows(&Db::open(&target).unwrap()), model);
 }
+
+/// Review P1 regression: PostgreSQL-dialect databases must support base backup + incremental WAL
+/// point-in-time restore (with and without a WAL segment switch), restore-and-check verification,
+/// and replica source inspection (`is_replica` / `inspect_source`).
+#[test]
+fn review_p1_postgres_dialect_backup_restore_and_replica_inspection() {
+    use amphora::db::Sharing;
+
+    for switch_wal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg_source.db");
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let read = Arc::clone(&now);
+        let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+        let mut db = Db::open_postgres_sharing(&path, &Sharing::Off).unwrap();
+        db.back_up(Arc::clone(&hooks));
+        let blobs = SimBlobs::new(1 << 20, 1_000_000, 1 << 30);
+
+        db.exec("CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT NOT NULL, active BOOLEAN NOT NULL, meta JSONB NOT NULL)")
+            .unwrap();
+        let mut shipper = Shipper::open("pg", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
+
+        let insert_batch = |db: &mut Db, range: std::ops::RangeInclusive<i64>| {
+            db.transaction(|db| {
+                for id in range {
+                    db.query_owned(
+                        "INSERT INTO items (id, label, active, meta) VALUES (?1, ?2, ?3, ?4)",
+                        [
+                            Value::from_i64(id),
+                            Value::from_text(format!("row-{id}")),
+                            Value::from_i64(i64::from(id % 2 == 0)),
+                            Value::from_text(format!(r#"{{"n":{id}}}"#)),
+                        ],
+                        |_| Ok(true),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            (db.flusher())().unwrap();
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        };
+
+        // First 20 rows -> ship -> take base backup.
+        insert_batch(&mut db, 1..=20);
+        shipper.ship(&db, &blobs, until()).unwrap();
+        copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
+
+        if switch_wal {
+            db.checkpoint().unwrap();
+            let _ = db.restart_log().unwrap();
+        }
+
+        // Next 20 rows -> ship -> archive through this second.
+        insert_batch(&mut db, 21..=40);
+        let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+        archive_through(&mut shipper, &db, &blobs, &now);
+
+        let expected_digest = backup::digest(&db).unwrap();
+
+        // Point-in-time restore must replay PostgreSQL-dialect base + WAL cleanly.
+        let restored_path = dir.path().join("restored.db");
+        backup::restore(&blobs, "pg", second, &restored_path, until())
+            .unwrap_or_else(|e| panic!("switch_wal={switch_wal}: restore failed: {e:#}"));
+        let restored_db = Db::open_postgres_sharing(&restored_path, &Sharing::Off).unwrap();
+        let mut got = Vec::new();
+        restored_db
+            .query("SELECT id, label FROM items ORDER BY id", [], |r| {
+                got.push((
+                    r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    r.get::<String>(1).map_err(|e| anyhow::anyhow!("{e}"))?,
+                ));
+                Ok(true)
+            })
+            .unwrap();
+        let want: Vec<(i64, String)> = (1..=40).map(|id| (id, format!("row-{id}"))).collect();
+        assert_eq!(got, want, "switch_wal={switch_wal}: restored rows mismatch");
+        assert_eq!(
+            backup::digest(&restored_db).unwrap(),
+            expected_digest,
+            "switch_wal={switch_wal}: restored digest mismatch"
+        );
+        drop(restored_db);
+
+        // Restore-and-check must also pass against the PostgreSQL-dialect source digest.
+        let check_path = dir.path().join("checked.db");
+        let counters = backup::CheckCounters::default();
+        let check = backup::restore_and_check_at(
+            &blobs,
+            "pg",
+            second,
+            &check_path,
+            &|_| Ok(Some(expected_digest.clone())),
+            &counters,
+            &mut backup::Unpaced,
+            until(),
+        )
+        .unwrap();
+        assert!(
+            matches!(check, backup::Check::Passed { .. }),
+            "switch_wal={switch_wal}: restore_and_check_at failed: {check:?}"
+        );
+
+        // Drop source writer handle so replica bootstrap inspection can acquire the exclusive lease.
+        drop(shipper);
+        drop(db);
+
+        // Reopening source confirms all 40 rows are durable on disk.
+        {
+            let reopened = Db::open_postgres_sharing(&path, &Sharing::Off).unwrap();
+            let mut cnt = 0i64;
+            reopened
+                .query("SELECT COUNT(*) FROM items", [], |r| {
+                    cnt = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(false)
+                })
+                .unwrap();
+            assert_eq!(cnt, 40, "switch_wal={switch_wal}: source reopen row count");
+        }
+
+        // Replica source inspection (`is_replica` and `inspect_source`) must open PostgreSQL-dialect
+        // source databases without rejecting their schema as corrupt.
+        assert!(
+            !amphora::replication::bootstrap::is_replica(&path)
+                .unwrap_or_else(|e| panic!("switch_wal={switch_wal}: is_replica failed: {e}")),
+            "switch_wal={switch_wal}: source must not be reported as replica"
+        );
+        let bootstrap = amphora::replication::bootstrap::inspect_source(&path, 1)
+            .unwrap_or_else(|e| panic!("switch_wal={switch_wal}: inspect_source failed: {e}"));
+        assert_eq!(bootstrap.source_node, 1);
+    }
+}
+
+/// Review P2 regression: backup row-digest verification must include legal user tables whose name
+/// starts with `sqlite` without an underscore (e.g. `sqliteLedger`) AND must incorporate rowids so
+/// databases with identical visible columns at different rowids do not verify as equal.
+#[test]
+fn review_p2_digest_includes_sqlite_prefix_tables_and_rowids() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Legal user table `sqliteLedger` (no underscore after `sqlite`) must be included in digest.
+    let a = Db::open(&dir.path().join("ledger_a.db")).unwrap();
+    let b = Db::open(&dir.path().join("ledger_b.db")).unwrap();
+    for (db, count) in [(&a, 31i64), (&b, 40i64)] {
+        db.exec("CREATE TABLE sqliteLedger (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+            .unwrap();
+        for i in 1..=count {
+            db.query_owned(
+                "INSERT INTO sqliteLedger (id, v) VALUES (?1, ?2)",
+                [Value::from_i64(i), Value::from_text(format!("r-{i}"))],
+                |_| Ok(true),
+            )
+            .unwrap();
+        }
+    }
+    let da = backup::digest(&a).unwrap();
+    let db_dig = backup::digest(&b).unwrap();
+    assert!(
+        da.0.iter()
+            .any(|(name, rows, _)| name.eq_ignore_ascii_case("sqliteLedger") && *rows == 31),
+        "sqliteLedger must be included in RowDigest: {da:?}"
+    );
+    assert_ne!(
+        da, db_dig,
+        "databases with different row counts in sqliteLedger must not have equal digests"
+    );
+
+    // 2. Regular rowid table with same visible column value at rowid 9 vs rowid 1 must differ.
+    let r1 = Db::open(&dir.path().join("rowid_a.db")).unwrap();
+    let r2 = Db::open(&dir.path().join("rowid_b.db")).unwrap();
+    r1.exec("CREATE TABLE notes (v TEXT NOT NULL)").unwrap();
+    r2.exec("CREATE TABLE notes (v TEXT NOT NULL)").unwrap();
+    r1.exec("INSERT INTO notes (rowid, v) VALUES (9, 'same')")
+        .unwrap();
+    r2.exec("INSERT INTO notes (rowid, v) VALUES (1, 'same')")
+        .unwrap();
+    assert_ne!(
+        backup::digest(&r1).unwrap(),
+        backup::digest(&r2).unwrap(),
+        "identical visible columns at different rowids must produce different digests"
+    );
+
+    // 3. Table shadowing `rowid` as a user column must fall back to `_rowid_` for hidden rowid.
+    let s1 = Db::open(&dir.path().join("shadow_a.db")).unwrap();
+    let s2 = Db::open(&dir.path().join("shadow_b.db")).unwrap();
+    s1.exec("CREATE TABLE shadowed (rowid TEXT NOT NULL, v TEXT NOT NULL)")
+        .unwrap();
+    s2.exec("CREATE TABLE shadowed (rowid TEXT NOT NULL, v TEXT NOT NULL)")
+        .unwrap();
+    s1.exec("INSERT INTO shadowed (_rowid_, rowid, v) VALUES (9, 'lbl', 'same')")
+        .unwrap();
+    s2.exec("INSERT INTO shadowed (_rowid_, rowid, v) VALUES (1, 'lbl', 'same')")
+        .unwrap();
+    assert_ne!(
+        backup::digest(&s1).unwrap(),
+        backup::digest(&s2).unwrap(),
+        "table shadowing rowid column must still distinguish hidden _rowid_ values"
+    );
+}

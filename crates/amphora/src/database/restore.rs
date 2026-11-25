@@ -67,8 +67,8 @@ impl Restore {
         }
         api::bound("restore source", source.len(), SOURCE_MAX)?;
         let database = Database::open_owned(path, until, true, None, |db| {
-            db.exec(super::SCHEMA).map_err(unavailable)?;
-            db.exec(SCHEMA).map_err(unavailable)?;
+            db.exec_internal(super::SCHEMA).map_err(unavailable)?;
+            db.exec_internal(SCHEMA).map_err(unavailable)?;
             db.transaction(|db| {
             if let Some(prior) = progress(db)? {
                 if prior.source != source {

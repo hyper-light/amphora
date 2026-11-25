@@ -164,29 +164,42 @@ fn load_shard(
     target: &Arc<dyn Target>,
     shape: &GauntletShape,
     cedar: bool,
+    pg_schema: &str,
 ) -> anyhow::Result<(u64, f64, f64, f64)> {
     let d = target.dialect();
     let t0 = Instant::now();
+    if d == Dialect::Postgres {
+        target.setup(&[
+            (format!("DROP SCHEMA IF EXISTS {pg_schema} CASCADE"), vec![]),
+            (format!("CREATE SCHEMA {pg_schema}"), vec![]),
+        ])?;
+    }
     let tbls: Vec<(String, Vec<P>)> = schema::tables(d, cedar)
         .into_iter()
         .map(|s| (s, vec![]))
         .collect();
     target.setup(&tbls)?;
 
-    let rows_loaded = load_all(
-        d,
-        shape,
-        |batch| target.setup(&batch),
-        || target.settle(),
-    )?;
+    let rows_loaded = load_all(d, shape, |batch| target.setup(&batch), || target.settle())?;
     let load_s = t0.elapsed().as_secs_f64();
 
     let t_idx = Instant::now();
-    let idxs: Vec<(String, Vec<P>)> = schema::indexes(d)
-        .into_iter()
-        .map(|s| (s, vec![]))
-        .collect();
-    target.setup(&idxs)?;
+    let mut create_idxs: Vec<(String, Vec<P>)> = Vec::new();
+    let mut maintenance: Vec<String> = Vec::new();
+    for stmt in schema::indexes(d) {
+        let upper = stmt.trim_start().to_ascii_uppercase();
+        if upper.starts_with("VACUUM") || upper.starts_with("ANALYZE") {
+            maintenance.push(stmt);
+        } else {
+            create_idxs.push((stmt, vec![]));
+        }
+    }
+    if !create_idxs.is_empty() {
+        target.setup(&create_idxs)?;
+    }
+    for stmt in maintenance {
+        target.setup(&[(stmt, vec![])])?;
+    }
     let index_s = t_idx.elapsed().as_secs_f64();
 
     let t_set = Instant::now();
@@ -194,6 +207,113 @@ fn load_shard(
     let settle_s = t_set.elapsed().as_secs_f64();
 
     Ok((rows_loaded, load_s, index_s, settle_s))
+}
+
+fn pg_schema_for_shard(shard: usize, shards: usize) -> String {
+    if shards <= 1 {
+        "amphora_gauntlet".to_owned()
+    } else {
+        format!("amphora_gauntlet_s{shard:03}")
+    }
+}
+
+/// All single-column `id` primary-key tables whose runtime writes allocate IDs via
+/// `GauntletShape::alloc_id()`.
+const ID_ALLOC_TABLES: &[&str] = &[
+    "workspaces",
+    "agent_runs",
+    "agent_turns",
+    "tool_calls",
+    "file_diffs",
+    "agent_memories",
+    "plan_steps",
+    "token_cost_ledger",
+    "accounts",
+    "channels",
+    "messages",
+    "moderation_reports",
+    "tenants",
+    "teams",
+    "saas_users",
+    "projects",
+    "issues",
+    "labels",
+    "issue_comments",
+    "attachments",
+    "categories",
+    "products",
+    "customers",
+    "orders",
+    "order_items",
+    "payments",
+    "fx_rates",
+    "ledger_entries",
+    "services",
+    "spans",
+    "experiments",
+    "exp_events",
+    "ci_jobs",
+    "test_results",
+    "bookings",
+    "documents",
+];
+
+/// Seeds `shape.next_id` past every existing primary key across all shards on `--reuse` so
+/// repeated write runs never collide on primary keys.
+fn seed_reuse_allocator(targets: &[Arc<dyn Target>], shape: &GauntletShape) -> anyhow::Result<()> {
+    let mut max_id = 0i64;
+    for t in targets {
+        let mut sess = t.session()?;
+        for table in ID_ALLOC_TABLES {
+            let sql = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
+            if let Ok(rows) = sess.answer(&[sql], &[vec![]]) {
+                let v = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(|c| c.as_deref())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                max_id = max_id.max(v);
+            }
+        }
+    }
+    if max_id > 0 {
+        shape.advance_next_id_past(max_id);
+    }
+    Ok(())
+}
+
+fn aggregate_shard_oracles(
+    reports: Vec<(usize, oracles::OracleReport)>,
+) -> (bool, serde_json::Value) {
+    if reports.len() == 1 {
+        let (_, r) = reports.into_iter().next().unwrap();
+        return (
+            r.passed,
+            serde_json::json!({ "passed": r.passed, "details": r.details }),
+        );
+    }
+    let passed = reports.iter().all(|(_, r)| r.passed);
+    let failed_shards: Vec<usize> = reports
+        .iter()
+        .filter(|(_, r)| !r.passed)
+        .map(|(sh, _)| *sh)
+        .collect();
+    let per_shard: Vec<serde_json::Value> = reports
+        .into_iter()
+        .map(|(sh, r)| serde_json::json!({ "shard": sh, "passed": r.passed, "details": r.details }))
+        .collect();
+    (
+        passed,
+        serde_json::json!({
+            "passed": passed,
+            "details": {
+                "shards_checked": per_shard.len(),
+                "failed_shards": failed_shards,
+                "shards": per_shard,
+            }
+        }),
+    )
 }
 
 fn shard_dir(base: &str, shard: usize, shards: usize) -> String {
@@ -240,18 +360,22 @@ pub fn main() -> anyhow::Result<()> {
         o.phases
     );
 
-    // Open 1 or N shards (parallel load when shards > 1!).
+    // Open 1 or N shards (parallel load when shards > 1, each with its own PostgreSQL schema).
     let mut targets: Vec<Arc<dyn Target>> = Vec::with_capacity(o.shards);
+    let mut pg_schemas: Vec<String> = Vec::with_capacity(o.shards);
     for sh in 0..o.shards {
         let dir = shard_dir(&o.dir, sh, o.shards);
-        let t = suite_db::open(
+        let pg_schema = pg_schema_for_shard(sh, o.shards);
+        let t = suite_db::open_gauntlet(
             &o.target,
             &dir,
             o.dsn.as_deref(),
             session_budget,
             o.reuse,
+            &pg_schema,
         )?;
         targets.push(t);
+        pg_schemas.push(pg_schema);
     }
     let dialect = targets[0].dialect();
     let cedar = o.target == "cedardb";
@@ -264,17 +388,20 @@ pub fn main() -> anyhow::Result<()> {
     if !o.reuse {
         let t_all = Instant::now();
         if o.shards == 1 {
-            let (r, ls, is, ss) = load_shard(&targets[0], &shape, cedar)?;
+            let (r, ls, is, ss) = load_shard(&targets[0], &shape, cedar, &pg_schemas[0])?;
             total_rows_loaded = r;
             load_s = ls;
             index_s = is;
             settle_s = ss;
         } else {
             let mut handles = Vec::with_capacity(o.shards);
-            for t in &targets {
+            for (t, pg_schema) in targets.iter().zip(&pg_schemas) {
                 let t = t.clone();
                 let shape = shape.clone();
-                handles.push(std::thread::spawn(move || load_shard(&t, &shape, cedar)));
+                let pg_schema = pg_schema.clone();
+                handles.push(std::thread::spawn(move || {
+                    load_shard(&t, &shape, cedar, &pg_schema)
+                }));
             }
             for h in handles {
                 let (r, ls, is, ss) = h
@@ -292,6 +419,9 @@ pub fn main() -> anyhow::Result<()> {
     for t in &targets {
         t.ready()?;
     }
+    if o.reuse {
+        seed_reuse_allocator(&targets, &shape)?;
+    }
 
     let mut report = serde_json::Map::new();
     report.insert("target".into(), serde_json::json!(o.target));
@@ -300,9 +430,18 @@ pub fn main() -> anyhow::Result<()> {
     report.insert("shards".into(), serde_json::json!(o.shards));
     report.insert("logical_agents".into(), serde_json::json!(o.logical_agents));
     report.insert("rows_loaded".into(), serde_json::json!(total_rows_loaded));
-    report.insert("load_s".into(), serde_json::json!((load_s * 1000.0).round() / 1000.0));
-    report.insert("index_s".into(), serde_json::json!((index_s * 1000.0).round() / 1000.0));
-    report.insert("settle_s".into(), serde_json::json!((settle_s * 1000.0).round() / 1000.0));
+    report.insert(
+        "load_s".into(),
+        serde_json::json!((load_s * 1000.0).round() / 1000.0),
+    );
+    report.insert(
+        "index_s".into(),
+        serde_json::json!((index_s * 1000.0).round() / 1000.0),
+    );
+    report.insert(
+        "settle_s".into(),
+        serde_json::json!((settle_s * 1000.0).round() / 1000.0),
+    );
 
     // =========================================================================
     // Execute ALL deterministic read phases BEFORE any writes/DDL/chaos mutate
@@ -358,7 +497,10 @@ pub fn main() -> anyhow::Result<()> {
                 );
                 continue;
             };
-            let seed = op.name.bytes().fold(0x1234_5678u64, |a, b| a.wrapping_mul(31) ^ u64::from(b));
+            let seed = op
+                .name
+                .bytes()
+                .fold(0x1234_5678u64, |a, b| a.wrapping_mul(31) ^ u64::from(b));
             let mut rng = Rng(mix(seed));
 
             if o.answers && op.kind == Kind::Read {
@@ -509,20 +651,38 @@ pub fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Phase 3: Live Read-Only Oracles (Pagination Conservation, Index-Invariance, Conservation)
+    // Phase 3: Live Read-Only Oracles across ALL shards (Pagination Conservation,
+    // Index-Invariance, Conservation & Integrity)
     let mut oracles_map = serde_json::Map::new();
     if phase_enabled(&o.phases, "oracles") {
-        let mut sess = targets[0].session()?;
-        let o1 = oracles::oracle_pagination_conservation(sess.as_mut(), &shape);
-        let o3 = oracles::oracle_index_invariance(sess.as_mut(), dialect, &shape);
-        let o4 = oracles::oracle_conservation_and_integrity(sess.as_mut(), dialect, &shape);
+        let mut o1_all = Vec::with_capacity(o.shards);
+        let mut o3_all = Vec::with_capacity(o.shards);
+        let mut o4_all = Vec::with_capacity(o.shards);
+        for (sh, target) in targets.iter().enumerate() {
+            let mut sess = target.session()?;
+            o1_all.push((
+                sh,
+                oracles::oracle_pagination_conservation(sess.as_mut(), &shape),
+            ));
+            o3_all.push((
+                sh,
+                oracles::oracle_index_invariance(sess.as_mut(), dialect, &shape),
+            ));
+            o4_all.push((
+                sh,
+                oracles::oracle_conservation_and_integrity(sess.as_mut(), dialect, &shape),
+            ));
+        }
+        let (o1_ok, o1_val) = aggregate_shard_oracles(o1_all);
+        let (o3_ok, o3_val) = aggregate_shard_oracles(o3_all);
+        let (o4_ok, o4_val) = aggregate_shard_oracles(o4_all);
         eprintln!(
-            "[gauntlet oracles live] pagination={} index_inv={} conservation={}",
-            o1.passed, o3.passed, o4.passed
+            "[gauntlet oracles live] shards={} pagination={} index_inv={} conservation={}",
+            o.shards, o1_ok, o3_ok, o4_ok
         );
-        oracles_map.insert("pagination_conservation".into(), serde_json::json!({ "passed": o1.passed, "details": o1.details }));
-        oracles_map.insert("index_invariance".into(), serde_json::json!({ "passed": o3.passed, "details": o3.details }));
-        oracles_map.insert("conservation_integrity".into(), serde_json::json!({ "passed": o4.passed, "details": o4.details }));
+        oracles_map.insert("pagination_conservation".into(), o1_val);
+        oracles_map.insert("index_invariance".into(), o3_val);
+        oracles_map.insert("conservation_integrity".into(), o4_val);
     }
 
     // Phase 1b: Named Write & DDL ops
@@ -550,7 +710,10 @@ pub fn main() -> anyhow::Result<()> {
             }),
         );
         if o.answers {
-            report.insert("named_answers".into(), serde_json::Value::Object(named_answers_out));
+            report.insert(
+                "named_answers".into(),
+                serde_json::Value::Object(named_answers_out),
+            );
         }
     }
 
@@ -564,6 +727,7 @@ pub fn main() -> anyhow::Result<()> {
             inflight_cap: o.inflight,
             seconds: o.chaos_seconds,
             logical_agents: shape.logical_agents,
+            session_budget,
         };
         let mut chaos_out = Vec::new();
         for &scen in SCENARIOS {
@@ -579,17 +743,25 @@ pub fn main() -> anyhow::Result<()> {
             let res = run_scenario(scen, &targets, &shape, &cfg)?;
             eprintln!(
                 "[gauntlet chaos] finished {scen}: ops={} ({} ops/s) audits={} audit_fails={} errs={}",
-                res["ops"], res["ops_per_s"], res["audit_checks"], res["audit_failures"], res["errors"]
+                res["ops"],
+                res["ops_per_s"],
+                res["audit_checks"],
+                res["audit_failures"],
+                res["errors"]
             );
             chaos_out.push(res);
         }
-        // Post-chaos conservation check on shard 0!
-        let mut sess = targets[0].session()?;
-        let post_cons = oracles::oracle_conservation_and_integrity(sess.as_mut(), dialect, &shape);
-        oracles_map.insert(
-            "post_chaos_conservation".into(),
-            serde_json::json!({ "passed": post_cons.passed, "details": post_cons.details }),
-        );
+        // Post-chaos conservation check across ALL shards!
+        let mut post_all = Vec::with_capacity(o.shards);
+        for (sh, target) in targets.iter().enumerate() {
+            let mut sess = target.session()?;
+            post_all.push((
+                sh,
+                oracles::oracle_conservation_and_integrity(sess.as_mut(), dialect, &shape),
+            ));
+        }
+        let (_, post_val) = aggregate_shard_oracles(post_all);
+        oracles_map.insert("post_chaos_conservation".into(), post_val);
         report.insert("chaos".into(), serde_json::Value::Array(chaos_out));
     }
 
@@ -598,21 +770,72 @@ pub fn main() -> anyhow::Result<()> {
         serde_json::Value::Array(targets.iter().map(|t| t.stats()).collect()),
     );
 
-    // Drop live targets so file locks release cleanly before cold-reopen & spill-invariance oracles!
+    // Capture pre-close durable snapshots and teardown weak-reference probes on ALL shards BEFORE
+    // closing targets so the cold-reopen durability oracle verifies both genuine disk recovery
+    // (old engine instance dropped) and exact row counts, sums, and digests on every shard.
+    let pre_close_snapshots: Vec<oracles::PreCloseSnapshot> = if phase_enabled(&o.phases, "oracles")
+    {
+        let mut snaps = Vec::with_capacity(o.shards);
+        for target in &targets {
+            let mut sess = target.session()?;
+            snaps.push(oracles::capture_pre_close_snapshot(sess.as_mut())?);
+        }
+        snaps
+    } else {
+        Vec::new()
+    };
+    let drop_probes: Vec<Option<Box<dyn Fn() -> bool + Send + Sync>>> =
+        targets.iter().map(|t| t.instance_dropped_probe()).collect();
+
+    // Drop live targets so background threads join and every engine instance releases cleanly
+    // before cold-reopen & spill-invariance oracles!
     drop(targets);
 
     // =========================================================================
-    // Phase 5: File-Level Oracles (Spill-Invariance cache=4000 vs 48 & Cold Reopen/OIDs)
+    // Phase 5: File-Level Oracles across ALL shards (Spill-Invariance & Cold Reopen/OIDs)
     // =========================================================================
     if phase_enabled(&o.phases, "oracles") {
-        let sh0_dir = shard_dir(&o.dir, 0, o.shards);
-        let (o2, o5) = oracles::oracle_spill_and_cold_reopen(&o.target, &sh0_dir, &shape);
+        let mut o2_all = Vec::with_capacity(o.shards);
+        let mut o5_all = Vec::with_capacity(o.shards);
+        for sh in 0..o.shards {
+            let sh_dir = shard_dir(&o.dir, sh, o.shards);
+            let instance_dropped = drop_probes.get(sh).and_then(|p| p.as_ref()).map(|p| p());
+            let (o2, mut o5) = oracles::oracle_spill_and_cold_reopen(
+                &o.target,
+                &sh_dir,
+                &shape,
+                pre_close_snapshots.get(sh),
+            );
+            if instance_dropped == Some(false) {
+                o5.passed = false;
+                if let Some(arr) = o5
+                    .details
+                    .get_mut("failures")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    arr.push(serde_json::json!(format!(
+                        "shard {sh}: live engine instance remained alive after Target drop; reopen was not cold"
+                    )));
+                }
+            } else if let Some(dropped) = instance_dropped
+                && let Some(meta) = o5.details.get_mut("meta").and_then(|v| v.as_object_mut())
+            {
+                meta.insert(
+                    "previous_instance_dropped".into(),
+                    serde_json::json!(dropped),
+                );
+            }
+            o2_all.push((sh, o2));
+            o5_all.push((sh, o5));
+        }
+        let (o2_ok, o2_val) = aggregate_shard_oracles(o2_all);
+        let (o5_ok, o5_val) = aggregate_shard_oracles(o5_all);
         eprintln!(
-            "[gauntlet oracles reopen] spill_inv={} cold_reopen={}",
-            o2.passed, o5.passed
+            "[gauntlet oracles reopen] shards={} spill_inv={} cold_reopen={}",
+            o.shards, o2_ok, o5_ok
         );
-        oracles_map.insert("spill_invariance".into(), serde_json::json!({ "passed": o2.passed, "details": o2.details }));
-        oracles_map.insert("cold_reopen_oid".into(), serde_json::json!({ "passed": o5.passed, "details": o5.details }));
+        oracles_map.insert("spill_invariance".into(), o2_val);
+        oracles_map.insert("cold_reopen_oid".into(), o5_val);
     }
 
     if !oracles_map.is_empty() {
@@ -627,7 +850,11 @@ pub fn main() -> anyhow::Result<()> {
             .iter()
             .filter(|sc| {
                 sc.get("errors").and_then(|v| v.as_u64()).unwrap_or(0) > 0
-                    || sc.get("audit_failures").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+                    || sc
+                        .get("audit_failures")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        > 0
             })
             .count();
     }
@@ -639,4 +866,17 @@ pub fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pg_schema_for_shard;
+
+    #[test]
+    fn review_p1_pg_schemas_are_isolated_per_shard() {
+        assert_eq!(pg_schema_for_shard(0, 1), "amphora_gauntlet");
+        assert_eq!(pg_schema_for_shard(0, 2), "amphora_gauntlet_s000");
+        assert_eq!(pg_schema_for_shard(1, 2), "amphora_gauntlet_s001");
+        assert_ne!(pg_schema_for_shard(0, 2), pg_schema_for_shard(1, 2));
+    }
 }

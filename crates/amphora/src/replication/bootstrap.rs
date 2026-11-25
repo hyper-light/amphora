@@ -151,7 +151,7 @@ fn table_exists(db: &Db) -> Result<bool, Refusal> {
 fn nonempty(db: &Db) -> Result<bool, Refusal> {
     let mut found = false;
     db.query(
-        "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
+        "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite!_%' ESCAPE '!' LIMIT 1",
         [],
         |_| {
             found = true;
@@ -457,7 +457,7 @@ impl Baseline {
         let Some(declaration) = &self.declaration else {
             return Ok(());
         };
-        db.exec(TABLE)?;
+        db.exec_internal(TABLE)?;
         db.query("INSERT INTO __amphora_baseline(id,source,identity,complete,received,total,image) VALUES(1,?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET source=excluded.source,identity=excluded.identity,complete=excluded.complete,received=excluded.received,total=excluded.total,image=excluded.image", [Value::from_text(declaration.source_node.to_string()), Value::from_slice(&declaration.source_id)?, Value::from_i64(i64::from(complete)), Value::from_text(received.to_string()), Value::from_text(total.to_string()), Value::from_slice(image)?], |_| Ok(true))
     }
 }

@@ -1075,10 +1075,10 @@ pub(crate) fn exclusive_file_of(path: &Path, owner: &Owned) -> Result<File, Refu
 /// The database at `path` for `owner`, as [`exclusive_file_of`] makes its directories.
 pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
     if !owner.guarded() {
-        return Db::open(path).map_err(unavailable);
+        return Db::open_existing_sharing(path, &crate::db::Sharing::Off).map_err(unavailable);
     }
     let path = existing_path(path)?;
-    Db::open_made(&path, &crate::db::Sharing::Process).map_err(unavailable)
+    Db::open_existing_made(&path, &crate::db::Sharing::Process).map_err(unavailable)
 }
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
@@ -1576,13 +1576,14 @@ fn bytes(r: &amphora_engine::Row, n: usize) -> anyhow::Result<Option<Vec<u8>>> {
 }
 
 pub(crate) fn bootstrap_db(db: &Db) -> Result<(), Refusal> {
-    db.exec(SCHEMA).map_err(unavailable)?;
-    db.exec(restore::SCHEMA).map_err(unavailable)?;
-    db.exec(import::SCHEMA).map_err(unavailable)?;
-    db.exec(group::SCHEMA).map_err(unavailable)?;
+    db.exec_internal(SCHEMA).map_err(unavailable)?;
+    db.exec_internal(restore::SCHEMA).map_err(unavailable)?;
+    db.exec_internal(import::SCHEMA).map_err(unavailable)?;
+    db.exec_internal(group::SCHEMA).map_err(unavailable)?;
     // Every group keeps the tables of transactions across groups, so a single-group commit can
     // respect their locks (AC-T1.10.1, lane xgroup-sql-6).
-    db.exec(crate::xgroup::sql::SCHEMA).map_err(unavailable)?;
+    db.exec_internal(crate::xgroup::sql::SCHEMA)
+        .map_err(unavailable)?;
     Ok(())
 }
 
@@ -5570,5 +5571,191 @@ mod records_reads {
             .get("f", b"k", Consistency::Linearizable, until())
             .unwrap();
         assert_eq!(row.expect("the row").value, b"v");
+    }
+
+    /// Review regression: a PostgreSQL-dialect database file that replication preflight
+    /// (`is_replica` / `inspect_source`) accepts must also open cleanly under BOTH standalone
+    /// ownership (`Database::open`, plus guarded `Db::open_existing_made`) and replicated
+    /// ownership (`Database::open_replicated`) with all internal `__amphora_*` catalog tables
+    /// created cleanly and user rows queryable.
+    #[test]
+    fn review_standalone_and_replicated_ownership_accept_postgres_dialect_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed_path = dir.path().join("pg-seed.db");
+        {
+            let mut db = Db::open_postgres_sharing(&seed_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+                .unwrap();
+            db.exec("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
+                .unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+
+        // Preflight accepts the PostgreSQL-dialect source file.
+        assert!(!crate::replication::bootstrap::is_replica(&seed_path).unwrap());
+        let declaration = crate::replication::bootstrap::inspect_source(&seed_path, 1).unwrap();
+
+        let until = || Instant::now() + Duration::from_secs(30);
+
+        // 1. Standalone ownership (`Database::open`).
+        let standalone_path = dir.path().join("standalone.db");
+        std::fs::copy(&seed_path, &standalone_path).unwrap();
+        {
+            let db = Database::open(&standalone_path, until()).unwrap();
+            let labels: Vec<(i64, String)> = db
+                .query_local(until(), |conn| {
+                    let mut stmt = conn.prepare("SELECT id, label FROM items ORDER BY id")?;
+                    let mut rows = stmt.query([])?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        out.push((row.get(0)?, row.get(1)?));
+                    }
+                    Ok(out)
+                })
+                .unwrap();
+            assert_eq!(labels, vec![(1, "alpha".into()), (2, "beta".into())]);
+        }
+
+        // 2. Guarded-directory opener (`Db::open_existing_made`) + `bootstrap_db`.
+        let guarded_path = dir.path().join("guarded.db");
+        std::fs::copy(&seed_path, &guarded_path).unwrap();
+        {
+            let db = Db::open_existing_made(&guarded_path, &crate::db::Sharing::Process).unwrap();
+            assert!(db.is_postgres());
+            bootstrap_db(&db).unwrap();
+        }
+
+        // 3. Replicated ownership (`Database::open_replicated`): opens the PostgreSQL-dialect
+        //    file, elects the single voter, applies its baseline seed (`apply_seed`), creates
+        //    all internal `__amphora_*` catalog tables, and answers linearizable SQL queries.
+        let repl_path = dir.path().join("replicated.db");
+        let log_path = dir.path().join("replicated.log");
+        std::fs::copy(&seed_path, &repl_path).unwrap();
+        {
+            let config = api::replication::ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: vec![],
+                bootstrap: Some(declaration),
+            };
+            let db = Database::open_replicated(&repl_path, &log_path, config, until()).unwrap();
+            let labels: Vec<(i64, String)> = db
+                .query(until(), AnswerMax::bytes(4096), |conn| {
+                    let mut stmt = conn.prepare("SELECT id, label FROM items ORDER BY id")?;
+                    let mut rows = stmt.query([])?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        out.push((row.get(0)?, row.get(1)?));
+                    }
+                    Ok(out)
+                })
+                .unwrap();
+            assert_eq!(labels, vec![(1, "alpha".into()), (2, "beta".into())]);
+        }
+    }
+
+    /// Review Round 5 Spec P1 regression: dropping the last PostgreSQL user table leaves zero
+    /// tables in `sqlite_schema` but preserves `pg_next_oid` in page 1; both standalone and
+    /// replicated ownership must still detect PostgreSQL and keep the file reopenable as
+    /// PostgreSQL rather than silently converting it to SQLite.
+    #[test]
+    fn review_p1_dropping_last_postgres_table_preserves_postgres_dialect_under_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let dropped_path = dir.path().join("pg-dropped.db");
+        {
+            let mut db =
+                Db::open_postgres_sharing(&dropped_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE TABLE gone(id int4)").unwrap();
+            db.exec("DROP TABLE gone").unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+
+        // Untouched copy reopens as PostgreSQL and assigns OID 16385 (past dropped 16384).
+        let untouched = dir.path().join("untouched.db");
+        std::fs::copy(&dropped_path, &untouched).unwrap();
+        {
+            let db = Db::open_postgres_sharing(&untouched, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE TABLE after_drop(id int4)").unwrap();
+            let mut oid = 0i64;
+            db.query(
+                "SELECT oid FROM pg_class WHERE relname = 'after_drop'",
+                [],
+                |row| {
+                    oid = row.get::<i64>(0)?;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            assert_eq!(oid, 16385);
+        }
+
+        // Standalone ownership preserves PostgreSQL dialect.
+        let until = || Instant::now() + Duration::from_secs(30);
+        let standalone = dir.path().join("standalone-dropped.db");
+        std::fs::copy(&dropped_path, &standalone).unwrap();
+        {
+            let _db = Database::open(&standalone, until()).unwrap();
+        }
+        {
+            let pg = Db::open_postgres_sharing(&standalone, &crate::db::Sharing::Off)
+                .expect("standalone ownership must not convert dropped-table PG file to SQLite");
+            assert!(pg.is_postgres());
+            pg.exec("CREATE TABLE fresh_pg(id int4)").unwrap();
+        }
+
+        // Replicated ownership preserves PostgreSQL dialect.
+        let replicated = dir.path().join("replicated-dropped.db");
+        let log_path = dir.path().join("replicated-dropped.log");
+        std::fs::copy(&dropped_path, &replicated).unwrap();
+        let declaration = crate::replication::bootstrap::inspect_source(&replicated, 1).unwrap();
+        {
+            let config = api::replication::ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: vec![],
+                bootstrap: Some(declaration),
+            };
+            let db = Database::open_replicated(&replicated, &log_path, config, until()).unwrap();
+            let count: i64 = db
+                .query(until(), AnswerMax::bytes(1024), |conn| {
+                    Ok(conn.query_row("SELECT COUNT(*) FROM pg_class", [], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert!(count > 0);
+        }
+        {
+            let pg = Db::open_postgres_sharing(&replicated, &crate::db::Sharing::Off)
+                .expect("replicated ownership must not convert dropped-table PG file to SQLite");
+            assert!(pg.is_postgres());
+        }
+    }
+
+    /// Review Round 5 Spec P2 regression: keeping a live `Db::open_postgres_sharing` handle open
+    /// on a populated PostgreSQL file must not prevent `Database::open` from adopting the
+    /// registered PostgreSQL handle via registry-dialect fallback.
+    #[test]
+    fn review_p2_live_postgres_handle_does_not_block_database_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-pg.db");
+        let live = Db::open_postgres_sharing(&path, &crate::db::Sharing::Off).unwrap();
+        live.exec("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+            .unwrap();
+        live.exec("INSERT INTO items VALUES (1, 'live-pg')")
+            .unwrap();
+        live.flusher()().unwrap();
+
+        let until = || Instant::now() + Duration::from_secs(30);
+        let db = Database::open(&path, until())
+            .expect("Database::open must succeed while Db::open_postgres_sharing remains live");
+        let label: String = db
+            .query_local(until(), |conn| {
+                Ok(conn.query_row("SELECT label FROM items WHERE id = 1", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(label, "live-pg");
+        drop(db);
+        drop(live);
     }
 }

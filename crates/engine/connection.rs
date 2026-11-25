@@ -1786,6 +1786,18 @@ impl Connection {
         Ok(true)
     }
 
+    /// Captures the connection's current schema together with its matching [`vdbe::PrepareContext`]
+    /// under `self.schema.read()` so a concurrent schema adoption on the same connection (e.g. a
+    /// second `prepare()` after an equal-cookie restore) cannot advance `prepare_context_generation`
+    /// or `last_restore_epoch` between reading `schema` and recording the plan's context.
+    pub(crate) fn snapshot_schema_and_prepare_context(
+        &self,
+    ) -> (Arc<Schema>, crate::vdbe::PrepareContext) {
+        let schema = self.schema.read();
+        let ctx = crate::vdbe::PrepareContext::from_connection(self);
+        (schema.clone(), ctx)
+    }
+
     #[amphora_engine_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
@@ -1800,7 +1812,7 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
-        let schema = self.schema.read().clone();
+        let (schema, prepare_context) = self.snapshot_schema_and_prepare_context();
         match translate::translate(
             &schema,
             stmt,
@@ -1811,6 +1823,7 @@ impl Connection {
             input,
             origin,
             prepare_options,
+            prepare_context,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1832,7 +1845,7 @@ impl Connection {
                 let mode = QueryMode::new(&cmd);
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
                     cmd;
-                let schema = self.schema.read().clone();
+                let (schema, prepare_context) = self.snapshot_schema_and_prepare_context();
                 translate::translate(
                     &schema,
                     stmt,
@@ -1843,6 +1856,7 @@ impl Connection {
                     input,
                     origin,
                     prepare_options,
+                    prepare_context,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -2228,7 +2242,7 @@ impl Connection {
         self.maybe_update_schema();
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
-        let schema = self.schema.read().clone();
+        let (schema, prepare_context) = self.snapshot_schema_and_prepare_context();
         let input = format!("AMPHORA BACKFILL INDEX {index}");
         let program = translate::translate_index_backfill(
             &schema,
@@ -2238,6 +2252,7 @@ impl Connection {
             index,
             after,
             rows,
+            prepare_context,
         )?;
         Ok(Statement::new_with_origin(
             program,
@@ -3128,6 +3143,11 @@ impl Connection {
         let schema = self.db.schema.lock();
         let locked_epoch = self.db.schema_epoch.load(Ordering::Acquire);
         let locked_restore_epoch = self.db.shared_wal.restore_epoch();
+        // Re-check against the locked restore epoch so a restore that completed
+        // between the lock-free pre-check and acquiring `self.db.schema` cannot
+        // advance `last_restore_epoch` without adopting the restored catalog.
+        let restore_changed =
+            self.last_restore_epoch.load(Ordering::Acquire) != locked_restore_epoch;
         // MVCC checkpoint can publish physical btree roots into the shared
         // schema without changing SQLite's schema cookie, and an external raw
         // restore can replace the catalog at an equal schema cookie. If this
@@ -3146,13 +3166,19 @@ impl Connection {
                     mv_store.resolve_schema_negative_roots(schema);
                 }
             }
-            *self.schema.write() = adopted;
+            let mut local = self.schema.write();
+            *local = adopted;
             self.bump_prepare_context_generation();
+            self.local_schema_epoch
+                .store(locked_epoch, Ordering::Relaxed);
+            self.last_restore_epoch
+                .store(locked_restore_epoch, Ordering::Release);
+        } else {
+            self.local_schema_epoch
+                .store(locked_epoch, Ordering::Relaxed);
+            self.last_restore_epoch
+                .store(locked_restore_epoch, Ordering::Release);
         }
-        self.local_schema_epoch
-            .store(locked_epoch, Ordering::Relaxed);
-        self.last_restore_epoch
-            .store(locked_restore_epoch, Ordering::Release);
     }
 
     fn has_no_open_transaction_state(&self) -> bool {
@@ -3211,17 +3237,34 @@ impl Connection {
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
         let current_schema = self.schema.read().clone();
-        let (schema, epoch) = {
+        let (mut schema, epoch, restore_epoch) = {
             let guard = self.db.schema.lock();
-            (guard.clone(), self.db.schema_epoch.load(Ordering::Acquire))
+            (
+                guard.clone(),
+                self.db.schema_epoch.load(Ordering::Acquire),
+                self.db.shared_wal.restore_epoch(),
+            )
         };
-        if current_schema.schema_version < schema.schema_version
+        let restore_changed = self.last_restore_epoch.load(Ordering::Acquire) != restore_epoch;
+        if restore_changed
+            || current_schema.schema_version < schema.schema_version
             || (self.has_no_open_transaction_state()
                 && self
                     .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
-            *self.schema.write() = schema;
+            if restore_changed {
+                let mv_store_guard = self.db.get_mv_store();
+                if let Some(mv_store) = mv_store_guard.as_ref() {
+                    if let Ok(mutable) = Schema::try_make_mut(&mut schema) {
+                        mv_store.resolve_schema_negative_roots(mutable);
+                    }
+                }
+            }
+            let mut local = self.schema.write();
+            *local = schema;
             self.local_schema_epoch.store(epoch, Ordering::Relaxed);
+            self.last_restore_epoch
+                .store(restore_epoch, Ordering::Release);
             self.bump_prepare_context_generation();
         }
     }
@@ -3638,10 +3681,17 @@ impl Connection {
         }
 
         let schema = self.schema.read().clone();
-        self.db.with_schema_mut(|current| {
-            *current = schema.as_ref().try_clone()?;
-            Ok(())
-        })?;
+        let published_restore_epoch = {
+            let mut db_schema = self.db.schema.lock();
+            *db_schema = Arc::new(schema.as_ref().try_clone()?);
+            self.db.bump_schema_epoch();
+            self.db.shared_wal.bump_restore_epoch()
+        };
+        let local = self.schema.write();
+        self.bump_prepare_context_generation();
+        self.last_restore_epoch
+            .store(published_restore_epoch, Ordering::Release);
+        drop(local);
         Ok(())
     }
 

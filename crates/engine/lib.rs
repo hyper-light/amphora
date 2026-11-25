@@ -150,7 +150,6 @@ pub use connection::{
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
-pub use parking_lot::RwLock as FastRwLock;
 #[cfg(any(feature = "simulator", feature = "bench"))]
 pub use translate::optimizer::learned_costs::LearnedWeights;
 pub use translate::optimizer::learned_costs::WeightRule;
@@ -263,6 +262,15 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 }
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
+
+/// Extracts the persisted PostgreSQL `pg_next_oid` counter from raw page-1 bytes, returning
+/// `None` if `page1` is shorter than a SQLite database header.
+pub fn header_pg_next_oid(page1: &[u8]) -> Option<u32> {
+    let header_bytes = page1.get(..storage::sqlite3_ondisk::DatabaseHeader::SIZE)?;
+    let header =
+        bytemuck::try_from_bytes::<storage::sqlite3_ondisk::DatabaseHeader>(header_bytes).ok()?;
+    Some(header.pg_next_oid.get())
+}
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {

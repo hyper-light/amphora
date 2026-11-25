@@ -191,7 +191,10 @@ pub fn oracle_index_invariance(
     dialect: Dialect,
     shape: &GauntletShape,
 ) -> OracleReport {
-    if matches!(dialect, Dialect::Postgres | Dialect::MySql | Dialect::ClickHouse) {
+    if matches!(
+        dialect,
+        Dialect::Postgres | Dialect::MySql | Dialect::ClickHouse
+    ) {
         return OracleReport {
             passed: true,
             details: serde_json::json!({ "skipped": "NOT INDEXED is SQLite/Amphora syntax" }),
@@ -320,19 +323,42 @@ pub fn oracle_conservation_and_integrity(
         Ok(s.parse::<i64>().unwrap_or(0))
     };
 
-    // 1. Commerce double-entry trial balance == 0
-    match scalar_i64(session, "SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries", &[]) {
-        Ok(v) => {
-            metrics.insert("ledger_sum_cents".into(), serde_json::json!(v));
-            if v != 0 {
-                failures.push(format!("ledger_entries SUM(amount_cents) = {v} != 0"));
+    // 1. Commerce double-entry trial balance == 0 (and non-empty when orders were loaded)
+    match session.answer(
+        &["SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger_entries".into()],
+        &[vec![]],
+    ) {
+        Ok(rows) => {
+            let cnt = rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|c| c.as_deref())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let sum = rows
+                .first()
+                .and_then(|r| r.get(1))
+                .and_then(|c| c.as_deref())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            metrics.insert("ledger_count".into(), serde_json::json!(cnt));
+            metrics.insert("ledger_sum_cents".into(), serde_json::json!(sum));
+            if sum != 0 {
+                failures.push(format!("ledger_entries SUM(amount_cents) = {sum} != 0"));
+            }
+            if shape.orders > 0 && cnt == 0 {
+                failures.push("ledger_entries has 0 rows despite non-empty scale".into());
             }
         }
         Err(e) => failures.push(format!("ledger check error: {e:#}")),
     }
 
     // 2. Agentic token double-entry trial balance == 0
-    match scalar_i64(session, "SELECT COALESCE(SUM(amount_micros), 0) FROM token_cost_ledger", &[]) {
+    match scalar_i64(
+        session,
+        "SELECT COALESCE(SUM(amount_micros), 0) FROM token_cost_ledger",
+        &[],
+    ) {
         Ok(v) => {
             metrics.insert("token_ledger_sum_micros".into(), serde_json::json!(v));
             if v != 0 {
@@ -362,13 +388,17 @@ pub fn oracle_conservation_and_integrity(
         Ok(v) => {
             metrics.insert("empty_tenant_issues".into(), serde_json::json!(v));
             if v != 0 {
-                failures.push(format!("empty tenant {} has {v} issues != 0", shape.empty_tenant));
+                failures.push(format!(
+                    "empty tenant {} has {v} issues != 0",
+                    shape.empty_tenant
+                ));
             }
         }
         Err(e) => failures.push(format!("empty tenant check error: {e:#}")),
     }
 
-    // 5. Referential checks: zero orphan order_items -> orders, zero orphan turns -> runs
+    // 5. Referential checks: zero orphan order_items -> orders, agent_turns -> agent_runs,
+    //    payments -> orders
     match scalar_i64(
         session,
         "SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.id = oi.order_id WHERE o.id IS NULL",
@@ -381,6 +411,32 @@ pub fn oracle_conservation_and_integrity(
             }
         }
         Err(e) => failures.push(format!("orphan order_items check error: {e:#}")),
+    }
+    match scalar_i64(
+        session,
+        "SELECT COUNT(*) FROM agent_turns t LEFT JOIN agent_runs r ON r.id = t.run_id WHERE r.id IS NULL",
+        &[],
+    ) {
+        Ok(v) => {
+            metrics.insert("orphan_agent_turns".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("found {v} orphaned agent_turns"));
+            }
+        }
+        Err(e) => failures.push(format!("orphan agent_turns check error: {e:#}")),
+    }
+    match scalar_i64(
+        session,
+        "SELECT COUNT(*) FROM payments p LEFT JOIN orders o ON o.id = p.order_id WHERE o.id IS NULL",
+        &[],
+    ) {
+        Ok(v) => {
+            metrics.insert("orphan_payments".into(), serde_json::json!(v));
+            if v != 0 {
+                failures.push(format!("found {v} orphaned payments"));
+            }
+        }
+        Err(e) => failures.push(format!("orphan payments check error: {e:#}")),
     }
 
     // 6. PRAGMA integrity_check on SQLite / Amphora / AmphoraPostgres
@@ -410,6 +466,112 @@ pub fn oracle_conservation_and_integrity(
     }
 }
 
+/// Pre-close durable state snapshot captured from the live database before closing handles,
+/// compared field-for-field after cold reopen so silent data loss (even balanced 0-row deletion!)
+/// can never pass the durability oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreCloseSnapshot {
+    pub ledger_count: i64,
+    pub ledger_sum: i64,
+    pub ledger_abs_sum: i64,
+    pub ledger_digest: String,
+    pub token_ledger_count: i64,
+    pub token_ledger_sum: i64,
+    pub token_ledger_abs_sum: i64,
+    pub orders_count: i64,
+    pub payments_count: i64,
+    pub issues_count: i64,
+}
+
+fn parse_i64_cell(rows: &[Vec<Option<String>>], col: usize) -> i64 {
+    rows.first()
+        .and_then(|r| r.get(col))
+        .and_then(|c| c.as_deref())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn snapshot_from_query<F>(mut run: F) -> anyhow::Result<PreCloseSnapshot>
+where
+    F: FnMut(&'static str) -> anyhow::Result<Vec<Vec<Option<String>>>>,
+{
+    let l = run(
+        "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0), COALESCE(SUM(ABS(amount_cents)), 0) FROM ledger_entries",
+    )?;
+    let l_rows =
+        run("SELECT id, account_id, amount_cents FROM ledger_entries ORDER BY id LIMIT 200")?;
+    let tl = run(
+        "SELECT COUNT(*), COALESCE(SUM(amount_micros), 0), COALESCE(SUM(ABS(amount_micros)), 0) FROM token_cost_ledger",
+    )?;
+    let counts = run(
+        "SELECT (SELECT COUNT(*) FROM orders), (SELECT COUNT(*) FROM payments), (SELECT COUNT(*) FROM issues)",
+    )?;
+    Ok(PreCloseSnapshot {
+        ledger_count: parse_i64_cell(&l, 0),
+        ledger_sum: parse_i64_cell(&l, 1),
+        ledger_abs_sum: parse_i64_cell(&l, 2),
+        ledger_digest: super::parametric::digest_answer(&l_rows),
+        token_ledger_count: parse_i64_cell(&tl, 0),
+        token_ledger_sum: parse_i64_cell(&tl, 1),
+        token_ledger_abs_sum: parse_i64_cell(&tl, 2),
+        orders_count: parse_i64_cell(&counts, 0),
+        payments_count: parse_i64_cell(&counts, 1),
+        issues_count: parse_i64_cell(&counts, 2),
+    })
+}
+
+pub fn capture_pre_close_snapshot(session: &mut dyn Session) -> anyhow::Result<PreCloseSnapshot> {
+    snapshot_from_query(|sql| session.answer(&[sql.into()], &[vec![]]))
+}
+
+fn verify_reopen_snapshot(
+    reopened: &PreCloseSnapshot,
+    pre_close: Option<&PreCloseSnapshot>,
+    shape: &GauntletShape,
+    reopen_meta: &mut serde_json::Map<String, serde_json::Value>,
+    reopen_failures: &mut Vec<String>,
+) {
+    reopen_meta.insert(
+        "cold_reopen_ledger".into(),
+        serde_json::json!({
+            "count": reopened.ledger_count,
+            "sum": reopened.ledger_sum,
+            "abs_sum": reopened.ledger_abs_sum,
+            "digest": reopened.ledger_digest,
+            "token_ledger_count": reopened.token_ledger_count,
+            "token_ledger_sum": reopened.token_ledger_sum,
+            "orders_count": reopened.orders_count,
+            "payments_count": reopened.payments_count,
+            "issues_count": reopened.issues_count,
+        }),
+    );
+    if reopened.ledger_sum != 0 {
+        reopen_failures.push(format!(
+            "cold reopen ledger_entries SUM(amount_cents) = {} != 0",
+            reopened.ledger_sum
+        ));
+    }
+    if reopened.token_ledger_sum != 0 {
+        reopen_failures.push(format!(
+            "cold reopen token_cost_ledger SUM(amount_micros) = {} != 0",
+            reopened.token_ledger_sum
+        ));
+    }
+    if shape.orders > 0 && (reopened.ledger_count <= 0 || reopened.ledger_abs_sum <= 0) {
+        reopen_failures.push(format!(
+            "cold reopen lost ledger rows on non-empty scale: count={}, abs_sum={}",
+            reopened.ledger_count, reopened.ledger_abs_sum
+        ));
+    }
+    if let Some(before) = pre_close {
+        if reopened != before {
+            reopen_failures.push(format!(
+                "cold reopen state diverged from pre-close snapshot: before={before:?}, after={reopened:?}"
+            ));
+        }
+    }
+}
+
 /// Oracle 2 (Spill-Invariance: `cache=4000` vs `cache=48`) AND Oracle 5 (Cold-Reopen &
 /// `pg_class` OID Durability) run directly on the settled database file after the live `Target`
 /// has closed cleanly.
@@ -417,6 +579,7 @@ pub fn oracle_spill_and_cold_reopen(
     target_name: &str,
     dir: &str,
     shape: &GauntletShape,
+    pre_close: Option<&PreCloseSnapshot>,
 ) -> (OracleReport, OracleReport) {
     if !matches!(target_name, "amphora" | "amphora-pg" | "sqlite") {
         let skipped = OracleReport {
@@ -436,18 +599,66 @@ pub fn oracle_spill_and_cold_reopen(
     let slice_hi = shape.issues.min(3_000).max(1);
     let ord_hi = shape.orders.min(3_000).max(1);
     let spill_queries: Vec<(&str, &str, Vec<P>)> = vec![
-        ("wide_desc_sort", "SELECT id, priority, title, LENGTH(description) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY updated_at DESC, priority ASC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
-        ("due_nulls_first", "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at DESC NULLS FIRST, priority ASC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
-        ("due_nulls_last", "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at ASC NULLS LAST, priority DESC, id ASC LIMIT 60", vec![P::I(slice_hi)]),
-        ("high_card_groupby", "SELECT tenant_id, project_id, status, priority, COUNT(*), COALESCE(SUM(estimate_hrs), 0) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id, project_id, status, priority HAVING COUNT(*) >= 1 ORDER BY COUNT(*) DESC, tenant_id ASC, project_id ASC, priority ASC LIMIT 50", vec![P::I(slice_hi)]),
-        ("multi_count_distinct", "SELECT tenant_id, COUNT(DISTINCT project_id), COUNT(DISTINCT author_id), COUNT(DISTINCT assignee_id) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id ORDER BY tenant_id LIMIT 30", vec![P::I(slice_hi)]),
-        ("window_multi_spec", "SELECT id, project_id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY priority ASC, id ASC), COUNT(*) OVER (PARTITION BY assignee_id) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY id LIMIT 80", vec![P::I(slice_hi.min(500))]),
-        ("window_running_sum", "SELECT id, account_id, SUM(amount_cents) OVER (PARTITION BY account_id ORDER BY posted_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ledger_entries WHERE account_id <= 5 ORDER BY account_id, posted_at, id LIMIT 100", vec![]),
-        ("setop_compound", "SELECT author_id FROM issues WHERE id BETWEEN 1 AND ? UNION SELECT author_id FROM issue_comments WHERE id BETWEEN 1 AND ? EXCEPT SELECT id FROM saas_users WHERE NOT active ORDER BY 1 LIMIT 50", vec![P::I(slice_hi), P::I(slice_hi)]),
-        ("join_6table", "SELECT t.slug, p.key_code, i.id, u.display_name, COUNT(c.id) FROM tenants t JOIN projects p ON p.tenant_id = t.id JOIN issues i ON i.project_id = p.id JOIN saas_users u ON u.id = i.author_id LEFT JOIN issue_comments c ON c.issue_id = i.id WHERE i.id BETWEEN 1 AND ? GROUP BY t.slug, p.key_code, i.id, u.display_name ORDER BY i.id ASC LIMIT 40", vec![P::I(slice_hi.min(500))]),
-        ("orders_export_sort", "SELECT o.id, c.country, o.total_cents FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id BETWEEN 1 AND ? ORDER BY c.country ASC, o.total_cents DESC, o.id ASC LIMIT 80", vec![P::I(ord_hi)]),
-        ("recursive_categories", "WITH RECURSIVE ctree(id) AS (SELECT id FROM categories WHERE id = 1 UNION ALL SELECT c.id FROM categories c JOIN ctree ON c.parent_id = ctree.id) SELECT p.id, p.price_cents FROM products p JOIN ctree ON ctree.id = p.category_id ORDER BY p.price_cents ASC, p.id ASC LIMIT 40", vec![]),
-        ("distinct_pairs", "SELECT DISTINCT status, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY status, priority", vec![P::I(slice_hi)]),
+        (
+            "wide_desc_sort",
+            "SELECT id, priority, title, LENGTH(description) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY updated_at DESC, priority ASC, id ASC LIMIT 60",
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "due_nulls_first",
+            "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at DESC NULLS FIRST, priority ASC, id ASC LIMIT 60",
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "due_nulls_last",
+            "SELECT id, due_at, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY due_at ASC NULLS LAST, priority DESC, id ASC LIMIT 60",
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "high_card_groupby",
+            "SELECT tenant_id, project_id, status, priority, COUNT(*), COALESCE(SUM(estimate_hrs), 0) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id, project_id, status, priority HAVING COUNT(*) >= 1 ORDER BY COUNT(*) DESC, tenant_id ASC, project_id ASC, priority ASC LIMIT 50",
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "multi_count_distinct",
+            "SELECT tenant_id, COUNT(DISTINCT project_id), COUNT(DISTINCT author_id), COUNT(DISTINCT assignee_id) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY tenant_id ORDER BY tenant_id LIMIT 30",
+            vec![P::I(slice_hi)],
+        ),
+        (
+            "window_multi_spec",
+            "SELECT id, project_id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY priority ASC, id ASC), COUNT(*) OVER (PARTITION BY assignee_id) FROM issues WHERE id BETWEEN 1 AND ? ORDER BY id LIMIT 80",
+            vec![P::I(slice_hi.min(500))],
+        ),
+        (
+            "window_running_sum",
+            "SELECT id, account_id, SUM(amount_cents) OVER (PARTITION BY account_id ORDER BY posted_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ledger_entries WHERE account_id <= 5 ORDER BY account_id, posted_at, id LIMIT 100",
+            vec![],
+        ),
+        (
+            "setop_compound",
+            "SELECT author_id FROM issues WHERE id BETWEEN 1 AND ? UNION SELECT author_id FROM issue_comments WHERE id BETWEEN 1 AND ? EXCEPT SELECT id FROM saas_users WHERE NOT active ORDER BY 1 LIMIT 50",
+            vec![P::I(slice_hi), P::I(slice_hi)],
+        ),
+        (
+            "join_6table",
+            "SELECT t.slug, p.key_code, i.id, u.display_name, COUNT(c.id) FROM tenants t JOIN projects p ON p.tenant_id = t.id JOIN issues i ON i.project_id = p.id JOIN saas_users u ON u.id = i.author_id LEFT JOIN issue_comments c ON c.issue_id = i.id WHERE i.id BETWEEN 1 AND ? GROUP BY t.slug, p.key_code, i.id, u.display_name ORDER BY i.id ASC LIMIT 40",
+            vec![P::I(slice_hi.min(500))],
+        ),
+        (
+            "orders_export_sort",
+            "SELECT o.id, c.country, o.total_cents FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id BETWEEN 1 AND ? ORDER BY c.country ASC, o.total_cents DESC, o.id ASC LIMIT 80",
+            vec![P::I(ord_hi)],
+        ),
+        (
+            "recursive_categories",
+            "WITH RECURSIVE ctree(id) AS (SELECT id FROM categories WHERE id = 1 UNION ALL SELECT c.id FROM categories c JOIN ctree ON c.parent_id = ctree.id) SELECT p.id, p.price_cents FROM products p JOIN ctree ON ctree.id = p.category_id ORDER BY p.price_cents ASC, p.id ASC LIMIT 40",
+            vec![],
+        ),
+        (
+            "distinct_pairs",
+            "SELECT DISTINCT status, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY status, priority",
+            vec![P::I(slice_hi)],
+        ),
     ];
 
     let mut spill_failures = Vec::new();
@@ -477,15 +688,27 @@ pub fn oracle_spill_and_cold_reopen(
                         (_, Err(e)) => spill_failures.push(format!("{name} tight err: {e:#}")),
                     }
                 }
-                match direct_query_sqlite(
-                    &warm,
-                    "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger_entries",
-                    &[],
-                ) {
-                    Ok(r) => {
-                        reopen_meta.insert("cold_reopen_ledger".into(), serde_json::json!(r));
-                    }
+                match snapshot_from_query(|sql| direct_query_sqlite(&warm, sql, &[])) {
+                    Ok(reopened) => verify_reopen_snapshot(
+                        &reopened,
+                        pre_close,
+                        shape,
+                        &mut reopen_meta,
+                        &mut reopen_failures,
+                    ),
                     Err(e) => reopen_failures.push(format!("sqlite reopen err: {e:#}")),
+                }
+                match direct_query_sqlite(&warm, "PRAGMA integrity_check", &[]) {
+                    Ok(rows)
+                        if rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|c| c.as_deref())
+                            == Some("ok") => {}
+                    Ok(rows) => reopen_failures.push(format!(
+                        "sqlite cold reopen integrity_check failed: {rows:?}"
+                    )),
+                    Err(e) => reopen_failures.push(format!("sqlite integrity_check err: {e:#}")),
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -521,22 +744,30 @@ pub fn oracle_spill_and_cold_reopen(
                         (_, Err(e)) => spill_failures.push(format!("{name} tight err: {e:#}")),
                     }
                 }
-                // Cold-reopen check: verify integrity, ledger trial balance, and (on amphora-pg)
-                // durable pg_class OIDs surviving reopen & ALTER TABLE RENAME!
-                match direct_query_amphora(
-                    &mut warm,
-                    "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger_entries",
-                    &[],
-                ) {
-                    Ok(r) => {
-                        reopen_meta.insert("cold_reopen_ledger".into(), serde_json::json!(r));
-                        if r.first().and_then(|row| row.get(1)).and_then(|c| c.as_deref())
-                            != Some("0")
-                        {
-                            reopen_failures.push(format!("cold reopen ledger != 0: {r:?}"));
-                        }
+                // Cold-reopen check: verify integrity, exact pre-close snapshot durability, and
+                // (on amphora-pg) durable pg_class OIDs surviving reopen & ALTER TABLE RENAME!
+                match snapshot_from_query(|sql| direct_query_amphora(&mut warm, sql, &[])) {
+                    Ok(reopened) => verify_reopen_snapshot(
+                        &reopened,
+                        pre_close,
+                        shape,
+                        &mut reopen_meta,
+                        &mut reopen_failures,
+                    ),
+                    Err(e) => reopen_failures.push(format!("cold reopen snapshot err: {e:#}")),
+                }
+                match direct_query_amphora(&mut warm, "PRAGMA integrity_check", &[]) {
+                    Ok(rows)
+                        if rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|c| c.as_deref())
+                            == Some("ok") => {}
+                    Ok(rows) => reopen_failures
+                        .push(format!("cold reopen integrity_check failed: {rows:?}")),
+                    Err(e) => {
+                        reopen_failures.push(format!("cold reopen integrity_check err: {e:#}"))
                     }
-                    Err(e) => reopen_failures.push(format!("cold reopen ledger err: {e:#}")),
                 }
                 if is_pg {
                     let oid_before = direct_query_amphora(
@@ -574,7 +805,8 @@ pub fn oracle_spill_and_cold_reopen(
                                     "SELECT oid FROM pg_class WHERE relname = '__oid_reopen_a'",
                                     &[],
                                 )?;
-                                reopened.exec("ALTER TABLE __oid_reopen_a RENAME TO __oid_reopen_b")?;
+                                reopened
+                                    .exec("ALTER TABLE __oid_reopen_a RENAME TO __oid_reopen_b")?;
                                 let o2 = direct_query_amphora(
                                     &mut reopened,
                                     "SELECT oid FROM pg_class WHERE relname = '__oid_reopen_b'",
@@ -582,7 +814,9 @@ pub fn oracle_spill_and_cold_reopen(
                                 )?;
                                 reopened.exec("DROP TABLE __oid_reopen_b")?;
                                 if o1.is_empty() || o1 != o2 {
-                                    anyhow::bail!("OID changed on ALTER TABLE RENAME: {o1:?} -> {o2:?}");
+                                    anyhow::bail!(
+                                        "OID changed on ALTER TABLE RENAME: {o1:?} -> {o2:?}"
+                                    );
                                 }
                                 Ok(())
                             })();

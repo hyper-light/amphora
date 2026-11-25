@@ -92,8 +92,14 @@ fn gen_saas_grid(d: Dialect, s: &GauntletShape, out: &mut Vec<ParametricQuery>) 
     ];
     let sorts = [
         ("prio_upd", "i.priority ASC, i.updated_at DESC, i.id ASC"),
-        ("due_nf", "i.due_at DESC NULLS FIRST, i.priority ASC, i.id ASC"),
-        ("due_nl", "i.due_at ASC NULLS LAST, i.priority DESC, i.id ASC"),
+        (
+            "due_nf",
+            "i.due_at DESC NULLS FIRST, i.priority ASC, i.id ASC",
+        ),
+        (
+            "due_nl",
+            "i.due_at ASC NULLS LAST, i.priority DESC, i.id ASC",
+        ),
         ("est_nl", "i.estimate_hrs DESC NULLS LAST, i.id ASC"),
     ];
     let mid_off = (s.issues / 20).clamp(1, 200);
@@ -198,12 +204,21 @@ fn gen_social_grid(_d: Dialect, s: &GauntletShape, out: &mut Vec<ParametricQuery
     let mfilters = [
         ("live", "m.deleted_at IS NULL"),
         ("edited", "m.deleted_at IS NULL AND m.edited_at IS NOT NULL"),
-        ("replies", "m.deleted_at IS NULL AND m.reply_to_id IS NOT NULL"),
+        (
+            "replies",
+            "m.deleted_at IS NULL AND m.reply_to_id IS NOT NULL",
+        ),
         ("roots", "m.deleted_at IS NULL AND m.reply_to_id IS NULL"),
         ("verified", "m.deleted_at IS NULL AND a.verified"),
-        ("unblocked", "m.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.blocker_id = 1 AND b.blocked_id = m.author_id)"),
+        (
+            "unblocked",
+            "m.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.blocker_id = 1 AND b.blocked_id = m.author_id)",
+        ),
         ("deleted", "m.deleted_at IS NOT NULL"),
-        ("has_react", "m.deleted_at IS NULL AND EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id)"),
+        (
+            "has_react",
+            "m.deleted_at IS NULL AND EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id)",
+        ),
     ];
     let sorts = [
         ("seq_desc", "m.seq DESC, m.id DESC"),
@@ -230,15 +245,38 @@ fn gen_social_grid(_d: Dialect, s: &GauntletShape, out: &mut Vec<ParametricQuery
 }
 
 fn gen_agentic_obs_grid(d: Dialect, s: &GauntletShape, out: &mut Vec<ParametricQuery>) {
-    let models = ["gemini-2.5-pro", "claude-sonnet-4", "gpt-5-codex", "llama-4-maverick"];
+    let models = [
+        "gemini-2.5-pro",
+        "claude-sonnet-4",
+        "gpt-5-codex",
+        "llama-4-maverick",
+    ];
     let statuses = ["completed", "failed", "running", "queued"];
     let windows = [
-        ("rn", "ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY cost_micros DESC, id ASC)"),
-        ("rk", "RANK() OVER (PARTITION BY workspace_id ORDER BY priority ASC, id ASC)"),
-        ("drk", "DENSE_RANK() OVER (PARTITION BY workspace_id ORDER BY priority DESC, id ASC)"),
-        ("cum", "SUM(cost_micros) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"),
-        ("lag", "COALESCE(LAG(total_tokens) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC), 0)"),
-        ("lead", "COALESCE(LEAD(total_tokens) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC), 0)"),
+        (
+            "rn",
+            "ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY cost_micros DESC, id ASC)",
+        ),
+        (
+            "rk",
+            "RANK() OVER (PARTITION BY workspace_id ORDER BY priority ASC, id ASC)",
+        ),
+        (
+            "drk",
+            "DENSE_RANK() OVER (PARTITION BY workspace_id ORDER BY priority DESC, id ASC)",
+        ),
+        (
+            "cum",
+            "SUM(cost_micros) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
+        ),
+        (
+            "lag",
+            "COALESCE(LAG(total_tokens) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC), 0)",
+        ),
+        (
+            "lead",
+            "COALESCE(LEAD(total_tokens) OVER (PARTITION BY workspace_id ORDER BY started_at ASC, id ASC), 0)",
+        ),
     ];
     let run_hi = s.agent_runs.min(3_000).max(1);
     // 4 * 4 * 6 = 96 window function queries across agent_runs!
@@ -258,7 +296,12 @@ fn gen_agentic_obs_grid(d: Dialect, s: &GauntletShape, out: &mut Vec<ParametricQ
     // 48 observability JSON + status + op_name group-by queries
     let ops = ["http.get", "http.post", "db.query", "llm.infer"];
     let regions = ["US", "DE", "JP"];
-    let codes = [("ok", "status_code = 200"), ("err5xx", "status_code >= 500"), ("throttled", "status_code = 429"), ("any", "status_code >= 200")];
+    let codes = [
+        ("ok", "status_code = 200"),
+        ("err5xx", "status_code >= 500"),
+        ("throttled", "status_code = 429"),
+        ("any", "status_code >= 200"),
+    ];
     let reg_expr = json_str(d, "tags_json", "region");
     let span_hi = s.spans.min(4_000).max(1);
     for op_n in ops {

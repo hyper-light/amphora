@@ -178,7 +178,7 @@ pub(crate) fn step(
     visits: usize,
 ) -> anyhow::Result<api::CompactionProgress> {
     // Lazy DDL is part of the same prepared/committed command, never startup-only replica state.
-    db.exec("CREATE TABLE IF NOT EXISTS __amphora_compaction(namespace TEXT PRIMARY KEY, target INTEGER, completed INTEGER NOT NULL, family TEXT, key BLOB, rev INTEGER)")?;
+    db.exec_internal("CREATE TABLE IF NOT EXISTS __amphora_compaction(namespace TEXT PRIMARY KEY, target INTEGER, completed INTEGER NOT NULL, family TEXT, key BLOB, rev INTEGER)")?;
     db.query("INSERT OR IGNORE INTO __amphora_namespaces(name,head,horizon,feed,live) VALUES (?1,0,0,0,0)",[text(ns)], |_| Ok(true))?;
     db.query(
         "INSERT OR IGNORE INTO __amphora_compaction(namespace,completed) VALUES (?1,0)",

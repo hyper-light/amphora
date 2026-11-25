@@ -966,24 +966,32 @@ impl<E: Engine> Groups<E> {
                     Reply::Discarded { done }
                 })
             }
-            Do::Retire { group } => self.route.write_all(|route| {
-                if let Some(held) = route.groups.get(&group) {
-                    let h = held.holding;
-                    if h.owned().is_some() || h.incoming().is_some() || h.fenced().is_some() {
-                        return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Invalid(
-                            "a group retired while it holds a span",
-                        ))));
+            Do::Retire { group } => {
+                let mut retired_group = None;
+                let reply = self.route.write_all(|route| {
+                    if let Some(held) = route.groups.get(&group) {
+                        let h = held.holding;
+                        if h.owned().is_some() || h.incoming().is_some() || h.fenced().is_some() {
+                            return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Invalid(
+                                "a group retired while it holds a span",
+                            ))));
+                        }
                     }
-                    route.groups.remove(&group);
-                }
-                // Kept before it is answered, with the directory routed by: a create asked again
-                // after a restart is refused, never made an empty group, whatever directory the
-                // node is started by.
-                let mut next = route.retired.clone();
-                next.insert(group);
-                route.retired = keep_book(&route.book, &route.directory, &next)?;
-                Ok(Reply::Retired)
-            }),
+                    // Kept before it is answered, with the directory routed by: a create asked again
+                    // after a restart is refused, never made an empty group, whatever directory the
+                    // node is started by.
+                    let mut next = route.retired.clone();
+                    next.insert(group);
+                    route.retired = keep_book(&route.book, &route.directory, &next)?;
+                    // Remove after `keep_book` succeeds and drop outside `write_all` so shutting
+                    // down the store's notify thread cannot deadlock with a durability callback
+                    // reading `self.route`.
+                    retired_group = route.groups.remove(&group);
+                    Ok(Reply::Retired)
+                });
+                drop(retired_group);
+                reply
+            }
         }
     }
 

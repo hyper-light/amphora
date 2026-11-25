@@ -336,6 +336,7 @@ pub struct TursoRwLock(AtomicU64);
 pub struct ShardedRwLock {
     value: AtomicU32,
     upgraded_shard: AtomicUsize,
+    writer_held: AtomicBool,
     shards: Box<[crossbeam_utils::CachePadded<AtomicU64>]>,
     mask: usize,
 }
@@ -360,6 +361,7 @@ impl ShardedRwLock {
         Self {
             value: AtomicU32::new(0),
             upgraded_shard: AtomicUsize::new(0),
+            writer_held: AtomicBool::new(false),
             shards,
             mask: count.wrapping_sub(1),
         }
@@ -417,11 +419,13 @@ impl ShardedRwLock {
                 return false;
             }
         }
+        self.writer_held.store(true, Ordering::Release);
         true
     }
 
     #[inline]
     pub fn unlock_write(&self) {
+        self.writer_held.store(false, Ordering::Release);
         for shard in self.shards.iter() {
             shard.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
         }
@@ -429,9 +433,7 @@ impl ShardedRwLock {
 
     #[inline]
     pub fn is_write_locked(&self) -> bool {
-        self.shards
-            .first()
-            .is_some_and(|s| (s.load(Ordering::Acquire) & Self::EXCLUSIVE) != 0)
+        self.writer_held.load(Ordering::Acquire)
     }
 
     /// Approximate count of active shared holders across all per-core shards.
@@ -478,10 +480,13 @@ impl ShardedRwLock {
             return false;
         }
         let Some(shard_idx) = upgraded else {
-            self.unlock_write();
+            for shard in self.shards.iter() {
+                shard.fetch_and(!Self::EXCLUSIVE, Ordering::Release);
+            }
             return false;
         };
         self.upgraded_shard.store(shard_idx, Ordering::Release);
+        self.writer_held.store(true, Ordering::Release);
         true
     }
 
@@ -489,6 +494,7 @@ impl ShardedRwLock {
     /// single shared read lock on the recorded shard.
     #[inline]
     pub fn downgrade(&self) {
+        self.writer_held.store(false, Ordering::Release);
         let target = self.upgraded_shard.load(Ordering::Acquire) & self.mask;
         for (i, shard) in self.shards.iter().enumerate() {
             if i == target {
@@ -4730,6 +4736,13 @@ impl SharedLog {
 
     pub(crate) fn restore_epoch(&self) -> u64 {
         self.restore_epoch.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn bump_restore_epoch(&self) -> u64 {
+        self.restore_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
     }
 
     /// Replaces both WAL segments and the recovered dual-segment state in place after a quiescent
@@ -16347,5 +16360,48 @@ pub mod test {
         release.wait();
         writer.join().unwrap();
         assert_eq!(snap_cell.load_snapshot().max_frame, 42);
+    }
+
+    /// Review Standards P2 regression: a reader calling the public compatibility `unlock()` while
+    /// a competing writer partially holds `shards[0]` during `write()` must release its read lock
+    /// instead of calling `unlock_write()` and permanently leaking `reader_count == 1`.
+    #[test]
+    fn review_p2_sharded_rwlock_unlock_does_not_mistake_competing_partial_write() {
+        let lock = Arc::new(super::ShardedRwLock::new());
+        let stop = Arc::new(crate::sync::atomic::AtomicBool::new(false));
+        let lock_w = Arc::clone(&lock);
+        let stop_w = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Relaxed) {
+                if lock_w.write() {
+                    lock_w.unlock_write();
+                }
+            }
+        });
+
+        for round in 0..2_000 {
+            if lock.read() {
+                // Force overlap with the competing writer acquiring earlier shards.
+                std::thread::yield_now();
+                lock.unlock();
+            }
+            if round % 200 == 199 {
+                std::thread::yield_now();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert_eq!(
+            lock.reader_count(),
+            0,
+            "reader count must be zero after reader unlock() raced with competing write()"
+        );
+        assert!(!lock.is_write_locked());
+        assert!(
+            lock.write(),
+            "fresh exclusive acquisition must succeed after reader + writer join"
+        );
+        lock.unlock_write();
     }
 }

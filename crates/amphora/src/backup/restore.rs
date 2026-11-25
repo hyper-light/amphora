@@ -429,7 +429,7 @@ pub fn restore_within(
 /// restore's other steps move), each part a step made durable as it ends, so a paced check pauses
 /// inside the replay (T-T1.12.C8); the last fold empties the log.
 fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<()> {
-    let mut db = Db::open(path)?;
+    let mut db = Db::open_existing_sharing(path, &crate::db::Sharing::Off)?;
     if pace.paced() {
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
         let per_step = step.checked_div(FRAME_BYTES).unwrap_or(0).max(1);

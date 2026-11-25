@@ -65,7 +65,13 @@ def main():
     if ref_name not in reports:
         print(f"no answers from the reference {ref_name} (targets with answers: {sorted(reports)})")
         return 2
-    ref = {(a["op"], json.dumps(a["params"])): a for a in reports[ref_name]["answers"]}
+    ref_rep = reports[ref_name]
+    ref = {(a["op"], json.dumps(a["params"])): a for a in ref_rep["answers"]}
+    ref_results = {
+        (r.get("op"), r.get("clients")): r
+        for r in ref_rep.get("results", [])
+        if isinstance(r, dict) and not r.get("unsupported")
+    }
     bad = 0
     for name, rep in sorted(reports.items()):
         if name == ref_name:
@@ -120,9 +126,47 @@ def main():
             compared += 1
             differ += 1
             print(f"MISSING {name} vs {ref_name}: {op} params {params_json}: {name} produced no answer")
+
+        # Also validate timed results (writes, DDL, reads): errors, 0-op stalls, or missing ops fail.
+        cand_results = {
+            (r.get("op"), r.get("clients")): r
+            for r in rep.get("results", [])
+            if isinstance(r, dict) and not r.get("unsupported")
+        }
+        result_errors = 0
+        checked_results = 0
+        for (op, clients), cr in sorted(cand_results.items()):
+            checked_results += 1
+            if cr.get("errors", 0) > 0 or cr.get("error"):
+                result_errors += 1
+                print(
+                    f"RESULT_ERROR {name}: {op} (clients={clients}): "
+                    f"errors={cr.get('errors')} ops_per_s={cr.get('ops_per_s')} error={cr.get('error')}"
+                )
+                continue
+            rr = ref_results.get((op, clients))
+            if rr and rr.get("errors", 0) == 0 and rr.get("ops_per_s", 0) > 0 and cr.get("ops_per_s", 0) <= 0:
+                result_errors += 1
+                print(
+                    f"RESULT_ZERO_OPS {name} vs {ref_name}: {op} (clients={clients}): "
+                    f"{name} completed 0 ops/s while {ref_name} completed {rr.get('ops_per_s')} ops/s"
+                )
+        for (op, clients), rr in sorted(ref_results.items()):
+            if (op, clients) not in cand_results and op not in unsupported_ops:
+                checked_results += 1
+                result_errors += 1
+                print(f"MISSING_RESULT {name} vs {ref_name}: {op} (clients={clients}) omitted by {name}")
+
+        if compared == 0 and checked_results == 0:
+            result_errors += 1
+            print(f"MISSING_EVIDENCE {name} vs {ref_name}: 0 answers and 0 results compared")
         missing = len(rep["answers"]) - compared
-        print(f"{name} vs {ref_name}: {compared} answers compared, {differ} differ or failed" + (f", {missing} with no {ref_name} answer to compare" if missing > 0 else ""))
-        bad += differ
+        print(
+            f"{name} vs {ref_name}: {compared} answers compared, {differ} differ or failed, "
+            f"{checked_results} results checked, {result_errors} result errors"
+            + (f", {missing} with no {ref_name} answer to compare" if missing > 0 else "")
+        )
+        bad += differ + result_errors
     return 1 if bad else 0
 
 

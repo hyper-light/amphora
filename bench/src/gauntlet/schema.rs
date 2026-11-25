@@ -92,73 +92,153 @@ pub fn tables(d: Dialect, cedar: bool) -> Vec<String> {
         // -------------------------------------------------------------------------
         // Domain 1: Agentic Coding & Multi-Agent Orchestration Fleet (9 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE workspaces (id {pk}, tenant_id {i} NOT NULL, repo_url {s}{c} NOT NULL, default_branch {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE agent_runs (id {pk}, workspace_id {i} NOT NULL, parent_run_id {i}, model {s}{c} NOT NULL, status {s}{c} NOT NULL, priority {i} NOT NULL, started_at {i} NOT NULL, finished_at {i}, total_tokens {i} NOT NULL, cost_micros {i} NOT NULL, summary {s}{c})"),
-        format!("CREATE TABLE agent_turns (id {pk}, run_id {i} NOT NULL, turn_no {i} NOT NULL, role {s}{c} NOT NULL, prompt_tokens {i} NOT NULL, completion_tokens {i} NOT NULL, latency_ms {i} NOT NULL, content {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE tool_calls (id {pk}, run_id {i} NOT NULL, turn_id {i} NOT NULL, parent_span_id {i}, tool_name {s}{c} NOT NULL, status {s}{c} NOT NULL, exit_code {i}, duration_ms {i} NOT NULL, args_json {j} NOT NULL, result_json {j} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE file_diffs (id {pk}, run_id {i} NOT NULL, path {s}{c} NOT NULL, lines_added {i} NOT NULL, lines_removed {i} NOT NULL, patch_body {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE agent_memories (id {pk}, workspace_id {i} NOT NULL, scope {s}{c} NOT NULL, key_name {s}{c} NOT NULL, content {s}{c} NOT NULL, embedding_blob {bl} NOT NULL, score {f} NOT NULL, expires_at {i}, updated_at {i} NOT NULL)"),
-        format!("CREATE TABLE plan_steps (id {pk}, run_id {i} NOT NULL, step_order {i} NOT NULL, title {s}{c} NOT NULL, status {s}{c} NOT NULL, owner_agent {s}{c} NOT NULL, est_seconds {i} NOT NULL, updated_at {i} NOT NULL)"),
-        format!("CREATE TABLE plan_edges (from_step_id {i} NOT NULL, to_step_id {i} NOT NULL, kind {s}{c} NOT NULL, PRIMARY KEY (from_step_id, to_step_id))"),
-        format!("CREATE TABLE token_cost_ledger (id {pk}, workspace_id {i} NOT NULL, run_id {i} NOT NULL, account_code {s}{c} NOT NULL, direction {s}{c} NOT NULL, amount_micros {i} NOT NULL, posted_at {i} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE workspaces (id {pk}, tenant_id {i} NOT NULL, repo_url {s}{c} NOT NULL, default_branch {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE agent_runs (id {pk}, workspace_id {i} NOT NULL, parent_run_id {i}, model {s}{c} NOT NULL, status {s}{c} NOT NULL, priority {i} NOT NULL, started_at {i} NOT NULL, finished_at {i}, total_tokens {i} NOT NULL, cost_micros {i} NOT NULL, summary {s}{c})"
+        ),
+        format!(
+            "CREATE TABLE agent_turns (id {pk}, run_id {i} NOT NULL, turn_no {i} NOT NULL, role {s}{c} NOT NULL, prompt_tokens {i} NOT NULL, completion_tokens {i} NOT NULL, latency_ms {i} NOT NULL, content {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE tool_calls (id {pk}, run_id {i} NOT NULL, turn_id {i} NOT NULL, parent_span_id {i}, tool_name {s}{c} NOT NULL, status {s}{c} NOT NULL, exit_code {i}, duration_ms {i} NOT NULL, args_json {j} NOT NULL, result_json {j} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE file_diffs (id {pk}, run_id {i} NOT NULL, path {s}{c} NOT NULL, lines_added {i} NOT NULL, lines_removed {i} NOT NULL, patch_body {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE agent_memories (id {pk}, workspace_id {i} NOT NULL, scope {s}{c} NOT NULL, key_name {s}{c} NOT NULL, content {s}{c} NOT NULL, embedding_blob {bl} NOT NULL, score {f} NOT NULL, expires_at {i}, updated_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE plan_steps (id {pk}, run_id {i} NOT NULL, step_order {i} NOT NULL, title {s}{c} NOT NULL, status {s}{c} NOT NULL, owner_agent {s}{c} NOT NULL, est_seconds {i} NOT NULL, updated_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE plan_edges (from_step_id {i} NOT NULL, to_step_id {i} NOT NULL, kind {s}{c} NOT NULL, PRIMARY KEY (from_step_id, to_step_id))"
+        ),
+        format!(
+            "CREATE TABLE token_cost_ledger (id {pk}, workspace_id {i} NOT NULL, run_id {i} NOT NULL, account_code {s}{c} NOT NULL, direction {s}{c} NOT NULL, amount_micros {i} NOT NULL, posted_at {i} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 2: Social Graph, News Feed, Messaging & Moderation (8 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE accounts (id {pk}, handle {s}{c} NOT NULL UNIQUE, display_name {s}{c} NOT NULL, bio {s}{c}, verified {b} NOT NULL, follower_tier {i} NOT NULL, locale {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE follows (follower_id {i} NOT NULL, followee_id {i} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (follower_id, followee_id))"),
-        format!("CREATE TABLE blocks (blocker_id {i} NOT NULL, blocked_id {i} NOT NULL, reason {s}{c} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (blocker_id, blocked_id))"),
-        format!("CREATE TABLE channels (id {pk}, kind {s}{c} NOT NULL, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, last_message_at {i} NOT NULL, message_count {i} NOT NULL)"),
-        format!("CREATE TABLE channel_members (channel_id {i} NOT NULL, account_id {i} NOT NULL, role {s}{c} NOT NULL, last_read_seq {i} NOT NULL, muted {b} NOT NULL, PRIMARY KEY (channel_id, account_id))"),
-        format!("CREATE TABLE messages (id {pk}, channel_id {i} NOT NULL, seq {i} NOT NULL, author_id {i} NOT NULL, reply_to_id {i}, body {s}{c} NOT NULL, edited_at {i}, deleted_at {i}, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE reactions (message_id {i} NOT NULL, account_id {i} NOT NULL, emoji {s}{c} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (message_id, account_id, emoji))"),
-        format!("CREATE TABLE moderation_reports (id {pk}, target_type {s}{c} NOT NULL, target_id {i} NOT NULL, reporter_id {i} NOT NULL, severity {i} NOT NULL, status {s}{c} NOT NULL, notes {s}{c}, created_at {i} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE accounts (id {pk}, handle {s}{c} NOT NULL UNIQUE, display_name {s}{c} NOT NULL, bio {s}{c}, verified {b} NOT NULL, follower_tier {i} NOT NULL, locale {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE follows (follower_id {i} NOT NULL, followee_id {i} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (follower_id, followee_id))"
+        ),
+        format!(
+            "CREATE TABLE blocks (blocker_id {i} NOT NULL, blocked_id {i} NOT NULL, reason {s}{c} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (blocker_id, blocked_id))"
+        ),
+        format!(
+            "CREATE TABLE channels (id {pk}, kind {s}{c} NOT NULL, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, last_message_at {i} NOT NULL, message_count {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE channel_members (channel_id {i} NOT NULL, account_id {i} NOT NULL, role {s}{c} NOT NULL, last_read_seq {i} NOT NULL, muted {b} NOT NULL, PRIMARY KEY (channel_id, account_id))"
+        ),
+        format!(
+            "CREATE TABLE messages (id {pk}, channel_id {i} NOT NULL, seq {i} NOT NULL, author_id {i} NOT NULL, reply_to_id {i}, body {s}{c} NOT NULL, edited_at {i}, deleted_at {i}, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE reactions (message_id {i} NOT NULL, account_id {i} NOT NULL, emoji {s}{c} NOT NULL, created_at {i} NOT NULL, PRIMARY KEY (message_id, account_id, emoji))"
+        ),
+        format!(
+            "CREATE TABLE moderation_reports (id {pk}, target_type {s}{c} NOT NULL, target_id {i} NOT NULL, reporter_id {i} NOT NULL, severity {i} NOT NULL, status {s}{c} NOT NULL, notes {s}{c}, created_at {i} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 3: Multi-Tenant B2B SaaS Workspace (9 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE tenants (id {pk}, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, plan {s}{c} NOT NULL, seat_limit {i} NOT NULL, settings_json {j} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE teams (id {pk}, tenant_id {i} NOT NULL, name {s}{c} NOT NULL, lead_user_id {i})"),
-        format!("CREATE TABLE saas_users (id {pk}, tenant_id {i} NOT NULL, email {s}{c} NOT NULL UNIQUE, display_name {s}{c} NOT NULL, role {s}{c} NOT NULL, active {b} NOT NULL, last_seen_at {i} NOT NULL)"),
-        format!("CREATE TABLE projects (id {pk}, tenant_id {i} NOT NULL, parent_project_id {i}, key_code {s}{c} NOT NULL, name {s}{c} NOT NULL, archived {b} NOT NULL, budget_cents {i} NOT NULL)"),
-        format!("CREATE TABLE issues (id {pk}, tenant_id {i} NOT NULL, project_id {i} NOT NULL, number {i} NOT NULL, author_id {i} NOT NULL, assignee_id {i}, status {s}{c} NOT NULL, priority {i} NOT NULL, title {s}{c} NOT NULL, description {s}{c} NOT NULL, metadata_json {j} NOT NULL, estimate_hrs {f}, due_at {i}, created_at {i} NOT NULL, updated_at {i} NOT NULL, deleted_at {i})"),
-        format!("CREATE TABLE labels (id {pk}, tenant_id {i} NOT NULL, name {s}{c} NOT NULL, color {s}{c} NOT NULL)"),
-        format!("CREATE TABLE issue_labels (issue_id {i} NOT NULL, label_id {i} NOT NULL, added_by {i} NOT NULL, added_at {i} NOT NULL, PRIMARY KEY (issue_id, label_id))"),
-        format!("CREATE TABLE issue_comments (id {pk}, tenant_id {i} NOT NULL, issue_id {i} NOT NULL, author_id {i} NOT NULL, body {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE attachments (id {pk}, tenant_id {i} NOT NULL, issue_id {i} NOT NULL, filename {s}{c} NOT NULL, mime_type {s}{c} NOT NULL, size_bytes {i} NOT NULL, payload {bl} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE tenants (id {pk}, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, plan {s}{c} NOT NULL, seat_limit {i} NOT NULL, settings_json {j} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE teams (id {pk}, tenant_id {i} NOT NULL, name {s}{c} NOT NULL, lead_user_id {i})"
+        ),
+        format!(
+            "CREATE TABLE saas_users (id {pk}, tenant_id {i} NOT NULL, email {s}{c} NOT NULL UNIQUE, display_name {s}{c} NOT NULL, role {s}{c} NOT NULL, active {b} NOT NULL, last_seen_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE projects (id {pk}, tenant_id {i} NOT NULL, parent_project_id {i}, key_code {s}{c} NOT NULL, name {s}{c} NOT NULL, archived {b} NOT NULL, budget_cents {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE issues (id {pk}, tenant_id {i} NOT NULL, project_id {i} NOT NULL, number {i} NOT NULL, author_id {i} NOT NULL, assignee_id {i}, status {s}{c} NOT NULL, priority {i} NOT NULL, title {s}{c} NOT NULL, description {s}{c} NOT NULL, metadata_json {j} NOT NULL, estimate_hrs {f}, due_at {i}, created_at {i} NOT NULL, updated_at {i} NOT NULL, deleted_at {i})"
+        ),
+        format!(
+            "CREATE TABLE labels (id {pk}, tenant_id {i} NOT NULL, name {s}{c} NOT NULL, color {s}{c} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE issue_labels (issue_id {i} NOT NULL, label_id {i} NOT NULL, added_by {i} NOT NULL, added_at {i} NOT NULL, PRIMARY KEY (issue_id, label_id))"
+        ),
+        format!(
+            "CREATE TABLE issue_comments (id {pk}, tenant_id {i} NOT NULL, issue_id {i} NOT NULL, author_id {i} NOT NULL, body {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE attachments (id {pk}, tenant_id {i} NOT NULL, issue_id {i} NOT NULL, filename {s}{c} NOT NULL, mime_type {s}{c} NOT NULL, size_bytes {i} NOT NULL, payload {bl} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 4: E-Commerce, Inventory & Double-Entry Financial Ledger (8 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE categories (id {pk}, parent_id {i}, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL)"),
-        format!("CREATE TABLE products (id {pk}, category_id {i} NOT NULL, sku {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, price_cents {i} NOT NULL, price_float {f} NOT NULL, stock {i} NOT NULL, active {b} NOT NULL, attrs_json {j} NOT NULL, updated_at {i} NOT NULL)"),
-        format!("CREATE TABLE customers (id {pk}, email {s}{c} NOT NULL UNIQUE, country {s}{c} NOT NULL, tier {s}{c} NOT NULL, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE orders (id {pk}, customer_id {i} NOT NULL, status {s}{c} NOT NULL, subtotal_cents {i} NOT NULL, tax_cents {i} NOT NULL, total_cents {i} NOT NULL, currency {s}{c} NOT NULL, created_at {i} NOT NULL, shipped_at {i})"),
-        format!("CREATE TABLE order_items (id {pk}, order_id {i} NOT NULL, product_id {i} NOT NULL, qty {i} NOT NULL, unit_price_cents {i} NOT NULL)"),
-        format!("CREATE TABLE payments (id {pk}, order_id {i} NOT NULL, provider {s}{c} NOT NULL, status {s}{c} NOT NULL, amount_cents {i} NOT NULL, idempotency_key {s}{c} NOT NULL UNIQUE, created_at {i} NOT NULL)"),
-        format!("CREATE TABLE fx_rates (id {pk}, currency {s}{c} NOT NULL, rate_float {f} NOT NULL, effective_at {i} NOT NULL)"),
-        format!("CREATE TABLE ledger_entries (id {pk}, account_id {i} NOT NULL, order_id {i}, direction {s}{c} NOT NULL, amount_cents {i} NOT NULL, note {s}{c}, posted_at {i} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE categories (id {pk}, parent_id {i}, slug {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE products (id {pk}, category_id {i} NOT NULL, sku {s}{c} NOT NULL UNIQUE, name {s}{c} NOT NULL, price_cents {i} NOT NULL, price_float {f} NOT NULL, stock {i} NOT NULL CHECK (stock >= 0), active {b} NOT NULL, attrs_json {j} NOT NULL, updated_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE customers (id {pk}, email {s}{c} NOT NULL UNIQUE, country {s}{c} NOT NULL, tier {s}{c} NOT NULL, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE orders (id {pk}, customer_id {i} NOT NULL, status {s}{c} NOT NULL, subtotal_cents {i} NOT NULL, tax_cents {i} NOT NULL, total_cents {i} NOT NULL, currency {s}{c} NOT NULL, created_at {i} NOT NULL, shipped_at {i})"
+        ),
+        format!(
+            "CREATE TABLE order_items (id {pk}, order_id {i} NOT NULL, product_id {i} NOT NULL, qty {i} NOT NULL, unit_price_cents {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE payments (id {pk}, order_id {i} NOT NULL, provider {s}{c} NOT NULL, status {s}{c} NOT NULL, amount_cents {i} NOT NULL, idempotency_key {s}{c} NOT NULL UNIQUE, created_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE fx_rates (id {pk}, currency {s}{c} NOT NULL, rate_float {f} NOT NULL, effective_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE ledger_entries (id {pk}, account_id {i} NOT NULL, order_id {i}, direction {s}{c} NOT NULL, amount_cents {i} NOT NULL, note {s}{c}, posted_at {i} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 5: Observability, Distributed Tracing & Experimentation (4 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE services (id {pk}, name {s}{c} NOT NULL UNIQUE, team_name {s}{c} NOT NULL, tier {i} NOT NULL)"),
-        format!("CREATE TABLE spans (id {pk}, trace_id {i} NOT NULL, parent_span_id {i}, service_id {i} NOT NULL, op_name {s}{c} NOT NULL, status_code {i} NOT NULL, duration_us {i} NOT NULL, tags_json {j} NOT NULL, started_at {i} NOT NULL)"),
-        format!("CREATE TABLE experiments (id {pk}, key_name {s}{c} NOT NULL UNIQUE, status {s}{c} NOT NULL, started_at {i} NOT NULL)"),
-        format!("CREATE TABLE exp_events (id {pk}, experiment_id {i} NOT NULL, account_id {i} NOT NULL, variant {s}{c} NOT NULL, event_kind {s}{c} NOT NULL, value_float {f} NOT NULL, ts {i} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE services (id {pk}, name {s}{c} NOT NULL UNIQUE, team_name {s}{c} NOT NULL, tier {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE spans (id {pk}, trace_id {i} NOT NULL, parent_span_id {i}, service_id {i} NOT NULL, op_name {s}{c} NOT NULL, status_code {i} NOT NULL, duration_us {i} NOT NULL, tags_json {j} NOT NULL, started_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE experiments (id {pk}, key_name {s}{c} NOT NULL UNIQUE, status {s}{c} NOT NULL, started_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE exp_events (id {pk}, experiment_id {i} NOT NULL, account_id {i} NOT NULL, variant {s}{c} NOT NULL, event_kind {s}{c} NOT NULL, value_float {f} NOT NULL, ts {i} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 6: CI/CD Build Fleet & Test-Flake Intelligence (2 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE ci_jobs (id {pk}, repo_id {i} NOT NULL, commit_sha {s}{c} NOT NULL, status {s}{c} NOT NULL, priority {i} NOT NULL, runner_id {i}, created_at {i} NOT NULL, claimed_at {i}, finished_at {i})"),
-        format!("CREATE TABLE test_results (id {pk}, job_id {i} NOT NULL, suite_name {s}{c} NOT NULL, test_name {s}{c} NOT NULL, outcome {s}{c} NOT NULL, duration_ms {i} NOT NULL, run_at {i} NOT NULL)"),
-
+        format!(
+            "CREATE TABLE ci_jobs (id {pk}, repo_id {i} NOT NULL, commit_sha {s}{c} NOT NULL, status {s}{c} NOT NULL, priority {i} NOT NULL, runner_id {i}, created_at {i} NOT NULL, claimed_at {i}, finished_at {i})"
+        ),
+        format!(
+            "CREATE TABLE test_results (id {pk}, job_id {i} NOT NULL, suite_name {s}{c} NOT NULL, test_name {s}{c} NOT NULL, outcome {s}{c} NOT NULL, duration_ms {i} NOT NULL, run_at {i} NOT NULL)"
+        ),
         // -------------------------------------------------------------------------
         // Domain 7 & 8: Cluster Bookings, Docs & Wiki Graph (3 tables)
         // -------------------------------------------------------------------------
-        format!("CREATE TABLE bookings (id {pk}, resource_id {i} NOT NULL, owner_id {i} NOT NULL, start_ts {i} NOT NULL, end_ts {i} NOT NULL, status {s}{c} NOT NULL, title {s}{c} NOT NULL)"),
-        format!("CREATE TABLE documents (id {pk}, tenant_id {i} NOT NULL, slug {s}{c} NOT NULL, title {s}{c} NOT NULL, version {i} NOT NULL, body {s}{c} NOT NULL, updated_at {i} NOT NULL)"),
-        format!("CREATE TABLE doc_links (from_doc_id {i} NOT NULL, to_doc_id {i} NOT NULL, anchor_text {s}{c} NOT NULL, PRIMARY KEY (from_doc_id, to_doc_id))"),
+        format!(
+            "CREATE TABLE bookings (id {pk}, resource_id {i} NOT NULL, owner_id {i} NOT NULL, start_ts {i} NOT NULL, end_ts {i} NOT NULL, status {s}{c} NOT NULL, title {s}{c} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE documents (id {pk}, tenant_id {i} NOT NULL, slug {s}{c} NOT NULL, title {s}{c} NOT NULL, version {i} NOT NULL, body {s}{c} NOT NULL, updated_at {i} NOT NULL)"
+        ),
+        format!(
+            "CREATE TABLE doc_links (from_doc_id {i} NOT NULL, to_doc_id {i} NOT NULL, anchor_text {s}{c} NOT NULL, PRIMARY KEY (from_doc_id, to_doc_id))"
+        ),
     ]
 }
 

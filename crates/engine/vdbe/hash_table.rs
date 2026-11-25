@@ -969,19 +969,6 @@ impl Default for HashTableConfig {
     }
 }
 
-/// Opens a spill temp file for hash join build/probe partitions. Mirrors `Sorter::open_temp_file`:
-/// under `TempStore::Default`, falls back to in-memory temp storage if creating a disk temp file
-/// fails (e.g. `EMFILE`, full `TMPDIR`), while `TempStore::File` strictly propagates I/O errors.
-fn open_spill_temp_file(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<TempFile> {
-    match TempFile::with_temp_store(io, temp_store) {
-        Ok(tf) => Ok(tf),
-        Err(_) if matches!(temp_store, crate::TempStore::Default) => {
-            TempFile::with_temp_store(io, crate::TempStore::Memory)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 struct SpillState {
     /// In-memory partition buffers for grace hash join.
     /// When spilling is triggered, entries are partitioned by hash before writing.
@@ -1008,7 +995,7 @@ impl SpillState {
                 .try_collect()?,
             partitions: vec![],
             next_spill_offset: 0,
-            temp_file: open_spill_temp_file(io, temp_store)?,
+            temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
         })
     }
@@ -1058,7 +1045,7 @@ impl ProbeSpillState {
                 .try_collect()?,
             partitions: vec![],
             next_spill_offset: 0,
-            temp_file: open_spill_temp_file(io, temp_store)?,
+            temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
             mem_used: 0,
             mem_budget,
@@ -6259,6 +6246,76 @@ mod hashtests {
         assert!(
             max_blob <= 32,
             "blob hashing must distribute crafted keys; max chain = {max_blob}"
+        );
+    }
+
+    /// Review P1 regression: when opening a disk spill temp file fails under `TempStore::Default`,
+    /// `HashTable` must propagate the I/O error instead of silently falling back to unbounded heap
+    /// `MemoryIO` while deducting spilled entries from `mem_used`.
+    #[test]
+    fn review_p1_hash_spill_propagates_temp_file_open_failure_within_budget() {
+        struct FailOpenIO;
+        impl crate::io::Clock for FailOpenIO {
+            fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+                crate::io::clock::DefaultClock.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+                crate::io::clock::DefaultClock.current_time_wall_clock()
+            }
+        }
+        impl IO for FailOpenIO {
+            fn open_file(
+                &self,
+                _path: &str,
+                _flags: crate::io::OpenFlags,
+                _direct: bool,
+            ) -> Result<Arc<dyn crate::io::File>> {
+                Err(crate::error::io_error(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected EMFILE"),
+                    "open",
+                ))
+            }
+            fn remove_file(&self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn step(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let io: Arc<dyn IO> = Arc::new(FailOpenIO);
+        let config = HashTableConfig {
+            initial_buckets: 64,
+            mem_budget: 256 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let payload = "x".repeat(512);
+        let mut hit_err = false;
+        for i in 0..8_000i64 {
+            let res = ht.insert(
+                vec![Value::from_i64(i)],
+                i,
+                vec![Value::from_text(payload.clone())],
+                None,
+            );
+            if res.is_err() {
+                hit_err = true;
+                break;
+            }
+        }
+        assert!(
+            hit_err,
+            "failed disk spill must return an error rather than bypassing the 256 KiB budget on heap"
+        );
+        assert!(
+            ht.mem_used <= 256 * 1024 + 4096,
+            "mem_used exceeded budget after failed spill: {}",
+            ht.mem_used
         );
     }
 }

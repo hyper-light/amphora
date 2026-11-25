@@ -560,10 +560,7 @@ pub const OPS: &[Op] = &[
         "ddl_alter_add_column",
         "CREATE TABLE, INSERT, ALTER TABLE ADD COLUMN, UPDATE, SELECT and DROP TABLE",
     ),
-    ddl(
-        "ddl_analyze_stats",
-        "ANALYZE regions and verify row count",
-    ),
+    ddl("ddl_analyze_stats", "ANALYZE regions and verify row count"),
 ];
 
 /// `sql` (SQLite's `?` placeholders) in `d`'s: PostgreSQL's `$n`.
@@ -1396,6 +1393,18 @@ fn load_all(
     columnar: bool,
 ) -> anyhow::Result<(f64, f64, f64)> {
     let began = Instant::now();
+    if matches!(d, Dialect::Postgres | Dialect::MySql | Dialect::ClickHouse) {
+        let suffix = if d == Dialect::ClickHouse {
+            " SYNC"
+        } else {
+            ""
+        };
+        let drops: Vec<(String, Vec<P>)> = ["items", "owners", "regions"]
+            .into_iter()
+            .map(|t| (format!("DROP TABLE IF EXISTS {t}{suffix}"), vec![]))
+            .collect();
+        target.setup(&drops)?;
+    }
     let declare = |s: String| if columnar { format!("{s} COLUMNAR") } else { s };
     target.setup(
         &tables(d, cedardb)
@@ -1507,7 +1516,15 @@ pub fn main() -> anyhow::Result<()> {
                 Some(_) => Some(crate::profile_start()?),
                 None => None,
             };
-            let out = run_op(&target, op, &stmts, &shape, run_clients, o.warmup, o.seconds);
+            let out = run_op(
+                &target,
+                op,
+                &stmts,
+                &shape,
+                run_clients,
+                o.warmup,
+                o.seconds,
+            );
             if let (Some(prefix), Some(guard)) = (&profile, profiler) {
                 crate::write_profile(
                     &format!("{prefix}-{}-{}-{run_clients}", o.target, op.name),
@@ -1554,5 +1571,24 @@ pub fn main() -> anyhow::Result<()> {
         "stats": target.stats(),
     });
     println!("{report}");
+    let failed_results = results
+        .iter()
+        .filter(|r| {
+            !r.get("unsupported")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && (r.get("errors").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+                    || r.get("error").is_some_and(|v| !v.is_null()))
+        })
+        .count();
+    let failed_answers = answers
+        .iter()
+        .filter(|a| a.get("answer").and_then(|v| v.get("error")).is_some())
+        .count();
+    if failed_results > 0 || failed_answers > 0 {
+        anyhow::bail!(
+            "suite failed: failed_results={failed_results} failed_answers={failed_answers}"
+        );
+    }
     Ok(())
 }

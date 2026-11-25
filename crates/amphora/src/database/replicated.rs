@@ -16679,6 +16679,146 @@ mod tests {
         pump.finish();
     }
 
+    /// Review Spec P1 regression: empty followers in a 3-member group must bootstrap cleanly from
+    /// a populated PostgreSQL-dialect source without fencing on `table was created by the postgres
+    /// frontend`, adopt the PostgreSQL dialect on seed application, replicate subsequent writes,
+    /// and reopen cleanly across a full restart.
+    #[test]
+    fn review_p1_empty_followers_bootstrap_from_populated_postgres_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("state-3.db");
+        {
+            let db = Db::open_postgres_sharing(&source, &crate::db::Sharing::Off).unwrap();
+            db.exec(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+                 INSERT INTO items VALUES(1, 'pg-seed')",
+            )
+            .unwrap();
+            db.flusher()().unwrap();
+        }
+        let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
+        let read_items = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
+            let mut out = String::new();
+            db.query("SELECT id, label FROM items ORDER BY id", [], |row| {
+                let id = row
+                    .get_value(0)
+                    .as_int()
+                    .ok_or_else(|| anyhow::anyhow!("expected integer id"))?;
+                let label = row
+                    .get_value(1)
+                    .to_text()
+                    .ok_or_else(|| anyhow::anyhow!("expected text label"))?;
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                out.push_str(&format!("{id}:{label}"));
+                Ok(true)
+            })?;
+            Ok(out.into_bytes())
+        };
+
+        // Members 1 and 2 start completely empty (no pre-existing file); member 3 holds the
+        // populated PostgreSQL source.
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 0);
+
+        for (idx, client) in clients.iter().enumerate() {
+            let got = driven
+                .call(&mut pump, client, read_items)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "member {} failed initial read after pg seed: {e:?}",
+                        idx + 1
+                    )
+                });
+            assert_eq!(String::from_utf8(got).unwrap(), "1:pg-seed");
+            let status = client.handle().status().unwrap();
+            assert!(
+                status.fenced.is_none(),
+                "member {} fenced after pg bootstrap: {:?}",
+                idx + 1,
+                status.fenced
+            );
+            assert!(
+                !status.bootstrapping,
+                "member {} still bootstrapping",
+                idx + 1
+            );
+        }
+
+        // Write through an empty-bootstrapped follower (forwarded to leader) and verify all 3
+        // members see both the seeded row and the replicated delta, and remain in postgres dialect.
+        driven.follow(&mut pump, &clients, 0);
+        driven
+            .call(&mut pump, clients.get(1).unwrap(), |db| {
+                db.exec("INSERT INTO items VALUES(2, 'pg-delta')")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        for (idx, client) in clients.iter().enumerate() {
+            let got = driven
+                .call(&mut pump, client, read_items)
+                .unwrap_or_else(|e| panic!("member {} failed post-delta read: {e:?}", idx + 1));
+            assert_eq!(String::from_utf8(got).unwrap(), "1:pg-seed,2:pg-delta");
+            let is_pg = driven
+                .call(&mut pump, client, |db| Ok(vec![u8::from(db.is_postgres())]))
+                .unwrap();
+            assert_eq!(
+                is_pg,
+                vec![1],
+                "member {} must stay in postgres dialect after seed + delta",
+                idx + 1
+            );
+        }
+
+        for owner in 0..3 {
+            driven.advance(owner, past_quiet(&driven, owner));
+        }
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        // Full restart of all 3 members from disk: all 3 must reopen cleanly in PostgreSQL dialect
+        // with no fencing and both rows intact.
+        let mut driven = Driven::new();
+        let reopened: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&reopened);
+        driven.elect(&mut pump, &reopened, 0, 0);
+        for (idx, client) in reopened.iter().enumerate() {
+            let status = client.handle().status().unwrap();
+            assert!(
+                status.fenced.is_none(),
+                "reopened member {} fenced: {:?}",
+                idx + 1,
+                status.fenced
+            );
+            assert!(!status.bootstrapping);
+            let rows = driven.call(&mut pump, client, read_items).unwrap();
+            let is_pg = driven
+                .call(&mut pump, client, |db| Ok(vec![u8::from(db.is_postgres())]))
+                .unwrap();
+            assert_eq!(
+                is_pg,
+                vec![1],
+                "reopened member {} lost postgres dialect",
+                idx + 1
+            );
+            assert_eq!(String::from_utf8(rows).unwrap(), "1:pg-seed,2:pg-delta");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// U15/CP-T1.8 under a nemesis (replication.md, "The owner's time"): the seeded group with
     /// the lead moved while the delta's call is in flight, while a replica reads the seed's image,
     /// and while the reopened group's reads are. The seed's own transfer to its source is its

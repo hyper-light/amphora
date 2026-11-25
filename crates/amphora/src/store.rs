@@ -1184,6 +1184,15 @@ fn notifier(sends: &Sends) {
 /// to flush to be committed or refused, each a commit of the writer away; what is handed after
 /// joins the next flush (docs/design/store.md, decision 14).
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
+    struct FlusherPanicGuard<'a>(&'a Sends);
+    impl Drop for FlusherPanicGuard<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.disk_failed();
+            }
+        }
+    }
+    let _panic_guard = FlusherPanicGuard(sends);
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
@@ -1553,12 +1562,39 @@ impl<R: Send + 'static> Readers<R> {
 /// A handle to a store: cheap to clone, usable from any thread. Its writer's queue counts nothing:
 /// its batches are bounded by their charge ([`Engine::row_bytes`]), its jobs by their callers, each
 /// waiting for its own.
+/// Background thread handles owned by a [`Store`]: joined when the last `Store` clone drops (after
+/// `tx` closes so the writer exits, releases readers/checkpointer, and signals flushers/notifier),
+/// guaranteeing that all engine handles (`Arc<Database>`) are fully torn down before drop returns.
+struct StoreThreads(Mutex<Vec<std::thread::JoinHandle<()>>>);
+
+impl Drop for StoreThreads {
+    fn drop(&mut self) {
+        let me = std::thread::current().id();
+        let handles: Vec<_> = locked(&self.0).drain(..).collect();
+        // If the final `Store` handle drops on one of the store's own threads (e.g., an
+        // `on_commit` watcher, `Store::run` job, or `put_then` callback), joining peer threads
+        // synchronously would deadlock because `writer` cannot emit `sends.stop()` until the
+        // callback returns. Detach here so the callback finishes and the closed channel drives
+        // clean shutdown asynchronously.
+        if handles.iter().any(|handle| handle.thread().id() == me) {
+            return;
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A database's commit pipeline and its readers, handed out by [`Store::start`].
 pub struct Store<E: Engine> {
+    // Declared BEFORE `_threads` so closing the last sender triggers writer/flusher/notifier
+    // shutdown before `StoreThreads::drop` joins them.
     tx: mpsc::Sender<Msg<E>>,
     meter: Arc<Meter>,
     watchers: Arc<Mutex<Vec<Watcher>>>,
     sends: Arc<Sends>,
     readers: Arc<Readers<E::Reader>>,
+    _threads: Arc<StoreThreads>,
 }
 
 impl<E: Engine> Clone for Store<E> {
@@ -1569,6 +1605,7 @@ impl<E: Engine> Clone for Store<E> {
             watchers: self.watchers.clone(),
             sends: self.sends.clone(),
             readers: self.readers.clone(),
+            _threads: Arc::clone(&self._threads),
         }
     }
 }
@@ -1587,6 +1624,7 @@ impl<E: Engine> Store<E> {
         let sends: Arc<Sends> = Arc::default();
         let readers: Arc<Readers<E::Reader>> =
             Arc::new(Readers::new(config.readers, meter.clone()));
+        let mut threads = Vec::new();
         if let Some(open) = engine.opener() {
             readers.start(open, Checkpointing::of::<E>(&config), sends.clone());
         }
@@ -1595,32 +1633,39 @@ impl<E: Engine> Store<E> {
                 let flush = Arc::new(flush);
                 for _ in 0..config.flushers.max(1) {
                     let (s, m, f) = (sends.clone(), meter.clone(), flush.clone());
-                    std::thread::Builder::new()
-                        .name("amphora-flush".into())
-                        .spawn(move || flusher(&s, &f, &m))?;
+                    threads.push(
+                        std::thread::Builder::new()
+                            .name("amphora-flush".into())
+                            .spawn(move || flusher(&s, &f, &m))?,
+                    );
                 }
             }
             None => sends.durable_as_committed.store(true, Ordering::Relaxed),
         }
         let told = sends.clone();
-        std::thread::Builder::new()
-            .name("amphora-notify".into())
-            .spawn(move || notifier(&told))?;
+        threads.push(
+            std::thread::Builder::new()
+                .name("amphora-notify".into())
+                .spawn(move || notifier(&told))?,
+        );
         let (m, w, s, r) = (
             meter.clone(),
             watchers.clone(),
             sends.clone(),
             readers.clone(),
         );
-        std::thread::Builder::new()
-            .name("amphora-writer".into())
-            .spawn(move || writer(engine, &rx, &config, &m, &w, &s, &r))?;
+        threads.push(
+            std::thread::Builder::new()
+                .name("amphora-writer".into())
+                .spawn(move || writer(engine, &rx, &config, &m, &w, &s, &r))?,
+        );
         Ok(Self {
             tx,
             meter,
             watchers,
             sends,
             readers,
+            _threads: Arc::new(StoreThreads(Mutex::new(threads))),
         })
     }
 
@@ -1712,15 +1757,17 @@ impl<E: Engine> Store<E> {
         if bytes == 0 {
             return Ok(None);
         }
-        self.charge_queue(bytes, until.unwrap_or_else(Instant::now))
-            .map(Some)
-            .map_err(|refusal| match refusal {
-                amphora_api::Refusal::TooLarge { size, limit, .. } => Refused::TooLarge {
-                    size: u64::try_from(size).unwrap_or(u64::MAX),
-                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                },
-                _ => Refused::Full,
-            })
+        let admitted = match until {
+            Some(deadline) => self.charge_queue(bytes, deadline),
+            None => crate::memory::process().try_take(crate::memory::Use::Queues, bytes),
+        };
+        admitted.map(Some).map_err(|refusal| match refusal {
+            amphora_api::Refusal::TooLarge { size, limit, .. } => Refused::TooLarge {
+                size: u64::try_from(size).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            },
+            _ => Refused::Full,
+        })
     }
 
     /// `bytes` charged to the memory budget's room for queues, this writer's queue among them, until
@@ -1895,6 +1942,20 @@ fn writer<E: Engine>(
     sends: &Arc<Sends>,
     readers: &Readers<E::Reader>,
 ) {
+    // Unconditionally release readers/checkpointer and signal `sends.stop()` when `writer` exits,
+    // including if a `Store::run` job, watcher, or engine call panics, so flushers, notifier, and
+    // external `Store::drop` joins can never block waiting for a shutdown signal that never fires.
+    struct WriterShutdown<'a, R: Send + 'static> {
+        readers: &'a Readers<R>,
+        sends: &'a Sends,
+    }
+    impl<R: Send + 'static> Drop for WriterShutdown<'_, R> {
+        fn drop(&mut self) {
+            self.readers.release();
+            self.sends.stop();
+        }
+    }
+    let _shutdown = WriterShutdown { readers, sends };
     let mut pending: Vec<E::Row> = Vec::new();
     let mut batches: Vec<Batch> = Vec::new();
     // Commits made, which number the batches' fates.
@@ -2034,8 +2095,6 @@ fn writer<E: Engine>(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
-                readers.release();
-                sends.stop();
                 return;
             }
         }
@@ -2055,8 +2114,6 @@ fn writer<E: Engine>(
             Err(e) => {
                 tracing::error!(target: "amphora.store", event = "upkeep_failed", error = %format!("{e:#}"), "the engine's upkeep failed; the store stops");
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
-                readers.release();
-                sends.stop();
                 return;
             }
         }
@@ -2259,5 +2316,293 @@ mod tests {
         store
             .durable(&ticket, Instant::now() + Duration::from_secs(10))
             .unwrap();
+    }
+
+    /// Review P1 regression: non-blocking `Store::put` must admit ordinary writes when memory is
+    /// available rather than failing with `Refused::Full` against an expired `Instant::now()`.
+    #[test]
+    fn review_p1_nonblocking_put_admits_ordinary_writes_with_room() {
+        let fed = Fed::new(Some(2 << 20), Some(0));
+        let (_budget, _unset) = budget(&fed);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let store = Store::start(Kept(Arc::clone(&kept)), Config::default()).unwrap();
+        let mut tickets = Vec::with_capacity(8);
+        for i in 0..8 {
+            let ticket = store
+                .put(vec![format!("k{i}")])
+                .unwrap_or_else(|e| panic!("put #{i} refused with >1 MiB available: {e:?}"));
+            tickets.push(ticket);
+        }
+        let far = Instant::now() + Duration::from_secs(5);
+        for ticket in tickets {
+            store.durable(&ticket, far).unwrap();
+        }
+        assert_eq!(kept.lock().unwrap().len(), 8);
+    }
+
+    /// Review P1 regression: dropping a `Store` must deterministically join its background
+    /// writer/flusher/notifier/checkpointer threads and release every `Arc<Database>` before
+    /// returning so a subsequent cold reopen genuinely reads from disk instead of hitting the old
+    /// instance in `DATABASE_REGISTRY`.
+    #[test]
+    fn review_p1_store_drop_releases_engine_database_before_reopen() {
+        use crate::db::{Db, Sharing};
+        use amphora_engine::Value;
+
+        struct DbEngine(Db);
+        impl Engine for DbEngine {
+            type Row = (i64, String);
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                self.0.transaction(|db| {
+                    for (id, val) in rows {
+                        db.query(
+                            "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                            [Value::from_i64(*id), Value::from_text(val.clone())],
+                            |_| Ok(true),
+                        )?;
+                    }
+                    Ok(rows.len())
+                })
+            }
+            fn flusher(&self) -> Option<Flush> {
+                Some(self.0.flusher())
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.0.opener())
+            }
+            fn checkpoint(reader: &mut Db) -> anyhow::Result<Checkpointed> {
+                reader.checkpoint()
+            }
+            fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+                Ok(Some(reader.uncopied()))
+            }
+            fn restart_log(&mut self) -> anyhow::Result<bool> {
+                self.0.restart_log()
+            }
+        }
+
+        for postgres in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reopen.db");
+            let db = if postgres {
+                Db::open_postgres_sharing(&path, &Sharing::Off).unwrap()
+            } else {
+                Db::open_sharing(&path, &Sharing::Off).unwrap()
+            };
+            db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let weak = db.database_weak();
+            let store = Store::start(
+                DbEngine(db),
+                Config {
+                    readers: 4,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            let far = Instant::now() + Duration::from_secs(5);
+            let ticket = store.put_wait(vec![(1, "hello".to_owned())], far).unwrap();
+            store.durable(&ticket, far).unwrap();
+            let count = store
+                .read_committed(
+                    far,
+                    |reader| {
+                        let mut c = 0i64;
+                        reader.query("SELECT COUNT(*) FROM t", [], |r| {
+                            c = r.get::<i64>(0)?;
+                            Ok(false)
+                        })?;
+                        Ok(c)
+                    },
+                    |e| {
+                        let mut c = 0i64;
+                        e.0.query("SELECT COUNT(*) FROM t", [], |r| {
+                            c = r.get::<i64>(0)?;
+                            Ok(false)
+                        })?;
+                        Ok(c)
+                    },
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(
+                weak.upgrade().is_some(),
+                "database instance must be alive while Store is open"
+            );
+            drop(store);
+            assert!(
+                weak.upgrade().is_none(),
+                "postgres={postgres}: Store drop must release every Arc<Database> before reopen"
+            );
+            let reopened = if postgres {
+                Db::open_postgres_sharing(&path, &Sharing::Off).unwrap()
+            } else {
+                Db::open_sharing(&path, &Sharing::Off).unwrap()
+            };
+            let mut recovered = 0i64;
+            reopened
+                .query("SELECT COUNT(*) FROM t", [], |r| {
+                    recovered = r.get::<i64>(0)?;
+                    Ok(false)
+                })
+                .unwrap();
+            assert_eq!(recovered, 1);
+        }
+    }
+
+    /// Review P1 regression: dropping the final `Store` handle inside an `on_commit` callback
+    /// running on `amphora-writer` must not deadlock joining peer threads waiting for shutdown,
+    /// and the committed write must survive reopen cleanly.
+    #[test]
+    fn review_p1_dropping_last_store_from_on_commit_callback_never_deadlocks() {
+        use crate::db::{Db, Sharing};
+        use amphora_engine::Value;
+
+        struct SimpleDbEngine(Db);
+        impl Engine for SimpleDbEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                self.0.transaction(|db| {
+                    for id in rows {
+                        db.query(
+                            "INSERT INTO t (id) VALUES (?1)",
+                            [Value::from_i64(*id)],
+                            |_| Ok(true),
+                        )?;
+                    }
+                    Ok(rows.len())
+                })
+            }
+            fn flusher(&self) -> Option<Flush> {
+                Some(self.0.flusher())
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.0.opener())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback_drop.db");
+        let db = Db::open_sharing(&path, &Sharing::Off).unwrap();
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+        let weak = db.database_weak();
+        let store = Store::start(SimpleDbEngine(db), Config::default()).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let held = Mutex::new(Some(store.clone()));
+        let go_rx = Mutex::new(go_rx);
+        store.on_commit(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = locked(&go_rx).recv();
+            // Drop the final `Store` handle directly on the writer thread.
+            drop(locked(&held).take());
+            let _ = done_tx.send(());
+            false
+        }));
+
+        let far = Instant::now() + Duration::from_secs(5);
+        let _ticket = store.put_wait(vec![42], far).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("commit callback must fire");
+        // Drop the external handle while the callback holds the last remaining `Store`.
+        drop(store);
+        go_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropping final Store inside on_commit callback deadlocked writer");
+
+        // Wait briefly for the detached writer/flusher/notifier threads to finish unwinding.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "detached store threads failed to exit and release Database"
+            );
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+        let reopened = Db::open_sharing(&path, &Sharing::Off).unwrap();
+        let mut got = 0i64;
+        reopened
+            .query("SELECT id FROM t", [], |r| {
+                got = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(got, 42);
+    }
+
+    /// Review P1 regression: a panicking `Store::run` callback must still release readers and
+    /// signal shutdown so dropping `Store` completes cleanly without hanging on flushers/notifier.
+    #[test]
+    fn review_p1_panicking_store_run_callback_unblocks_shutdown() {
+        use crate::db::{Db, Sharing};
+
+        struct PanicableEngine(Db);
+        impl Engine for PanicableEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+            fn flusher(&self) -> Option<Flush> {
+                Some(self.0.flusher())
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.0.opener())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panic_run.db");
+        let db = Db::open_sharing(&path, &Sharing::Off).unwrap();
+        let weak = db.database_weak();
+        let store = Store::start(PanicableEngine(db), Config::default()).unwrap();
+
+        let err = store.run(
+            Instant::now() + Duration::from_secs(5),
+            |_| -> anyhow::Result<()> {
+                panic!("intentional callback panic");
+            },
+        );
+        assert!(
+            err.is_err(),
+            "panicking Store::run must report Stopped error"
+        );
+
+        let (dropped_tx, dropped_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            drop(store);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Store::drop hung after Store::run callback panicked");
+        assert!(
+            weak.upgrade().is_none(),
+            "Database must be released after writer panic and Store drop"
+        );
     }
 }

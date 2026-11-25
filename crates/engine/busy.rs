@@ -31,10 +31,14 @@ pub struct LockRelease {
     /// Packed waiter state kept on its own cache line so uncontended shared-read unlocks
     /// (`notify_shared`) stay read-only and never dirty `generation` across cores:
     /// - bit 0 ([`Self::ARMED_BIT`]): at least one waker is registered in `wakers`
-    /// - bits 1..32 (step [`Self::INTEREST_INC`]): active [`SharedInterestGuard`] count
+    /// - bit 1 ([`Self::PROBE_BIT`]): a caller read [`Self::generation`] and may soon call
+    ///   [`Self::wait`]; cleared by the next non-self [`Self::notify`] so uncontended readers
+    ///   return to a single read-only cache-line load
+    /// - bits 2..32 (step [`Self::INTEREST_INC`]): active [`SharedInterestGuard`] count
     ///
     /// Checking `wait_state != 0` in `notify_shared()` wakes both crate-internal retrying
-    /// statements and direct public [`Self::wait`] callers without an extra cache-line read.
+    /// statements and direct public [`Self::generation`] / [`Self::wait`] callers without an extra
+    /// cache-line read.
     wait_state: CachePadded<AtomicU32>,
     wakers: Mutex<Vec<Waker>>,
 }
@@ -66,11 +70,24 @@ impl Drop for SharedInterestGuard {
 
 impl LockRelease {
     const ARMED_BIT: u32 = 1;
-    const INTEREST_INC: u32 = 2;
+    const PROBE_BIT: u32 = 2;
+    const INTEREST_INC: u32 = 4;
 
     /// The releases so far.
+    ///
+    /// Arms [`Self::PROBE_BIT`] before returning the generation snapshot so a subsequent
+    /// [`Self::notify_shared`] release by another thread cannot skip [`Self::notify`] between a
+    /// caller's `generation()` read, failed lock attempt, and [`Self::wait`] call—even without an
+    /// explicit [`Self::interest`] guard.
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        loop {
+            let g1 = self.generation.load(Ordering::SeqCst);
+            self.wait_state.fetch_or(Self::PROBE_BIT, Ordering::SeqCst);
+            let g2 = self.generation.load(Ordering::SeqCst);
+            if g1 == g2 {
+                return g2;
+            }
+        }
     }
 
     /// Holds `waker` for the next release after `seen` by anyone but this thread's own `step`:
@@ -159,14 +176,23 @@ impl LockRelease {
 
     /// A lock was released: wakes every statement waiting.
     pub fn notify(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
         let key = self.key();
+        let mut is_self = false;
         let _ = OWN.try_with(|own| {
             let (held, made) = own.get();
             if held == key {
                 own.set((held, made.wrapping_add(1)));
+                is_self = true;
             }
         });
+        // Clear PROBE_BIT before advancing `generation` on non-self releases so any caller whose
+        // `generation()` snapshot completed before this release sees `generation` move, while
+        // self-releases never disarm a waiting step's probe for another thread's release.
+        if !is_self {
+            self.wait_state
+                .fetch_and(!Self::PROBE_BIT, Ordering::SeqCst);
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if (self.wait_state.load(Ordering::SeqCst) & Self::ARMED_BIT) == 0 {
             return;
         }
@@ -808,6 +834,33 @@ mod tests {
             count.0.load(Ordering::SeqCst),
             1,
             "public waiter must be woken by notify_shared()"
+        );
+    }
+
+    /// Review Standards P2 regression: a public caller following `generation()` -> failed lock ->
+    /// `wait()` without `interest()` must NOT park when the last reader calls `notify_shared()`
+    /// between `generation()` and `wait()`, and `wait_state` must return to 0 after that release.
+    #[test]
+    fn review_p2_public_generation_before_wait_sees_last_reader_notify_shared() {
+        let release = LockRelease::default();
+        let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&count));
+        let step = release.own_releases();
+
+        // Caller snapshots generation before attempting exclusive lock (no `interest()` guard).
+        let seen = release.generation();
+        // Last reader unlocks and calls `notify_shared()` BEFORE caller invokes `wait()`.
+        std::thread::scope(|s| {
+            s.spawn(|| release.notify_shared());
+        });
+        assert!(
+            !release.wait(seen, &step, &waker),
+            "wait() must observe the generation bump from notify_shared() and refuse to park"
+        );
+        assert_eq!(
+            release.wait_state.load(Ordering::SeqCst),
+            0,
+            "wait_state must return to 0 after the probe release so uncontended readers stay read-only"
         );
     }
 }

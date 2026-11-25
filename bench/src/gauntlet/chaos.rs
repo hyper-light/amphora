@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::suite::{Dialect, Kind, P, mix};
-use crate::suite_db::Target;
+use crate::suite_db::{Session, Target};
 use crate::{Hist, Rng, summary};
 
 use super::loader::{BASE_TS_US, GauntletShape};
@@ -74,7 +74,12 @@ impl ShardedQueue {
         let n = num_queues.max(1);
         let cap_per_shard = (total_cap / n).max(64);
         let shards = (0..n)
-            .map(|_| (Mutex::new(VecDeque::with_capacity(cap_per_shard)), Condvar::new()))
+            .map(|_| {
+                (
+                    Mutex::new(VecDeque::with_capacity(cap_per_shard)),
+                    Condvar::new(),
+                )
+            })
             .collect();
         Self {
             shards,
@@ -88,7 +93,9 @@ impl ShardedQueue {
 
     fn push(&self, qidx: usize, task: AgentTask) -> bool {
         let (lock, cv) = &self.shards[qidx % self.shards.len()];
-        let mut q = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut q = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if q.len() >= self.cap_per_shard {
             self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -101,14 +108,31 @@ impl ShardedQueue {
     }
 
     fn pop(&self, qidx: usize) -> Option<AgentTask> {
-        let (lock, cv) = &self.shards[qidx % self.shards.len()];
-        let mut q = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = self.shards.len();
+        let home = qidx % len;
+        let (lock, cv) = &self.shards[home];
+        let mut q = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(t) = q.pop_front() {
                 self.inflight.fetch_sub(1, Ordering::Relaxed);
                 return Some(t);
             }
             if self.closed.load(Ordering::Acquire) {
+                drop(q);
+                // Drain any accepted tasks left on other shards so shutdown never abandons work
+                // even if callers construct more queue shards than workers.
+                for step in 1..len {
+                    let (other_lock, _) = &self.shards[(home + step) % len];
+                    let mut other = other_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(t) = other.pop_front() {
+                        self.inflight.fetch_sub(1, Ordering::Relaxed);
+                        return Some(t);
+                    }
+                }
                 return None;
             }
             let (guard, _) = cv
@@ -121,7 +145,9 @@ impl ShardedQueue {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         for (lock, cv) in &self.shards {
-            let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _g = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cv.notify_all();
         }
     }
@@ -146,69 +172,181 @@ fn pick_task(scenario: &str, rng: &mut Rng) -> (Persona, &'static str) {
     match scenario {
         "agentic_fleet_rush" => {
             if r < 45 {
-                let ops = ["ag_record_turn_txn", "ag_upsert_memory", "ag_complete_plan_step", "ag_append_balanced_cost"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ag_record_turn_txn",
+                    "ag_upsert_memory",
+                    "ag_complete_plan_step",
+                    "ag_append_balanced_cost",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 82 {
-                let ops = ["ag_run_detail", "ag_ws_active_runs", "ag_memory_recall_top", "ag_plan_ready_steps", "ag_run_turns_timeline"];
-                (Persona::ShortRead, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ag_run_detail",
+                    "ag_ws_active_runs",
+                    "ag_memory_recall_top",
+                    "ag_plan_ready_steps",
+                    "ag_run_turns_timeline",
+                ];
+                (
+                    Persona::ShortRead,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 94 {
-                let ops = ["ag_model_token_spend", "ag_tool_error_rates", "ag_diff_churn_top"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ag_model_token_spend",
+                    "ag_tool_error_rates",
+                    "ag_diff_churn_top",
+                ];
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else {
                 (Persona::Audit, "ag_token_trial_balance")
             }
         }
         "social_celebrity_storm" => {
             if r < 55 {
-                let ops = ["soc_channel_hot_general", "soc_channel_latest_50", "soc_feed_normal_user", "soc_profile_by_handle", "soc_unread_counts_all"];
-                (Persona::ShortRead, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "soc_channel_hot_general",
+                    "soc_channel_latest_50",
+                    "soc_feed_normal_user",
+                    "soc_profile_by_handle",
+                    "soc_unread_counts_all",
+                ];
+                (
+                    Persona::ShortRead,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 80 {
-                let ops = ["soc_post_message_txn", "soc_toggle_reaction", "soc_edit_message", "soc_mark_channel_read"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "soc_post_message_txn",
+                    "soc_toggle_reaction",
+                    "soc_edit_message",
+                    "soc_mark_channel_read",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 92 {
-                let ops = ["soc_feed_celebrity_fanout", "soc_top_reacted_messages", "soc_channel_leaderboard"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "soc_feed_celebrity_fanout",
+                    "soc_top_reacted_messages",
+                    "soc_channel_leaderboard",
+                ];
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else {
                 let ops = ["soc_unicode_search", "soc_mod_queue_priority"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             }
         }
         "flash_sale_ledger_audit" => {
             if r < 42 {
-                let ops = ["com_checkout_acid_txn", "com_checkout_savepoint_abort", "com_refund_restock_txn", "com_restock_hot_sku"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "com_checkout_acid_txn",
+                    "com_checkout_savepoint_abort",
+                    "com_refund_restock_txn",
+                    "com_restock_hot_sku",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 82 {
-                let ops = ["com_sku_point_lookup", "com_faceted_catalog", "com_customer_order_history", "com_order_full_receipt"];
-                (Persona::ShortRead, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "com_sku_point_lookup",
+                    "com_faceted_catalog",
+                    "com_customer_order_history",
+                    "com_order_full_receipt",
+                ];
+                (
+                    Persona::ShortRead,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 90 {
                 let ops = ["com_revenue_by_country_tier", "com_hot_sku_velocity"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else {
                 (Persona::Audit, "com_ledger_trial_balance")
             }
         }
         "ci_runner_claim_storm" => {
             if r < 45 {
-                let ops = ["ci_claim_and_finish_txn", "ci_bulk_test_results_50", "ci_enqueue_job", "ci_record_flake_retry"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ci_claim_and_finish_txn",
+                    "ci_bulk_test_results_50",
+                    "ci_enqueue_job",
+                    "ci_record_flake_retry",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 80 {
-                let ops = ["ci_queue_next_job", "ci_queue_depth_by_repo", "ci_test_history_timeline"];
-                (Persona::ShortRead, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ci_queue_next_job",
+                    "ci_queue_depth_by_repo",
+                    "ci_test_history_timeline",
+                ];
+                (
+                    Persona::ShortRead,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else {
-                let ops = ["ci_flakiest_tests_top50", "ci_pass_to_fail_regress", "ci_suite_pass_rate_pivot"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "ci_flakiest_tests_top50",
+                    "ci_pass_to_fail_regress",
+                    "ci_suite_pass_rate_pivot",
+                ];
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             }
         }
         "zero_downtime_migrations" => {
             if r < 52 {
-                let ops = ["saas_inbox_mega_tenant", "saas_inbox_tiny_tenant", "saas_inbox_empty_tenant", "saas_issue_detail_hydrate", "saas_login_email_lower"];
-                (Persona::ShortRead, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "saas_inbox_mega_tenant",
+                    "saas_inbox_tiny_tenant",
+                    "saas_inbox_empty_tenant",
+                    "saas_issue_detail_hydrate",
+                    "saas_login_email_lower",
+                ];
+                (
+                    Persona::ShortRead,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 86 {
-                let ops = ["saas_create_issue_workflow", "saas_add_comment_bump", "saas_toggle_issue_label", "saas_edit_issue_md_json"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "saas_create_issue_workflow",
+                    "saas_add_comment_bump",
+                    "saas_toggle_issue_label",
+                    "saas_edit_issue_md_json",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 94 {
                 let ops = ["saas_kanban_pivot", "saas_assignee_workload"];
-                (Persona::HeavyBi, ops[(rng.next() % ops.len() as u64) as usize])
+                (
+                    Persona::HeavyBi,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else {
                 (Persona::Migration, "live_migration")
             }
@@ -216,11 +354,26 @@ fn pick_task(scenario: &str, rng: &mut Rng) -> (Persona, &'static str) {
         _ => {
             // rollback_timeout_storm
             if r < 35 {
-                let ops = ["com_checkout_acid_txn", "ag_record_turn_txn", "saas_add_comment_bump"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "com_checkout_acid_txn",
+                    "ag_record_turn_txn",
+                    "saas_add_comment_bump",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 60 {
-                let ops = ["com_checkout_savepoint_abort", "ag_turn_with_savepoint", "ci_job_savepoint_abort", "wiki_savepoint_edit"];
-                (Persona::Write, ops[(rng.next() % ops.len() as u64) as usize])
+                let ops = [
+                    "com_checkout_savepoint_abort",
+                    "ag_turn_with_savepoint",
+                    "ci_job_savepoint_abort",
+                    "wiki_savepoint_edit",
+                ];
+                (
+                    Persona::Write,
+                    ops[(rng.next() % ops.len() as u64) as usize],
+                )
             } else if r < 85 {
                 (Persona::Rollback, "explicit_rollback")
             } else {
@@ -249,9 +402,121 @@ pub struct ChaosConfig {
     pub inflight_cap: usize,
     pub seconds: u64,
     pub logical_agents: u64,
+    pub session_budget: usize,
+}
+
+/// Bounded per-shard pool of reusable sessions so `workers` (up to 512) multiplex over targets
+/// with capped connection pools (e.g., MySQL's `session_budget + 4`) without ever holding
+/// connections idle across empty-queue waits or deadlocking before submitters start.
+struct SessionPoolState {
+    idle: Vec<Box<dyn Session>>,
+    created: usize,
+}
+
+struct SessionPool {
+    target: Arc<dyn Target>,
+    max_sessions: usize,
+    state: Mutex<SessionPoolState>,
+    avail: Condvar,
+}
+
+struct SessionGuard<'a> {
+    pool: &'a SessionPool,
+    session: Option<Box<dyn Session>>,
+}
+
+impl SessionPool {
+    fn new(target: Arc<dyn Target>, max_sessions: usize) -> anyhow::Result<Self> {
+        let cap = match target.max_sessions() {
+            Some(limit) => max_sessions.min(limit),
+            None => max_sessions,
+        }
+        .max(1);
+        // Probe one session up front to fail fast on broken targets, then immediately return it to
+        // `idle` so startup never pins a full pool before submitters begin.
+        let first = target.session()?;
+        Ok(Self {
+            target,
+            max_sessions: cap,
+            state: Mutex::new(SessionPoolState {
+                idle: vec![first],
+                created: 1,
+            }),
+            avail: Condvar::new(),
+        })
+    }
+
+    fn checkout(&self) -> anyhow::Result<SessionGuard<'_>> {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(session) = st.idle.pop() {
+                return Ok(SessionGuard {
+                    pool: self,
+                    session: Some(session),
+                });
+            }
+            if st.created < self.max_sessions {
+                st.created += 1;
+                drop(st);
+                match self.target.session() {
+                    Ok(session) => {
+                        return Ok(SessionGuard {
+                            pool: self,
+                            session: Some(session),
+                        });
+                    }
+                    Err(e) => {
+                        let mut st = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        st.created = st.created.saturating_sub(1);
+                        self.avail.notify_one();
+                        return Err(e);
+                    }
+                }
+            }
+            st = self
+                .avail
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !std::thread::panicking()
+            && let Some(session) = self.session.take()
+        {
+            st.idle.push(session);
+        } else {
+            self.session.take();
+            st.created = st.created.saturating_sub(1);
+        }
+        self.pool.avail.notify_one();
+    }
 }
 
 /// Runs one live multi-persona billion-agent chaos scenario across `targets` (1 or `N` shards).
+/// Computes bounded open-loop submitter thread count without panicking when callers request >32.
+fn submitter_threads(workers: usize, requested: usize) -> usize {
+    requested.max(workers / 64).clamp(2, 32)
+}
+
+/// Computes queue shard count so every shard always has at least one assigned worker.
+fn queue_shard_count(workers: usize) -> usize {
+    (workers / 4).clamp(1, 128).min(workers.max(1))
+}
+
 /// Hard cap on live OS worker threads so high-concurrency runs never exhaust macOS's kernel
 /// thread table (`kern.num_taskthreads`); billions of logical agents multiplex over these workers.
 pub const MAX_CHAOS_WORKERS: usize = 512;
@@ -265,11 +530,8 @@ pub fn run_scenario(
     let dialect = targets[0].dialect();
     let num_shards = targets.len().max(1);
     let workers = cfg.workers.clamp(4, MAX_CHAOS_WORKERS);
-    let queue_shards = (workers / 4).clamp(8, 128);
-    let effective_inflight = cfg
-        .inflight_cap
-        .max(workers.saturating_mul(4))
-        .max(1024);
+    let queue_shards = queue_shard_count(workers);
+    let effective_inflight = cfg.inflight_cap.max(workers.saturating_mul(4)).max(1024);
     let queue = Arc::new(ShardedQueue::new(queue_shards, effective_inflight));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -290,13 +552,23 @@ pub fn run_scenario(
     let write_e2e = Arc::new(Mutex::new(Hist::new()));
     let bi_svc = Arc::new(Mutex::new(Hist::new()));
 
-    // Spawn worker sessions (each holds one Session per shard so cross-shard routing is zero-open!)
+    // Build one bounded session pool per shard (default <= 64) so worker startup never blocks on
+    // capped pools (such as MySQL's 68-session pool) before submitters start pushing work.
+    let session_budget = if cfg.session_budget == 0 {
+        workers.min(64)
+    } else {
+        cfg.session_budget.clamp(1, workers)
+    };
+    let mut session_pools = Vec::with_capacity(num_shards);
+    for t in targets {
+        session_pools.push(Arc::new(SessionPool::new(t.clone(), session_budget)?));
+    }
+
+    // Spawn worker threads (each checks out a pooled session per task and releases it before
+    // waiting on the queue).
     let mut worker_handles = Vec::with_capacity(workers);
     for wid in 0..workers {
-        let mut sessions = Vec::with_capacity(num_shards);
-        for t in targets {
-            sessions.push(t.session()?);
-        }
+        let pools = session_pools.clone();
         let q = queue.clone();
         let shape = shape.clone();
         let total_ops = total_ops.clone();
@@ -334,8 +606,23 @@ pub fn run_scenario(
             };
 
             while let Some(task) = q.pop(wid) {
-                let sidx = task.shard % sessions.len();
-                let sess = &mut sessions[sidx];
+                let sidx = task.shard % pools.len();
+                let mut guard = match pools[sidx].checkout() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        total_errors.fetch_add(1, Ordering::Relaxed);
+                        let mut slot = first_error
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(format!("session checkout shard {}: {e:#}", task.shard));
+                        }
+                        continue;
+                    }
+                };
+                let Some(sess) = guard.session.as_mut() else {
+                    continue;
+                };
                 // Seed rng lightly from logical_agent_id so every logical agent hits its deterministic slice
                 rng.0 ^= mix(task.logical_agent_id);
                 let svc_t0 = Instant::now();
@@ -503,7 +790,7 @@ pub fn run_scenario(
     }
 
     // Spawn open-loop / thundering-herd fleet submitter threads multiplexing 1B+ logical agents!
-    let submitters = (workers / 64).clamp(cfg.submitters.max(2), 32);
+    let submitters = submitter_threads(workers, cfg.submitters);
     let burst_size = workers.clamp(512, 4096);
     let logical_agents = cfg.logical_agents.max(1);
     let scenario_name = scenario.to_owned();
@@ -577,11 +864,26 @@ pub fn run_scenario(
     let errs = total_errors.load(Ordering::Relaxed);
     let afails = audit_failures.load(Ordering::Relaxed);
 
-    let r_svc = read_svc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    let r_e2e = read_e2e.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    let w_svc = write_svc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    let w_e2e = write_e2e.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    let bi_h = bi_svc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let r_svc = read_svc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let r_e2e = read_e2e
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let w_svc = write_svc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let w_e2e = write_e2e
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let bi_h = bi_svc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
 
     Ok(serde_json::json!({
         "scenario": scenario,
@@ -608,4 +910,171 @@ pub fn run_scenario(
         "errors": errs,
         "first_error": first_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_p2_sharded_queue_drains_all_accepted_tasks_even_with_more_queues_than_workers() {
+        let q = Arc::new(ShardedQueue::new(8, 64));
+        for i in 0..8usize {
+            assert!(q.push(
+                i,
+                AgentTask {
+                    logical_agent_id: i as u64 + 1,
+                    shard: 0,
+                    persona: Persona::ShortRead,
+                    op: "ag_run_detail",
+                    enqueued_at: Instant::now(),
+                },
+            ));
+        }
+        q.close();
+        let completed = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for wid in 0..4usize {
+                let q = Arc::clone(&q);
+                let completed = Arc::clone(&completed);
+                s.spawn(move || {
+                    while q.pop(wid).is_some() {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(completed.load(Ordering::Relaxed), 8);
+        assert_eq!(q.inflight.load(Ordering::Relaxed), 0);
+        assert!(queue_shard_count(4) <= 4);
+    }
+
+    #[test]
+    fn review_p2_submitters_clamp_never_panics_above_32() {
+        assert_eq!(submitter_threads(4, 0), 2);
+        assert_eq!(submitter_threads(4, 1), 2);
+        assert_eq!(submitter_threads(4, 33), 32);
+        assert_eq!(submitter_threads(512, 1), 8);
+        assert_eq!(submitter_threads(512, 1000), 32);
+    }
+
+    /// Review P1 regression: chaos startup must never deadlock when `workers` exceeds a target's
+    /// capped session pool (e.g., MySQL's 68-session pool vs 512 chaos workers).
+    #[test]
+    fn review_p1_chaos_startup_never_deadlocks_on_capped_session_pool() {
+        struct CappedTarget {
+            inner: Arc<dyn Target>,
+            cap: usize,
+            in_use: Arc<(Mutex<usize>, Condvar)>,
+        }
+        struct CappedSession {
+            inner: Box<dyn Session>,
+            in_use: Arc<(Mutex<usize>, Condvar)>,
+        }
+        impl Drop for CappedSession {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.in_use;
+                let mut cur = lock.lock().unwrap();
+                *cur -= 1;
+                cv.notify_one();
+            }
+        }
+        impl Session for CappedSession {
+            fn run(
+                &mut self,
+                kind: Kind,
+                stmts: &[String],
+                params: &[Vec<P>],
+            ) -> anyhow::Result<usize> {
+                self.inner.run(kind, stmts, params)
+            }
+            fn answer(
+                &mut self,
+                stmts: &[String],
+                params: &[Vec<P>],
+            ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+                self.inner.answer(stmts, params)
+            }
+        }
+        impl Target for CappedTarget {
+            fn dialect(&self) -> Dialect {
+                self.inner.dialect()
+            }
+            fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
+                self.inner.setup(stmts)
+            }
+            fn session(&self) -> anyhow::Result<Box<dyn Session>> {
+                let (lock, cv) = &*self.in_use;
+                let mut cur = lock.lock().unwrap();
+                while *cur >= self.cap {
+                    cur = cv.wait(cur).unwrap();
+                }
+                *cur += 1;
+                drop(cur);
+                Ok(Box::new(CappedSession {
+                    inner: self.inner.session()?,
+                    in_use: Arc::clone(&self.in_use),
+                }))
+            }
+            fn max_sessions(&self) -> Option<usize> {
+                Some(self.cap)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw =
+            crate::suite_db::open("sqlite", dir.path().to_str().unwrap(), None, 4, false).unwrap();
+        let shape = Arc::new(GauntletShape::new(1, 1_000));
+        let tbls: Vec<(String, Vec<P>)> = super::super::schema::tables(Dialect::Sqlite, false)
+            .into_iter()
+            .map(|s| (s, vec![]))
+            .collect();
+        raw.setup(&tbls).unwrap();
+        super::super::loader::load_all(Dialect::Sqlite, &shape, |b| raw.setup(&b), || raw.settle())
+            .unwrap();
+        raw.ready().unwrap();
+
+        let capped: Arc<dyn Target> = Arc::new(CappedTarget {
+            inner: raw,
+            cap: 4,
+            in_use: Arc::new((Mutex::new(0), Condvar::new())),
+        });
+        let cfg = ChaosConfig {
+            workers: 24,
+            submitters: 2,
+            inflight_cap: 512,
+            seconds: 1,
+            logical_agents: 1_000,
+            session_budget: 64,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t_clone = Arc::clone(&capped);
+        let s_clone = Arc::clone(&shape);
+        std::thread::spawn(move || {
+            let _ = tx.send(run_scenario(
+                "agentic_fleet_rush",
+                &[t_clone],
+                &s_clone,
+                &cfg,
+            ));
+        });
+        let res = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("chaos startup deadlocked on capped session pool")
+            .unwrap();
+        assert!(
+            res["ops"].as_u64().unwrap_or(0) > 0,
+            "chaos must complete operations on capped pool: {res}"
+        );
+        assert_eq!(
+            res["errors"].as_u64().unwrap_or(1),
+            0,
+            "unexpected errors: {res}"
+        );
+        assert_eq!(
+            res["audit_failures"].as_u64().unwrap_or(1),
+            0,
+            "unexpected audit failures: {res}"
+        );
+    }
 }

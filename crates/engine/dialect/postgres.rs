@@ -71,11 +71,31 @@ impl PostgresDialect {
     }
 
     /// The table definition in a stored definition.
+    ///
+    /// Tables without [`super::POSTGRES_TABLE_SQL_PREFIX`] are accepted only when they are
+    /// engine-internal system tables (such as `__turso_internal_*` or `sqlite_*`). User tables
+    /// created by the SQLite dialect lack the prefix and are rejected so opening a SQLite
+    /// database under [`PostgresDialect`] fails cleanly instead of mixing dialects in one file.
     fn definition<'a>(&self, sql: &'a str) -> crate::Result<&'a str> {
-        Ok(match split_stored(sql)? {
-            Some((_, definition)) => definition,
-            None => sql,
-        })
+        match split_stored(sql)? {
+            Some((_, definition)) => Ok(definition),
+            None => {
+                let ast::Stmt::CreateTable { tbl_name, .. } =
+                    super::sqlite::parse_table_sql_ast(sql)?
+                else {
+                    return Err(LimboError::Corrupt(format!(
+                        "persisted table SQL is not CREATE TABLE: {sql}"
+                    )));
+                };
+                if crate::schema::is_system_table(tbl_name.name.as_str()) {
+                    Ok(sql)
+                } else {
+                    Err(LimboError::Corrupt(format!(
+                        "malformed database schema: table was created by the sqlite frontend: {sql}"
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -216,7 +236,8 @@ impl super::Dialect for PostgresDialect {
                 "VACUUM of a PostgreSQL table is not supported yet: replaying its definition would give it a new pg_class OID".to_string(),
             ));
         }
-        super::sqlite::table_sql_for_replay(sql)
+        let definition = self.definition(sql)?;
+        super::sqlite::table_sql_for_replay(definition)
     }
 
     /// A PostgreSQL table's OID is chosen against the tables a connection's transaction holds
@@ -663,6 +684,51 @@ mod tests {
             oid(&conn, "recovered"),
             16387,
             "gone took 16385 and checkpointed 16386, so neither comes back"
+        );
+    }
+
+    /// Review regression: opening an existing cold SQLite database with `PostgresDialect` must
+    /// reject its SQLite user tables instead of silently accepting them and allowing subsequent
+    /// PostgreSQL DDL to corrupt reopening under `SqliteDialect`.
+    #[test]
+    fn review_postgres_opener_rejects_cold_sqlite_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sqlite-user.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        {
+            let db =
+                Database::open_file(io.clone(), path_str, Arc::new(crate::SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (1, 'hello')")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let err = match Database::open_file(io.clone(), path_str, Arc::new(PostgresDialect::new()))
+        {
+            Ok(_) => panic!("PostgresDialect must reject a cold SQLite database with user tables"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("table was created by the sqlite frontend"),
+            "unexpected error opening SQLite database with PostgresDialect: {err}"
+        );
+
+        // The original SQLite database must still reopen cleanly under SqliteDialect.
+        let reopened = Database::open_file(io, path_str, Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        let rows = query(&conn, "SELECT id, label FROM items");
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::from_i64(1),
+                Value::from_text("hello".to_string())
+            ]]
         );
     }
 }

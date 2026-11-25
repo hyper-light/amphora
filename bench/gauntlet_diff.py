@@ -129,16 +129,26 @@ def main() -> int:
         ratios = []
         errs = []
         unsup = []
+        checked_ops = 0
         for op, cv in c_ops.items():
             if cv.get("status") == "unsupported":
                 unsup.append(op)
                 continue
+            checked_ops += 1
             if cv.get("errors", 0) > 0:
                 errs.append((op, cv.get("first_error")))
                 continue
             rv = r_ops.get(op)
+            if rv and rv.get("iters", 0) > 0 and cv.get("iters", 0) == 0:
+                errs.append((op, "candidate ran 0 successful iterations while reference succeeded"))
+                continue
             if rv and rv.get("ops_per_s", 0) > 0 and cv.get("ops_per_s", 0) > 0:
                 ratios.append((cv["ops_per_s"] / rv["ops_per_s"], op, cv["domain"], cv["ops_per_s"], rv["ops_per_s"]))
+        for op, rv in r_ops.items():
+            if rv.get("status") == "unsupported":
+                continue
+            if op not in c_ops:
+                errs.append((op, "missing from candidate named ops"))
         ratios.sort(key=lambda x: x[0])
         reported_named_failed = cand.get("named", {}).get("failed", 0)
         print(f"[3] Named Ops: passed={cand.get('named', {}).get('passed')} failed={max(len(errs), reported_named_failed)} unsupported={len(unsup)}")
@@ -156,24 +166,54 @@ def main() -> int:
         if errs or reported_named_failed > 0:
             exit_code = 1
 
-        # 4. Oracles
+        # 4. Oracles (require every reference oracle to be present and passing in candidate)
+        r_oracles = ref.get("oracles") or {}
+        c_oracles = cand.get("oracles") or {}
+        checked_oracles = 0
         print("[4] Anti-Gaming Oracles:")
-        for oname, ov in cand.get("oracles", {}).items():
+        if r_oracles and not c_oracles:
+            print("  FAIL  candidate omitted all oracles present in reference")
+            exit_code = 1
+        for oname in sorted(set(r_oracles) | set(c_oracles)):
+            checked_oracles += 1
+            if oname not in c_oracles:
+                print(f"  FAIL  {oname}: missing from candidate")
+                exit_code = 1
+                continue
+            ov = c_oracles[oname]
             ok = ov.get("passed", False)
             print(f"  {'PASS' if ok else 'FAIL'}  {oname}")
             if not ok:
                 print(f"        details: {ov.get('details')}")
                 exit_code = 1
 
-        # 5. Billions-of-Agents Chaos
-        chaos = cand.get("chaos", [])
-        if chaos:
+        # 5. Billions-of-Agents Chaos (require every reference scenario to be present and passing)
+        r_chaos_list = ref.get("chaos") or []
+        c_chaos_list = cand.get("chaos") or []
+        r_chaos = {sc["scenario"]: sc for sc in r_chaos_list if isinstance(sc, dict) and "scenario" in sc}
+        c_chaos = {sc["scenario"]: sc for sc in c_chaos_list if isinstance(sc, dict) and "scenario" in sc}
+        checked_chaos = 0
+        if r_chaos or c_chaos:
             print("[5] Billions-of-Agents Concurrent Chaos:")
-            for sc in chaos:
+            if r_chaos and not c_chaos:
+                print("  FAIL  candidate omitted all chaos scenarios present in reference")
+                exit_code = 1
+            for sname in sorted(set(r_chaos) | set(c_chaos)):
+                checked_chaos += 1
+                if sname not in c_chaos:
+                    print(f"  FAIL  {sname}: missing from candidate")
+                    exit_code = 1
+                    continue
+                sc = c_chaos[sname]
                 r_p99 = (sc.get("short_read_service_ms") or {}).get("p99")
                 re_p99 = (sc.get("short_read_e2e_ms") or {}).get("p99")
                 w_p99 = (sc.get("write_service_ms") or {}).get("p99")
-                ok = sc.get("errors", 0) == 0 and sc.get("audit_failures", 0) == 0
+                ref_ops = (r_chaos.get(sname) or {}).get("ops", 0)
+                ok = (
+                    sc.get("errors", 0) == 0
+                    and sc.get("audit_failures", 0) == 0
+                    and (ref_ops == 0 or sc.get("ops", 0) > 0)
+                )
                 print(
                     f"  {'PASS' if ok else 'FAIL'}  {sc['scenario']:26s} "
                     f"ops/s={sc['ops_per_s']:8.1f} read_p99={r_p99}ms (e2e={re_p99}ms) "
@@ -182,6 +222,10 @@ def main() -> int:
                 if not ok:
                     print(f"        err={sc.get('first_error')} audit_fail={sc.get('first_audit_failure')}")
                     exit_code = 1
+
+        if checked_named + checked_par + checked_ops + checked_oracles + checked_chaos == 0:
+            print("  FAIL  candidate report contained zero verifiable evidence")
+            exit_code = 1
 
     return exit_code
 

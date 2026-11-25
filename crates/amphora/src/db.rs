@@ -112,24 +112,42 @@ pub fn default_pages(memory: Option<u64>) -> usize {
         .max(MIN_PROCESS_PAGES)
 }
 
-/// PostgreSQL's documented default `maintenance_work_mem` (64 MiB), expressed in 4 KiB pages:
-/// caps a single writer's private page cache so large-RAM hosts do not accumulate unbounded
-/// flushed append pages instead of recycling page buffers through the buffer pool.
-const MAX_WRITER_PAGES: usize = (64 * 1024 * 1024) / 4096;
+/// Minimum byte budget for a single writer's private page cache (`MIN_PROCESS_PAGES` at 4 KiB =
+/// 16 MiB).
+const MIN_WRITER_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The pages a database's single writer keeps at most, derived from the process's memory budget:
-/// one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`] (1/16th of memory), bounded between
-/// [`MIN_PROCESS_PAGES`] (16 MiB) and PostgreSQL's `maintenance_work_mem` default (64 MiB) so
-/// sustained append workloads recycle clean flushed pages instead of growing the writer heap
-/// without bound.
+/// PostgreSQL's documented default `maintenance_work_mem` (64 MiB): caps a single writer's private
+/// page cache in bytes regardless of the database's `page_size` so large-page (e.g. 64 KiB)
+/// databases never receive an oversized cache ceiling.
+const MAX_WRITER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The pages a database's single writer keeps at most for a database with `page_bytes`-byte pages,
+/// derived from the process's memory budget: one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`]
+/// (1/16th of memory), bounded in bytes between [`MIN_WRITER_BYTES`] (16 MiB) and
+/// [`MAX_WRITER_BYTES`] (64 MiB) so sustained append workloads recycle clean flushed pages instead
+/// of growing the writer heap without bound, even on 64 KiB-page databases.
+#[must_use]
+pub fn writer_pages_for(memory: Option<u64>, page_bytes: u64) -> i64 {
+    let page_bytes = page_bytes.max(512);
+    let divisor = MEMORY_SHARE_DIVISOR.saturating_mul(MEMORY_SHARE_DIVISOR);
+    let target_bytes = match memory {
+        Some(bytes) => bytes.checked_div(divisor).unwrap_or(0),
+        None => u64::try_from(UNKNOWN_MEMORY_PAGES)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(PAGE_BYTES)
+            .checked_div(MEMORY_SHARE_DIVISOR)
+            .unwrap_or(0),
+    }
+    .clamp(MIN_WRITER_BYTES, MAX_WRITER_BYTES);
+    let pages = target_bytes.checked_div(page_bytes).unwrap_or(1).max(1);
+    i64::try_from(pages).unwrap_or(i64::MAX)
+}
+
+/// The pages a database's single writer keeps at most at the engine's default 4 KiB
+/// [`PAGE_BYTES`].
 #[must_use]
 pub fn writer_pages(memory: Option<u64>) -> i64 {
-    let divisor = usize::try_from(MEMORY_SHARE_DIVISOR).unwrap_or(4);
-    let pages = default_pages(memory)
-        .checked_div(divisor)
-        .unwrap_or(0)
-        .clamp(MIN_PROCESS_PAGES, MAX_WRITER_PAGES);
-    i64::try_from(pages).unwrap_or(i64::MAX)
+    writer_pages_for(memory, PAGE_BYTES)
 }
 
 fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
@@ -280,22 +298,41 @@ fn log_kept() -> u64 {
 }
 
 impl Db {
+    fn is_postgres_dialect_error_msg(msg: &str) -> bool {
+        msg.contains("table was created by the postgres frontend")
+            || msg.contains("database was created by the postgres frontend")
+            || msg.contains("database is already open with dialect 'postgres'")
+    }
+
+    fn is_postgres_dialect_error(err: &LimboError) -> bool {
+        Self::is_postgres_dialect_error_msg(&err.to_string())
+    }
+
     /// Read-only source inspection. This opens no directories, creates no database, and executes
-    /// no writable connection PRAGMAs. The caller owns the product's external lease.
+    /// no writable connection PRAGMAs. Supports both SQLite-dialect and PostgreSQL-dialect source
+    /// databases. The caller owns the product's external lease.
     pub(crate) fn open_readonly(path: &Path) -> anyhow::Result<Self> {
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the database path is not UTF-8"))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
-        // Do not let a registry hit substitute a writable engine for this inspection handle.
-        let db = Database::do_open(
-            Arc::clone(&io),
-            name,
-            OpenOptions::new(Arc::new(SqliteDialect))
-                .flags(OpenFlags::ReadOnly)
-                .db_opts(DatabaseOpts::new().with_without_rowid(true)),
-        )
-        .map_err(fail)?;
+        let open_with = |dialect: Arc<dyn Dialect>| {
+            // Do not let a registry hit substitute a writable engine for this inspection handle.
+            Database::do_open(
+                Arc::clone(&io),
+                name,
+                OpenOptions::new(dialect)
+                    .flags(OpenFlags::ReadOnly)
+                    .db_opts(DatabaseOpts::new().with_without_rowid(true)),
+            )
+        };
+        let db = match open_with(Arc::new(SqliteDialect)) {
+            Ok(db) => db,
+            Err(err) if Self::is_postgres_dialect_error(&err) => {
+                open_with(Arc::new(PostgresDialect::new())).map_err(fail)?
+            }
+            Err(err) => return Err(fail(err)),
+        };
         let conn = connect(&db).map_err(fail)?;
         conn.set_statement_journals(false);
         Ok(Self {
@@ -309,6 +346,70 @@ impl Db {
             log_kept: log_kept(),
             backup: None,
         })
+    }
+
+    /// Opens an existing database file without requiring the caller to know beforehand whether its
+    /// schema was created by `SqliteDialect` or `PostgresDialect` (used by standalone/replicated
+    /// ownership, backup replay, and restore-and-check verification).
+    pub(crate) fn open_existing_sharing(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
+        match Self::open_sharing(path, sharing) {
+            Ok(db) => Ok(db),
+            Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
+                Self::open_postgres_sharing(path, sharing)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// [`Db::open_existing_sharing`] in a directory that exists: it creates no directories,
+    /// preserving guarded-owner directory protection while supporting both SQLite-dialect and
+    /// PostgreSQL-dialect database files.
+    pub(crate) fn open_existing_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
+        match Self::open_made(path, sharing) {
+            Ok(db) => Ok(db),
+            Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
+                Self::open_postgres_made(path, sharing)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Opens an existing database on `io`, falling back to [`PostgresDialect`] when the database
+    /// header, schema, or live registry entry identifies PostgreSQL.
+    #[cfg(test)]
+    pub(crate) fn open_existing_with(path: &Path, io: Arc<dyn IO>) -> anyhow::Result<Self> {
+        match Self::open_with_dialect(
+            path,
+            Arc::clone(&io),
+            &Sharing::Off,
+            Arc::new(SqliteDialect),
+        ) {
+            Ok(db) => Ok(db),
+            Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
+                Self::open_with_dialect(path, io, &Sharing::Off, Arc::new(PostgresDialect::new()))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// True when this database was opened with [`PostgresDialect`].
+    pub(crate) fn is_postgres(&self) -> bool {
+        self.db.dialect().name() == "postgres"
+    }
+
+    /// Parses a persisted `sqlite_schema` table definition using this database's own SQL dialect.
+    pub(crate) fn parse_table_sql_ast(
+        &self,
+        sql: &str,
+    ) -> anyhow::Result<amphora_engine_parser::ast::Stmt> {
+        self.db.dialect().parse_table_sql_ast(sql).map_err(fail)
+    }
+
+    /// Weak handle to the underlying engine [`Database`], used by tests and cold-reopen oracles to
+    /// prove an old engine instance was fully torn down before reopening from disk.
+    #[must_use]
+    pub fn database_weak(&self) -> std::sync::Weak<Database> {
+        Arc::downgrade(&self.db)
     }
 
     /// Bound SQL VM work by the request's absolute deadline without `Arc` reference-count traffic.
@@ -379,6 +480,11 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        Self::open_postgres_made(path, sharing)
+    }
+
+    /// [`Db::open_postgres_sharing`] in a directory that exists: it makes none.
+    pub(crate) fn open_postgres_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
         in_place(&wal_path(path));
         Self::open_with_dialect(
@@ -455,7 +561,8 @@ impl Db {
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
-        let writer_cache = writer_pages(crate::memory::limit());
+        let page_bytes = d.page_bytes()?;
+        let writer_cache = writer_pages_for(crate::memory::limit(), page_bytes);
         d.exec(&format!("PRAGMA cache_size = {writer_cache}"))?;
         // A commit logs its pages' changes (docs/design/store.md, decision 37).
         d.log_format(LogFormat::Mixed)?;
@@ -474,6 +581,18 @@ impl Db {
     /// Keeps `pages` of the database in this connection's memory.
     pub fn keep_pages(&self, pages: i64) -> anyhow::Result<()> {
         self.exec(&format!("PRAGMA cache_size = {pages}"))
+    }
+
+    /// This database's page size in bytes (`PRAGMA page_size`), read without inserting into the
+    /// prepared-statement cache.
+    fn page_bytes(&self) -> anyhow::Result<u64> {
+        let mut stmt = self.conn.prepare("PRAGMA page_size").map_err(fail)?;
+        let mut bytes = None;
+        step(self.io.as_ref(), &mut stmt, [], |row| {
+            bytes = Some(u64::try_from(row.get::<i64>(0).map_err(fail)?).unwrap_or(PAGE_BYTES));
+            Ok(false)
+        })?;
+        Ok(bytes.unwrap_or(PAGE_BYTES))
     }
 
     /// This connection's page cache as `PRAGMA cache_size` states it: pages, or KiB when negative.
@@ -929,6 +1048,20 @@ impl Db {
         result
     }
 
+    /// Executes Amphora's internal `__amphora_*` catalog DDL against either SQLite-dialect or
+    /// PostgreSQL-dialect databases (translating SQLite's `BLOB` column type token to PostgreSQL's
+    /// `BYTEA` when this database uses [`PostgresDialect`], leaving SQLite schemas byte-identical).
+    pub(crate) fn exec_internal(&self, sql: &str) -> anyhow::Result<()> {
+        if !self.is_postgres() {
+            return self.exec(sql);
+        }
+        let rewritten = sql
+            .replace(" BLOB ", " BYTEA ")
+            .replace(" BLOB,", " BYTEA,")
+            .replace(" BLOB)", " BYTEA)");
+        self.exec(&rewritten)
+    }
+
     /// [`Db::exec`] of an online schema change's own statement (CP-T1.12): the engine lets only
     /// the change's own `ALTER COLUMN` redefine a column it holds. The mark is off again however
     /// the statement ends.
@@ -1294,6 +1427,8 @@ impl Db {
     ) -> anyhow::Result<R> {
         self.statements.clear()?;
         self.ensure_unfenced()?;
+        let prev_dialect = self.db.dialect();
+        let mut switched_dialect = false;
         self.conn.wal_insert_begin().map_err(fail)?;
         let result = (|| {
             let mut frame_no = self.conn.wal_state().map_err(fail)?.max_frame;
@@ -1315,7 +1450,27 @@ impl Db {
                 frame.extend_from_slice(bytes);
                 self.conn.wal_insert_frame(frame_no, &frame).map_err(fail)?;
             }
-            self.conn.reparse_unpublished_schema().map_err(fail)?;
+            // When installing a raw image (baseline seed or snapshot) whose page 1 carries a
+            // persisted PostgreSQL OID counter, switch an empty SQLite follower to PostgreSQL
+            // before reparsing the catalog and creating internal `__amphora_*` tables.
+            if let Some((_, page1)) = pages.iter().find(|(pgno, _)| *pgno == 1) {
+                let pg_next_oid = amphora_engine::header_pg_next_oid(page1).unwrap_or(0);
+                if pg_next_oid != 0 {
+                    let pg = Arc::new(PostgresDialect::new());
+                    pg.load_next_oid(pg_next_oid);
+                    self.db.set_dialect(pg);
+                    switched_dialect = true;
+                }
+            }
+            match self.conn.reparse_unpublished_schema() {
+                Ok(()) => {}
+                Err(ref err) if !switched_dialect && Self::is_postgres_dialect_error(err) => {
+                    self.db.set_dialect(Arc::new(PostgresDialect::new()));
+                    switched_dialect = true;
+                    self.conn.reparse_unpublished_schema().map_err(fail)?;
+                }
+                Err(err) => return Err(fail(err)),
+            }
             finish(self)
         })();
         match result {
@@ -1332,6 +1487,9 @@ impl Db {
             }
             Err(error) => {
                 self.conn.wal_insert_end(false).map_err(fail)?;
+                if switched_dialect {
+                    self.db.set_dialect(prev_dialect);
+                }
                 self.conn.force_reparse_schema().map_err(fail)?;
                 self.statements.clear()?;
                 Err(error)
@@ -2038,7 +2196,7 @@ mod tests {
         assert!(default_pages(Some(u64::MAX)) >= MIN_PROCESS_PAGES);
         assert_eq!(
             writer_pages(Some(32 << 30)),
-            i64::try_from(MAX_WRITER_PAGES).unwrap()
+            i64::try_from(MAX_WRITER_BYTES / PAGE_BYTES).unwrap()
         );
         assert_eq!(
             writer_pages(Some(16 << 20)),
@@ -2046,7 +2204,39 @@ mod tests {
         );
         assert_eq!(
             writer_pages(None),
-            i64::try_from((UNKNOWN_MEMORY_PAGES / 4).min(MAX_WRITER_PAGES)).unwrap()
+            i64::try_from(
+                (UNKNOWN_MEMORY_PAGES / 4)
+                    .min(usize::try_from(MAX_WRITER_BYTES / PAGE_BYTES).unwrap())
+            )
+            .unwrap()
+        );
+        // 64 KiB-page databases stay capped at 64 MiB (1,024 pages), never 1 GiB (16,384 pages).
+        assert_eq!(writer_pages_for(Some(32 << 30), 65_536), 1024);
+        assert_eq!(writer_pages_for(Some(16 << 20), 65_536), 256);
+    }
+
+    /// Review regression: opening a 64 KiB-page database must size the writer's `PRAGMA cache_size`
+    /// against its actual `page_size` so its ceiling stays at 64 MiB (<= 1,024 pages), not 1 GiB.
+    #[test]
+    fn review_64k_page_database_keeps_64_mib_writer_cache_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page64k.db");
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.exec("PRAGMA page_size = 65536").unwrap();
+            db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.exec("INSERT INTO items VALUES (1, 'ok')").unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.page_bytes().unwrap(), 65_536);
+        let cache = reopened.cache_pages().unwrap();
+        assert!(
+            cache > 0 && cache <= 1024,
+            "64 KiB-page writer cache_size must be <= 1024 pages (64 MiB), got {cache} pages ({} MiB)",
+            cache.saturating_mul(65_536) / (1024 * 1024)
         );
     }
 

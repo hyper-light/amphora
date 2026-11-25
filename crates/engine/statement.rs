@@ -304,14 +304,24 @@ pub(crate) fn plan_sql(
     origin: StatementOrigin,
     prepare_options: &PrepareOptions,
 ) -> Result<vdbe::Program> {
-    let schema = conn.schema.read().clone();
-    plan_sql_on(conn, pager, sql, mode, origin, prepare_options, schema)
+    let (schema, prepare_context) = conn.snapshot_schema_and_prepare_context();
+    plan_sql_on(
+        conn,
+        pager,
+        sql,
+        mode,
+        origin,
+        prepare_options,
+        schema,
+        prepare_context,
+    )
 }
 
 /// A statement's SQL parsed and planned on `conn` with `prepare_options`, on `schema` (its
 /// statistics with it, `Schema::analyze_stats`): the exact search that follows a fast plan plans
 /// on the schema the fast plan was made on, taken as the request was handed off and never changed
 /// after (`background_search::SearchRequest::run`, lanes pl8-17 and pl8-18).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_sql_on(
     conn: &Arc<Connection>,
     pager: Arc<Pager>,
@@ -320,6 +330,7 @@ pub(crate) fn plan_sql_on(
     origin: StatementOrigin,
     prepare_options: &PrepareOptions,
     schema: Arc<crate::schema::Schema>,
+    prepare_context: crate::vdbe::PrepareContext,
 ) -> Result<vdbe::Program> {
     let (cmd, _) = conn.parse_sql(sql)?;
     let Some(cmd) = cmd else {
@@ -341,6 +352,7 @@ pub(crate) fn plan_sql_on(
         sql,
         origin,
         prepare_options,
+        prepare_context,
     )
 }
 
@@ -542,10 +554,12 @@ impl Statement {
         // statement's own thread, as the fast plan was made: the schema and its statistics, never
         // changed after, and the generation of the connection's settings, which the plan must
         // still match when the statement takes it (`take_exact_plan`).
+        let (schema, prepare_context) = conn.snapshot_schema_and_prepare_context();
         let request = crate::background_search::SearchRequest {
             conn: Arc::downgrade(&conn),
-            schema: conn.schema.read().clone(),
-            generation: conn.prepare_context_generation(),
+            schema,
+            generation: prepare_context.generation(),
+            prepare_context,
             pager: self.pager.clone(),
             sql: self.program.sql.clone(),
             mode: self.query_mode,
@@ -2072,6 +2086,7 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         if self.clean_reset && matches!(self.state.execution_state, ProgramExecutionState::Init) {
+            self.state.n_change.store(0, Ordering::SeqCst);
             return Ok(());
         }
         self.close_custom_run();
@@ -3189,5 +3204,24 @@ mod tests {
             stmt.stmt_status(StatementStatusCounter::Reprepare) >= 1,
             "Init-gated schema/prepare-context check must trigger reprepare after reset()"
         );
+    }
+
+    /// Review Spec P3 regression: `Statement::reset()` must clear `n_change` even when taking the
+    /// `clean_reset && Init` fast shortcut after `set_n_change(...)`.
+    #[test]
+    fn review_p3_statement_reset_clears_earlier_n_change() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        stmt.set_n_change(7);
+        stmt.reset().unwrap();
+        assert_eq!(stmt.n_change(), 0, "reset() must clear n_change to 0");
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(
+            conn.changes(),
+            1,
+            "changes() after reset() + one insert must be 1, not 8"
+        );
+        assert_eq!(stmt.n_change(), 1);
     }
 }

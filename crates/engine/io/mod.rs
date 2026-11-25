@@ -327,6 +327,19 @@ pub trait File: Send + Sync {
     }
 }
 
+/// Removes a temporary file from its owning `IO` backend (both filesystem unlink and `MemoryIO`
+/// path-registry eviction) when dropped, after the file handle itself has already closed.
+struct RemoveOnDrop {
+    io: Arc<dyn IO>,
+    path: String,
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = self.io.remove_file(&self.path);
+    }
+}
+
 /// File wrapper for ephemeral B-trees that defers creating a temporary directory and opening an OS
 /// file descriptor until the first write/non-zero truncate (when pages actually spill past the
 /// ephemeral `PageCache`). Small in-memory ephemeral tables (`IN`, `UNION`, `WITH RECURSIVE`,
@@ -335,42 +348,30 @@ pub trait File: Send + Sync {
 /// concurrent reader connections.
 #[cfg(all(not(target_family = "wasm"), feature = "fs"))]
 struct LazyTempOpened {
-    // Declared before `_temp_dir` so the file closes before Windows removes its directory.
+    // Field order guarantees: (1) file handle closes, (2) `io.remove_file` evicts from MemoryIO /
+    // unlinks on disk, (3) `_temp_dir` removes the directory (safe on Windows too).
     file: Arc<dyn File>,
     #[allow(dead_code, reason = "held for its Drop side effect")]
-    _temp_dir: Option<tempfile::TempDir>,
+    _remove_on_drop: RemoveOnDrop,
+    #[allow(dead_code, reason = "held for its Drop side effect")]
+    _temp_dir: tempfile::TempDir,
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "fs"))]
 struct LazyTempFile {
     io: Arc<dyn IO>,
-    allow_memory_fallback: bool,
     opened: std::sync::OnceLock<LazyTempOpened>,
     init_lock: crate::sync::Mutex<()>,
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "fs"))]
 impl LazyTempFile {
-    fn new(io: Arc<dyn IO>, allow_memory_fallback: bool) -> Self {
+    fn new(io: Arc<dyn IO>) -> Self {
         Self {
             io,
-            allow_memory_fallback,
             opened: std::sync::OnceLock::new(),
             init_lock: crate::sync::Mutex::new(()),
         }
-    }
-
-    fn open_disk(&self) -> Result<LazyTempOpened> {
-        let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
-        let path = temp_dir.as_ref().join("tursodb_temp_file");
-        let path_str = path.to_str().ok_or_else(|| {
-            crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
-        })?;
-        let file = self.io.open_file(path_str, OpenFlags::Create, false)?;
-        Ok(LazyTempOpened {
-            file,
-            _temp_dir: Some(temp_dir),
-        })
     }
 
     fn ensure_open(&self) -> Result<&Arc<dyn File>> {
@@ -381,19 +382,23 @@ impl LazyTempFile {
         if let Some(opened) = self.opened.get() {
             return Ok(&opened.file);
         }
-        let opened = match self.open_disk() {
-            Ok(disk) => disk,
-            Err(_) if self.allow_memory_fallback => {
-                let memory_io = Arc::new(MemoryIO::new());
-                let file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                LazyTempOpened {
-                    file,
-                    _temp_dir: None,
-                }
-            }
-            Err(err) => return Err(err),
-        };
-        let _ = self.opened.set(opened);
+        let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+        let path = temp_dir.as_ref().join("tursodb_temp_file");
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+            })?
+            .to_owned();
+        let file = self.io.open_file(&path_str, OpenFlags::Create, false)?;
+        let _ = self.opened.set(LazyTempOpened {
+            file,
+            _remove_on_drop: RemoveOnDrop {
+                io: Arc::clone(&self.io),
+                path: path_str,
+            },
+            _temp_dir: temp_dir,
+        });
         self.opened
             .get()
             .map(|o| &o.file)
@@ -477,9 +482,7 @@ impl File for LazyTempFile {
     }
 
     fn is_open_disk_file(&self) -> bool {
-        self.opened
-            .get()
-            .is_some_and(|opened| opened._temp_dir.is_some())
+        self.opened.get().is_some()
     }
 }
 
@@ -487,18 +490,18 @@ pub struct TempFile {
     pub(crate) file: Arc<dyn File>,
     /// True when backed by (or lazily backed by) a filesystem temp file rather than `MemoryIO`.
     disk_backed: bool,
+    /// Removes the temp file from `io` (evicting `MemoryIO` entries and unlinking on disk) after
+    /// `file` closes and before `temp_dir` removes the directory.
+    #[allow(dead_code, reason = "held for its Drop side effect")]
+    _remove_on_drop: Option<RemoveOnDrop>,
     /// When temp_dir is dropped the folder is deleted
     /// set to None if tempfile allocated in memory (for example, in case of WASM target)
-    /// Declared after `file` so the file closes before Windows removes its directory.
+    /// Declared after `file` and `_remove_on_drop` so the file closes before Windows removes its directory.
     #[allow(dead_code, reason = "held for its Drop side effect")]
     temp_dir: Option<tempfile::TempDir>,
 }
 
 impl TempFile {
-    pub(crate) fn is_disk_backed(&self) -> bool {
-        self.disk_backed
-    }
-
     /// True when this temp file currently holds an open OS file descriptor on disk.
     pub(crate) fn has_open_disk_fd(&self) -> bool {
         self.disk_backed && self.file.is_open_disk_file()
@@ -509,14 +512,23 @@ impl TempFile {
         {
             let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
             let chunk_file_path = temp_dir.as_ref().join("tursodb_temp_file");
-            let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
-                crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
-            })?;
-            let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
+            let chunk_file_path_str = chunk_file_path
+                .to_str()
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "temp file path is not valid UTF-8".to_string(),
+                    )
+                })?
+                .to_owned();
+            let chunk_file = io.open_file(&chunk_file_path_str, OpenFlags::Create, false)?;
             Ok(TempFile {
                 disk_backed: true,
+                _remove_on_drop: Some(RemoveOnDrop {
+                    io: Arc::clone(io),
+                    path: chunk_file_path_str,
+                }),
                 temp_dir: Some(temp_dir),
-                file: chunk_file.clone(),
+                file: chunk_file,
             })
         }
         // on WASM in browser we do not support temp files (as we pre-register db files in advance and can't easily create a new one)
@@ -529,6 +541,7 @@ impl TempFile {
             let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
             Ok(TempFile {
                 disk_backed: false,
+                _remove_on_drop: None,
                 temp_dir: None,
                 file: memory_file,
             })
@@ -550,6 +563,7 @@ impl TempFile {
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                 Ok(TempFile {
                     disk_backed: false,
+                    _remove_on_drop: None,
                     temp_dir: None,
                     file: memory_file,
                 })
@@ -562,6 +576,7 @@ impl TempFile {
                         memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                     return Ok(TempFile {
                         disk_backed: false,
+                        _remove_on_drop: None,
                         temp_dir: None,
                         file: memory_file,
                     });
@@ -585,10 +600,10 @@ impl TempFile {
         #[cfg(all(not(target_family = "wasm"), feature = "fs"))]
         {
             if !matches!(temp_store, crate::TempStore::Memory) {
-                let allow_memory_fallback = matches!(temp_store, crate::TempStore::Default);
                 return Ok(TempFile {
-                    file: Arc::new(LazyTempFile::new(Arc::clone(io), allow_memory_fallback)),
+                    file: Arc::new(LazyTempFile::new(Arc::clone(io))),
                     disk_backed: true,
+                    _remove_on_drop: None,
                     temp_dir: None,
                 });
             }
@@ -606,7 +621,7 @@ mod lazy_temp_file_tests {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         // Opening 512 lazy temp files must succeed even under macOS's 256-FD soft limit.
         let handles: Vec<Arc<LazyTempFile>> = (0..512)
-            .map(|_| Arc::new(LazyTempFile::new(Arc::clone(&io), true)))
+            .map(|_| Arc::new(LazyTempFile::new(Arc::clone(&io))))
             .collect();
         for h in &handles {
             assert!(!h.is_opened());
@@ -674,6 +689,149 @@ mod lazy_temp_file_tests {
             kept.push(stmt);
         }
         assert_eq!(kept.len(), 300);
+    }
+
+    /// Review P1 regression: a failed disk temp-file open must propagate the I/O error rather than
+    /// silently falling back to heap-backed `MemoryIO` behind the memory budget.
+    #[test]
+    fn review_p1_lazy_temp_file_propagates_disk_open_error_without_heap_fallback() {
+        struct FailOpenIO;
+        impl Clock for FailOpenIO {
+            fn current_time_monotonic(&self) -> clock::MonotonicInstant {
+                clock::DefaultClock.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> clock::WallClockInstant {
+                clock::DefaultClock.current_time_wall_clock()
+            }
+        }
+        impl IO for FailOpenIO {
+            fn open_file(
+                &self,
+                _path: &str,
+                _flags: OpenFlags,
+                _direct: bool,
+            ) -> Result<Arc<dyn File>> {
+                Err(crate::error::io_error(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected EMFILE"),
+                    "open",
+                ))
+            }
+            fn remove_file(&self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn step(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let io: Arc<dyn IO> = Arc::new(FailOpenIO);
+        let tf = TempFile::lazy_with_temp_store(&io, crate::TempStore::Default).unwrap();
+        let buf = Arc::new(Buffer::new_temporary(64));
+        let err = tf.pwrite(0, buf, Completion::new_write(|_| {}));
+        assert!(
+            err.is_err(),
+            "failed disk spill open must propagate error instead of allocating unbounded heap MemoryIO"
+        );
+    }
+
+    /// Review P1 regression: large ephemeral B-tree spills backed by `MemoryIO` must remove their
+    /// temporary files from `MemoryIO`'s path registry when their statements drop so spilled bytes
+    /// do not outlive the statement or remain reopenable on the connection's `IO` backend.
+    #[test]
+    fn review_p1_memory_io_temp_files_are_removed_from_registry_on_drop() {
+        struct RecordingMemoryIO {
+            inner: Arc<MemoryIO>,
+            opened_paths: crate::sync::Mutex<Vec<String>>,
+        }
+        impl Clock for RecordingMemoryIO {
+            fn current_time_monotonic(&self) -> clock::MonotonicInstant {
+                self.inner.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> clock::WallClockInstant {
+                self.inner.current_time_wall_clock()
+            }
+        }
+        impl IO for RecordingMemoryIO {
+            fn open_file(
+                &self,
+                path: &str,
+                flags: OpenFlags,
+                direct: bool,
+            ) -> Result<Arc<dyn File>> {
+                if path.contains("tursodb_temp_file") {
+                    self.opened_paths.lock().push(path.to_owned());
+                }
+                self.inner.open_file(path, flags, direct)
+            }
+            fn remove_file(&self, path: &str) -> Result<()> {
+                self.inner.remove_file(path)
+            }
+            fn step(&self) -> Result<()> {
+                self.inner.step()
+            }
+        }
+
+        let mem = Arc::new(MemoryIO::new());
+        let rec = Arc::new(RecordingMemoryIO {
+            inner: Arc::clone(&mem),
+            opened_paths: crate::sync::Mutex::new(Vec::new()),
+        });
+        let io: Arc<dyn IO> = rec.clone();
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE big(id INTEGER PRIMARY KEY, pad TEXT)")
+            .unwrap();
+        // Force ephemeral B-tree spill past the 2000-page default cache (~8 MiB): 4,300 rows of
+        // ~3 KiB each (~13 MiB) across two separate UNION queries on the same connection.
+        conn.execute("BEGIN").unwrap();
+        let pad = "a".repeat(3000);
+        let mut ins = conn
+            .prepare("INSERT INTO big(id, pad) VALUES (?1, ?2)")
+            .unwrap();
+        for i in 1..=4_300i64 {
+            ins.reset().unwrap();
+            ins.bind_at(
+                std::num::NonZero::new(1).unwrap(),
+                crate::Value::from_i64(i),
+            )
+            .unwrap();
+            ins.bind_at(
+                std::num::NonZero::new(2).unwrap(),
+                crate::Value::from_text(format!("{i:06}-{pad}")),
+            )
+            .unwrap();
+            while !matches!(ins.step().unwrap(), crate::StepResult::Done) {}
+        }
+        drop(ins);
+        conn.execute("COMMIT").unwrap();
+
+        for run in 0..2 {
+            let sql = format!(
+                "SELECT id, pad FROM big WHERE id > {run} UNION SELECT id + 10000, pad FROM big WHERE id > {run}"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut count = 0usize;
+            while matches!(stmt.step().unwrap(), crate::StepResult::Row) {
+                count += 1;
+            }
+            assert!(count >= 8_000, "expected spilled UNION rows, got {count}");
+            drop(stmt);
+        }
+
+        let paths = rec.opened_paths.lock().clone();
+        assert!(
+            paths.len() >= 2,
+            "expected at least 2 spilled temp files on MemoryIO, saw {}",
+            paths.len()
+        );
+        for path in &paths {
+            let reopened = mem.open_file(path, OpenFlags::None, false);
+            assert!(
+                reopened.is_err(),
+                "spilled MemoryIO temp file {path} remained registered after statement drop"
+            );
+        }
     }
 }
 

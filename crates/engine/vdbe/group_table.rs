@@ -78,6 +78,11 @@ pub struct GroupTable {
     slots: Vec<u32>,
     bytes: usize,
     budget: usize,
+    /// Set once any new group is refused for exceeding `budget`; thereafter no
+    /// new groups are admitted so a group whose first row spilled (e.g. wider
+    /// non-key payload or longer collation-equal key) cannot also be inserted
+    /// into the hash table by a smaller later row and emitted twice.
+    spilled: bool,
     /// The group the last find loaded, for its save.
     current: Option<u32>,
     /// The groups in output order, once sorted, and the next to drain.
@@ -99,6 +104,7 @@ impl GroupTable {
             slots: Vec::new(),
             bytes: 0,
             budget,
+            spilled: false,
             current: None,
             order: Vec::new(),
             next: 0,
@@ -122,6 +128,7 @@ impl GroupTable {
         }
         self.bytes = 0;
         self.budget = budget;
+        self.spilled = false;
         self.current = None;
         self.order.clear();
         self.next = 0;
@@ -173,6 +180,7 @@ impl GroupTable {
             self.slots.fill(EMPTY_SLOT);
         }
         self.bytes = 0;
+        self.spilled = false;
         self.current = None;
         self.order.clear();
         self.next = 0;
@@ -352,12 +360,17 @@ impl GroupTable {
             self.current = Some(g);
             return Ok(Some(g));
         }
+        if self.spilled {
+            self.current = None;
+            return Ok(None);
+        }
         let size = regs
             .iter()
             .map(|r| value_bytes(r.get_value()))
             .fold(GROUP_OVERHEAD, usize::saturating_add)
             .saturating_add(num_accs.saturating_mul(std::mem::size_of::<Register>()));
         if self.bytes.saturating_add(size) > self.budget {
+            self.spilled = true;
             self.current = None;
             return Ok(None);
         }
@@ -411,12 +424,17 @@ impl GroupTable {
             self.current = Some(g);
             return Ok(Some(g));
         }
+        if self.spilled {
+            self.current = None;
+            return Ok(None);
+        }
         let size = values
             .iter()
             .map(|v| value_bytes(v))
             .fold(GROUP_OVERHEAD, usize::saturating_add)
             .saturating_add(num_accs.saturating_mul(std::mem::size_of::<Register>()));
         if self.bytes.saturating_add(size) > self.budget {
+            self.spilled = true;
             self.current = None;
             return Ok(None);
         }
@@ -639,5 +657,98 @@ mod tests {
             "large group table ({} bytes) must be dropped on reset",
             t.allocated_bytes()
         );
+    }
+
+    /// Review Spec P1 regression: once any new group spills past `budget`, no subsequent new group
+    /// may be admitted into `GroupTable`—even if a later row for the same group has a smaller
+    /// serialized footprint (e.g. shorter RTRIM-equivalent key or smaller non-key payload)—so a
+    /// group can never exist in both `GroupTable` and the GROUP BY sorter and be emitted twice.
+    #[test]
+    fn review_p1_spilled_group_table_never_admits_smaller_later_group() {
+        let short_key = Value::from_text("a".to_string());
+        let padded_key = Value::from_text(format!("a{}", " ".repeat(2048)));
+        let kept_key = Value::from_text("b".to_string());
+        let one_small = GROUP_OVERHEAD + value_bytes(&kept_key) + std::mem::size_of::<Register>();
+        // Budget comfortably holds 2 small groups, but NOT `padded_key`.
+        let mut t = GroupTable::new(1, vec![CollationSeq::Rtrim], one_small * 2);
+
+        // Admit 'b' first.
+        assert_eq!(t.find_or_insert(&[&kept_key], 1).unwrap(), Some(0));
+        // Long RTRIM-equivalent key 'a   ...' exceeds remaining budget and spills.
+        assert_eq!(t.find_or_insert(&[&padded_key], 1).unwrap(), None);
+        // Short RTRIM-equivalent key 'a' would have fit in remaining budget, but MUST also spill
+        // because the table has already started spilling.
+        assert_eq!(
+            t.find_or_insert(&[&short_key], 1).unwrap(),
+            None,
+            "shorter equivalent key arriving after a spill must also go to the sorter"
+        );
+        // Already-admitted group 'b' is still matched in place.
+        assert_eq!(t.find_or_insert(&[&kept_key], 1).unwrap(), Some(0));
+
+        // Same invariant with an integer group key and a wide non-key selected column.
+        let wide_val = Value::from_text("w".repeat(2048));
+        let narrow_val = Value::from_text("n".to_string());
+        let int_group = GROUP_OVERHEAD
+            + value_bytes(&int(1))
+            + value_bytes(&narrow_val)
+            + std::mem::size_of::<Register>();
+        let mut t2 = GroupTable::new(1, vec![CollationSeq::Binary], int_group * 2);
+        assert_eq!(t2.find_or_insert(&[&int(1), &wide_val], 1).unwrap(), None);
+        assert_eq!(
+            t2.find_or_insert(&[&int(1), &narrow_val], 1).unwrap(),
+            None,
+            "narrow second row for a spilled integer group must not be admitted into GroupTable"
+        );
+    }
+
+    /// End-to-end SQLite query regression matching the exact review reproducer: two RTRIM-equivalent
+    /// keys (wide padded first, short second) and an integer group key with a wide non-key column
+    /// first and narrow second must each produce count `[2]`, never `[1, 1]`.
+    #[test]
+    fn review_p1_sql_hash_group_by_spill_does_not_duplicate_groups() {
+        use crate::sync::Arc;
+        use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect, IO};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        // Force a tiny group-table budget by capping page cache size, and exceed it on row 1.
+        conn.execute("PRAGMA cache_size = 1").unwrap();
+        conn.execute("CREATE TABLE rtrim_t(k TEXT COLLATE RTRIM)")
+            .unwrap();
+        let big_spaces = " ".repeat(128 * 1024);
+        conn.execute(format!("INSERT INTO rtrim_t VALUES ('a{big_spaces}')"))
+            .unwrap();
+        conn.execute("INSERT INTO rtrim_t VALUES ('a')").unwrap();
+        let rtrim_counts = conn
+            .prepare("SELECT COUNT(*) FROM rtrim_t GROUP BY k")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rtrim_counts,
+            vec![vec![Value::from_i64(2)]],
+            "RTRIM-equivalent keys must collapse into a single group [2], never [1, 1]"
+        );
+
+        conn.execute("CREATE TABLE wide_t(k INTEGER, v TEXT)")
+            .unwrap();
+        let big_payload = "x".repeat(128 * 1024);
+        conn.execute(format!("INSERT INTO wide_t VALUES (1, '{big_payload}')"))
+            .unwrap();
+        conn.execute("INSERT INTO wide_t VALUES (1, 's')").unwrap();
+        let wide_counts = conn
+            .prepare("SELECT k, COUNT(*), v FROM wide_t GROUP BY k")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            wide_counts.len(),
+            1,
+            "integer group with wide then narrow selected column must emit 1 group, not 2"
+        );
+        assert_eq!(wide_counts[0][0], Value::from_i64(1));
+        assert_eq!(wide_counts[0][1], Value::from_i64(2));
     }
 }

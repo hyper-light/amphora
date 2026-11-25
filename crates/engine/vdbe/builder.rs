@@ -2624,6 +2624,17 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
+        self.build_with_context(connection, prepare_context, change_cnt_on, sql)
+    }
+
+    #[amphora_engine_macros::trace_stack]
+    pub fn build_with_context(
+        self,
+        connection: Arc<Connection>,
+        prepare_context: PrepareContext,
+        change_cnt_on: bool,
+        sql: &str,
+    ) -> crate::Result<Program> {
         let mut prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         // Amphora (QT.7): a read-only program's scans read their leaves by column batches when
         // the connection's switch is on; a program that writes keeps the row-at-a-time read.

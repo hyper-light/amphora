@@ -720,7 +720,7 @@ pub enum Member {
 /// Makes a group's tables for transactions across groups, if it hasn't them: the node that owns a
 /// group does it before it serves steps over the transport.
 pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
-    group.call_internal(until, AnswerMax::fixed(), |db| db.exec(SCHEMA))
+    group.call_internal(until, AnswerMax::fixed(), |db| db.exec_internal(SCHEMA))
 }
 
 /// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as

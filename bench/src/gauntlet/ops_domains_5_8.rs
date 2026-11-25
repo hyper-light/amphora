@@ -43,202 +43,914 @@ pub const OPS_5_10: &[GauntletOp] = &[
     // =========================================================================
     // Domain 5: Observability, Distributed Tracing & Experimentation (40 ops)
     // =========================================================================
-    r("observability", "obs_trace_waterfall_rec", "WITH RECURSIVE full distributed trace waterfall from root span"),
-    r("observability", "obs_trace_spans_ordered", "all spans in a trace joined to service name ordered by start time"),
-    r("observability", "obs_svc_latency_summary", "avg/min/max/count latency per service & op_name in time slice"),
-    r("observability", "obs_svc_error_rate", "5xx and 429 error rates grouped by service & tier"),
-    r("observability", "obs_slow_outliers_top30", "top 30 slowest spans > 500ms with service & JSON tags"),
-    r("observability", "obs_canary_vs_baseline", "JSON canary=true vs baseline latency & error comparison"),
-    r("observability", "obs_region_latency_json", "latency breakdown by JSON region tag across services"),
-    r("observability", "obs_rolling_30_anomaly", "rolling 30-span moving avg latency per service via ROWS BETWEEN"),
-    r("observability", "obs_multi_window_spans", "two distinct WINDOW specs (by service & by trace) in one SELECT"),
-    r("observability", "obs_span_percent_rank", "PERCENT_RANK & NTILE(100) latency percentiles per service"),
-    r("observability", "obs_orphan_spans_anti", "spans whose parent_span_id is non-NULL but missing (LEFT JOIN IS NULL)"),
-    r("observability", "obs_trace_total_duration", "total span count, error count, and sum duration per trace"),
-    r("observability", "obs_deepest_traces", "traces with >= 4 spans ordered by total duration DESC"),
-    r("observability", "obs_team_tier_rollup", "service team x tier error & latency rollup"),
-    r("observability", "obs_critical_path_span", "self-join finding child spans slower than their parent span"),
-    r("observability", "obs_op_latency_buckets", "CASE latency histogram (<1ms, 1-10ms, 10-100ms, 100ms+)"),
-    r("observability", "obs_exp_conversion_24h", "non-equi temporal join: conversions within 24h after exposure"),
-    r("observability", "obs_exp_variant_lift", "experiment control vs treatment conversion rate & avg value"),
-    r("observability", "obs_exp_srm_check", "sample ratio mismatch check: distinct accounts per variant"),
-    r("observability", "obs_exp_active_summary", "running experiments joined to event volume and revenue"),
-    r("observability", "obs_exp_first_exposure", "first exposure timestamp per account via ROW_NUMBER() = 1"),
-    r("observability", "obs_exp_multi_touch", "accounts exposed to >= 2 running experiments (GROUP BY HAVING)"),
-    r("observability", "obs_exp_unconverted_anti", "exposed accounts with zero conversion event (NOT EXISTS)"),
-    r("observability", "obs_exp_value_quantiles", "conversion value deciles per variant via NTILE(10)"),
-    r("observability", "obs_exp_daily_trend", "experiment exposures vs conversions by day bucket"),
-    r("observability", "obs_spans_count_total", "whole-table COUNT(*) of spans"),
-    r("observability", "obs_exp_events_count", "whole-table COUNT(*) of exp_events"),
-    r("observability", "obs_svc_silent_check", "services with zero error spans in recent slice (NOT EXISTS)"),
-    r("observability", "obs_trace_fanout_rank", "rank services by span fanout per trace using DENSE_RANK"),
-    r("observability", "obs_span_lag_interarrival", "inter-span arrival delta per service via LAG window"),
-    w("observability", "obs_ingest_span_single", "insert single telemetry span with JSON tags"),
-    w("observability", "obs_ingest_spans_bulk_50", "bulk ingest 50 distributed tracing spans in one statement"),
-    w("observability", "obs_ingest_exp_event", "record experiment exposure or conversion event"),
-    w("observability", "obs_bulk_exp_events_50", "bulk ingest 50 experiment events in one statement"),
-    w("observability", "obs_close_experiment", "transition experiment status and verify rollback/restore"),
-    w("observability", "obs_update_span_tags", "patch tags_json on a span"),
-    w("observability", "obs_prune_old_spans_reins", "insert & purge a batch of synthetic spans in 1 txn"),
-    w("observability", "obs_register_service_tmp", "insert temporary microservice and remove it"),
-    w("observability", "obs_trace_pair_txn", "insert parent + child span pair atomically"),
-    w("observability", "obs_exp_upsert_toggle", "update experiment event value_float for correction"),
-
+    r(
+        "observability",
+        "obs_trace_waterfall_rec",
+        "WITH RECURSIVE full distributed trace waterfall from root span",
+    ),
+    r(
+        "observability",
+        "obs_trace_spans_ordered",
+        "all spans in a trace joined to service name ordered by start time",
+    ),
+    r(
+        "observability",
+        "obs_svc_latency_summary",
+        "avg/min/max/count latency per service & op_name in time slice",
+    ),
+    r(
+        "observability",
+        "obs_svc_error_rate",
+        "5xx and 429 error rates grouped by service & tier",
+    ),
+    r(
+        "observability",
+        "obs_slow_outliers_top30",
+        "top 30 slowest spans > 500ms with service & JSON tags",
+    ),
+    r(
+        "observability",
+        "obs_canary_vs_baseline",
+        "JSON canary=true vs baseline latency & error comparison",
+    ),
+    r(
+        "observability",
+        "obs_region_latency_json",
+        "latency breakdown by JSON region tag across services",
+    ),
+    r(
+        "observability",
+        "obs_rolling_30_anomaly",
+        "rolling 30-span moving avg latency per service via ROWS BETWEEN",
+    ),
+    r(
+        "observability",
+        "obs_multi_window_spans",
+        "two distinct WINDOW specs (by service & by trace) in one SELECT",
+    ),
+    r(
+        "observability",
+        "obs_span_percent_rank",
+        "PERCENT_RANK & NTILE(100) latency percentiles per service",
+    ),
+    r(
+        "observability",
+        "obs_orphan_spans_anti",
+        "spans whose parent_span_id is non-NULL but missing (LEFT JOIN IS NULL)",
+    ),
+    r(
+        "observability",
+        "obs_trace_total_duration",
+        "total span count, error count, and sum duration per trace",
+    ),
+    r(
+        "observability",
+        "obs_deepest_traces",
+        "traces with >= 4 spans ordered by total duration DESC",
+    ),
+    r(
+        "observability",
+        "obs_team_tier_rollup",
+        "service team x tier error & latency rollup",
+    ),
+    r(
+        "observability",
+        "obs_critical_path_span",
+        "self-join finding child spans slower than their parent span",
+    ),
+    r(
+        "observability",
+        "obs_op_latency_buckets",
+        "CASE latency histogram (<1ms, 1-10ms, 10-100ms, 100ms+)",
+    ),
+    r(
+        "observability",
+        "obs_exp_conversion_24h",
+        "non-equi temporal join: conversions within 24h after exposure",
+    ),
+    r(
+        "observability",
+        "obs_exp_variant_lift",
+        "experiment control vs treatment conversion rate & avg value",
+    ),
+    r(
+        "observability",
+        "obs_exp_srm_check",
+        "sample ratio mismatch check: distinct accounts per variant",
+    ),
+    r(
+        "observability",
+        "obs_exp_active_summary",
+        "running experiments joined to event volume and revenue",
+    ),
+    r(
+        "observability",
+        "obs_exp_first_exposure",
+        "first exposure timestamp per account via ROW_NUMBER() = 1",
+    ),
+    r(
+        "observability",
+        "obs_exp_multi_touch",
+        "accounts exposed to >= 2 running experiments (GROUP BY HAVING)",
+    ),
+    r(
+        "observability",
+        "obs_exp_unconverted_anti",
+        "exposed accounts with zero conversion event (NOT EXISTS)",
+    ),
+    r(
+        "observability",
+        "obs_exp_value_quantiles",
+        "conversion value deciles per variant via NTILE(10)",
+    ),
+    r(
+        "observability",
+        "obs_exp_daily_trend",
+        "experiment exposures vs conversions by day bucket",
+    ),
+    r(
+        "observability",
+        "obs_spans_count_total",
+        "whole-table COUNT(*) of spans",
+    ),
+    r(
+        "observability",
+        "obs_exp_events_count",
+        "whole-table COUNT(*) of exp_events",
+    ),
+    r(
+        "observability",
+        "obs_svc_silent_check",
+        "services with zero error spans in recent slice (NOT EXISTS)",
+    ),
+    r(
+        "observability",
+        "obs_trace_fanout_rank",
+        "rank services by span fanout per trace using DENSE_RANK",
+    ),
+    r(
+        "observability",
+        "obs_span_lag_interarrival",
+        "inter-span arrival delta per service via LAG window",
+    ),
+    w(
+        "observability",
+        "obs_ingest_span_single",
+        "insert single telemetry span with JSON tags",
+    ),
+    w(
+        "observability",
+        "obs_ingest_spans_bulk_50",
+        "bulk ingest 50 distributed tracing spans in one statement",
+    ),
+    w(
+        "observability",
+        "obs_ingest_exp_event",
+        "record experiment exposure or conversion event",
+    ),
+    w(
+        "observability",
+        "obs_bulk_exp_events_50",
+        "bulk ingest 50 experiment events in one statement",
+    ),
+    w(
+        "observability",
+        "obs_close_experiment",
+        "transition experiment status and verify rollback/restore",
+    ),
+    w(
+        "observability",
+        "obs_update_span_tags",
+        "patch tags_json on a span",
+    ),
+    w(
+        "observability",
+        "obs_prune_old_spans_reins",
+        "insert & purge a batch of synthetic spans in 1 txn",
+    ),
+    w(
+        "observability",
+        "obs_register_service_tmp",
+        "insert temporary microservice and remove it",
+    ),
+    w(
+        "observability",
+        "obs_trace_pair_txn",
+        "insert parent + child span pair atomically",
+    ),
+    w(
+        "observability",
+        "obs_exp_upsert_toggle",
+        "update experiment event value_float for correction",
+    ),
     // =========================================================================
     // Domain 6: CI/CD Fleet & Test-Flake Intelligence (35 ops)
     // =========================================================================
-    r("cicd", "ci_queue_next_job", "priority queue peek: highest-priority oldest queued CI job"),
-    r("cicd", "ci_queue_depth_by_repo", "queued & running job counts per repo_id"),
-    r("cicd", "ci_runner_utilization", "jobs completed & avg runtime per runner_id"),
-    r("cicd", "ci_stuck_running_jobs", "jobs claimed > 1h ago with finished_at IS NULL"),
-    r("cicd", "ci_queue_wait_outliers", "top 25 jobs with longest claimed_at - created_at wait"),
-    r("cicd", "ci_commit_status_rollup", "build pass/fail summary grouped by commit_sha"),
-    r("cicd", "ci_flakiest_tests_top50", "tests with pass rate strictly between 10% and 90% (HAVING >= 5)"),
-    r("cicd", "ci_pass_to_fail_regress", "pass->fail test regressions across consecutive runs via LAG"),
-    r("cicd", "ci_slowest_tests_per_suite", "top 5 slowest tests per suite via ROW_NUMBER() OVER"),
-    r("cicd", "ci_suite_pass_rate_pivot", "conditional pass/fail/flake/skip matrix per suite_name"),
-    r("cicd", "ci_suite_duration_rank", "rank suites by p-high/avg/max duration using DENSE_RANK"),
-    r("cicd", "ci_failing_jobs_with_tests", "failed CI jobs joined to their failing test names"),
-    r("cicd", "ci_jobs_without_tests", "finished CI jobs that reported zero test_results (LEFT JOIN IS NULL)"),
-    r("cicd", "ci_test_history_timeline", "last 50 executions of one specific test_name ordered by run_at DESC"),
-    r("cicd", "ci_flaky_tests_intersect", "tests that both passed AND failed (INTERSECT)"),
-    r("cicd", "ci_always_green_except", "tests that passed EXCEPT tests that ever failed"),
-    r("cicd", "ci_repo_failure_trend", "monthly pass/fail rate per repo_id"),
-    r("cicd", "ci_test_duration_delta", "test runtime regression vs prior run via LAG(duration_ms)"),
-    r("cicd", "ci_runner_null_sort", "jobs sorted by runner_id ASC NULLS FIRST, priority DESC"),
-    r("cicd", "ci_distinct_tests_per_job", "COUNT(DISTINCT test_name) and total duration per job"),
-    r("cicd", "ci_high_prio_failures", "priority >= 8 failed jobs with aggregated failing suites"),
-    r("cicd", "ci_test_results_count", "whole-table COUNT(*) of test_results"),
-    r("cicd", "ci_jobs_count_total", "whole-table COUNT(*) of ci_jobs"),
-    r("cicd", "ci_job_wallclock_buckets", "bucket job durations (<30s, 30-120s, 120s+) with CASE"),
-    r("cicd", "ci_test_name_prefix_like", "filter test_results by suite::test prefix LIKE"),
-    w("cicd", "ci_enqueue_job", "enqueue new CI job in queued status"),
-    w("cicd", "ci_claim_and_finish_txn", "claim queued job for runner then mark passed with finished_at"),
-    w("cicd", "ci_bulk_test_results_50", "bulk ingest 50 test_results rows in one statement"),
-    w("cicd", "ci_requeue_stale_job", "reset job runner_id and claimed_at to NULL"),
-    w("cicd", "ci_cancel_repo_jobs", "update queued jobs in a slice for a repo"),
-    w("cicd", "ci_record_flake_retry", "insert retry test_result + update job finished_at in 1 txn"),
-    w("cicd", "ci_job_savepoint_abort", "enqueue job then SAVEPOINT rollback bad test batch"),
-    w("cicd", "ci_bump_job_priority", "bump priority on urgent CI jobs"),
-    w("cicd", "ci_purge_temp_job_tree", "insert job + 5 test results then delete both cleanly"),
-    w("cicd", "ci_bulk_jobs_25", "bulk enqueue 25 CI jobs in one statement"),
-
+    r(
+        "cicd",
+        "ci_queue_next_job",
+        "priority queue peek: highest-priority oldest queued CI job",
+    ),
+    r(
+        "cicd",
+        "ci_queue_depth_by_repo",
+        "queued & running job counts per repo_id",
+    ),
+    r(
+        "cicd",
+        "ci_runner_utilization",
+        "jobs completed & avg runtime per runner_id",
+    ),
+    r(
+        "cicd",
+        "ci_stuck_running_jobs",
+        "jobs claimed > 1h ago with finished_at IS NULL",
+    ),
+    r(
+        "cicd",
+        "ci_queue_wait_outliers",
+        "top 25 jobs with longest claimed_at - created_at wait",
+    ),
+    r(
+        "cicd",
+        "ci_commit_status_rollup",
+        "build pass/fail summary grouped by commit_sha",
+    ),
+    r(
+        "cicd",
+        "ci_flakiest_tests_top50",
+        "tests with pass rate strictly between 10% and 90% (HAVING >= 5)",
+    ),
+    r(
+        "cicd",
+        "ci_pass_to_fail_regress",
+        "pass->fail test regressions across consecutive runs via LAG",
+    ),
+    r(
+        "cicd",
+        "ci_slowest_tests_per_suite",
+        "top 5 slowest tests per suite via ROW_NUMBER() OVER",
+    ),
+    r(
+        "cicd",
+        "ci_suite_pass_rate_pivot",
+        "conditional pass/fail/flake/skip matrix per suite_name",
+    ),
+    r(
+        "cicd",
+        "ci_suite_duration_rank",
+        "rank suites by p-high/avg/max duration using DENSE_RANK",
+    ),
+    r(
+        "cicd",
+        "ci_failing_jobs_with_tests",
+        "failed CI jobs joined to their failing test names",
+    ),
+    r(
+        "cicd",
+        "ci_jobs_without_tests",
+        "finished CI jobs that reported zero test_results (LEFT JOIN IS NULL)",
+    ),
+    r(
+        "cicd",
+        "ci_test_history_timeline",
+        "last 50 executions of one specific test_name ordered by run_at DESC",
+    ),
+    r(
+        "cicd",
+        "ci_flaky_tests_intersect",
+        "tests that both passed AND failed (INTERSECT)",
+    ),
+    r(
+        "cicd",
+        "ci_always_green_except",
+        "tests that passed EXCEPT tests that ever failed",
+    ),
+    r(
+        "cicd",
+        "ci_repo_failure_trend",
+        "monthly pass/fail rate per repo_id",
+    ),
+    r(
+        "cicd",
+        "ci_test_duration_delta",
+        "test runtime regression vs prior run via LAG(duration_ms)",
+    ),
+    r(
+        "cicd",
+        "ci_runner_null_sort",
+        "jobs sorted by runner_id ASC NULLS FIRST, priority DESC",
+    ),
+    r(
+        "cicd",
+        "ci_distinct_tests_per_job",
+        "COUNT(DISTINCT test_name) and total duration per job",
+    ),
+    r(
+        "cicd",
+        "ci_high_prio_failures",
+        "priority >= 8 failed jobs with aggregated failing suites",
+    ),
+    r(
+        "cicd",
+        "ci_test_results_count",
+        "whole-table COUNT(*) of test_results",
+    ),
+    r(
+        "cicd",
+        "ci_jobs_count_total",
+        "whole-table COUNT(*) of ci_jobs",
+    ),
+    r(
+        "cicd",
+        "ci_job_wallclock_buckets",
+        "bucket job durations (<30s, 30-120s, 120s+) with CASE",
+    ),
+    r(
+        "cicd",
+        "ci_test_name_prefix_like",
+        "filter test_results by suite::test prefix LIKE",
+    ),
+    w(
+        "cicd",
+        "ci_enqueue_job",
+        "enqueue new CI job in queued status",
+    ),
+    w(
+        "cicd",
+        "ci_claim_and_finish_txn",
+        "claim queued job for runner then mark passed with finished_at",
+    ),
+    w(
+        "cicd",
+        "ci_bulk_test_results_50",
+        "bulk ingest 50 test_results rows in one statement",
+    ),
+    w(
+        "cicd",
+        "ci_requeue_stale_job",
+        "reset job runner_id and claimed_at to NULL",
+    ),
+    w(
+        "cicd",
+        "ci_cancel_repo_jobs",
+        "update queued jobs in a slice for a repo",
+    ),
+    w(
+        "cicd",
+        "ci_record_flake_retry",
+        "insert retry test_result + update job finished_at in 1 txn",
+    ),
+    w(
+        "cicd",
+        "ci_job_savepoint_abort",
+        "enqueue job then SAVEPOINT rollback bad test batch",
+    ),
+    w(
+        "cicd",
+        "ci_bump_job_priority",
+        "bump priority on urgent CI jobs",
+    ),
+    w(
+        "cicd",
+        "ci_purge_temp_job_tree",
+        "insert job + 5 test results then delete both cleanly",
+    ),
+    w(
+        "cicd",
+        "ci_bulk_jobs_25",
+        "bulk enqueue 25 CI jobs in one statement",
+    ),
     // =========================================================================
     // Domain 7 & 8: Cluster Bookings, Temporal Overlaps & Wiki Graph (35 ops)
     // =========================================================================
-    r("graph_sched", "sch_interval_overlap", "find bookings overlapping [start, end) on a resource"),
-    r("graph_sched", "sch_double_booking_self", "self-join detecting overlapping confirmed bookings on same resource"),
-    r("graph_sched", "sch_free_slot_gaps_lead", "gap-and-island free slot finder via LEAD(start_ts) - end_ts"),
-    r("graph_sched", "sch_resource_utilization", "total booked seconds & booking count per resource_id"),
-    r("graph_sched", "sch_owner_schedule", "upcoming non-cancelled bookings for an owner sorted by start_ts"),
-    r("graph_sched", "sch_owner_conflicts", "self-join detecting an owner booked on two resources at once"),
-    r("graph_sched", "sch_longest_bookings", "top 25 longest duration bookings (end_ts - start_ts)"),
-    r("graph_sched", "sch_status_breakdown", "confirmed vs tentative vs cancelled counts per resource"),
-    r("graph_sched", "sch_busy_resources_having", "resources with >= 5 confirmed bookings in window"),
-    r("graph_sched", "sch_booking_rank_per_res", "rank bookings chronologically per resource via ROW_NUMBER"),
-    r("graph_sched", "sch_bookings_count_total", "whole-table COUNT(*) of bookings"),
-    r("graph_sched", "wiki_doc_by_slug", "load wiki document by (tenant_id, slug)"),
-    r("graph_sched", "wiki_backlinks", "all inbound backlinks to a wiki document with source titles"),
-    r("graph_sched", "wiki_outbound_links", "all outbound links from a wiki document with target titles"),
-    r("graph_sched", "wiki_orphan_docs_anti", "documents with ZERO inbound links (LEFT JOIN ... IS NULL)"),
-    r("graph_sched", "wiki_deadend_docs_notex", "documents with ZERO outbound links (NOT EXISTS)"),
-    r("graph_sched", "wiki_hub_degree_top25", "top 25 wiki hubs by in-degree + out-degree"),
-    r("graph_sched", "wiki_shortest_path_rec", "WITH RECURSIVE multi-hop reachability in doc_links graph"),
-    r("graph_sched", "wiki_mutual_links_self", "bidirectional wiki links (A->B AND B->A self-join)"),
-    r("graph_sched", "wiki_wide_doc_search", "substring search across wide 6 KiB markdown doc bodies"),
-    r("graph_sched", "wiki_tenant_doc_versions", "version histogram and total body length per tenant"),
-    r("graph_sched", "wiki_doc_link_union", "UNION of inbound and outbound neighbors for one document"),
-    r("graph_sched", "wiki_most_updated_docs", "recently updated docs per tenant ranked via DENSE_RANK"),
-    r("graph_sched", "wiki_docs_count_total", "whole-table COUNT(*) of documents"),
-    r("graph_sched", "wiki_links_count_total", "whole-table COUNT(*) of doc_links"),
-    w("graph_sched", "sch_create_booking_txn", "insert new confirmed booking and cancel/cleanup temp id"),
-    w("graph_sched", "sch_reschedule_booking", "shift booking start_ts and end_ts forward"),
-    w("graph_sched", "sch_cancel_booking", "toggle booking status cancelled <-> confirmed"),
-    w("graph_sched", "sch_bulk_bookings_25", "bulk insert 25 cluster bookings in one statement"),
-    w("graph_sched", "wiki_publish_revision", "increment document version, update body & updated_at"),
-    w("graph_sched", "wiki_upsert_link", "insert doc_links edge ON CONFLICT DO UPDATE anchor_text"),
-    w("graph_sched", "wiki_rewire_links_txn", "delete old link and insert replacement link atomically"),
-    w("graph_sched", "wiki_create_doc_and_link", "create wide 8 KiB design doc + link + cleanup"),
-    w("graph_sched", "wiki_bulk_links_25", "bulk insert 25 doc_links edges ON CONFLICT DO NOTHING"),
-    w("graph_sched", "wiki_savepoint_edit", "update doc body with SAVEPOINT rollback on validation fail"),
-
+    r(
+        "graph_sched",
+        "sch_interval_overlap",
+        "find bookings overlapping [start, end) on a resource",
+    ),
+    r(
+        "graph_sched",
+        "sch_double_booking_self",
+        "self-join detecting overlapping confirmed bookings on same resource",
+    ),
+    r(
+        "graph_sched",
+        "sch_free_slot_gaps_lead",
+        "gap-and-island free slot finder via LEAD(start_ts) - end_ts",
+    ),
+    r(
+        "graph_sched",
+        "sch_resource_utilization",
+        "total booked seconds & booking count per resource_id",
+    ),
+    r(
+        "graph_sched",
+        "sch_owner_schedule",
+        "upcoming non-cancelled bookings for an owner sorted by start_ts",
+    ),
+    r(
+        "graph_sched",
+        "sch_owner_conflicts",
+        "self-join detecting an owner booked on two resources at once",
+    ),
+    r(
+        "graph_sched",
+        "sch_longest_bookings",
+        "top 25 longest duration bookings (end_ts - start_ts)",
+    ),
+    r(
+        "graph_sched",
+        "sch_status_breakdown",
+        "confirmed vs tentative vs cancelled counts per resource",
+    ),
+    r(
+        "graph_sched",
+        "sch_busy_resources_having",
+        "resources with >= 5 confirmed bookings in window",
+    ),
+    r(
+        "graph_sched",
+        "sch_booking_rank_per_res",
+        "rank bookings chronologically per resource via ROW_NUMBER",
+    ),
+    r(
+        "graph_sched",
+        "sch_bookings_count_total",
+        "whole-table COUNT(*) of bookings",
+    ),
+    r(
+        "graph_sched",
+        "wiki_doc_by_slug",
+        "load wiki document by (tenant_id, slug)",
+    ),
+    r(
+        "graph_sched",
+        "wiki_backlinks",
+        "all inbound backlinks to a wiki document with source titles",
+    ),
+    r(
+        "graph_sched",
+        "wiki_outbound_links",
+        "all outbound links from a wiki document with target titles",
+    ),
+    r(
+        "graph_sched",
+        "wiki_orphan_docs_anti",
+        "documents with ZERO inbound links (LEFT JOIN ... IS NULL)",
+    ),
+    r(
+        "graph_sched",
+        "wiki_deadend_docs_notex",
+        "documents with ZERO outbound links (NOT EXISTS)",
+    ),
+    r(
+        "graph_sched",
+        "wiki_hub_degree_top25",
+        "top 25 wiki hubs by in-degree + out-degree",
+    ),
+    r(
+        "graph_sched",
+        "wiki_shortest_path_rec",
+        "WITH RECURSIVE multi-hop reachability in doc_links graph",
+    ),
+    r(
+        "graph_sched",
+        "wiki_mutual_links_self",
+        "bidirectional wiki links (A->B AND B->A self-join)",
+    ),
+    r(
+        "graph_sched",
+        "wiki_wide_doc_search",
+        "substring search across wide 6 KiB markdown doc bodies",
+    ),
+    r(
+        "graph_sched",
+        "wiki_tenant_doc_versions",
+        "version histogram and total body length per tenant",
+    ),
+    r(
+        "graph_sched",
+        "wiki_doc_link_union",
+        "UNION of inbound and outbound neighbors for one document",
+    ),
+    r(
+        "graph_sched",
+        "wiki_most_updated_docs",
+        "recently updated docs per tenant ranked via DENSE_RANK",
+    ),
+    r(
+        "graph_sched",
+        "wiki_docs_count_total",
+        "whole-table COUNT(*) of documents",
+    ),
+    r(
+        "graph_sched",
+        "wiki_links_count_total",
+        "whole-table COUNT(*) of doc_links",
+    ),
+    w(
+        "graph_sched",
+        "sch_create_booking_txn",
+        "insert new confirmed booking and cancel/cleanup temp id",
+    ),
+    w(
+        "graph_sched",
+        "sch_reschedule_booking",
+        "shift booking start_ts and end_ts forward",
+    ),
+    w(
+        "graph_sched",
+        "sch_cancel_booking",
+        "toggle booking status cancelled <-> confirmed",
+    ),
+    w(
+        "graph_sched",
+        "sch_bulk_bookings_25",
+        "bulk insert 25 cluster bookings in one statement",
+    ),
+    w(
+        "graph_sched",
+        "wiki_publish_revision",
+        "increment document version, update body & updated_at",
+    ),
+    w(
+        "graph_sched",
+        "wiki_upsert_link",
+        "insert doc_links edge ON CONFLICT DO UPDATE anchor_text",
+    ),
+    w(
+        "graph_sched",
+        "wiki_rewire_links_txn",
+        "delete old link and insert replacement link atomically",
+    ),
+    w(
+        "graph_sched",
+        "wiki_create_doc_and_link",
+        "create wide 8 KiB design doc + link + cleanup",
+    ),
+    w(
+        "graph_sched",
+        "wiki_bulk_links_25",
+        "bulk insert 25 doc_links edges ON CONFLICT DO NOTHING",
+    ),
+    w(
+        "graph_sched",
+        "wiki_savepoint_edit",
+        "update doc body with SAVEPOINT rollback on validation fail",
+    ),
     // =========================================================================
     // Domain 9: Cross-Domain Messy Analyst / BI SQL & ETL (40 ops)
     // =========================================================================
-    r("bi_etl", "bi_6table_saas_join", "6-table join: tenants x projects x issues x users x labels x comments"),
-    r("bi_etl", "bi_7table_agentic_saas", "7-table cross-domain join: tenants x workspaces x runs x turns x tools x diffs x projects"),
-    r("bi_etl", "bi_8table_full_enterprise", "8-table enterprise mega-join across SaaS + Agentic + Wiki"),
-    r("bi_etl", "bi_4step_funnel_cte", "4-step CTE funnel: accounts -> follows -> messages -> reactions"),
-    r("bi_etl", "bi_commerce_funnel_cte", "4-step e-commerce funnel: customers -> orders -> items -> captured payments"),
-    r("bi_etl", "bi_monthly_cohort_matrix", "customer cohort retention by signup month vs order month"),
-    r("bi_etl", "bi_compound_union_except", "compound (A UNION B) EXCEPT C ORDER BY ... LIMIT ..."),
-    r("bi_etl", "bi_4x_count_distinct", "4 distinct COUNT(DISTINCT ...) columns in one GROUP BY"),
-    r("bi_etl", "bi_high_card_4col_groupby", "4-column high-cardinality GROUP BY with HAVING & ORDER BY"),
-    r("bi_etl", "bi_unbounded_csv_export", "unbounded multi-column sorted export across orders + customers"),
-    r("bi_etl", "bi_full_outer_reconcile", "FULL OUTER JOIN reconciling orders vs payments on slice"),
-    r("bi_etl", "bi_cross_domain_org_score", "CTE joining SaaS issue volume + Agentic token burn + Wiki docs per tenant"),
-    r("bi_etl", "bi_correlated_having_avg", "tenants whose avg issue estimate exceeds global avg (subquery in HAVING)"),
-    r("bi_etl", "bi_scalar_subq_multi_col", "3 correlated scalar subqueries in SELECT projection per tenant"),
-    r("bi_etl", "bi_exists_and_not_exists", "combined EXISTS + NOT EXISTS across orders, payments & ledger"),
-    r("bi_etl", "bi_wide_sort_nulls_mixed", "wide sort with mixed ASC/DESC and NULLS FIRST/NULLS LAST"),
-    r("bi_etl", "bi_nested_derived_3deep", "3-level nested derived tables with aggregation at each level"),
-    r("bi_etl", "bi_window_running_pct", "cumulative revenue share % using SUM OVER / SUM OVER()"),
-    r("bi_etl", "bi_window_frame_range_avg", "rolling 5-row centered window (2 PRECEDING AND 2 FOLLOWING)"),
-    r("bi_etl", "bi_union_all_ledger_audit", "UNION ALL auditing both ledger_entries and token_cost_ledger balances"),
-    r("bi_etl", "bi_case_nullif_coalesce", "complex arithmetic with COALESCE, NULLIF, ABS, ROUND, CASE"),
-    r("bi_etl", "bi_in_subquery_multi", "WHERE id IN (SELECT ...) AND project_id IN (SELECT ...)"),
-    r("bi_etl", "bi_string_concat_agg", "string concatenation + GROUP_CONCAT/STRING_AGG across 3-table join"),
-    r("bi_etl", "bi_json_join_analytics", "join issues to tenants filtering on JSON fields from BOTH tables"),
-    r("bi_etl", "bi_self_join_same_day", "self-join finding pairs of orders by same customer in window"),
-    r("bi_etl", "bi_distinct_on_window", "deduplicated latest event per account using ROW_NUMBER() = 1"),
-    r("bi_etl", "bi_cross_join_matrix", "small cross-join grid (tiers x statuses) LEFT JOINed to issues"),
-    r("bi_etl", "bi_top_n_per_group_3way", "top 3 highest-spend orders per country using DENSE_RANK"),
-    r("bi_etl", "bi_anti_join_3way_chain", "3-table LEFT JOIN chain finding customers with orders but no captured payment or ledger"),
-    r("bi_etl", "bi_multi_cte_diamond", "diamond-shaped CTE graph referenced twice in final join"),
-    r("bi_etl", "bi_unicode_collation_sort", "ORDER BY display_name, handle across CJK/emoji/accented accounts"),
-    r("bi_etl", "bi_empty_filter_agg", "aggregate over empty predicate returning 1 row of (0, NULL, NULL)"),
-    r("bi_etl", "bi_group_by_expr_bucket", "GROUP BY computed arithmetic bucket (price_cents / 5000)"),
-    r("bi_etl", "bi_left_join_filter_on", "LEFT JOIN with predicate inside ON vs WHERE semantic contrast"),
-    r("bi_etl", "bi_sum_of_distinct_vals", "SUM(DISTINCT priority) and COUNT(DISTINCT status) per tenant"),
-    w("bi_etl", "etl_insert_select_rollup", "CREATE + INSERT INTO ... SELECT aggregated rollup + DROP scratch"),
-    w("bi_etl", "etl_ctas_snapshot", "CREATE TABLE AS SELECT filtered join snapshot + DROP"),
-    w("bi_etl", "etl_batched_purge_subq", "insert 20 staging rows then DELETE WHERE id IN (SELECT ...)"),
-    w("bi_etl", "etl_update_from_agg", "update denormalized channel.message_count from subquery COUNT(*)"),
-    w("bi_etl", "etl_bulk_upsert_25", "upsert 25 agent_memories rows ON CONFLICT(id) DO UPDATE"),
-
+    r(
+        "bi_etl",
+        "bi_6table_saas_join",
+        "6-table join: tenants x projects x issues x users x labels x comments",
+    ),
+    r(
+        "bi_etl",
+        "bi_7table_agentic_saas",
+        "7-table cross-domain join: tenants x workspaces x runs x turns x tools x diffs x projects",
+    ),
+    r(
+        "bi_etl",
+        "bi_8table_full_enterprise",
+        "8-table enterprise mega-join across SaaS + Agentic + Wiki",
+    ),
+    r(
+        "bi_etl",
+        "bi_4step_funnel_cte",
+        "4-step CTE funnel: accounts -> follows -> messages -> reactions",
+    ),
+    r(
+        "bi_etl",
+        "bi_commerce_funnel_cte",
+        "4-step e-commerce funnel: customers -> orders -> items -> captured payments",
+    ),
+    r(
+        "bi_etl",
+        "bi_monthly_cohort_matrix",
+        "customer cohort retention by signup month vs order month",
+    ),
+    r(
+        "bi_etl",
+        "bi_compound_union_except",
+        "compound (A UNION B) EXCEPT C ORDER BY ... LIMIT ...",
+    ),
+    r(
+        "bi_etl",
+        "bi_4x_count_distinct",
+        "4 distinct COUNT(DISTINCT ...) columns in one GROUP BY",
+    ),
+    r(
+        "bi_etl",
+        "bi_high_card_4col_groupby",
+        "4-column high-cardinality GROUP BY with HAVING & ORDER BY",
+    ),
+    r(
+        "bi_etl",
+        "bi_unbounded_csv_export",
+        "unbounded multi-column sorted export across orders + customers",
+    ),
+    r(
+        "bi_etl",
+        "bi_full_outer_reconcile",
+        "FULL OUTER JOIN reconciling orders vs payments on slice",
+    ),
+    r(
+        "bi_etl",
+        "bi_cross_domain_org_score",
+        "CTE joining SaaS issue volume + Agentic token burn + Wiki docs per tenant",
+    ),
+    r(
+        "bi_etl",
+        "bi_correlated_having_avg",
+        "tenants whose avg issue estimate exceeds global avg (subquery in HAVING)",
+    ),
+    r(
+        "bi_etl",
+        "bi_scalar_subq_multi_col",
+        "3 correlated scalar subqueries in SELECT projection per tenant",
+    ),
+    r(
+        "bi_etl",
+        "bi_exists_and_not_exists",
+        "combined EXISTS + NOT EXISTS across orders, payments & ledger",
+    ),
+    r(
+        "bi_etl",
+        "bi_wide_sort_nulls_mixed",
+        "wide sort with mixed ASC/DESC and NULLS FIRST/NULLS LAST",
+    ),
+    r(
+        "bi_etl",
+        "bi_nested_derived_3deep",
+        "3-level nested derived tables with aggregation at each level",
+    ),
+    r(
+        "bi_etl",
+        "bi_window_running_pct",
+        "cumulative revenue share % using SUM OVER / SUM OVER()",
+    ),
+    r(
+        "bi_etl",
+        "bi_window_frame_range_avg",
+        "rolling 5-row centered window (2 PRECEDING AND 2 FOLLOWING)",
+    ),
+    r(
+        "bi_etl",
+        "bi_union_all_ledger_audit",
+        "UNION ALL auditing both ledger_entries and token_cost_ledger balances",
+    ),
+    r(
+        "bi_etl",
+        "bi_case_nullif_coalesce",
+        "complex arithmetic with COALESCE, NULLIF, ABS, ROUND, CASE",
+    ),
+    r(
+        "bi_etl",
+        "bi_in_subquery_multi",
+        "WHERE id IN (SELECT ...) AND project_id IN (SELECT ...)",
+    ),
+    r(
+        "bi_etl",
+        "bi_string_concat_agg",
+        "string concatenation + GROUP_CONCAT/STRING_AGG across 3-table join",
+    ),
+    r(
+        "bi_etl",
+        "bi_json_join_analytics",
+        "join issues to tenants filtering on JSON fields from BOTH tables",
+    ),
+    r(
+        "bi_etl",
+        "bi_self_join_same_day",
+        "self-join finding pairs of orders by same customer in window",
+    ),
+    r(
+        "bi_etl",
+        "bi_distinct_on_window",
+        "deduplicated latest event per account using ROW_NUMBER() = 1",
+    ),
+    r(
+        "bi_etl",
+        "bi_cross_join_matrix",
+        "small cross-join grid (tiers x statuses) LEFT JOINed to issues",
+    ),
+    r(
+        "bi_etl",
+        "bi_top_n_per_group_3way",
+        "top 3 highest-spend orders per country using DENSE_RANK",
+    ),
+    r(
+        "bi_etl",
+        "bi_anti_join_3way_chain",
+        "3-table LEFT JOIN chain finding customers with orders but no captured payment or ledger",
+    ),
+    r(
+        "bi_etl",
+        "bi_multi_cte_diamond",
+        "diamond-shaped CTE graph referenced twice in final join",
+    ),
+    r(
+        "bi_etl",
+        "bi_unicode_collation_sort",
+        "ORDER BY display_name, handle across CJK/emoji/accented accounts",
+    ),
+    r(
+        "bi_etl",
+        "bi_empty_filter_agg",
+        "aggregate over empty predicate returning 1 row of (0, NULL, NULL)",
+    ),
+    r(
+        "bi_etl",
+        "bi_group_by_expr_bucket",
+        "GROUP BY computed arithmetic bucket (price_cents / 5000)",
+    ),
+    r(
+        "bi_etl",
+        "bi_left_join_filter_on",
+        "LEFT JOIN with predicate inside ON vs WHERE semantic contrast",
+    ),
+    r(
+        "bi_etl",
+        "bi_sum_of_distinct_vals",
+        "SUM(DISTINCT priority) and COUNT(DISTINCT status) per tenant",
+    ),
+    w(
+        "bi_etl",
+        "etl_insert_select_rollup",
+        "CREATE + INSERT INTO ... SELECT aggregated rollup + DROP scratch",
+    ),
+    w(
+        "bi_etl",
+        "etl_ctas_snapshot",
+        "CREATE TABLE AS SELECT filtered join snapshot + DROP",
+    ),
+    w(
+        "bi_etl",
+        "etl_batched_purge_subq",
+        "insert 20 staging rows then DELETE WHERE id IN (SELECT ...)",
+    ),
+    w(
+        "bi_etl",
+        "etl_update_from_agg",
+        "update denormalized channel.message_count from subquery COUNT(*)",
+    ),
+    w(
+        "bi_etl",
+        "etl_bulk_upsert_25",
+        "upsert 25 agent_memories rows ON CONFLICT(id) DO UPDATE",
+    ),
     // =========================================================================
     // Domain 10: DBA, Views, Triggers, Temp Tables, Live DDL & Catalog (30 ops)
     // =========================================================================
-    ddl("dba_ddl", "ddl_create_drop_table", "CREATE TABLE + insert 5 rows + SELECT + DROP TABLE"),
-    ddl("dba_ddl", "ddl_create_single_idx", "CREATE INDEX on scratch table + query + DROP INDEX"),
-    ddl("dba_ddl", "ddl_create_comp_desc_idx", "CREATE composite mixed ASC/DESC index + ordered read + DROP"),
-    ddl("dba_ddl", "ddl_create_unique_idx", "CREATE UNIQUE INDEX + lookup + DROP"),
-    ddl("dba_ddl", "ddl_create_partial_idx", "CREATE partial index (WHERE active) + filtered read + DROP"),
-    ddl("dba_ddl", "ddl_create_expr_idx", "CREATE expression index (LOWER(name)) + query + DROP"),
-    ddl("dba_ddl", "ddl_rename_table", "CREATE TABLE + insert + ALTER TABLE RENAME TO + read + DROP"),
-    ddl("dba_ddl", "ddl_rename_column", "CREATE TABLE + ALTER TABLE RENAME COLUMN + read + DROP"),
-    ddl("dba_ddl", "ddl_add_column_backfill", "CREATE TABLE + ALTER TABLE ADD COLUMN + UPDATE backfill + DROP"),
-    ddl("dba_ddl", "ddl_drop_column", "CREATE TABLE + ALTER TABLE DROP COLUMN + read + DROP"),
-    ddl("dba_ddl", "ddl_view_create_join_drop", "CREATE VIEW + join view against base table + DROP VIEW"),
-    ddl("dba_ddl", "ddl_nested_views", "CREATE VIEW v2 over VIEW v1 + aggregate query + DROP both"),
-    ddl("dba_ddl", "ddl_trigger_after_insert", "CREATE AFTER INSERT TRIGGER auditing writes + verify audit + DROP"),
-    ddl("dba_ddl", "ddl_trigger_after_update", "CREATE AFTER UPDATE TRIGGER tracking changes + verify + DROP"),
-    ddl("dba_ddl", "ddl_trigger_after_delete", "CREATE AFTER DELETE TRIGGER logging deletions + verify + DROP"),
-    ddl("dba_ddl", "ddl_temp_table_join", "CREATE TEMP TABLE + populate + join to issues + DROP"),
-    ddl("dba_ddl", "ddl_analyze_stats", "run ANALYZE to refresh optimizer statistics"),
-    ddl("dba_ddl", "ddl_reindex_table", "REINDEX on scratch table with secondary indexes"),
-    ddl("dba_ddl", "ddl_wal_checkpoint_pass", "PRAGMA wal_checkpoint(PASSIVE)"),
+    ddl(
+        "dba_ddl",
+        "ddl_create_drop_table",
+        "CREATE TABLE + insert 5 rows + SELECT + DROP TABLE",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_create_single_idx",
+        "CREATE INDEX on scratch table + query + DROP INDEX",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_create_comp_desc_idx",
+        "CREATE composite mixed ASC/DESC index + ordered read + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_create_unique_idx",
+        "CREATE UNIQUE INDEX + lookup + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_create_partial_idx",
+        "CREATE partial index (WHERE active) + filtered read + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_create_expr_idx",
+        "CREATE expression index (LOWER(name)) + query + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_rename_table",
+        "CREATE TABLE + insert + ALTER TABLE RENAME TO + read + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_rename_column",
+        "CREATE TABLE + ALTER TABLE RENAME COLUMN + read + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_add_column_backfill",
+        "CREATE TABLE + ALTER TABLE ADD COLUMN + UPDATE backfill + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_drop_column",
+        "CREATE TABLE + ALTER TABLE DROP COLUMN + read + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_view_create_join_drop",
+        "CREATE VIEW + join view against base table + DROP VIEW",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_nested_views",
+        "CREATE VIEW v2 over VIEW v1 + aggregate query + DROP both",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_trigger_after_insert",
+        "CREATE AFTER INSERT TRIGGER auditing writes + verify audit + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_trigger_after_update",
+        "CREATE AFTER UPDATE TRIGGER tracking changes + verify + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_trigger_after_delete",
+        "CREATE AFTER DELETE TRIGGER logging deletions + verify + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_temp_table_join",
+        "CREATE TEMP TABLE + populate + join to issues + DROP",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_analyze_stats",
+        "run ANALYZE to refresh optimizer statistics",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_reindex_table",
+        "REINDEX on scratch table with secondary indexes",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_wal_checkpoint_pass",
+        "PRAGMA wal_checkpoint(PASSIVE)",
+    ),
     ddl("dba_ddl", "ddl_integrity_check", "PRAGMA integrity_check"),
-    r("dba_ddl", "cat_list_tables", "catalog: list all user tables (sqlite_schema / pg_class)"),
-    r("dba_ddl", "cat_list_indexes", "catalog: list all indexes across all 43 tables"),
-    r("dba_ddl", "cat_table_columns", "catalog: inspect columns & types of issues table"),
-    r("dba_ddl", "cat_pg_namespaces", "catalog: inspect pg_namespace / schema metadata"),
-    r("dba_ddl", "cat_pg_types", "catalog: inspect pg_type built-in type registry"),
-    r("dba_ddl", "cat_pg_class_oids", "catalog: inspect pg_class OIDs & relkind"),
-    r("dba_ddl", "cat_pg_attributes_join", "catalog: join pg_class + pg_attribute + pg_type"),
-    ddl("dba_ddl", "cat_oid_rename_stability", "create table -> rename -> verify pg_class OID / table exists -> drop"),
-    ddl("dba_ddl", "ddl_if_not_exists_idemp", "idempotent CREATE TABLE/INDEX IF NOT EXISTS + DROP IF EXISTS"),
-    ddl("dba_ddl", "ddl_wide_schema_20cols", "CREATE TABLE with 20 mixed-type columns + insert + read + DROP"),
+    r(
+        "dba_ddl",
+        "cat_list_tables",
+        "catalog: list all user tables (sqlite_schema / pg_class)",
+    ),
+    r(
+        "dba_ddl",
+        "cat_list_indexes",
+        "catalog: list all indexes across all 43 tables",
+    ),
+    r(
+        "dba_ddl",
+        "cat_table_columns",
+        "catalog: inspect columns & types of issues table",
+    ),
+    r(
+        "dba_ddl",
+        "cat_pg_namespaces",
+        "catalog: inspect pg_namespace / schema metadata",
+    ),
+    r(
+        "dba_ddl",
+        "cat_pg_types",
+        "catalog: inspect pg_type built-in type registry",
+    ),
+    r(
+        "dba_ddl",
+        "cat_pg_class_oids",
+        "catalog: inspect pg_class OIDs & relkind",
+    ),
+    r(
+        "dba_ddl",
+        "cat_pg_attributes_join",
+        "catalog: join pg_class + pg_attribute + pg_type",
+    ),
+    ddl(
+        "dba_ddl",
+        "cat_oid_rename_stability",
+        "create table -> rename -> verify pg_class OID / table exists -> drop",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_if_not_exists_idemp",
+        "idempotent CREATE TABLE/INDEX IF NOT EXISTS + DROP IF EXISTS",
+    ),
+    ddl(
+        "dba_ddl",
+        "ddl_wide_schema_20cols",
+        "CREATE TABLE with 20 mixed-type columns + insert + read + DROP",
+    ),
 ];
 
 pub fn statements_5_10(op: &str, d: Dialect) -> Option<Vec<String>> {
@@ -757,10 +1469,18 @@ pub fn params_5_10(
 
     match op {
         // Domain 5
-        "obs_trace_waterfall_rec" | "obs_trace_spans_ordered" => one(vec![P::I(pick(rng, s.traces))]),
-        "obs_svc_latency_summary" | "obs_svc_error_rate" | "obs_canary_vs_baseline"
-        | "obs_region_latency_json" | "obs_multi_window_spans" | "obs_orphan_spans_anti"
-        | "obs_team_tier_rollup" | "obs_critical_path_span" | "obs_op_latency_buckets"
+        "obs_trace_waterfall_rec" | "obs_trace_spans_ordered" => {
+            one(vec![P::I(pick(rng, s.traces))])
+        }
+        "obs_svc_latency_summary"
+        | "obs_svc_error_rate"
+        | "obs_canary_vs_baseline"
+        | "obs_region_latency_json"
+        | "obs_multi_window_spans"
+        | "obs_orphan_spans_anti"
+        | "obs_team_tier_rollup"
+        | "obs_critical_path_span"
+        | "obs_op_latency_buckets"
         | "obs_svc_silent_check" => {
             let (a, b) = span(rng, s.spans, 5_000);
             one(vec![P::I(a), P::I(b)])
@@ -783,7 +1503,9 @@ pub fn params_5_10(
             let (a, b) = span(rng, s.exp_events, 5_000);
             one(vec![P::I(a), P::I(b)])
         }
-        "obs_slow_outliers_top30" | "obs_exp_active_summary" | "obs_spans_count_total"
+        "obs_slow_outliers_top30"
+        | "obs_exp_active_summary"
+        | "obs_spans_count_total"
         | "obs_exp_events_count" => one(vec![]),
         "obs_ingest_span_single" => one(vec![
             P::I(s.alloc_id()),
@@ -820,7 +1542,12 @@ pub fn params_5_10(
             let ex = pick(rng, s.experiments);
             let mut v = Vec::with_capacity(50 * 4);
             for _ in 0..50 {
-                v.extend([P::I(s.alloc_id()), P::I(ex), P::I(pick(rng, s.accounts)), P::I(ts)]);
+                v.extend([
+                    P::I(s.alloc_id()),
+                    P::I(ex),
+                    P::I(pick(rng, s.accounts)),
+                    P::I(ts),
+                ]);
             }
             one(v)
         }
@@ -835,21 +1562,39 @@ pub fn params_5_10(
         "obs_prune_old_spans_reins" => {
             let id = s.alloc_id();
             Some(vec![
-                vec![P::I(id), P::T(r#"{"region":"US","canary":false}"#.into()), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::T(r#"{"region":"US","canary":false}"#.into()),
+                    P::I(ts),
+                ],
                 vec![P::I(id)],
             ])
         }
         "obs_register_service_tmp" => {
             let id = s.alloc_id();
-            Some(vec![vec![P::I(id), P::T(format!("tmp-svc-{id}"))], vec![P::I(id)]])
+            Some(vec![
+                vec![P::I(id), P::T(format!("tmp-svc-{id}"))],
+                vec![P::I(id)],
+            ])
         }
         "obs_trace_pair_txn" => {
             let p_id = s.alloc_id();
             let c_id = s.alloc_id();
             let tr = s.alloc_id();
             Some(vec![
-                vec![P::I(p_id), P::I(tr), P::T(r#"{"region":"US","canary":false}"#.into()), P::I(ts)],
-                vec![P::I(c_id), P::I(tr), P::I(p_id), P::T(r#"{"region":"US","canary":false}"#.into()), P::I(ts + 100)],
+                vec![
+                    P::I(p_id),
+                    P::I(tr),
+                    P::T(r#"{"region":"US","canary":false}"#.into()),
+                    P::I(ts),
+                ],
+                vec![
+                    P::I(c_id),
+                    P::I(tr),
+                    P::I(p_id),
+                    P::T(r#"{"region":"US","canary":false}"#.into()),
+                    P::I(ts + 100),
+                ],
             ])
         }
         "obs_exp_upsert_toggle" => one(vec![P::F(9.99), P::I(own(rng, s.exp_events))]),
@@ -860,8 +1605,11 @@ pub fn params_5_10(
             let (a, b) = span(rng, s.ci_jobs, 2_000);
             one(vec![P::I(a), P::I(b)])
         }
-        "ci_flakiest_tests_top50" | "ci_pass_to_fail_regress" | "ci_slowest_tests_per_suite"
-        | "ci_suite_duration_rank" | "ci_test_duration_delta" => {
+        "ci_flakiest_tests_top50"
+        | "ci_pass_to_fail_regress"
+        | "ci_slowest_tests_per_suite"
+        | "ci_suite_duration_rank"
+        | "ci_test_duration_delta" => {
             let (a, b) = span(rng, s.test_results, 6_000);
             one(vec![P::I(a), P::I(b)])
         }
@@ -870,7 +1618,14 @@ pub fn params_5_10(
             one(vec![P::I(a), P::I(b), P::I(a), P::I(b)])
         }
         "ci_test_history_timeline" => {
-            let suites = ["unit", "integration", "planner", "storage", "postgres", "e2e"];
+            let suites = [
+                "unit",
+                "integration",
+                "planner",
+                "storage",
+                "postgres",
+                "e2e",
+            ];
             let h = rng.next();
             let su = suites[(h % suites.len() as u64) as usize];
             one(vec![P::T(format!("{su}::test_{:03}", h % 20))])
@@ -880,10 +1635,17 @@ pub fn params_5_10(
             one(vec![P::I(a), P::I(b)])
         }
         "ci_test_name_prefix_like" => one(vec![P::T("planner::test_00%".into())]),
-        "ci_queue_next_job" | "ci_queue_depth_by_repo" | "ci_runner_utilization"
-        | "ci_queue_wait_outliers" | "ci_suite_pass_rate_pivot" | "ci_failing_jobs_with_tests"
-        | "ci_repo_failure_trend" | "ci_high_prio_failures" | "ci_test_results_count"
-        | "ci_jobs_count_total" | "ci_job_wallclock_buckets" => one(vec![]),
+        "ci_queue_next_job"
+        | "ci_queue_depth_by_repo"
+        | "ci_runner_utilization"
+        | "ci_queue_wait_outliers"
+        | "ci_suite_pass_rate_pivot"
+        | "ci_failing_jobs_with_tests"
+        | "ci_repo_failure_trend"
+        | "ci_high_prio_failures"
+        | "ci_test_results_count"
+        | "ci_jobs_count_total"
+        | "ci_job_wallclock_buckets" => one(vec![]),
         "ci_enqueue_job" => {
             let id = s.alloc_id();
             one(vec![
@@ -896,13 +1658,22 @@ pub fn params_5_10(
         }
         "ci_claim_and_finish_txn" => {
             let id = own(rng, s.ci_jobs);
-            Some(vec![vec![P::I(1 + (c.0 as i64 % 64)), P::I(ts), P::I(id)], vec![P::I(ts + 5000), P::I(id)]])
+            Some(vec![
+                vec![P::I(1 + (c.0 as i64 % 64)), P::I(ts), P::I(id)],
+                vec![P::I(ts + 5000), P::I(id)],
+            ])
         }
         "ci_bulk_test_results_50" => {
             let job = own(rng, s.ci_jobs);
             let mut v = Vec::with_capacity(50 * 5);
             for k in 0..50 {
-                v.extend([P::I(s.alloc_id()), P::I(job), P::T(format!("unit::bulk_{k:03}")), P::I(15 + k), P::I(ts)]);
+                v.extend([
+                    P::I(s.alloc_id()),
+                    P::I(job),
+                    P::T(format!("unit::bulk_{k:03}")),
+                    P::I(15 + k),
+                    P::I(ts),
+                ]);
             }
             one(v)
         }
@@ -913,7 +1684,10 @@ pub fn params_5_10(
         }
         "ci_record_flake_retry" => {
             let job = own(rng, s.ci_jobs);
-            Some(vec![vec![P::I(s.alloc_id()), P::I(job), P::I(ts)], vec![P::I(ts), P::I(job)]])
+            Some(vec![
+                vec![P::I(s.alloc_id()), P::I(job), P::I(ts)],
+                vec![P::I(ts), P::I(job)],
+            ])
         }
         "ci_job_savepoint_abort" => {
             let jid = s.alloc_id();
@@ -950,7 +1724,9 @@ pub fn params_5_10(
             let start = BASE_TS_US + (rng.next() % 50) as i64 * 7_200_000_000;
             one(vec![P::I(res), P::I(start + 14_400_000_000), P::I(start)])
         }
-        "sch_double_booking_self" | "sch_free_slot_gaps_lead" => one(vec![P::I(pick(rng, s.resources))]),
+        "sch_double_booking_self" | "sch_free_slot_gaps_lead" => {
+            one(vec![P::I(pick(rng, s.resources))])
+        }
         "sch_owner_schedule" => one(vec![P::I(pick(rng, s.accounts))]),
         "sch_owner_conflicts" => {
             let (a, b) = span(rng, s.bookings, 3_000);
@@ -979,14 +1755,28 @@ pub fn params_5_10(
             let (a, b) = span(rng, s.tenants, 10);
             one(vec![P::I(a), P::I(b)])
         }
-        "sch_resource_utilization" | "sch_longest_bookings" | "sch_status_breakdown"
-        | "sch_busy_resources_having" | "sch_bookings_count_total" | "wiki_orphan_docs_anti"
-        | "wiki_deadend_docs_notex" | "wiki_hub_degree_top25" | "wiki_mutual_links_self"
-        | "wiki_tenant_doc_versions" | "wiki_docs_count_total" | "wiki_links_count_total" => one(vec![]),
+        "sch_resource_utilization"
+        | "sch_longest_bookings"
+        | "sch_status_breakdown"
+        | "sch_busy_resources_having"
+        | "sch_bookings_count_total"
+        | "wiki_orphan_docs_anti"
+        | "wiki_deadend_docs_notex"
+        | "wiki_hub_degree_top25"
+        | "wiki_mutual_links_self"
+        | "wiki_tenant_doc_versions"
+        | "wiki_docs_count_total"
+        | "wiki_links_count_total" => one(vec![]),
         "sch_create_booking_txn" => {
             let id = s.alloc_id();
             Some(vec![
-                vec![P::I(id), P::I(pick(rng, s.resources)), P::I(pick(rng, s.accounts)), P::I(ts), P::I(ts + 3_600_000_000)],
+                vec![
+                    P::I(id),
+                    P::I(pick(rng, s.resources)),
+                    P::I(pick(rng, s.accounts)),
+                    P::I(ts),
+                    P::I(ts + 3_600_000_000),
+                ],
                 vec![P::I(id)],
             ])
         }
@@ -1001,11 +1791,21 @@ pub fn params_5_10(
             let mut v = Vec::with_capacity(25 * 5);
             for k in 0..25 {
                 let st = ts + k * 7_200_000_000;
-                v.extend([P::I(s.alloc_id()), P::I(res), P::I(owner), P::I(st), P::I(st + 3_600_000_000)]);
+                v.extend([
+                    P::I(s.alloc_id()),
+                    P::I(res),
+                    P::I(owner),
+                    P::I(st),
+                    P::I(st + 3_600_000_000),
+                ]);
             }
             one(v)
         }
-        "wiki_publish_revision" => one(vec![P::T("Updated RFC design doc text ".repeat(30)), P::I(ts), P::I(own(rng, s.documents))]),
+        "wiki_publish_revision" => one(vec![
+            P::T("Updated RFC design doc text ".repeat(30)),
+            P::I(ts),
+            P::I(own(rng, s.documents)),
+        ]),
         "wiki_upsert_link" => {
             let a = own(rng, s.documents);
             let b = 1 + (a % s.documents.max(1));
@@ -1020,7 +1820,12 @@ pub fn params_5_10(
             let id = s.alloc_id();
             let body = "Architecture decision paragraph. ".repeat(250);
             Some(vec![
-                vec![P::I(id), P::T(format!("tmp-rfc-{id}")), P::T(body), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::T(format!("tmp-rfc-{id}")),
+                    P::T(body),
+                    P::I(ts),
+                ],
                 vec![P::I(id)],
                 vec![P::I(id)],
                 vec![P::I(id)],
@@ -1041,9 +1846,15 @@ pub fn params_5_10(
         }
 
         // Domain 9: Cross-Domain BI & ETL
-        "bi_6table_saas_join" | "bi_wide_sort_nulls_mixed" | "bi_case_nullif_coalesce"
-        | "bi_in_subquery_multi" | "bi_string_concat_agg" | "bi_json_join_analytics"
-        | "bi_cross_join_matrix" | "bi_multi_cte_diamond" | "bi_sum_of_distinct_vals" => {
+        "bi_6table_saas_join"
+        | "bi_wide_sort_nulls_mixed"
+        | "bi_case_nullif_coalesce"
+        | "bi_in_subquery_multi"
+        | "bi_string_concat_agg"
+        | "bi_json_join_analytics"
+        | "bi_cross_join_matrix"
+        | "bi_multi_cte_diamond"
+        | "bi_sum_of_distinct_vals" => {
             let (a, b) = span(rng, s.issues, 3_000);
             one(vec![P::I(a), P::I(b)])
         }
@@ -1063,8 +1874,12 @@ pub fn params_5_10(
             let (a, b) = span(rng, s.customers, 2_000);
             one(vec![P::I(a), P::I(b)])
         }
-        "bi_monthly_cohort_matrix" | "bi_unbounded_csv_export" | "bi_exists_and_not_exists"
-        | "bi_nested_derived_3deep" | "bi_window_frame_range_avg" | "bi_top_n_per_group_3way"
+        "bi_monthly_cohort_matrix"
+        | "bi_unbounded_csv_export"
+        | "bi_exists_and_not_exists"
+        | "bi_nested_derived_3deep"
+        | "bi_window_frame_range_avg"
+        | "bi_top_n_per_group_3way"
         | "bi_anti_join_3way_chain" => {
             let (a, b) = span(rng, s.orders, 3_000);
             one(vec![P::I(a), P::I(b)])
@@ -1090,9 +1905,14 @@ pub fn params_5_10(
             let (a, b) = span(rng, s.projects, 30);
             one(vec![P::I(a), P::I(b)])
         }
-        "bi_4x_count_distinct" | "bi_high_card_4col_groupby" | "bi_cross_domain_org_score"
-        | "bi_correlated_having_avg" | "bi_window_running_pct" | "bi_union_all_ledger_audit"
-        | "bi_empty_filter_agg" | "bi_group_by_expr_bucket" => one(vec![]),
+        "bi_4x_count_distinct"
+        | "bi_high_card_4col_groupby"
+        | "bi_cross_domain_org_score"
+        | "bi_correlated_having_avg"
+        | "bi_window_running_pct"
+        | "bi_union_all_ledger_audit"
+        | "bi_empty_filter_agg"
+        | "bi_group_by_expr_bucket" => one(vec![]),
         "etl_insert_select_rollup" => Some(vec![vec![], vec![], vec![], vec![], vec![]]),
         "etl_ctas_snapshot" => {
             let (a, b) = span(rng, s.orders, 1_000);
@@ -1109,7 +1929,12 @@ pub fn params_5_10(
             let mut v = Vec::with_capacity(25 * 4);
             for k in 0..25 {
                 let id = 1 + ((own(rng, s.agent_memories) + k) % s.agent_memories.max(1));
-                v.extend([P::I(id), P::T(format!("etl-{id}")), P::B(vec![9u8; 64]), P::I(ts)]);
+                v.extend([
+                    P::I(id),
+                    P::T(format!("etl-{id}")),
+                    P::B(vec![9u8; 64]),
+                    P::I(ts),
+                ]);
             }
             one(v)
         }
@@ -1122,24 +1947,34 @@ pub fn params_5_10(
             vec![],
             vec![],
         ]),
-        "ddl_wide_schema_20cols" => Some(vec![
-            vec![],
-            vec![P::Z(true), P::Z(false)],
-            vec![],
-            vec![],
-        ]),
-        "ddl_create_drop_table" | "ddl_rename_table" | "ddl_rename_column"
-        | "ddl_drop_column" | "ddl_view_create_join_drop" | "ddl_temp_table_join"
-        | "ddl_reindex_table" | "ddl_create_comp_desc_idx" | "ddl_create_unique_idx"
+        "ddl_wide_schema_20cols" => {
+            Some(vec![vec![], vec![P::Z(true), P::Z(false)], vec![], vec![]])
+        }
+        "ddl_create_drop_table"
+        | "ddl_rename_table"
+        | "ddl_rename_column"
+        | "ddl_drop_column"
+        | "ddl_view_create_join_drop"
+        | "ddl_temp_table_join"
+        | "ddl_reindex_table"
+        | "ddl_create_comp_desc_idx"
+        | "ddl_create_unique_idx"
         | "ddl_create_expr_idx" => Some(vec![vec![]; 5]),
         "ddl_create_single_idx" | "ddl_add_column_backfill" => Some(vec![vec![]; 6]),
         "ddl_nested_views" | "ddl_if_not_exists_idemp" => Some(vec![vec![]; 7]),
         "ddl_trigger_after_insert" | "ddl_trigger_after_delete" => Some(vec![vec![]; 8]),
         "ddl_trigger_after_update" => Some(vec![vec![]; 9]),
         "cat_oid_rename_stability" => Some(vec![vec![]; 5]),
-        "ddl_analyze_stats" | "ddl_wal_checkpoint_pass" | "ddl_integrity_check"
-        | "cat_list_tables" | "cat_list_indexes" | "cat_table_columns" | "cat_pg_namespaces"
-        | "cat_pg_types" | "cat_pg_class_oids" | "cat_pg_attributes_join" => one(vec![]),
+        "ddl_analyze_stats"
+        | "ddl_wal_checkpoint_pass"
+        | "ddl_integrity_check"
+        | "cat_list_tables"
+        | "cat_list_indexes"
+        | "cat_table_columns"
+        | "cat_pg_namespaces"
+        | "cat_pg_types"
+        | "cat_pg_class_oids"
+        | "cat_pg_attributes_join" => one(vec![]),
         _ => None,
     }
 }

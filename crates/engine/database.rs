@@ -785,10 +785,10 @@ pub struct Database<
     // in std.
     pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
-    /// SQL rows. Passed explicitly by every open path, fixed at open time,
-    /// and shared by all connections because the parsed [`Schema`] is
-    /// shared per database.
-    dialect: Arc<dyn Dialect>,
+    /// SQL rows. Passed explicitly by every open path and shared by all
+    /// connections; updated only when an empty follower installs a raw page
+    /// image from a different-dialect source via [`Self::set_dialect`].
+    dialect: parking_lot::RwLock<Arc<dyn Dialect>>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -988,7 +988,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
-            dialect,
+            dialect: parking_lot::RwLock::new(dialect),
             io: io.clone(),
             open_flags: flags,
             opts,
@@ -1236,11 +1236,12 @@ impl Database {
     /// user of the registered instance, so a mismatch is an error rather
     /// than a silent share.
     fn check_registry_dialect(db: &Database, requested: &dyn Dialect) -> Result<()> {
+        let current = db.dialect();
         let requested_name = requested.name();
-        if db.dialect.name() != requested_name {
+        if current.name() != requested_name {
             return Err(LimboError::InvalidArgument(format!(
                 "database is already open with dialect '{}'; requested '{}'",
-                db.dialect.name(),
+                current.name(),
                 requested_name
             )));
         }
@@ -1830,7 +1831,14 @@ impl Database {
                         |header| (header.schema_cookie.get(), header.pg_next_oid.get())
                     ));
                     if let Some(db) = state.db.as_ref() {
-                        db.dialect().load_next_oid(pg_next_oid);
+                        let dialect = db.dialect();
+                        if pg_next_oid != 0 && dialect.name() == "sqlite" {
+                            return Err(LimboError::Corrupt(format!(
+                                "malformed database schema: database was created by the postgres frontend (pg_next_oid={pg_next_oid})"
+                            ))
+                            .into());
+                        }
+                        dialect.load_next_oid(pg_next_oid);
                     }
                     let guard = state
                         .schema_guard
@@ -2625,9 +2633,9 @@ impl Database {
         cipher: CipherMode,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Self>> {
-        let enable_custom_types =
-            self.opts.enable_custom_types || self.dialect.requires_custom_types();
-        let mut empty_schema = Schema::with_options(enable_custom_types, self.dialect.as_ref())?;
+        let dialect = self.dialect();
+        let enable_custom_types = self.opts.enable_custom_types || dialect.requires_custom_types();
+        let mut empty_schema = Schema::with_options(enable_custom_types, dialect.as_ref())?;
         empty_schema.generated_columns_enabled = self.opts.enable_generated_columns;
         let db = Self {
             mv_store: ArcSwapOption::empty(),
@@ -2651,7 +2659,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(SymbolTable::new()),
-            dialect: self.dialect.clone(),
+            dialect: parking_lot::RwLock::new(dialect),
             io: self.io.clone(),
             open_flags: self.open_flags,
             opts: self.opts,
@@ -2675,16 +2683,16 @@ impl Database {
 
     #[cfg(feature = "conn_raw_api")]
     /// Validates page-1 header metadata of a restored populated image on `staging_pager`, matching
-    /// cold [`Self::header_validation`], and returns whether the restored image uses MVCC mode.
+    /// cold [`Self::header_validation`], and returns `(open_mv_store, pg_next_oid)`.
     fn validate_restored_header(
         &self,
         staging_pager: &Arc<Pager>,
         encryption_key: Option<&EncryptionKey>,
         log_exists: bool,
-    ) -> Result<bool> {
+    ) -> Result<(bool, u32)> {
         staging_pager.begin_read_tx()?;
         let header_res = self.io.block(|| HeaderRef::from_pager(staging_pager));
-        let open_mv_store = (|| -> Result<bool> {
+        let validated = (|| -> Result<(bool, u32)> {
             let header = header_res?;
             let header_ref = header.borrow();
             if !header_ref.text_encoding.is_utf8() {
@@ -2759,10 +2767,16 @@ impl Database {
                     self.path
                 )));
             }
-            Ok(open_mv_store)
+            let pg_next_oid = header_ref.pg_next_oid.get();
+            if pg_next_oid != 0 && self.dialect().name() == "sqlite" {
+                return Err(LimboError::Corrupt(format!(
+                    "malformed database schema: database was created by the postgres frontend (pg_next_oid={pg_next_oid})"
+                )));
+            }
+            Ok((open_mv_store, pg_next_oid))
         })();
         staging_pager.end_read_tx();
-        open_mv_store
+        validated
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -3009,10 +3023,11 @@ impl Database {
         // Stage 3: validate page 1 (header, journal mode, checksum/decryption), parse the catalog,
         // and (for MVCC images) open & bootstrap the replacement `MvStore` on an isolated
         // unregistered staging `Database` BEFORE mutating any live state on `self`.
-        let (restored_schema, staged_mv_store, restored_init_page_1): (
+        let (restored_schema, staged_mv_store, restored_init_page_1, restored_pg_next_oid): (
             Arc<Schema>,
             Option<Arc<MvStore>>,
             Option<PageRef>,
+            u32,
         ) = if is_empty_image {
             if log_exists {
                 return Err(LimboError::Corrupt(format!(
@@ -3020,15 +3035,15 @@ impl Database {
                     self.path
                 )));
             }
-            let mut empty = Schema::with_options(
-                self.experimental_custom_types_enabled(),
-                self.dialect.as_ref(),
-            )?;
+            let dialect = self.dialect();
+            let mut empty =
+                Schema::with_options(self.experimental_custom_types_enabled(), dialect.as_ref())?;
             empty.generated_columns_enabled = self.opts.enable_generated_columns;
             (
                 Arc::new(empty),
                 None,
                 Some(pager::default_page1(cipher_opt.as_ref())),
+                0,
             )
         } else {
             let staging_pool = BufferPool::begin_init(&self.io, BufferPool::TEST_ARENA_SIZE);
@@ -3068,7 +3083,7 @@ impl Database {
                 staging_pager.set_encryption_context(cipher, key)?;
             }
 
-            let open_mv_store =
+            let (open_mv_store, pg_next_oid) =
                 self.validate_restored_header(&staging_pager, encryption_key.as_ref(), log_exists)?;
 
             let staging_db = self.build_staging_for_restore(
@@ -3130,7 +3145,7 @@ impl Database {
             drop(staging_db);
             drop(staging_pager);
             drop(staging_shared_wal);
-            (final_schema, staged_mv, None)
+            (final_schema, staged_mv, None, pg_next_oid)
         };
 
         let new_first_wal = Arc::try_unwrap(new_first_wal).map_err(|_| {
@@ -3161,8 +3176,9 @@ impl Database {
             let new_key = DatabaseKey::File(new_fid, self.io.registry_scope());
             let self_weak = Arc::downgrade(self);
             let mut registry = DATABASE_MANAGER.lock();
-            let _ = registry_reservation.disarm();
+            let reserved_key = registry_reservation.disarm();
             let mut reg_key = self.registry_key.lock();
+            let mut promoted = false;
             if let Some(old_key) = reg_key.as_ref() {
                 if *old_key != new_key {
                     let owned = matches!(
@@ -3174,24 +3190,37 @@ impl Database {
                     }
                     registry.insert(new_key.clone(), RegistryEntry::Ready(self_weak));
                     *reg_key = Some(new_key.clone());
+                    promoted = true;
+                }
+            }
+            if !promoted {
+                if let Some(key) = reserved_key {
+                    if matches!(registry.get(&key), Some(RegistryEntry::Opening)) {
+                        registry.remove(&key);
+                    }
                 }
             }
             if let Some(scoped) = self.registry_registration.lock().as_mut() {
                 scoped.key = new_key;
             }
         }
-        self.pager_state.set_restored_page_info(
-            new_page_size,
-            new_reserved_bytes,
-            restored_init_page_1,
-        );
-        self.shared_wal.replace_after_external_restore(
-            new_first_wal.into_inner(),
-            new_second_wal.into_inner(),
-            segments,
-        );
-        self.mv_store.store(staged_mv_store);
-        self.replace_schema(restored_schema);
+        {
+            let mut schema_guard = self.schema.lock();
+            self.pager_state.set_restored_page_info(
+                new_page_size,
+                new_reserved_bytes,
+                restored_init_page_1,
+            );
+            self.mv_store.store(staged_mv_store);
+            self.dialect().load_next_oid(restored_pg_next_oid);
+            *schema_guard = restored_schema;
+            self.bump_schema_epoch();
+            self.shared_wal.replace_after_external_restore(
+                new_first_wal.into_inner(),
+                new_second_wal.into_inner(),
+                segments,
+            );
+        }
         Ok(())
     }
 
@@ -4584,9 +4613,16 @@ impl Database {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
 
-    /// The SQL dialect this database was opened with.
+    /// The SQL dialect this database runs under.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
-        self.dialect.clone()
+        self.dialect.read().clone()
+    }
+
+    /// Replaces this database's SQL dialect in place when installing a raw replicated or restored
+    /// image whose page-1 header or catalog belongs to another dialect (e.g. an empty follower
+    /// receiving a PostgreSQL baseline seed).
+    pub fn set_dialect(&self, dialect: Arc<dyn Dialect>) {
+        *self.dialect.write() = dialect;
     }
 
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
@@ -4632,7 +4668,7 @@ impl Database {
     }
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
-        self.opts.enable_custom_types || self.dialect.requires_custom_types()
+        self.opts.enable_custom_types || self.dialect().requires_custom_types()
     }
 
     pub fn experimental_encryption_enabled(&self) -> bool {
@@ -6981,5 +7017,339 @@ mod database_tests {
             .connect(ConnectOpts::new().with_page_codec(codec))
             .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    /// Review Spec P1 regression: live restore must publish the restored schema atomically with
+    /// the bumped `restore_epoch` under `self.schema.lock()` so a concurrent `maybe_update_schema`
+    /// observing the new epoch cannot adopt the old schema under an equal schema cookie.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn review_p1_live_restore_publishes_schema_and_restore_epoch_atomically() {
+        for is_postgres in [false, true] {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let target_path = temp_dir.path().join("target.db");
+            let donor_path = temp_dir.path().join("donor.db");
+            let target_str = target_path.to_str().unwrap();
+            let donor_str = donor_path.to_str().unwrap();
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+            let make_dialect = || -> Arc<dyn crate::Dialect> {
+                if is_postgres {
+                    Arc::new(crate::PostgresDialect::new())
+                } else {
+                    Arc::new(SqliteDialect)
+                }
+            };
+
+            // Build donor with equal schema cookie (1 table) but different column name (`new_value`).
+            {
+                let donor = Database::open_file(io.clone(), donor_str, make_dialect()).unwrap();
+                let dconn = donor.connect(ConnectOpts::new()).unwrap();
+                dconn
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, new_value INTEGER)")
+                    .unwrap();
+                dconn.execute("INSERT INTO t VALUES (1, 22)").unwrap();
+                dconn
+                    .checkpoint(crate::storage::wal::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })
+                    .unwrap();
+                dconn.close().unwrap();
+            }
+
+            let target = Database::open_file(io.clone(), target_str, make_dialect()).unwrap();
+            let warmed = target.connect(ConnectOpts::new()).unwrap();
+            warmed
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, old_value INTEGER)")
+                .unwrap();
+            warmed.execute("INSERT INTO t VALUES (1, 11)").unwrap();
+            let _ = warmed
+                .prepare("SELECT old_value FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+
+            // Hammer `maybe_update_schema` across repeated live reloads to catch any publication window.
+            let stop = Arc::new(AtomicBool::new(false));
+            let warmed_bg = Arc::clone(&warmed);
+            let stop_bg = Arc::clone(&stop);
+            let poller = std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::Relaxed) {
+                    warmed_bg.maybe_update_schema();
+                }
+            });
+
+            for _ in 0..16 {
+                std::fs::copy(&donor_path, &target_path).unwrap();
+                let _ = std::fs::remove_file(format!("{target_str}-wal"));
+                let _ = std::fs::remove_file(format!("{target_str}-wal2"));
+                target.reload_wal_after_external_restore().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            poller.join().unwrap();
+
+            assert!(
+                warmed.execute("UPDATE t SET old_value = 44").is_err(),
+                "is_postgres={is_postgres}: warmed connection must not accept stale column old_value after live restore"
+            );
+            let rows = warmed
+                .prepare("SELECT new_value FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(22)]]);
+        }
+    }
+
+    /// Review Spec P2 regression: PostgreSQL live restore (both in-place copy and atomic rename)
+    /// must load the donor's persisted `pg_next_oid` so dropped table OIDs are never reused.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn review_p2_postgres_live_restore_preserves_pg_next_oid() {
+        for atomic_rename in [false, true] {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let donor_path = temp_dir.path().join("donor.db");
+            let cold_path = temp_dir.path().join("cold.db");
+            let target_path = temp_dir.path().join("target.db");
+            let donor_str = donor_path.to_str().unwrap();
+            let cold_str = cold_path.to_str().unwrap();
+            let target_str = target_path.to_str().unwrap();
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+            // Donor creates 6 tables and drops 5 so `pg_next_oid` advances to 16390.
+            {
+                let donor = Database::open_file(
+                    io.clone(),
+                    donor_str,
+                    Arc::new(crate::PostgresDialect::new()),
+                )
+                .unwrap();
+                let conn = donor.connect(ConnectOpts::new()).unwrap();
+                conn.execute("CREATE TABLE keep_t(id int4)").unwrap();
+                for i in 0..5 {
+                    conn.execute(format!("CREATE TABLE tmp_{i}(id int4)"))
+                        .unwrap();
+                    conn.execute(format!("DROP TABLE tmp_{i}")).unwrap();
+                }
+                conn.checkpoint(crate::storage::wal::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })
+                .unwrap();
+                conn.close().unwrap();
+            }
+
+            // Cold-open reference assigns `expected_oid`.
+            std::fs::copy(&donor_path, &cold_path).unwrap();
+            let expected_oid: i64 = {
+                let cold = Database::open_file(
+                    io.clone(),
+                    cold_str,
+                    Arc::new(crate::PostgresDialect::new()),
+                )
+                .unwrap();
+                let conn = cold.connect(ConnectOpts::new()).unwrap();
+                conn.execute("CREATE TABLE probe(id int4)").unwrap();
+                let rows = conn
+                    .prepare("SELECT oid FROM pg_class WHERE relname = 'probe'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                match &rows[0][0] {
+                    crate::Value::Numeric(crate::Numeric::Integer(v)) => *v,
+                    other => panic!("unexpected oid value: {other:?}"),
+                }
+            };
+            assert_eq!(expected_oid, 16390);
+
+            // Live target starts at OID 16384 (1 table), then reloads donor in place or via rename.
+            let target = Database::open_file(
+                io.clone(),
+                target_str,
+                Arc::new(crate::PostgresDialect::new()),
+            )
+            .unwrap();
+            let conn = target.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE orig(id int4)").unwrap();
+
+            if atomic_rename {
+                let staged = temp_dir.path().join("staged.db");
+                std::fs::copy(&donor_path, &staged).unwrap();
+                std::fs::rename(&staged, &target_path).unwrap();
+            } else {
+                std::fs::copy(&donor_path, &target_path).unwrap();
+            }
+            let _ = std::fs::remove_file(format!("{target_str}-wal"));
+            let _ = std::fs::remove_file(format!("{target_str}-wal2"));
+            target.reload_wal_after_external_restore().unwrap();
+
+            conn.execute("CREATE TABLE probe(id int4)").unwrap();
+            let rows = conn
+                .prepare("SELECT oid FROM pg_class WHERE relname = 'probe'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            let live_oid = match &rows[0][0] {
+                crate::Value::Numeric(crate::Numeric::Integer(v)) => *v,
+                other => panic!("unexpected oid value: {other:?}"),
+            };
+            assert_eq!(
+                live_oid, expected_oid,
+                "atomic_rename={atomic_rename}: live restore must preserve donor pg_next_oid"
+            );
+        }
+    }
+
+    /// Review Standards P2 regression: an atomic-rename restore on an unregistered raw `do_open`
+    /// handle (`registry_key == None`) must clear its temporary `RegistryEntry::Opening` sentinel
+    /// instead of leaving future `Database::open_file` calls livelocked.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn review_p2_raw_do_open_atomic_rename_restore_does_not_leak_opening_entry() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target.db");
+        let donor_path = temp_dir.path().join("donor.db");
+        let target_str = target_path.to_str().unwrap();
+        let donor_str = donor_path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        {
+            let donor =
+                Database::open_file(io.clone(), donor_str, Arc::new(SqliteDialect)).unwrap();
+            let conn = donor.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+            conn.execute("INSERT INTO t VALUES (99)").unwrap();
+            conn.checkpoint(crate::storage::wal::CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let raw = Database::do_open(
+                io.clone(),
+                target_str,
+                OpenOptions::new(Arc::new(SqliteDialect)),
+            )
+            .unwrap();
+            let conn = raw.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+            // Atomic rename replaces target with a fresh inode.
+            std::fs::rename(&donor_path, &target_path).unwrap();
+            let _ = std::fs::remove_file(format!("{target_str}-wal"));
+            let _ = std::fs::remove_file(format!("{target_str}-wal2"));
+            raw.reload_wal_after_external_restore().unwrap();
+            conn.close().unwrap();
+        }
+
+        // Normal registry-backed open must succeed immediately instead of livelocking on `Opening`.
+        let reopened = Database::open_file(io, target_str, Arc::new(SqliteDialect)).unwrap();
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        let rows = conn
+            .prepare("SELECT v FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(99)]]);
+    }
+
+    /// Review Round 5 Spec P1 regression: an in-flight `prepare()` that captured the pre-restore
+    /// schema before an equal-cookie restore + second `prepare()` on the same connection must
+    /// retain its pre-restore `PrepareContext` (generation & restore_epoch) so executing it forces
+    /// reprepare and refuses writes to a removed column (`old_value`), leaving the donor's
+    /// `new_value` untouched on both dialects.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn review_p1_inflight_prepare_across_equal_cookie_restore_and_second_prepare_refuses_stale_column(
+    ) {
+        for is_postgres in [false, true] {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let target_path = temp_dir.path().join("target.db");
+            let donor_path = temp_dir.path().join("donor.db");
+            let target_str = target_path.to_str().unwrap();
+            let donor_str = donor_path.to_str().unwrap();
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+            let make_dialect = || -> Arc<dyn crate::Dialect> {
+                if is_postgres {
+                    Arc::new(crate::PostgresDialect::new())
+                } else {
+                    Arc::new(SqliteDialect)
+                }
+            };
+
+            // Donor has equal schema cookie (1 table) with `new_value = 22`.
+            {
+                let donor = Database::open_file(io.clone(), donor_str, make_dialect()).unwrap();
+                let dconn = donor.connect(ConnectOpts::new()).unwrap();
+                dconn
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, new_value INTEGER)")
+                    .unwrap();
+                dconn.execute("INSERT INTO t VALUES (1, 22)").unwrap();
+                dconn
+                    .checkpoint(crate::storage::wal::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })
+                    .unwrap();
+                dconn.close().unwrap();
+            }
+
+            let target = Database::open_file(io.clone(), target_str, make_dialect()).unwrap();
+            let conn = target.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, old_value INTEGER)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 11)").unwrap();
+
+            // Simulate an in-flight `prepare("UPDATE t SET old_value = 44")` paused immediately
+            // after capturing `(schema, prepare_context)` and before building bytecode.
+            conn.maybe_update_schema();
+            let (stale_schema, stale_ctx) = conn.snapshot_schema_and_prepare_context();
+
+            // Complete an equal-cookie external restore, then prepare a second statement on the
+            // SAME connection so `conn.schema`, `conn.last_restore_epoch`, and
+            // `conn.prepare_context_generation` advance to the restored catalog.
+            std::fs::copy(&donor_path, &target_path).unwrap();
+            let _ = std::fs::remove_file(format!("{target_str}-wal"));
+            let _ = std::fs::remove_file(format!("{target_str}-wal2"));
+            target.reload_wal_after_external_restore().unwrap();
+            let _second = conn.prepare("SELECT new_value FROM t").unwrap();
+
+            // Now resume compiling the first statement against the pre-restore schema snapshot.
+            let stale_program = crate::statement::plan_sql_on(
+                &conn,
+                conn.get_pager(),
+                "UPDATE t SET old_value = 44",
+                crate::QueryMode::Normal,
+                crate::statement::StatementOrigin::Root,
+                &crate::PrepareOptions::default(),
+                stale_schema,
+                stale_ctx,
+            )
+            .unwrap();
+            let mut stmt = crate::Statement::new_with_origin(
+                stale_program,
+                conn.get_pager(),
+                crate::QueryMode::Normal,
+                "UPDATE t SET old_value = 44".len(),
+                crate::statement::StatementOrigin::Root,
+                false,
+            );
+
+            // Stepping the stale statement must detect the mismatch, reprepare against the donor
+            // schema, and fail because `old_value` does not exist.
+            assert!(
+                stmt.run_ignore_rows().is_err(),
+                "is_postgres={is_postgres}: paused prepare must not write through removed column old_value"
+            );
+
+            // Verify on a fresh connection that the donor's `new_value` is still 22.
+            let fresh = target.connect(ConnectOpts::new()).unwrap();
+            let rows = fresh
+                .prepare("SELECT new_value FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(22)]]);
+        }
     }
 }

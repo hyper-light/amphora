@@ -94,7 +94,7 @@ pub(super) fn recorded(db: &Db) -> anyhow::Result<Option<usize>> {
 
 /// Records `bound` as the group's member bound, in the transaction under way.
 pub(super) fn record(db: &mut Db, bound: usize) -> anyhow::Result<()> {
-    db.exec(TABLE)?;
+    db.exec_internal(TABLE)?;
     db.query(
         "INSERT INTO __amphora_member_bound(id, bound) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET bound = excluded.bound",
         [amphora_engine::Value::from_slice(&u64::try_from(bound)?.to_le_bytes())?],

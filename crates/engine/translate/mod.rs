@@ -85,6 +85,7 @@ pub fn translate(
     input: &str,
     origin: crate::statement::StatementOrigin,
     prepare_options: &PrepareOptions,
+    prepare_context: crate::vdbe::PrepareContext,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -284,13 +285,14 @@ pub fn translate(
     program.planned_subqueries = plan_values.take_planned_subqueries();
     program.write_target = write_target;
 
-    program.build(connection, change_cnt_on, input)
+    program.build_with_context(connection, prepare_context, change_cnt_on, input)
 }
 
 /// Amphora: the program of one online index backfill batch ([`index::emit_index_backfill`]),
 /// set up as [`translate`] sets up a statement's. `input` is the statement's text, which no SQL
 /// parses: a statement made stale by a schema change refuses to run again rather than be
 /// prepared as some other statement.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_index_backfill(
     schema: &Schema,
     connection: Arc<Connection>,
@@ -299,6 +301,7 @@ pub(crate) fn translate_index_backfill(
     index_name: &str,
     after: Option<i64>,
     rows: u64,
+    prepare_context: crate::vdbe::PrepareContext,
 ) -> Result<Program> {
     let prepare_options = PrepareOptions::default();
     let mut program = Box::new(ProgramBuilder::new(
@@ -321,7 +324,7 @@ pub(crate) fn translate_index_backfill(
     );
     index::emit_index_backfill(&mut program, &resolver, index_name, after, rows)?;
     program.epilogue(schema);
-    program.build(connection, false, input)
+    program.build_with_context(connection, prepare_context, false, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -802,6 +805,7 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
+        let prepare_context = crate::vdbe::PrepareContext::from_connection(&conn);
         let result = translate(
             &schema,
             stmt,
@@ -812,6 +816,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            prepare_context,
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1024,6 +1029,7 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
+        let prepare_context = crate::vdbe::PrepareContext::from_connection(&conn);
         let err = translate(
             &schema,
             stmt,
@@ -1034,6 +1040,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            prepare_context,
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -1069,6 +1076,7 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
+        let prepare_context = crate::vdbe::PrepareContext::from_connection(&conn);
         let err = translate(
             &schema,
             stmt,
@@ -1079,6 +1087,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            prepare_context,
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

@@ -176,6 +176,8 @@ pub(crate) struct SearchRequest {
     /// The generation of the connection's settings at hand-off
     /// (`Connection::prepare_context_generation`).
     pub(crate) generation: u64,
+    /// The full [`crate::vdbe::PrepareContext`] captured alongside `schema` at hand-off.
+    pub(crate) prepare_context: crate::vdbe::PrepareContext,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sql: String,
     pub(crate) mode: QueryMode,
@@ -223,6 +225,7 @@ impl SearchRequest {
             self.origin,
             &options,
             self.schema.clone(),
+            self.prepare_context.clone(),
         );
         let margin = conn.db.learned_costs.cost_margin();
         let found = match planned {

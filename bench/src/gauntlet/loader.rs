@@ -63,7 +63,9 @@ const CURRENCIES: &[&str] = &["USD", "EUR", "GBP", "JPY", "CAD"];
 const COUNTRIES: &[&str] = &["US", "DE", "JP", "GB", "CA", "FR", "BR", "IN", "AU", "KR"];
 const TIERS: &[&str] = &["free", "pro", "team", "enterprise"];
 const EMOJIS: &[&str] = &["👍", "🔥", "🚀", "👀", "❤️", "🎉", "🤔", "✅"];
-const OUTCOMES: &[&str] = &["pass", "pass", "pass", "pass", "pass", "pass", "pass", "fail", "flake", "skip"];
+const OUTCOMES: &[&str] = &[
+    "pass", "pass", "pass", "pass", "pass", "pass", "pass", "fail", "flake", "skip",
+];
 
 /// Exact row counts across all 43 tables derived from one core scale factor `n`.
 ///
@@ -341,6 +343,13 @@ impl GauntletShape {
     pub fn alloc_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Advances the monotonic ID allocator past `max_id` (used on `--reuse` so repeated runs never
+    /// collide with primary keys written by earlier runs).
+    pub fn advance_next_id_past(&self, max_id: i64) {
+        let floor = max_id.saturating_add(1);
+        self.next_id.fetch_max(floor, Ordering::AcqRel);
+    }
 }
 
 fn word(h: u64) -> &'static str {
@@ -491,7 +500,8 @@ where
             row_fn(item, &mut params);
             n += 1;
             if n >= batch_rows {
-                self.tx.push((full_sql.clone(), std::mem::take(&mut params)));
+                self.tx
+                    .push((full_sql.clone(), std::mem::take(&mut params)));
                 self.rows_total += n as u64;
                 self.rows_since_ckpt += n as u64;
                 self.rows_since_log += n as u64;
@@ -566,10 +576,20 @@ pub fn load_all(
             p.extend([
                 P::I(id),
                 P::T(format!("org-{id:05}")),
-                P::T(format!("Org {id} {}", UNICODE_NAMES[(id as usize) % UNICODE_NAMES.len()])),
+                P::T(format!(
+                    "Org {id} {}",
+                    UNICODE_NAMES[(id as usize) % UNICODE_NAMES.len()]
+                )),
                 P::T(plan.into()),
-                P::I(if id == 1 { 50_000 } else { 10 + (h % 500) as i64 }),
-                P::T(format!(r#"{{"sso":{sso},"region":"{region}","tier":"{plan}","retention_days":{}}}"#, 30 + (h % 335))),
+                P::I(if id == 1 {
+                    50_000
+                } else {
+                    10 + (h % 500) as i64
+                }),
+                P::T(format!(
+                    r#"{{"sso":{sso},"region":"{region}","tier":"{plan}","retention_days":{}}}"#,
+                    30 + (h % 335)
+                )),
                 P::I(BASE_TS_US - id * 86_400_000_000),
             ]);
         },
@@ -593,7 +613,10 @@ pub fn load_all(
                 P::I(id),
                 P::I(tid),
                 P::T(mixed_case),
-                P::T(format!("{} #{id}", UNICODE_NAMES[(h % UNICODE_NAMES.len() as u64) as usize])),
+                P::T(format!(
+                    "{} #{id}",
+                    UNICODE_NAMES[(h % UNICODE_NAMES.len() as u64) as usize]
+                )),
                 P::T(roles[(h % roles.len() as u64) as usize].into()),
                 P::Z(h % 20 != 0),
                 P::I(BASE_TS_US + (h % 2_500_000) as i64 * 1_000_000),
@@ -657,12 +680,20 @@ pub fn load_all(
         |id, p| {
             let h = mix(id as u64 ^ 0x1005);
             let tid = shape.skewed_tenant(h);
-            let names = ["bug", "urgent", "feature", "perf", "security", "wontfix", "docs", "infra"];
-            let colors = ["#d73a4a", "#0075ca", "#cfd3d7", "#a2eeef", "#7057ff", "#e4e669"];
+            let names = [
+                "bug", "urgent", "feature", "perf", "security", "wontfix", "docs", "infra",
+            ];
+            let colors = [
+                "#d73a4a", "#0075ca", "#cfd3d7", "#a2eeef", "#7057ff", "#e4e669",
+            ];
             p.extend([
                 P::I(id),
                 P::I(tid),
-                P::T(format!("{}-{}", names[(id as usize) % names.len()], id % 12)),
+                P::T(format!(
+                    "{}-{}",
+                    names[(id as usize) % names.len()],
+                    id % 12
+                )),
                 P::T(colors[(h % colors.len() as u64) as usize].into()),
             ]);
         },
@@ -770,7 +801,11 @@ pub fn load_all(
             let iid = 1 + (h % active_issues as u64) as i64;
             let tid = shape.skewed_tenant(mix(iid as u64 ^ 0x1006));
             let author = 1 + (mix(h ^ 11) % shape.saas_users.max(1) as u64) as i64;
-            let rare = if id % 700 == 0 { Some("LGTM-quasar") } else { None };
+            let rare = if id % 700 == 0 {
+                Some("LGTM-quasar")
+            } else {
+                None
+            };
             p.extend([
                 P::I(id),
                 P::I(tid),
@@ -782,7 +817,12 @@ pub fn load_all(
         },
     )?;
 
-    let mimes = ["image/png", "application/pdf", "text/plain", "application/octet-stream"];
+    let mimes = [
+        "image/png",
+        "application/pdf",
+        "text/plain",
+        "application/octet-stream",
+    ];
     em.emit_rows(
         "INSERT INTO attachments (id, tenant_id, issue_id, filename, mime_type, size_bytes, payload)",
         "(?, ?, ?, ?, ?, ?, ?)",
@@ -827,13 +867,25 @@ pub fn load_all(
                 P::I(id),
                 P::I(shape.skewed_tenant(h)),
                 P::T(format!("https://git.internal/org/repo-{id}")),
-                P::T(if id % 5 == 0 { "master".into() } else { "main".into() }),
+                P::T(if id % 5 == 0 {
+                    "master".into()
+                } else {
+                    "main".into()
+                }),
                 P::I(BASE_TS_US - id * 3_600_000_000),
             ]);
         },
     )?;
 
-    let run_statuses = ["queued", "running", "completed", "completed", "completed", "failed", "cancelled"];
+    let run_statuses = [
+        "queued",
+        "running",
+        "completed",
+        "completed",
+        "completed",
+        "failed",
+        "cancelled",
+    ];
     em.emit_rows(
         "INSERT INTO agent_runs (id, workspace_id, parent_run_id, model, status, priority, started_at, finished_at, total_tokens, cost_micros, summary)",
         "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1057,7 +1109,9 @@ pub fn load_all(
     // =========================================================================
     // Domain 2: Social Graph, News Feed, Messaging & Moderation (8 tables)
     // =========================================================================
-    let locales = ["en-US", "ja-JP", "es-ES", "de-DE", "ko-KR", "ar-SA", "fr-FR", "pt-BR"];
+    let locales = [
+        "en-US", "ja-JP", "es-ES", "de-DE", "ko-KR", "ar-SA", "fr-FR", "pt-BR",
+    ];
     em.emit_rows(
         "INSERT INTO accounts (id, handle, display_name, bio, verified, follower_tier, locale, created_at)",
         "(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1158,7 +1212,13 @@ pub fn load_all(
         let count = 4i64.min(shape.accounts);
         (0..count).map(move |k| {
             let aid = 1 + ((cid * 3 + k) % shape.accounts.max(1));
-            (cid, aid, if k == 0 { "owner" } else { "member" }, k * 5, k == 3)
+            (
+                cid,
+                aid,
+                if k == 0 { "owner" } else { "member" },
+                k * 5,
+                k == 3,
+            )
         })
     });
     em.emit_iter(
@@ -1167,7 +1227,13 @@ pub fn load_all(
         100,
         member_rows,
         |(cid, aid, role, seq, muted), p| {
-            p.extend([P::I(cid), P::I(aid), P::T(role.into()), P::I(seq), P::Z(muted)]);
+            p.extend([
+                P::I(cid),
+                P::I(aid),
+                P::T(role.into()),
+                P::I(seq),
+                P::Z(muted),
+            ]);
         },
     )?;
 
@@ -1428,7 +1494,9 @@ pub fn load_all(
         let sub = 1000 + (h % 150_000) as i64;
         let tot = sub + sub / 10;
         let acct_a = 1 + (h % (shape.ledger_accounts / 2).max(1) as u64) as i64;
-        let acct_b = (shape.ledger_accounts / 2).max(1) + 1 + (h % (shape.ledger_accounts / 2).max(1) as u64) as i64;
+        let acct_b = (shape.ledger_accounts / 2).max(1)
+            + 1
+            + (h % (shape.ledger_accounts / 2).max(1) as u64) as i64;
         let ts = BASE_TS_US + (oid % 90) * 86_400_000_000 + oid * 1_000_000;
         [
             (oid * 2 - 1, acct_a, oid, "debit", tot, ts),
@@ -1472,7 +1540,14 @@ pub fn load_all(
     )?;
 
     let span_tpl = format!("(?, ?, ?, ?, ?, ?, ?, {jp}, ?)");
-    let ops = ["http.get", "http.post", "db.query", "cache.get", "rpc.call", "llm.infer"];
+    let ops = [
+        "http.get",
+        "http.post",
+        "db.query",
+        "cache.get",
+        "rpc.call",
+        "llm.infer",
+    ];
     em.emit_rows(
         "INSERT INTO spans (id, trace_id, parent_span_id, service_id, op_name, status_code, duration_us, tags_json, started_at)",
         &span_tpl,
@@ -1514,7 +1589,11 @@ pub fn load_all(
             p.extend([
                 P::I(id),
                 P::T(format!("exp_{}_{id}", word(mix(id as u64 ^ 0x5003)))),
-                P::T(if id % 4 == 0 { "ended".into() } else { "running".into() }),
+                P::T(if id % 4 == 0 {
+                    "ended".into()
+                } else {
+                    "running".into()
+                }),
                 P::I(BASE_TS_US - id * 86_400_000_000),
             ]);
         },
@@ -1549,7 +1628,9 @@ pub fn load_all(
     // =========================================================================
     // Domain 6: CI/CD Fleet & Test-Flake Intelligence (2 tables)
     // =========================================================================
-    let job_statuses = ["queued", "queued", "running", "passed", "passed", "passed", "failed"];
+    let job_statuses = [
+        "queued", "queued", "running", "passed", "passed", "passed", "failed",
+    ];
     em.emit_rows(
         "INSERT INTO ci_jobs (id, repo_id, commit_sha, status, priority, runner_id, created_at, claimed_at, finished_at)",
         "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1576,7 +1657,14 @@ pub fn load_all(
         },
     )?;
 
-    let suites = ["unit", "integration", "planner", "storage", "postgres", "e2e"];
+    let suites = [
+        "unit",
+        "integration",
+        "planner",
+        "storage",
+        "postgres",
+        "e2e",
+    ];
     em.emit_rows(
         "INSERT INTO test_results (id, job_id, suite_name, test_name, outcome, duration_ms, run_at)",
         "(?, ?, ?, ?, ?, ?, ?)",
@@ -1619,7 +1707,8 @@ pub fn load_all(
             let res = 1 + (h % shape.resources.max(1) as u64) as i64;
             let owner = 1 + (mix(h ^ 2) % shape.accounts.max(1) as u64) as i64;
             // Deliberately create realistic clusters + occasional overlaps + gaps!
-            let start = BASE_TS_US + ((id / shape.resources.max(1)) * 7_200 + (h % 3_600) as i64) * 1_000_000;
+            let start = BASE_TS_US
+                + ((id / shape.resources.max(1)) * 7_200 + (h % 3_600) as i64) * 1_000_000;
             let dur = (1_800 + (h % 5_400) as i64) * 1_000_000;
             p.extend([
                 P::I(id),

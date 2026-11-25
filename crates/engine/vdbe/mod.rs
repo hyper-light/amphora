@@ -1048,15 +1048,16 @@ pub struct ProgramState {
     /// Amphora (CS.5, lane R6): the serial loop a column copy handed its statement to, timed while
     /// the statement steps and charged to its table's row path when it ends.
     pub(crate) rows_timed: Option<crate::storage::versioned::columns_sql::RowsTiming>,
-    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
-    /// Dropping removes the temp file from disk.
-    ephemeral_temp_files: HashMap<usize, TempFile>,
     /// Amphora: the statement's small ephemeral tables, kept by cursor id from one run to the next
     /// (their temp files stay in `ephemeral_temp_files`), each emptied when the next run opens it:
     /// one built again each run (a temp file, a pager, a transaction, a B-tree) was a third of a
     /// ten-key IN lookup's time. At most [`KEPT_EPHEMERAL_PAGES`] pages each; dropped when the
-    /// statement is prepared again or the cursor closed.
+    /// statement is prepared again or the cursor closed. Declared before `ephemeral_temp_files` so
+    /// cached cursors release their `File` handles before `TempFile` cleans up the temp file/dir.
     ephemeral_kept: HashMap<usize, Cursor>,
+    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
+    /// Dropping removes the temp file from `io` (including `MemoryIO`) and deletes its temp dir.
+    ephemeral_temp_files: HashMap<usize, TempFile>,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     /// Pending error to return after FAIL mode commit completes.
@@ -2203,9 +2204,16 @@ impl PrepareContext {
         Self {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
-            restore_epoch: connection.db.shared_wal.restore_epoch(),
+            restore_epoch: connection
+                .last_restore_epoch
+                .load(crate::sync::atomic::Ordering::Acquire),
             attached_restore_epochs: connection.attached_restore_epochs_snapshot(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[inline]

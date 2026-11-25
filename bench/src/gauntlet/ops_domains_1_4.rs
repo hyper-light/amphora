@@ -41,198 +41,911 @@ pub const OPS_1_4: &[GauntletOp] = &[
     // =========================================================================
     // Domain 1: Agentic Coding & Multi-Agent Fleet (40 ops)
     // =========================================================================
-    r("agentic", "ag_run_detail", "load an agent run with workspace metadata by primary key"),
-    r("agentic", "ag_ws_active_runs", "list latest active/running agent runs in a workspace"),
-    r("agentic", "ag_run_turns_timeline", "fetch full conversation turns for an agent run in order"),
-    r("agentic", "ag_tool_trace_tree", "WITH RECURSIVE tool-call call-tree reconstruction"),
-    r("agentic", "ag_run_subtree_rollup", "WITH RECURSIVE parent->child subagent run token rollup"),
-    r("agentic", "ag_slowest_tools", "top 20 slowest tool calls with JSON args & run model"),
-    r("agentic", "ag_tool_error_rates", "error rate and avg/max duration per tool_name and model"),
-    r("agentic", "ag_tool_json_filter", "filter tool calls on JSON retry count and output bytes"),
-    r("agentic", "ag_model_token_spend", "total tokens and cost by model and status across fleet"),
-    r("agentic", "ag_ws_daily_burn", "monthly/bucketed token cost per workspace"),
-    r("agentic", "ag_diff_read_wide", "fetch wide multi-KB file diff patches for a run"),
-    r("agentic", "ag_diff_search_path", "find recent runs that modified a given source file path"),
-    r("agentic", "ag_diff_churn_top", "top 25 highest-churn source paths across all agent runs"),
-    r("agentic", "ag_memory_recall_top", "recall top 20 non-expired memories by score for a workspace"),
-    r("agentic", "ag_memory_blob_read", "read binary embedding blobs for a workspace's top memories"),
-    r("agentic", "ag_plan_ready_steps", "DAG scheduler: find pending plan steps with NO unfinished dependency"),
-    r("agentic", "ag_plan_critical_path", "WITH RECURSIVE longest path / depth in plan_edges DAG"),
-    r("agentic", "ag_token_trial_balance", "double-entry token cost ledger trial balance (must sum to 0)"),
-    r("agentic", "ag_ws_running_cost", "running cumulative token spend per workspace (window SUM)"),
-    r("agentic", "ag_turn_latency_rank", "rank turns by latency within each run (RANK/DENSE_RANK)"),
-    r("agentic", "ag_failed_runs_with_tools", "failed runs joined to their failing tool calls and diffs"),
-    r("agentic", "ag_idle_workspaces", "workspaces with zero recent runs (LEFT JOIN ... IS NULL)"),
-    r("agentic", "ag_multi_agent_models_distinct", "distinct models and tools used per workspace"),
-    r("agentic", "ag_heavy_runs_having", "runs exceeding token threshold with >= 3 tool calls"),
-    r("agentic", "ag_parent_vs_child_cost", "self-join comparing parent agent runs against spawned child runs"),
-    r("agentic", "ag_turn_token_delta", "turn-over-turn prompt token growth via LAG window"),
-    r("agentic", "ag_memories_expiring_union", "UNION of expired memories and low-score memories for GC"),
-    r("agentic", "ag_fleet_kpi_pivot", "conditional multi-bucket KPI pivot across all runs"),
-    r("agentic", "ag_export_runs_sorted", "unbounded multi-column sorted export of a workspace's runs"),
-    r("agentic", "ag_run_count_total", "whole-table COUNT(*) of tool_calls"),
-    w("agentic", "ag_record_turn_txn", "ACID turn: insert turn + tool call + update run tokens + balanced ledger"),
-    w("agentic", "ag_upsert_memory", "insert/update workspace memory with 128B embedding blob"),
-    w("agentic", "ag_save_wide_diff", "insert 12 KiB overflow file diff patch and clean up"),
-    w("agentic", "ag_complete_plan_step", "mark plan step done and bump updated_at"),
-    w("agentic", "ag_bulk_tool_calls_50", "bulk insert 50 tool_calls in one statement"),
-    w("agentic", "ag_update_run_status", "transition agent_run status and record finished_at"),
-    w("agentic", "ag_prune_memory_reinsert", "delete expired/old memory and reinsert fresh entry"),
-    w("agentic", "ag_cancel_subruns", "update child runs by parent_run_id"),
-    w("agentic", "ag_append_balanced_cost", "insert matched debit+credit token_cost_ledger pair"),
-    w("agentic", "ag_turn_with_savepoint", "record turn with SAVEPOINT rollback of failed tool retry"),
-
+    r(
+        "agentic",
+        "ag_run_detail",
+        "load an agent run with workspace metadata by primary key",
+    ),
+    r(
+        "agentic",
+        "ag_ws_active_runs",
+        "list latest active/running agent runs in a workspace",
+    ),
+    r(
+        "agentic",
+        "ag_run_turns_timeline",
+        "fetch full conversation turns for an agent run in order",
+    ),
+    r(
+        "agentic",
+        "ag_tool_trace_tree",
+        "WITH RECURSIVE tool-call call-tree reconstruction",
+    ),
+    r(
+        "agentic",
+        "ag_run_subtree_rollup",
+        "WITH RECURSIVE parent->child subagent run token rollup",
+    ),
+    r(
+        "agentic",
+        "ag_slowest_tools",
+        "top 20 slowest tool calls with JSON args & run model",
+    ),
+    r(
+        "agentic",
+        "ag_tool_error_rates",
+        "error rate and avg/max duration per tool_name and model",
+    ),
+    r(
+        "agentic",
+        "ag_tool_json_filter",
+        "filter tool calls on JSON retry count and output bytes",
+    ),
+    r(
+        "agentic",
+        "ag_model_token_spend",
+        "total tokens and cost by model and status across fleet",
+    ),
+    r(
+        "agentic",
+        "ag_ws_daily_burn",
+        "monthly/bucketed token cost per workspace",
+    ),
+    r(
+        "agentic",
+        "ag_diff_read_wide",
+        "fetch wide multi-KB file diff patches for a run",
+    ),
+    r(
+        "agentic",
+        "ag_diff_search_path",
+        "find recent runs that modified a given source file path",
+    ),
+    r(
+        "agentic",
+        "ag_diff_churn_top",
+        "top 25 highest-churn source paths across all agent runs",
+    ),
+    r(
+        "agentic",
+        "ag_memory_recall_top",
+        "recall top 20 non-expired memories by score for a workspace",
+    ),
+    r(
+        "agentic",
+        "ag_memory_blob_read",
+        "read binary embedding blobs for a workspace's top memories",
+    ),
+    r(
+        "agentic",
+        "ag_plan_ready_steps",
+        "DAG scheduler: find pending plan steps with NO unfinished dependency",
+    ),
+    r(
+        "agentic",
+        "ag_plan_critical_path",
+        "WITH RECURSIVE longest path / depth in plan_edges DAG",
+    ),
+    r(
+        "agentic",
+        "ag_token_trial_balance",
+        "double-entry token cost ledger trial balance (must sum to 0)",
+    ),
+    r(
+        "agentic",
+        "ag_ws_running_cost",
+        "running cumulative token spend per workspace (window SUM)",
+    ),
+    r(
+        "agentic",
+        "ag_turn_latency_rank",
+        "rank turns by latency within each run (RANK/DENSE_RANK)",
+    ),
+    r(
+        "agentic",
+        "ag_failed_runs_with_tools",
+        "failed runs joined to their failing tool calls and diffs",
+    ),
+    r(
+        "agentic",
+        "ag_idle_workspaces",
+        "workspaces with zero recent runs (LEFT JOIN ... IS NULL)",
+    ),
+    r(
+        "agentic",
+        "ag_multi_agent_models_distinct",
+        "distinct models and tools used per workspace",
+    ),
+    r(
+        "agentic",
+        "ag_heavy_runs_having",
+        "runs exceeding token threshold with >= 3 tool calls",
+    ),
+    r(
+        "agentic",
+        "ag_parent_vs_child_cost",
+        "self-join comparing parent agent runs against spawned child runs",
+    ),
+    r(
+        "agentic",
+        "ag_turn_token_delta",
+        "turn-over-turn prompt token growth via LAG window",
+    ),
+    r(
+        "agentic",
+        "ag_memories_expiring_union",
+        "UNION of expired memories and low-score memories for GC",
+    ),
+    r(
+        "agentic",
+        "ag_fleet_kpi_pivot",
+        "conditional multi-bucket KPI pivot across all runs",
+    ),
+    r(
+        "agentic",
+        "ag_export_runs_sorted",
+        "unbounded multi-column sorted export of a workspace's runs",
+    ),
+    r(
+        "agentic",
+        "ag_run_count_total",
+        "whole-table COUNT(*) of tool_calls",
+    ),
+    w(
+        "agentic",
+        "ag_record_turn_txn",
+        "ACID turn: insert turn + tool call + update run tokens + balanced ledger",
+    ),
+    w(
+        "agentic",
+        "ag_upsert_memory",
+        "insert/update workspace memory with 128B embedding blob",
+    ),
+    w(
+        "agentic",
+        "ag_save_wide_diff",
+        "insert 12 KiB overflow file diff patch and clean up",
+    ),
+    w(
+        "agentic",
+        "ag_complete_plan_step",
+        "mark plan step done and bump updated_at",
+    ),
+    w(
+        "agentic",
+        "ag_bulk_tool_calls_50",
+        "bulk insert 50 tool_calls in one statement",
+    ),
+    w(
+        "agentic",
+        "ag_update_run_status",
+        "transition agent_run status and record finished_at",
+    ),
+    w(
+        "agentic",
+        "ag_prune_memory_reinsert",
+        "delete expired/old memory and reinsert fresh entry",
+    ),
+    w(
+        "agentic",
+        "ag_cancel_subruns",
+        "update child runs by parent_run_id",
+    ),
+    w(
+        "agentic",
+        "ag_append_balanced_cost",
+        "insert matched debit+credit token_cost_ledger pair",
+    ),
+    w(
+        "agentic",
+        "ag_turn_with_savepoint",
+        "record turn with SAVEPOINT rollback of failed tool retry",
+    ),
     // =========================================================================
     // Domain 2: Social Graph, News Feed, Messaging & Moderation (40 ops)
     // =========================================================================
-    r("social", "soc_profile_by_handle", "profile lookup by unique @handle"),
-    r("social", "soc_feed_normal_user", "home feed for a normal user excluding blocked authors"),
-    r("social", "soc_feed_celebrity_fanout", "all followers of celebrity account #1 (extreme skew!)"),
-    r("social", "soc_mutual_follows", "mutual connections via INTERSECT of follows"),
-    r("social", "soc_fof_recommendations", "2-hop friend-of-friend recommendations excluding already-followed & blocked"),
-    r("social", "soc_channel_latest_50", "latest 50 non-deleted messages in a channel with authors"),
-    r("social", "soc_channel_hot_general", "latest 50 messages in hot #general channel #1"),
-    r("social", "soc_channel_scrollback", "keyset cursor scroll-back (channel_id = ? AND seq < ?)"),
-    r("social", "soc_channel_deep_offset", "deep OFFSET pagination in message timeline"),
-    r("social", "soc_unread_counts_all", "unread message counts across all channels an account belongs to"),
-    r("social", "soc_thread_replies_tree", "WITH RECURSIVE full reply thread tree from root message"),
-    r("social", "soc_message_reactions", "reaction emoji counts for a channel's recent messages"),
-    r("social", "soc_top_reacted_messages", "top 20 most-reacted messages joined to author and channel"),
-    r("social", "soc_unicode_search", "Unicode/CJK/emoji substring search across message bodies"),
-    r("social", "soc_user_activity_history", "an account's recent messages and reactions via UNION ALL"),
-    r("social", "soc_blocked_excluded_feed", "verify NOT EXISTS blocklist filtering across channels"),
-    r("social", "soc_mod_queue_priority", "open moderation reports sorted by severity DESC, created_at ASC"),
-    r("social", "soc_mod_repeat_offenders", "targets with >= 2 moderation reports (GROUP BY HAVING)"),
-    r("social", "soc_celebrity_vs_tier_stats", "follower counts and engagement grouped by follower_tier & locale"),
-    r("social", "soc_silent_accounts", "accounts that have never posted a message (LEFT JOIN IS NULL)"),
-    r("social", "soc_verified_only_authors", "recent messages by verified accounts across public channels"),
-    r("social", "soc_channel_leaderboard", "top 15 most active channels with distinct author counts"),
-    r("social", "soc_user_mention_like", "case-insensitive handle prefix autocomplete"),
-    r("social", "soc_msg_edit_ratio", "edited vs deleted vs active message breakdown per channel"),
-    r("social", "soc_reaction_diversity", "COUNT(DISTINCT emoji) and COUNT(DISTINCT account_id) per channel"),
-    r("social", "soc_follow_asymmetry", "accounts you follow EXCEPT accounts following you back"),
-    r("social", "soc_channel_seq_gaps", "detect message seq gaps via LEAD window"),
-    r("social", "soc_mod_unassigned_nulls", "reports with NULL notes sorted NULLS FIRST"),
-    r("social", "soc_top_reactors_rank", "rank top reactors per emoji using DENSE_RANK"),
-    r("social", "soc_msg_count_total", "whole-table COUNT(*) of messages"),
-    w("social", "soc_post_message_txn", "post message + update channel last_message_at & count in 1 txn"),
-    w("social", "soc_toggle_reaction", "UPSERT reaction (ON CONFLICT DO NOTHING) then DELETE"),
-    w("social", "soc_edit_message", "edit message body and stamp edited_at"),
-    w("social", "soc_soft_delete_restore", "soft-delete message (SET deleted_at) and restore to NULL"),
-    w("social", "soc_follow_unfollow", "follow account (ON CONFLICT DO NOTHING) and unfollow"),
-    w("social", "soc_mark_channel_read", "advance channel_members.last_read_seq for a user"),
-    w("social", "soc_file_mod_report", "insert moderation report and triage its status"),
-    w("social", "soc_update_profile_unicode", "update account display_name & bio with Unicode/emoji"),
-    w("social", "soc_block_and_unfollow", "block user and delete follow edges in 1 transaction"),
-    w("social", "soc_bulk_messages_50", "bulk import 50 chat messages in one statement"),
-
+    r(
+        "social",
+        "soc_profile_by_handle",
+        "profile lookup by unique @handle",
+    ),
+    r(
+        "social",
+        "soc_feed_normal_user",
+        "home feed for a normal user excluding blocked authors",
+    ),
+    r(
+        "social",
+        "soc_feed_celebrity_fanout",
+        "all followers of celebrity account #1 (extreme skew!)",
+    ),
+    r(
+        "social",
+        "soc_mutual_follows",
+        "mutual connections via INTERSECT of follows",
+    ),
+    r(
+        "social",
+        "soc_fof_recommendations",
+        "2-hop friend-of-friend recommendations excluding already-followed & blocked",
+    ),
+    r(
+        "social",
+        "soc_channel_latest_50",
+        "latest 50 non-deleted messages in a channel with authors",
+    ),
+    r(
+        "social",
+        "soc_channel_hot_general",
+        "latest 50 messages in hot #general channel #1",
+    ),
+    r(
+        "social",
+        "soc_channel_scrollback",
+        "keyset cursor scroll-back (channel_id = ? AND seq < ?)",
+    ),
+    r(
+        "social",
+        "soc_channel_deep_offset",
+        "deep OFFSET pagination in message timeline",
+    ),
+    r(
+        "social",
+        "soc_unread_counts_all",
+        "unread message counts across all channels an account belongs to",
+    ),
+    r(
+        "social",
+        "soc_thread_replies_tree",
+        "WITH RECURSIVE full reply thread tree from root message",
+    ),
+    r(
+        "social",
+        "soc_message_reactions",
+        "reaction emoji counts for a channel's recent messages",
+    ),
+    r(
+        "social",
+        "soc_top_reacted_messages",
+        "top 20 most-reacted messages joined to author and channel",
+    ),
+    r(
+        "social",
+        "soc_unicode_search",
+        "Unicode/CJK/emoji substring search across message bodies",
+    ),
+    r(
+        "social",
+        "soc_user_activity_history",
+        "an account's recent messages and reactions via UNION ALL",
+    ),
+    r(
+        "social",
+        "soc_blocked_excluded_feed",
+        "verify NOT EXISTS blocklist filtering across channels",
+    ),
+    r(
+        "social",
+        "soc_mod_queue_priority",
+        "open moderation reports sorted by severity DESC, created_at ASC",
+    ),
+    r(
+        "social",
+        "soc_mod_repeat_offenders",
+        "targets with >= 2 moderation reports (GROUP BY HAVING)",
+    ),
+    r(
+        "social",
+        "soc_celebrity_vs_tier_stats",
+        "follower counts and engagement grouped by follower_tier & locale",
+    ),
+    r(
+        "social",
+        "soc_silent_accounts",
+        "accounts that have never posted a message (LEFT JOIN IS NULL)",
+    ),
+    r(
+        "social",
+        "soc_verified_only_authors",
+        "recent messages by verified accounts across public channels",
+    ),
+    r(
+        "social",
+        "soc_channel_leaderboard",
+        "top 15 most active channels with distinct author counts",
+    ),
+    r(
+        "social",
+        "soc_user_mention_like",
+        "case-insensitive handle prefix autocomplete",
+    ),
+    r(
+        "social",
+        "soc_msg_edit_ratio",
+        "edited vs deleted vs active message breakdown per channel",
+    ),
+    r(
+        "social",
+        "soc_reaction_diversity",
+        "COUNT(DISTINCT emoji) and COUNT(DISTINCT account_id) per channel",
+    ),
+    r(
+        "social",
+        "soc_follow_asymmetry",
+        "accounts you follow EXCEPT accounts following you back",
+    ),
+    r(
+        "social",
+        "soc_channel_seq_gaps",
+        "detect message seq gaps via LEAD window",
+    ),
+    r(
+        "social",
+        "soc_mod_unassigned_nulls",
+        "reports with NULL notes sorted NULLS FIRST",
+    ),
+    r(
+        "social",
+        "soc_top_reactors_rank",
+        "rank top reactors per emoji using DENSE_RANK",
+    ),
+    r(
+        "social",
+        "soc_msg_count_total",
+        "whole-table COUNT(*) of messages",
+    ),
+    w(
+        "social",
+        "soc_post_message_txn",
+        "post message + update channel last_message_at & count in 1 txn",
+    ),
+    w(
+        "social",
+        "soc_toggle_reaction",
+        "UPSERT reaction (ON CONFLICT DO NOTHING) then DELETE",
+    ),
+    w(
+        "social",
+        "soc_edit_message",
+        "edit message body and stamp edited_at",
+    ),
+    w(
+        "social",
+        "soc_soft_delete_restore",
+        "soft-delete message (SET deleted_at) and restore to NULL",
+    ),
+    w(
+        "social",
+        "soc_follow_unfollow",
+        "follow account (ON CONFLICT DO NOTHING) and unfollow",
+    ),
+    w(
+        "social",
+        "soc_mark_channel_read",
+        "advance channel_members.last_read_seq for a user",
+    ),
+    w(
+        "social",
+        "soc_file_mod_report",
+        "insert moderation report and triage its status",
+    ),
+    w(
+        "social",
+        "soc_update_profile_unicode",
+        "update account display_name & bio with Unicode/emoji",
+    ),
+    w(
+        "social",
+        "soc_block_and_unfollow",
+        "block user and delete follow edges in 1 transaction",
+    ),
+    w(
+        "social",
+        "soc_bulk_messages_50",
+        "bulk import 50 chat messages in one statement",
+    ),
     // =========================================================================
     // Domain 3: Multi-Tenant B2B SaaS Workspace (50 ops)
     // =========================================================================
-    r("saas", "saas_login_email_lower", "case-insensitive user login lookup LOWER(email)"),
-    r("saas", "saas_inbox_mega_tenant", "paginated open inbox for mega-enterprise tenant #1 (55% of rows!)"),
-    r("saas", "saas_inbox_tiny_tenant", "same inbox SQL for small tenant (extreme selectivity contrast)"),
-    r("saas", "saas_inbox_empty_tenant", "same inbox SQL for brand-new EMPTY tenant (must return 0 rows!)"),
-    r("saas", "saas_inbox_keyset_cursor", "keyset cursor pagination (priority, updated_at, id) on mega-tenant"),
-    r("saas", "saas_inbox_deep_offset", "deep OFFSET pagination with heavy priority ties"),
-    r("saas", "saas_inbox_badge_count", "open non-deleted issue badge count for tenant #1"),
-    r("saas", "saas_inbox_unassigned", "unassigned open issues (assignee_id IS NULL) sorted NULLS LAST"),
-    r("saas", "saas_inbox_overdue", "overdue issues (partial index due_at IS NOT NULL)"),
-    r("saas", "saas_inbox_label_and", "issues having BOTH label A AND label B (multi-EXISTS)"),
-    r("saas", "saas_inbox_label_exclude", "open issues NOT having label X (NOT EXISTS)"),
-    r("saas", "saas_issue_detail_hydrate", "full issue hydration: author + LEFT JOIN assignee + project + labels + comments"),
-    r("saas", "saas_search_title_desc", "global search bar: title LIKE ? OR description LIKE ?"),
-    r("saas", "saas_search_json_sev1", "filter issues by JSON metadata severity = 'sev1' and votes > 50"),
-    r("saas", "saas_project_tree_rollup", "WITH RECURSIVE project tree rolling up open issue count & est_hrs"),
-    r("saas", "saas_kanban_pivot", "status x priority kanban matrix via conditional SUM(CASE)"),
-    r("saas", "saas_stale_no_comments", "open issues with ZERO comments (LEFT JOIN ... IS NULL)"),
-    r("saas", "saas_assignee_workload", "open issue count & total estimate_hrs per assignee (incl. unassigned)"),
-    r("saas", "saas_top_contributors", "top 20 contributors across issues authored + comments posted (UNION ALL)"),
-    r("saas", "saas_attachment_blob_read", "download multi-KB binary attachment payload by issue"),
-    r("saas", "saas_attachment_storage_by_mime", "total attachment bytes by tenant and mime_type"),
-    r("saas", "saas_tenant_plan_summary", "5-table org health summary across tenants, projects, issues, users"),
-    r("saas", "saas_comments_thread", "all comments on an issue joined to commenter display_name"),
-    r("saas", "saas_user_permissions_exists", "permission-checked issue fetch via correlated EXISTS on saas_users"),
-    r("saas", "saas_due_nulls_first_desc", "sort issues by due_at DESC NULLS FIRST, priority ASC, id ASC"),
-    r("saas", "saas_due_nulls_last_asc", "sort issues by due_at ASC NULLS LAST, priority DESC, id ASC"),
-    r("saas", "saas_wide_desc_sort_limit", "sort wide 10 KiB descriptions by updated_at DESC LIMIT 30"),
-    r("saas", "saas_wide_desc_export_all", "unbounded wide sort of a project's issues (forces sorter work)"),
-    r("saas", "saas_issue_age_buckets", "bucket open issues by age (0-7d, 7-30d, 30d+) with CASE"),
-    r("saas", "saas_label_cooccurrence", "self-join on issue_labels finding top co-occurring label pairs"),
-    r("saas", "saas_not_in_null_trap", "projects whose id NOT IN nullable parent_project_id (3VL trap!)"),
-    r("saas", "saas_empty_scalar_subquery", "correlated scalar subquery returning NULL when no comments match"),
-    r("saas", "saas_multi_window_issues", "two distinct WINDOW specs (by project & by assignee) in one SELECT"),
-    r("saas", "saas_high_card_group_proj", "GROUP BY (tenant_id, project_id, status) with HAVING & aggregates"),
-    r("saas", "saas_distinct_commenters", "COUNT(DISTINCT author_id) and COUNT(DISTINCT issue_id) per tenant"),
-    r("saas", "saas_tenant_json_sso", "enterprise tenants with JSON sso=true and their active seat usage"),
-    r("saas", "saas_issues_per_month", "monthly issue creation & closure trend via date bucketing"),
-    r("saas", "saas_active_vs_deleted", "active vs soft-deleted issue ratios per tenant"),
-    r("saas", "saas_cross_tenant_top_orgs", "top 15 tenants by issue + comment volume"),
-    r("saas", "saas_issue_count_total", "whole-table COUNT(*) of issues"),
-    w("saas", "saas_create_issue_workflow", "create issue + attach 2 labels + initial comment in 1 transaction"),
-    w("saas", "saas_edit_issue_md_json", "update issue description (markdown) and metadata_json"),
-    w("saas", "saas_bulk_reassign_20", "bulk-reassign 20 issues in a range to another user"),
-    w("saas", "saas_toggle_issue_label", "UPSERT issue_labels (DO NOTHING) then DELETE"),
-    w("saas", "saas_soft_delete_restore", "soft-delete 5 issues and restore them"),
-    w("saas", "saas_upload_replace_blob", "insert 16 KiB attachment, shrink to 256 B, grow back, delete"),
-    w("saas", "saas_add_comment_bump", "insert comment and bump parent issue.updated_at in 1 txn"),
-    w("saas", "saas_archive_project_subq", "update project archived flag using correlated subquery count"),
-    w("saas", "saas_unique_email_rollback", "attempt duplicate email insert -> catch UNIQUE violation cleanly"),
-    w("saas", "saas_delete_issue_bundle", "delete issue + its labels + comments and re-insert cleanly"),
-
+    r(
+        "saas",
+        "saas_login_email_lower",
+        "case-insensitive user login lookup LOWER(email)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_mega_tenant",
+        "paginated open inbox for mega-enterprise tenant #1 (55% of rows!)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_tiny_tenant",
+        "same inbox SQL for small tenant (extreme selectivity contrast)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_empty_tenant",
+        "same inbox SQL for brand-new EMPTY tenant (must return 0 rows!)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_keyset_cursor",
+        "keyset cursor pagination (priority, updated_at, id) on mega-tenant",
+    ),
+    r(
+        "saas",
+        "saas_inbox_deep_offset",
+        "deep OFFSET pagination with heavy priority ties",
+    ),
+    r(
+        "saas",
+        "saas_inbox_badge_count",
+        "open non-deleted issue badge count for tenant #1",
+    ),
+    r(
+        "saas",
+        "saas_inbox_unassigned",
+        "unassigned open issues (assignee_id IS NULL) sorted NULLS LAST",
+    ),
+    r(
+        "saas",
+        "saas_inbox_overdue",
+        "overdue issues (partial index due_at IS NOT NULL)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_label_and",
+        "issues having BOTH label A AND label B (multi-EXISTS)",
+    ),
+    r(
+        "saas",
+        "saas_inbox_label_exclude",
+        "open issues NOT having label X (NOT EXISTS)",
+    ),
+    r(
+        "saas",
+        "saas_issue_detail_hydrate",
+        "full issue hydration: author + LEFT JOIN assignee + project + labels + comments",
+    ),
+    r(
+        "saas",
+        "saas_search_title_desc",
+        "global search bar: title LIKE ? OR description LIKE ?",
+    ),
+    r(
+        "saas",
+        "saas_search_json_sev1",
+        "filter issues by JSON metadata severity = 'sev1' and votes > 50",
+    ),
+    r(
+        "saas",
+        "saas_project_tree_rollup",
+        "WITH RECURSIVE project tree rolling up open issue count & est_hrs",
+    ),
+    r(
+        "saas",
+        "saas_kanban_pivot",
+        "status x priority kanban matrix via conditional SUM(CASE)",
+    ),
+    r(
+        "saas",
+        "saas_stale_no_comments",
+        "open issues with ZERO comments (LEFT JOIN ... IS NULL)",
+    ),
+    r(
+        "saas",
+        "saas_assignee_workload",
+        "open issue count & total estimate_hrs per assignee (incl. unassigned)",
+    ),
+    r(
+        "saas",
+        "saas_top_contributors",
+        "top 20 contributors across issues authored + comments posted (UNION ALL)",
+    ),
+    r(
+        "saas",
+        "saas_attachment_blob_read",
+        "download multi-KB binary attachment payload by issue",
+    ),
+    r(
+        "saas",
+        "saas_attachment_storage_by_mime",
+        "total attachment bytes by tenant and mime_type",
+    ),
+    r(
+        "saas",
+        "saas_tenant_plan_summary",
+        "5-table org health summary across tenants, projects, issues, users",
+    ),
+    r(
+        "saas",
+        "saas_comments_thread",
+        "all comments on an issue joined to commenter display_name",
+    ),
+    r(
+        "saas",
+        "saas_user_permissions_exists",
+        "permission-checked issue fetch via correlated EXISTS on saas_users",
+    ),
+    r(
+        "saas",
+        "saas_due_nulls_first_desc",
+        "sort issues by due_at DESC NULLS FIRST, priority ASC, id ASC",
+    ),
+    r(
+        "saas",
+        "saas_due_nulls_last_asc",
+        "sort issues by due_at ASC NULLS LAST, priority DESC, id ASC",
+    ),
+    r(
+        "saas",
+        "saas_wide_desc_sort_limit",
+        "sort wide 10 KiB descriptions by updated_at DESC LIMIT 30",
+    ),
+    r(
+        "saas",
+        "saas_wide_desc_export_all",
+        "unbounded wide sort of a project's issues (forces sorter work)",
+    ),
+    r(
+        "saas",
+        "saas_issue_age_buckets",
+        "bucket open issues by age (0-7d, 7-30d, 30d+) with CASE",
+    ),
+    r(
+        "saas",
+        "saas_label_cooccurrence",
+        "self-join on issue_labels finding top co-occurring label pairs",
+    ),
+    r(
+        "saas",
+        "saas_not_in_null_trap",
+        "projects whose id NOT IN nullable parent_project_id (3VL trap!)",
+    ),
+    r(
+        "saas",
+        "saas_empty_scalar_subquery",
+        "correlated scalar subquery returning NULL when no comments match",
+    ),
+    r(
+        "saas",
+        "saas_multi_window_issues",
+        "two distinct WINDOW specs (by project & by assignee) in one SELECT",
+    ),
+    r(
+        "saas",
+        "saas_high_card_group_proj",
+        "GROUP BY (tenant_id, project_id, status) with HAVING & aggregates",
+    ),
+    r(
+        "saas",
+        "saas_distinct_commenters",
+        "COUNT(DISTINCT author_id) and COUNT(DISTINCT issue_id) per tenant",
+    ),
+    r(
+        "saas",
+        "saas_tenant_json_sso",
+        "enterprise tenants with JSON sso=true and their active seat usage",
+    ),
+    r(
+        "saas",
+        "saas_issues_per_month",
+        "monthly issue creation & closure trend via date bucketing",
+    ),
+    r(
+        "saas",
+        "saas_active_vs_deleted",
+        "active vs soft-deleted issue ratios per tenant",
+    ),
+    r(
+        "saas",
+        "saas_cross_tenant_top_orgs",
+        "top 15 tenants by issue + comment volume",
+    ),
+    r(
+        "saas",
+        "saas_issue_count_total",
+        "whole-table COUNT(*) of issues",
+    ),
+    w(
+        "saas",
+        "saas_create_issue_workflow",
+        "create issue + attach 2 labels + initial comment in 1 transaction",
+    ),
+    w(
+        "saas",
+        "saas_edit_issue_md_json",
+        "update issue description (markdown) and metadata_json",
+    ),
+    w(
+        "saas",
+        "saas_bulk_reassign_20",
+        "bulk-reassign 20 issues in a range to another user",
+    ),
+    w(
+        "saas",
+        "saas_toggle_issue_label",
+        "UPSERT issue_labels (DO NOTHING) then DELETE",
+    ),
+    w(
+        "saas",
+        "saas_soft_delete_restore",
+        "soft-delete 5 issues and restore them",
+    ),
+    w(
+        "saas",
+        "saas_upload_replace_blob",
+        "insert 16 KiB attachment, shrink to 256 B, grow back, delete",
+    ),
+    w(
+        "saas",
+        "saas_add_comment_bump",
+        "insert comment and bump parent issue.updated_at in 1 txn",
+    ),
+    w(
+        "saas",
+        "saas_archive_project_subq",
+        "update project archived flag using correlated subquery count",
+    ),
+    w(
+        "saas",
+        "saas_unique_email_rollback",
+        "attempt duplicate email insert -> catch UNIQUE violation cleanly",
+    ),
+    w(
+        "saas",
+        "saas_delete_issue_bundle",
+        "delete issue + its labels + comments and re-insert cleanly",
+    ),
     // =========================================================================
     // Domain 4: Global E-Commerce, Inventory & Financial Ledger (50 ops)
     // =========================================================================
-    r("commerce", "com_sku_point_lookup", "product page lookup by unique SKU"),
-    r("commerce", "com_category_tree_browse", "WITH RECURSIVE category subtree product listing"),
-    r("commerce", "com_faceted_catalog", "active in-stock products by category, price range & JSON color"),
-    r("commerce", "com_facet_sidebar_counts", "sidebar facet counts per category and stock availability"),
-    r("commerce", "com_also_bought_self_join", "customers who bought product X also bought Y (self-join order_items)"),
-    r("commerce", "com_customer_order_history", "customer's last 20 orders with item counts & payment status"),
-    r("commerce", "com_latest_order_per_cust", "most recent order per customer via ROW_NUMBER() = 1"),
-    r("commerce", "com_customer_ltv_aov", "customer LTV & AOV with NULLIF zero-division guard"),
-    r("commerce", "com_asof_fx_conversion", "temporal as-of FX rate join (latest effective_at <= order.created_at)"),
-    r("commerce", "com_ledger_running_balance", "running balance per account via SUM OVER (PARTITION BY account_id)"),
-    r("commerce", "com_ledger_trial_balance", "full double-entry trial balance (SUM(amount_cents) must equal 0)"),
-    r("commerce", "com_ledger_account_stmt", "paginated ledger statement for an account with order details"),
-    r("commerce", "com_unreconciled_orders", "orders with NO captured payment (LEFT JOIN ... IS NULL)"),
-    r("commerce", "com_duplicate_payments", "detect orders with > 1 payment row (GROUP BY HAVING)"),
-    r("commerce", "com_monthly_revenue_mom", "monthly revenue and MoM growth via LAG window"),
-    r("commerce", "com_rolling_7d_revenue", "7-row/day moving revenue average (ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)"),
-    r("commerce", "com_spend_deciles_ntile", "customer spend deciles via NTILE(10)"),
-    r("commerce", "com_top5_skus_per_cat", "top 5 best-selling SKUs per category via DENSE_RANK"),
-    r("commerce", "com_revenue_by_country_tier", "revenue & distinct buyers by customer country and tier"),
-    r("commerce", "com_low_stock_alert", "active products with stock < 20 ordered by recent order velocity"),
-    r("commerce", "com_refund_rate_by_provider", "payment capture vs failure rates by payment provider"),
-    r("commerce", "com_order_full_receipt", "5-table receipt: order + customer + items + products + payment"),
-    r("commerce", "com_q1_not_q2_buyers", "buyers in first half EXCEPT buyers in second half (churn)"),
-    r("commerce", "com_repeat_buyers_intersect", "customers in both early & late periods (INTERSECT)"),
-    r("commerce", "com_high_value_orders_having", "orders with >= 2 items and total > threshold"),
-    r("commerce", "com_unpurchased_products", "active products never ordered (NOT EXISTS)"),
-    r("commerce", "com_price_float_vs_cents", "arithmetic consistency check between price_cents and price_float"),
-    r("commerce", "com_json_brand_rollup", "revenue grouped by JSON product brand attribute"),
-    r("commerce", "com_shipped_sla_outliers", "orders with longest shipping delay (shipped_at - created_at)"),
-    r("commerce", "com_ledger_debit_credit_split", "debit vs credit totals and counts per account"),
-    r("commerce", "com_orders_count_total", "whole-table COUNT(*) of order_items"),
-    r("commerce", "com_multi_currency_summary", "order totals by currency and status"),
-    r("commerce", "com_vip_customers_cte", "CTE identifying top 1% spenders joined to their favorite category"),
-    r("commerce", "com_basket_size_dist", "distribution of items-per-order via derived table GROUP BY"),
-    r("commerce", "com_hot_sku_velocity", "order volume across hot SKUs 1..10"),
-    w("commerce", "com_checkout_acid_txn", "full checkout: decrement stock + insert order + 2 items + payment + balanced ledger"),
-    w("commerce", "com_checkout_savepoint_abort", "checkout with SAVEPOINT rollback on simulated OOS item"),
-    w("commerce", "com_refund_restock_txn", "refund order + restock product + balanced reversal ledger pair"),
-    w("commerce", "com_webhook_idempotent_upsert", "idempotent payment webhook ON CONFLICT(idempotency_key) DO UPDATE"),
-    w("commerce", "com_update_product_price", "update product price_cents, price_float, updated_at"),
-    w("commerce", "com_restock_hot_sku", "increment stock on a hot SKU"),
-    w("commerce", "com_mark_order_shipped", "mark order shipped and stamp shipped_at"),
-    w("commerce", "com_update_product_json", "update product attrs_json specification"),
-    w("commerce", "com_bulk_orders_25", "bulk insert 25 orders in one statement"),
-    w("commerce", "com_update_customer_tier", "upgrade customer tier using subquery LTV check"),
-    w("commerce", "com_delete_cancel_order", "insert temp order + items then delete in one txn"),
+    r(
+        "commerce",
+        "com_sku_point_lookup",
+        "product page lookup by unique SKU",
+    ),
+    r(
+        "commerce",
+        "com_category_tree_browse",
+        "WITH RECURSIVE category subtree product listing",
+    ),
+    r(
+        "commerce",
+        "com_faceted_catalog",
+        "active in-stock products by category, price range & JSON color",
+    ),
+    r(
+        "commerce",
+        "com_facet_sidebar_counts",
+        "sidebar facet counts per category and stock availability",
+    ),
+    r(
+        "commerce",
+        "com_also_bought_self_join",
+        "customers who bought product X also bought Y (self-join order_items)",
+    ),
+    r(
+        "commerce",
+        "com_customer_order_history",
+        "customer's last 20 orders with item counts & payment status",
+    ),
+    r(
+        "commerce",
+        "com_latest_order_per_cust",
+        "most recent order per customer via ROW_NUMBER() = 1",
+    ),
+    r(
+        "commerce",
+        "com_customer_ltv_aov",
+        "customer LTV & AOV with NULLIF zero-division guard",
+    ),
+    r(
+        "commerce",
+        "com_asof_fx_conversion",
+        "temporal as-of FX rate join (latest effective_at <= order.created_at)",
+    ),
+    r(
+        "commerce",
+        "com_ledger_running_balance",
+        "running balance per account via SUM OVER (PARTITION BY account_id)",
+    ),
+    r(
+        "commerce",
+        "com_ledger_trial_balance",
+        "full double-entry trial balance (SUM(amount_cents) must equal 0)",
+    ),
+    r(
+        "commerce",
+        "com_ledger_account_stmt",
+        "paginated ledger statement for an account with order details",
+    ),
+    r(
+        "commerce",
+        "com_unreconciled_orders",
+        "orders with NO captured payment (LEFT JOIN ... IS NULL)",
+    ),
+    r(
+        "commerce",
+        "com_duplicate_payments",
+        "detect orders with > 1 payment row (GROUP BY HAVING)",
+    ),
+    r(
+        "commerce",
+        "com_monthly_revenue_mom",
+        "monthly revenue and MoM growth via LAG window",
+    ),
+    r(
+        "commerce",
+        "com_rolling_7d_revenue",
+        "7-row/day moving revenue average (ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)",
+    ),
+    r(
+        "commerce",
+        "com_spend_deciles_ntile",
+        "customer spend deciles via NTILE(10)",
+    ),
+    r(
+        "commerce",
+        "com_top5_skus_per_cat",
+        "top 5 best-selling SKUs per category via DENSE_RANK",
+    ),
+    r(
+        "commerce",
+        "com_revenue_by_country_tier",
+        "revenue & distinct buyers by customer country and tier",
+    ),
+    r(
+        "commerce",
+        "com_low_stock_alert",
+        "active products with stock < 20 ordered by recent order velocity",
+    ),
+    r(
+        "commerce",
+        "com_refund_rate_by_provider",
+        "payment capture vs failure rates by payment provider",
+    ),
+    r(
+        "commerce",
+        "com_order_full_receipt",
+        "5-table receipt: order + customer + items + products + payment",
+    ),
+    r(
+        "commerce",
+        "com_q1_not_q2_buyers",
+        "buyers in first half EXCEPT buyers in second half (churn)",
+    ),
+    r(
+        "commerce",
+        "com_repeat_buyers_intersect",
+        "customers in both early & late periods (INTERSECT)",
+    ),
+    r(
+        "commerce",
+        "com_high_value_orders_having",
+        "orders with >= 2 items and total > threshold",
+    ),
+    r(
+        "commerce",
+        "com_unpurchased_products",
+        "active products never ordered (NOT EXISTS)",
+    ),
+    r(
+        "commerce",
+        "com_price_float_vs_cents",
+        "arithmetic consistency check between price_cents and price_float",
+    ),
+    r(
+        "commerce",
+        "com_json_brand_rollup",
+        "revenue grouped by JSON product brand attribute",
+    ),
+    r(
+        "commerce",
+        "com_shipped_sla_outliers",
+        "orders with longest shipping delay (shipped_at - created_at)",
+    ),
+    r(
+        "commerce",
+        "com_ledger_debit_credit_split",
+        "debit vs credit totals and counts per account",
+    ),
+    r(
+        "commerce",
+        "com_orders_count_total",
+        "whole-table COUNT(*) of order_items",
+    ),
+    r(
+        "commerce",
+        "com_multi_currency_summary",
+        "order totals by currency and status",
+    ),
+    r(
+        "commerce",
+        "com_vip_customers_cte",
+        "CTE identifying top 1% spenders joined to their favorite category",
+    ),
+    r(
+        "commerce",
+        "com_basket_size_dist",
+        "distribution of items-per-order via derived table GROUP BY",
+    ),
+    r(
+        "commerce",
+        "com_hot_sku_velocity",
+        "order volume across hot SKUs 1..10",
+    ),
+    w(
+        "commerce",
+        "com_checkout_acid_txn",
+        "full checkout: decrement stock + insert order + 2 items + payment + balanced ledger",
+    ),
+    w(
+        "commerce",
+        "com_checkout_savepoint_abort",
+        "checkout with SAVEPOINT rollback on simulated OOS item",
+    ),
+    w(
+        "commerce",
+        "com_refund_restock_txn",
+        "refund order + restock product + balanced reversal ledger pair",
+    ),
+    w(
+        "commerce",
+        "com_webhook_idempotent_upsert",
+        "idempotent payment webhook ON CONFLICT(idempotency_key) DO UPDATE",
+    ),
+    w(
+        "commerce",
+        "com_update_product_price",
+        "update product price_cents, price_float, updated_at",
+    ),
+    w(
+        "commerce",
+        "com_restock_hot_sku",
+        "increment stock on a hot SKU",
+    ),
+    w(
+        "commerce",
+        "com_mark_order_shipped",
+        "mark order shipped and stamp shipped_at",
+    ),
+    w(
+        "commerce",
+        "com_update_product_json",
+        "update product attrs_json specification",
+    ),
+    w(
+        "commerce",
+        "com_bulk_orders_25",
+        "bulk insert 25 orders in one statement",
+    ),
+    w(
+        "commerce",
+        "com_update_customer_tier",
+        "upgrade customer tier using subquery LTV check",
+    ),
+    w(
+        "commerce",
+        "com_delete_cancel_order",
+        "insert temp order + items then delete in one txn",
+    ),
     w("commerce", "com_fx_rate_append", "append new FX rate tick"),
-    w("commerce", "com_ledger_transfer_txn", "balanced inter-account ledger transfer (debit + credit = 0)"),
-    w("commerce", "com_bulk_price_adjust_cat", "adjust prices across a category range"),
-    w("commerce", "com_cart_cleanup_txn", "delete & reinsert order_items in a slice"),
+    w(
+        "commerce",
+        "com_ledger_transfer_txn",
+        "balanced inter-account ledger transfer (debit + credit = 0)",
+    ),
+    w(
+        "commerce",
+        "com_bulk_price_adjust_cat",
+        "adjust prices across a category range",
+    ),
+    w(
+        "commerce",
+        "com_cart_cleanup_txn",
+        "delete & reinsert order_items in a slice",
+    ),
 ];
 
 pub fn statements_1_4(op: &str, d: Dialect) -> Option<Vec<String>> {
@@ -477,7 +1190,7 @@ pub fn statements_1_4(op: &str, d: Dialect) -> Option<Vec<String>> {
         "com_basket_size_dist" => "SELECT items_cnt, COUNT(*) FROM (SELECT order_id, COUNT(*) AS items_cnt FROM order_items WHERE order_id BETWEEN ? AND ? GROUP BY order_id) b GROUP BY items_cnt ORDER BY items_cnt".into(),
         "com_hot_sku_velocity" => "SELECT p.id, p.sku, p.stock, COUNT(oi.id), COALESCE(SUM(oi.qty), 0) FROM products p LEFT JOIN order_items oi ON oi.product_id = p.id WHERE p.id BETWEEN 1 AND 10 GROUP BY p.id, p.sku, p.stock ORDER BY p.id".into(),
         "com_checkout_acid_txn" => return Some(vec![
-            "UPDATE products SET stock = stock - 1, updated_at = ? WHERE id = ? AND stock >= 1".into(),
+            "UPDATE products SET stock = CASE WHEN stock >= 1 THEN stock - 1 ELSE NULL END, updated_at = ? WHERE id = ?".into(),
             "INSERT INTO orders (id, customer_id, status, subtotal_cents, tax_cents, total_cents, currency, created_at, shipped_at) VALUES (?, ?, 'paid', 2000, 200, 2200, 'USD', ?, NULL)".into(),
             "INSERT INTO order_items (id, order_id, product_id, qty, unit_price_cents) VALUES (?, ?, ?, 1, 2000)".into(),
             "INSERT INTO payments (id, order_id, provider, status, amount_cents, idempotency_key, created_at) VALUES (?, ?, 'stripe', 'captured', 2200, ?, ?)".into(),
@@ -542,12 +1255,14 @@ pub fn params_1_4(
 
     match op {
         // Domain 1
-        "ag_run_detail" | "ag_run_turns_timeline" | "ag_run_subtree_rollup" | "ag_diff_read_wide" => {
-            one(vec![P::I(pick(rng, s.agent_runs))])
-        }
-        "ag_ws_active_runs" | "ag_memory_blob_read" | "ag_ws_running_cost" | "ag_export_runs_sorted" => {
-            one(vec![P::I(pick(rng, s.workspaces))])
-        }
+        "ag_run_detail"
+        | "ag_run_turns_timeline"
+        | "ag_run_subtree_rollup"
+        | "ag_diff_read_wide" => one(vec![P::I(pick(rng, s.agent_runs))]),
+        "ag_ws_active_runs"
+        | "ag_memory_blob_read"
+        | "ag_ws_running_cost"
+        | "ag_export_runs_sorted" => one(vec![P::I(pick(rng, s.workspaces))]),
         "ag_tool_trace_tree" => one(vec![P::I(pick(rng, s.tool_calls))]),
         "ag_slowest_tools" | "ag_turn_latency_rank" | "ag_turn_token_delta" => {
             let (a, b) = span(rng, s.agent_runs, 100);
@@ -567,7 +1282,11 @@ pub fn params_1_4(
         }
         "ag_diff_search_path" => {
             let h = rng.next();
-            one(vec![P::T(format!("crates/mod_{}/src/file_{}.rs", h % 20, h % 200))])
+            one(vec![P::T(format!(
+                "crates/mod_{}/src/file_{}.rs",
+                h % 20,
+                h % 200
+            ))])
         }
         "ag_memory_recall_top" => one(vec![P::I(pick(rng, s.workspaces)), P::I(BASE_TS_US)]),
         "ag_plan_critical_path" => {
@@ -582,9 +1301,14 @@ pub fn params_1_4(
             one(vec![P::I(a), P::I(b)])
         }
         "ag_heavy_runs_having" => one(vec![P::I(100_000)]),
-        "ag_model_token_spend" | "ag_diff_churn_top" | "ag_plan_ready_steps"
-        | "ag_token_trial_balance" | "ag_failed_runs_with_tools" | "ag_parent_vs_child_cost"
-        | "ag_fleet_kpi_pivot" | "ag_run_count_total" => one(vec![]),
+        "ag_model_token_spend"
+        | "ag_diff_churn_top"
+        | "ag_plan_ready_steps"
+        | "ag_token_trial_balance"
+        | "ag_failed_runs_with_tools"
+        | "ag_parent_vs_child_cost"
+        | "ag_fleet_kpi_pivot"
+        | "ag_run_count_total" => one(vec![]),
         "ag_record_turn_txn" => {
             let run = own(rng, s.agent_runs);
             let ws = pick(rng, s.workspaces);
@@ -594,21 +1318,63 @@ pub fn params_1_4(
             let lc = s.alloc_id();
             let cost = 1200i64;
             Some(vec![
-                vec![P::I(tid), P::I(run), P::I(99), P::I(300), P::I(100), P::I(450), P::T("agent step".into()), P::I(ts)],
-                vec![P::I(tcid), P::I(run), P::I(tid), P::I(120), P::T(r#"{"cmd":"cargo test"}"#.into()), P::T(r#"{"ok":true,"bytes":512}"#.into()), P::I(ts)],
+                vec![
+                    P::I(tid),
+                    P::I(run),
+                    P::I(99),
+                    P::I(300),
+                    P::I(100),
+                    P::I(450),
+                    P::T("agent step".into()),
+                    P::I(ts),
+                ],
+                vec![
+                    P::I(tcid),
+                    P::I(run),
+                    P::I(tid),
+                    P::I(120),
+                    P::T(r#"{"cmd":"cargo test"}"#.into()),
+                    P::T(r#"{"ok":true,"bytes":512}"#.into()),
+                    P::I(ts),
+                ],
                 vec![P::I(400), P::I(cost), P::I(run)],
-                vec![P::I(ld), P::I(ws), P::I(run), P::I(cost), P::I(ts), P::I(lc), P::I(ws), P::I(run), P::I(-cost), P::I(ts)],
+                vec![
+                    P::I(ld),
+                    P::I(ws),
+                    P::I(run),
+                    P::I(cost),
+                    P::I(ts),
+                    P::I(lc),
+                    P::I(ws),
+                    P::I(run),
+                    P::I(-cost),
+                    P::I(ts),
+                ],
             ])
         }
         "ag_upsert_memory" => {
             let id = own(rng, s.agent_memories);
-            one(vec![P::I(id), P::I(1), P::T(format!("k-{id}")), P::T("updated memory".into()), P::B(vec![42u8; 128]), P::F(0.95), P::I(ts)])
+            one(vec![
+                P::I(id),
+                P::I(1),
+                P::T(format!("k-{id}")),
+                P::T("updated memory".into()),
+                P::B(vec![42u8; 128]),
+                P::F(0.95),
+                P::I(ts),
+            ])
         }
         "ag_save_wide_diff" => {
             let id = s.alloc_id();
             let body = "+line of generated patch content for overflow test\n".repeat(250);
             Some(vec![
-                vec![P::I(id), P::I(pick(rng, s.agent_runs)), P::T("crates/tmp/patch.rs".into()), P::T(body), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::I(pick(rng, s.agent_runs)),
+                    P::T("crates/tmp/patch.rs".into()),
+                    P::T(body),
+                    P::I(ts),
+                ],
                 vec![P::I(id)],
             ])
         }
@@ -619,7 +1385,15 @@ pub fn params_1_4(
             let mut v = Vec::with_capacity(50 * 7);
             for _ in 0..50 {
                 let id = s.alloc_id();
-                v.extend([P::I(id), P::I(run), P::I(turn), P::I(42), P::T(r#"{"p":"a.rs"}"#.into()), P::T(r#"{"ok":true}"#.into()), P::I(ts)]);
+                v.extend([
+                    P::I(id),
+                    P::I(run),
+                    P::I(turn),
+                    P::I(42),
+                    P::T(r#"{"p":"a.rs"}"#.into()),
+                    P::T(r#"{"ok":true}"#.into()),
+                    P::I(ts),
+                ]);
             }
             one(v)
         }
@@ -628,7 +1402,14 @@ pub fn params_1_4(
             let id = own(rng, s.agent_memories);
             Some(vec![
                 vec![P::I(id)],
-                vec![P::I(id), P::I(1), P::T(format!("k-{id}")), P::T("fresh memory".into()), P::B(vec![7u8; 128]), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::I(1),
+                    P::T(format!("k-{id}")),
+                    P::T("fresh memory".into()),
+                    P::B(vec![7u8; 128]),
+                    P::I(ts),
+                ],
             ])
         }
         "ag_cancel_subruns" => one(vec![P::I(own(rng, s.agent_runs))]),
@@ -637,7 +1418,18 @@ pub fn params_1_4(
             let lc = s.alloc_id();
             let ws = pick(rng, s.workspaces);
             let run = own(rng, s.agent_runs);
-            one(vec![P::I(ld), P::I(ws), P::I(run), P::I(900), P::I(ts), P::I(lc), P::I(ws), P::I(run), P::I(-900), P::I(ts)])
+            one(vec![
+                P::I(ld),
+                P::I(ws),
+                P::I(run),
+                P::I(900),
+                P::I(ts),
+                P::I(lc),
+                P::I(ws),
+                P::I(run),
+                P::I(-900),
+                P::I(ts),
+            ])
         }
         "ag_turn_with_savepoint" => {
             let tid = s.alloc_id();
@@ -655,7 +1447,10 @@ pub fn params_1_4(
         "soc_profile_by_handle" => {
             let id = pick(rng, s.accounts);
             let h = mix(id as u64 ^ 0x3001);
-            one(vec![P::T(format!("@{}_{id}", crate::WORDS[(h % crate::WORDS.len() as u64) as usize]))])
+            one(vec![P::T(format!(
+                "@{}_{id}",
+                crate::WORDS[(h % crate::WORDS.len() as u64) as usize]
+            ))])
         }
         "soc_feed_normal_user" | "soc_unread_counts_all" | "soc_blocked_excluded_feed" => {
             one(vec![P::I(pick(rng, s.accounts))])
@@ -671,11 +1466,20 @@ pub fn params_1_4(
         "soc_channel_latest_50" | "soc_message_reactions" | "soc_channel_seq_gaps" => {
             one(vec![P::I(pick(rng, s.channels))])
         }
-        "soc_channel_scrollback" => one(vec![P::I(pick(rng, s.channels)), P::I(pick(rng, s.messages))]),
-        "soc_channel_deep_offset" => one(vec![P::I((rng.next() % (s.messages / 8).max(1) as u64) as i64)]),
+        "soc_channel_scrollback" => one(vec![
+            P::I(pick(rng, s.channels)),
+            P::I(pick(rng, s.messages)),
+        ]),
+        "soc_channel_deep_offset" => one(vec![P::I(
+            (rng.next() % (s.messages / 8).max(1) as u64) as i64,
+        )]),
         "soc_thread_replies_tree" => one(vec![P::I(pick(rng, s.messages))]),
-        "soc_top_reacted_messages" | "soc_verified_only_authors" | "soc_channel_leaderboard"
-        | "soc_msg_edit_ratio" | "soc_reaction_diversity" | "soc_top_reactors_rank" => {
+        "soc_top_reacted_messages"
+        | "soc_verified_only_authors"
+        | "soc_channel_leaderboard"
+        | "soc_msg_edit_ratio"
+        | "soc_reaction_diversity"
+        | "soc_top_reactors_rank" => {
             let (a, b) = span(rng, s.messages, 5_000);
             one(vec![P::I(a), P::I(b)])
         }
@@ -688,23 +1492,41 @@ pub fn params_1_4(
             let w = crate::WORDS[(rng.next() % crate::WORDS.len() as u64) as usize];
             one(vec![P::T(format!("@{w}%"))])
         }
-        "soc_feed_celebrity_fanout" | "soc_channel_hot_general" | "soc_mod_queue_priority"
-        | "soc_mod_repeat_offenders" | "soc_mod_unassigned_nulls" | "soc_msg_count_total" => one(vec![]),
+        "soc_feed_celebrity_fanout"
+        | "soc_channel_hot_general"
+        | "soc_mod_queue_priority"
+        | "soc_mod_repeat_offenders"
+        | "soc_mod_unassigned_nulls"
+        | "soc_msg_count_total" => one(vec![]),
         "soc_post_message_txn" => {
             let id = s.alloc_id();
             let ch = own(rng, s.channels);
             let au = pick(rng, s.accounts);
             Some(vec![
-                vec![P::I(id), P::I(ch), P::I(id), P::I(au), P::T("Live chat update 🚀".into()), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::I(ch),
+                    P::I(id),
+                    P::I(au),
+                    P::T("Live chat update 🚀".into()),
+                    P::I(ts),
+                ],
                 vec![P::I(ts), P::I(ch)],
             ])
         }
         "soc_toggle_reaction" => {
             let m = own(rng, s.messages);
             let a = own(rng, s.accounts);
-            Some(vec![vec![P::I(m), P::I(a), P::I(ts)], vec![P::I(m), P::I(a)]])
+            Some(vec![
+                vec![P::I(m), P::I(a), P::I(ts)],
+                vec![P::I(m), P::I(a)],
+            ])
         }
-        "soc_edit_message" => one(vec![P::T("Edited message body".into()), P::I(ts), P::I(own(rng, s.messages))]),
+        "soc_edit_message" => one(vec![
+            P::T("Edited message body".into()),
+            P::I(ts),
+            P::I(own(rng, s.messages)),
+        ]),
         "soc_soft_delete_restore" => {
             let m = own(rng, s.messages);
             Some(vec![vec![P::I(ts), P::I(m)], vec![P::I(m)]])
@@ -712,21 +1534,37 @@ pub fn params_1_4(
         "soc_follow_unfollow" => {
             let a = own(rng, s.accounts);
             let b = pick(rng, s.accounts);
-            Some(vec![vec![P::I(a), P::I(b), P::I(ts)], vec![P::I(a), P::I(b)]])
+            Some(vec![
+                vec![P::I(a), P::I(b), P::I(ts)],
+                vec![P::I(a), P::I(b)],
+            ])
         }
         "soc_mark_channel_read" => one(vec![P::I(own(rng, s.channels)), P::I(1)]),
         "soc_file_mod_report" => {
             let id = s.alloc_id();
             Some(vec![
-                vec![P::I(id), P::I(pick(rng, s.messages)), P::I(pick(rng, s.accounts)), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::I(pick(rng, s.messages)),
+                    P::I(pick(rng, s.accounts)),
+                    P::I(ts),
+                ],
                 vec![P::I(id)],
             ])
         }
-        "soc_update_profile_unicode" => one(vec![P::T("田中 太郎 ⚡".into()), P::T("Updated bio 🚀".into()), P::I(own(rng, s.accounts))]),
+        "soc_update_profile_unicode" => one(vec![
+            P::T("田中 太郎 ⚡".into()),
+            P::T("Updated bio 🚀".into()),
+            P::I(own(rng, s.accounts)),
+        ]),
         "soc_block_and_unfollow" => {
             let a = own(rng, s.accounts);
             let b = pick(rng, s.accounts);
-            Some(vec![vec![P::I(a), P::I(b), P::I(ts)], vec![P::I(a), P::I(b)], vec![P::I(a), P::I(b)]])
+            Some(vec![
+                vec![P::I(a), P::I(b), P::I(ts)],
+                vec![P::I(a), P::I(b)],
+                vec![P::I(a), P::I(b)],
+            ])
         }
         "soc_bulk_messages_50" => {
             let ch = own(rng, s.channels);
@@ -734,7 +1572,14 @@ pub fn params_1_4(
             let mut v = Vec::with_capacity(50 * 6);
             for _ in 0..50 {
                 let id = s.alloc_id();
-                v.extend([P::I(id), P::I(ch), P::I(id), P::I(au), P::T("batch msg".into()), P::I(ts)]);
+                v.extend([
+                    P::I(id),
+                    P::I(ch),
+                    P::I(id),
+                    P::I(au),
+                    P::T("batch msg".into()),
+                    P::I(ts),
+                ]);
             }
             one(v)
         }
@@ -750,16 +1595,27 @@ pub fn params_1_4(
             one(vec![P::I(tid)])
         }
         "saas_inbox_empty_tenant" => one(vec![P::I(s.empty_tenant)]),
-        "saas_inbox_keyset_cursor" => one(vec![P::I(2), P::I(2), P::I(BASE_TS_US + s.issues * 30_000_000)]),
-        "saas_inbox_deep_offset" => one(vec![P::I((rng.next() % (s.issues / 4).max(1) as u64) as i64)]),
+        "saas_inbox_keyset_cursor" => one(vec![
+            P::I(2),
+            P::I(2),
+            P::I(BASE_TS_US + s.issues * 30_000_000),
+        ]),
+        "saas_inbox_deep_offset" => one(vec![P::I(
+            (rng.next() % (s.issues / 4).max(1) as u64) as i64,
+        )]),
         "saas_inbox_overdue" => one(vec![P::I(BASE_TS_US + s.issues * 60_000_000)]),
         "saas_inbox_label_and" => one(vec![P::I(pick(rng, s.labels)), P::I(pick(rng, s.labels))]),
         "saas_inbox_label_exclude" => one(vec![P::I(pick(rng, s.labels))]),
         "saas_issue_detail_hydrate" | "saas_attachment_blob_read" | "saas_comments_thread" => {
             one(vec![P::I(pick(rng, s.issues))])
         }
-        "saas_search_title_desc" => one(vec![P::T("%zephyr%".into()), P::T("%sev0-outage-zephyr%".into())]),
-        "saas_project_tree_rollup" | "saas_wide_desc_export_all" => one(vec![P::I(pick(rng, s.projects))]),
+        "saas_search_title_desc" => one(vec![
+            P::T("%zephyr%".into()),
+            P::T("%sev0-outage-zephyr%".into()),
+        ]),
+        "saas_project_tree_rollup" | "saas_wide_desc_export_all" => {
+            one(vec![P::I(pick(rng, s.projects))])
+        }
         "saas_top_contributors" => {
             let (a, b) = span(rng, s.issues, 5_000);
             let (c0, c1) = span(rng, s.issue_comments, 5_000);
@@ -769,9 +1625,15 @@ pub fn params_1_4(
             let (a, b) = span(rng, s.tenants, 10);
             one(vec![P::I(a), P::I(b)])
         }
-        "saas_user_permissions_exists" => one(vec![P::I(pick(rng, s.issues)), P::I(pick(rng, s.saas_users))]),
-        "saas_due_nulls_first_desc" | "saas_due_nulls_last_asc" | "saas_wide_desc_sort_limit"
-        | "saas_label_cooccurrence" | "saas_multi_window_issues" => {
+        "saas_user_permissions_exists" => one(vec![
+            P::I(pick(rng, s.issues)),
+            P::I(pick(rng, s.saas_users)),
+        ]),
+        "saas_due_nulls_first_desc"
+        | "saas_due_nulls_last_asc"
+        | "saas_wide_desc_sort_limit"
+        | "saas_label_cooccurrence"
+        | "saas_multi_window_issues" => {
             let (a, b) = span(rng, s.issues, 4_000);
             one(vec![P::I(a), P::I(b)])
         }
@@ -779,12 +1641,23 @@ pub fn params_1_4(
             let (a, b) = span(rng, s.issues, 100);
             one(vec![P::I(a), P::I(b)])
         }
-        "saas_inbox_mega_tenant" | "saas_inbox_badge_count" | "saas_inbox_unassigned"
-        | "saas_search_json_sev1" | "saas_kanban_pivot" | "saas_stale_no_comments"
-        | "saas_assignee_workload" | "saas_attachment_storage_by_mime" | "saas_issue_age_buckets"
-        | "saas_not_in_null_trap" | "saas_high_card_group_proj" | "saas_distinct_commenters"
-        | "saas_tenant_json_sso" | "saas_issues_per_month" | "saas_active_vs_deleted"
-        | "saas_cross_tenant_top_orgs" | "saas_issue_count_total" => one(vec![]),
+        "saas_inbox_mega_tenant"
+        | "saas_inbox_badge_count"
+        | "saas_inbox_unassigned"
+        | "saas_search_json_sev1"
+        | "saas_kanban_pivot"
+        | "saas_stale_no_comments"
+        | "saas_assignee_workload"
+        | "saas_attachment_storage_by_mime"
+        | "saas_issue_age_buckets"
+        | "saas_not_in_null_trap"
+        | "saas_high_card_group_proj"
+        | "saas_distinct_commenters"
+        | "saas_tenant_json_sso"
+        | "saas_issues_per_month"
+        | "saas_active_vs_deleted"
+        | "saas_cross_tenant_top_orgs"
+        | "saas_issue_count_total" => one(vec![]),
         "saas_create_issue_workflow" => {
             let iid = s.alloc_id();
             let cid = s.alloc_id();
@@ -792,25 +1665,52 @@ pub fn params_1_4(
             let u = pick(rng, s.saas_users);
             let lbl = pick(rng, s.labels);
             Some(vec![
-                vec![P::I(iid), P::I(proj), P::I(iid), P::I(u), P::I(u), P::T("New production incident".into()), P::T("Detailed incident body".into()), P::T(r#"{"severity":"sev1","votes":1}"#.into()), P::I(ts), P::I(ts)],
+                vec![
+                    P::I(iid),
+                    P::I(proj),
+                    P::I(iid),
+                    P::I(u),
+                    P::I(u),
+                    P::T("New production incident".into()),
+                    P::T("Detailed incident body".into()),
+                    P::T(r#"{"severity":"sev1","votes":1}"#.into()),
+                    P::I(ts),
+                    P::I(ts),
+                ],
                 vec![P::I(iid), P::I(lbl), P::I(u), P::I(ts)],
                 vec![P::I(cid), P::I(iid), P::I(u), P::I(ts)],
             ])
         }
-        "saas_edit_issue_md_json" => one(vec![P::T("Updated markdown body".repeat(12)), P::T(r#"{"severity":"sev2","votes":7}"#.into()), P::I(ts), P::I(own(rng, s.issues))]),
+        "saas_edit_issue_md_json" => one(vec![
+            P::T("Updated markdown body".repeat(12)),
+            P::T(r#"{"severity":"sev2","votes":7}"#.into()),
+            P::I(ts),
+            P::I(own(rng, s.issues)),
+        ]),
         "saas_bulk_reassign_20" => {
             let a = own(rng, s.issues);
-            one(vec![P::I(pick(rng, s.saas_users)), P::I(ts), P::I(a), P::I((a + 19).min(s.issues.max(1)))])
+            one(vec![
+                P::I(pick(rng, s.saas_users)),
+                P::I(ts),
+                P::I(a),
+                P::I((a + 19).min(s.issues.max(1))),
+            ])
         }
         "saas_toggle_issue_label" => {
             let i = own(rng, s.issues);
             let l = pick(rng, s.labels);
-            Some(vec![vec![P::I(i), P::I(l), P::I(1), P::I(ts)], vec![P::I(i), P::I(l)]])
+            Some(vec![
+                vec![P::I(i), P::I(l), P::I(1), P::I(ts)],
+                vec![P::I(i), P::I(l)],
+            ])
         }
         "saas_soft_delete_restore" => {
             let a = own(rng, s.issues);
             let b = (a + 4).min(s.issues.max(1));
-            Some(vec![vec![P::I(ts), P::I(a), P::I(b)], vec![P::I(a), P::I(b)]])
+            Some(vec![
+                vec![P::I(ts), P::I(a), P::I(b)],
+                vec![P::I(a), P::I(b)],
+            ])
         }
         "saas_upload_replace_blob" => {
             let id = s.alloc_id();
@@ -826,19 +1726,39 @@ pub fn params_1_4(
             let cid = s.alloc_id();
             let iid = own(rng, s.issues);
             Some(vec![
-                vec![P::I(cid), P::I(iid), P::I(pick(rng, s.saas_users)), P::T("Following up".into()), P::I(ts)],
+                vec![
+                    P::I(cid),
+                    P::I(iid),
+                    P::I(pick(rng, s.saas_users)),
+                    P::T("Following up".into()),
+                    P::I(ts),
+                ],
                 vec![P::I(ts), P::I(iid)],
             ])
         }
         "saas_archive_project_subq" => one(vec![P::I(own(rng, s.projects))]),
         "saas_unique_email_rollback" => {
             let id = s.alloc_id();
-            Some(vec![vec![P::I(id), P::T(format!("temp-{id}@org1.example.com")), P::Z(true), P::I(ts)], vec![P::I(id)]])
+            Some(vec![
+                vec![
+                    P::I(id),
+                    P::T(format!("temp-{id}@org1.example.com")),
+                    P::Z(true),
+                    P::I(ts),
+                ],
+                vec![P::I(id)],
+            ])
         }
         "saas_delete_issue_bundle" => {
             let id = s.alloc_id();
             Some(vec![
-                vec![P::I(id), P::I(id), P::T(r#"{"severity":"sev4"}"#.into()), P::I(ts), P::I(ts)],
+                vec![
+                    P::I(id),
+                    P::I(id),
+                    P::T(r#"{"severity":"sev4"}"#.into()),
+                    P::I(ts),
+                    P::I(ts),
+                ],
                 vec![P::I(id), P::I(ts)],
                 vec![P::I(id)],
                 vec![P::I(id)],
@@ -847,12 +1767,20 @@ pub fn params_1_4(
 
         // Domain 4
         "com_sku_point_lookup" => one(vec![P::T(format!("SKU-{:07}", pick(rng, s.products)))]),
-        "com_category_tree_browse" => one(vec![P::I(1 + (rng.next() % 8.min(s.categories.max(1)) as u64) as i64)]),
+        "com_category_tree_browse" => one(vec![P::I(
+            1 + (rng.next() % 8.min(s.categories.max(1)) as u64) as i64,
+        )]),
         "com_faceted_catalog" => {
             let colors = ["black", "silver", "blue", "red", "white"];
-            one(vec![P::I(500), P::I(50_000), P::T(colors[(rng.next() % colors.len() as u64) as usize].into())])
+            one(vec![
+                P::I(500),
+                P::I(50_000),
+                P::T(colors[(rng.next() % colors.len() as u64) as usize].into()),
+            ])
         }
-        "com_also_bought_self_join" => one(vec![P::I(1 + (rng.next() % 20.min(s.products.max(1)) as u64) as i64)]),
+        "com_also_bought_self_join" => one(vec![P::I(
+            1 + (rng.next() % 20.min(s.products.max(1)) as u64) as i64,
+        )]),
         "com_customer_order_history" => one(vec![P::I(pick(rng, s.customers))]),
         "com_latest_order_per_cust" | "com_customer_ltv_aov" | "com_spend_deciles_ntile" => {
             let (a, b) = span(rng, s.customers, 500);
@@ -872,18 +1800,34 @@ pub fn params_1_4(
         "com_order_full_receipt" => one(vec![P::I(pick(rng, s.orders))]),
         "com_q1_not_q2_buyers" | "com_repeat_buyers_intersect" => {
             let half = (s.orders / 2).max(1);
-            one(vec![P::I(1), P::I(half.min(3_000)), P::I(half + 1), P::I((half + 3_000).min(s.orders.max(1)))])
+            one(vec![
+                P::I(1),
+                P::I(half.min(3_000)),
+                P::I(half + 1),
+                P::I((half + 3_000).min(s.orders.max(1))),
+            ])
         }
         "com_high_value_orders_having" | "com_basket_size_dist" => {
             let (a, b) = span(rng, s.orders, 2_000);
             one(vec![P::I(a), P::I(b)])
         }
-        "com_facet_sidebar_counts" | "com_ledger_trial_balance" | "com_unreconciled_orders"
-        | "com_duplicate_payments" | "com_monthly_revenue_mom" | "com_rolling_7d_revenue"
-        | "com_revenue_by_country_tier" | "com_low_stock_alert" | "com_refund_rate_by_provider"
-        | "com_unpurchased_products" | "com_price_float_vs_cents" | "com_shipped_sla_outliers"
-        | "com_ledger_debit_credit_split" | "com_orders_count_total" | "com_multi_currency_summary"
-        | "com_vip_customers_cte" | "com_hot_sku_velocity" => one(vec![]),
+        "com_facet_sidebar_counts"
+        | "com_ledger_trial_balance"
+        | "com_unreconciled_orders"
+        | "com_duplicate_payments"
+        | "com_monthly_revenue_mom"
+        | "com_rolling_7d_revenue"
+        | "com_revenue_by_country_tier"
+        | "com_low_stock_alert"
+        | "com_refund_rate_by_provider"
+        | "com_unpurchased_products"
+        | "com_price_float_vs_cents"
+        | "com_shipped_sla_outliers"
+        | "com_ledger_debit_credit_split"
+        | "com_orders_count_total"
+        | "com_multi_currency_summary"
+        | "com_vip_customers_cte"
+        | "com_hot_sku_velocity" => one(vec![]),
         "com_checkout_acid_txn" => {
             let pid = 1 + (rng.next() % 10.min(s.products.max(1)) as u64) as i64;
             let oid = s.alloc_id();
@@ -895,7 +1839,12 @@ pub fn params_1_4(
                 vec![P::I(ts), P::I(pid)],
                 vec![P::I(oid), P::I(pick(rng, s.customers)), P::I(ts)],
                 vec![P::I(oiid), P::I(oid), P::I(pid)],
-                vec![P::I(payid), P::I(oid), P::T(format!("idem-{payid}")), P::I(ts)],
+                vec![
+                    P::I(payid),
+                    P::I(oid),
+                    P::T(format!("idem-{payid}")),
+                    P::I(ts),
+                ],
                 vec![P::I(ld), P::I(oid), P::I(ts), P::I(lc), P::I(oid), P::I(ts)],
             ])
         }
@@ -915,15 +1864,32 @@ pub fn params_1_4(
         }
         "com_webhook_idempotent_upsert" => {
             let oid = own(rng, s.orders);
-            one(vec![P::I(s.alloc_id()), P::I(oid), P::T(format!("idem-order-{oid}")), P::I(ts)])
+            one(vec![
+                P::I(s.alloc_id()),
+                P::I(oid),
+                P::T(format!("idem-order-{oid}")),
+                P::I(ts),
+            ])
         }
         "com_update_product_price" => {
             let cents = 999 + (rng.next() % 10_000) as i64;
-            one(vec![P::I(cents), P::F(cents as f64 / 100.0), P::I(ts), P::I(own(rng, s.products))])
+            one(vec![
+                P::I(cents),
+                P::F(cents as f64 / 100.0),
+                P::I(ts),
+                P::I(own(rng, s.products)),
+            ])
         }
-        "com_restock_hot_sku" => one(vec![P::I(ts), P::I(1 + (rng.next() % 10.min(s.products.max(1)) as u64) as i64)]),
+        "com_restock_hot_sku" => one(vec![
+            P::I(ts),
+            P::I(1 + (rng.next() % 10.min(s.products.max(1)) as u64) as i64),
+        ]),
         "com_mark_order_shipped" => one(vec![P::I(ts), P::I(own(rng, s.orders))]),
-        "com_update_product_json" => one(vec![P::T(r#"{"brand":"updated","color":"black","weight_g":420}"#.into()), P::I(ts), P::I(own(rng, s.products))]),
+        "com_update_product_json" => one(vec![
+            P::T(r#"{"brand":"updated","color":"black","weight_g":420}"#.into()),
+            P::I(ts),
+            P::I(own(rng, s.products)),
+        ]),
         "com_bulk_orders_25" => {
             let cust = pick(rng, s.customers);
             let mut v = Vec::with_capacity(25 * 3);
@@ -950,15 +1916,31 @@ pub fn params_1_4(
             let a1 = 1 + (rng.next() % 50) as i64;
             let a2 = 51 + (rng.next() % 50) as i64;
             let amt = 500 + (rng.next() % 5000) as i64;
-            one(vec![P::I(ld), P::I(a1), P::I(amt), P::I(ts), P::I(lc), P::I(a2), P::I(-amt), P::I(ts)])
+            one(vec![
+                P::I(ld),
+                P::I(a1),
+                P::I(amt),
+                P::I(ts),
+                P::I(lc),
+                P::I(a2),
+                P::I(-amt),
+                P::I(ts),
+            ])
         }
         "com_bulk_price_adjust_cat" => {
             let a = own(rng, s.products);
-            one(vec![P::I(ts), P::I(a), P::I((a + 9).min(s.products.max(1)))])
+            one(vec![
+                P::I(ts),
+                P::I(a),
+                P::I((a + 9).min(s.products.max(1))),
+            ])
         }
         "com_cart_cleanup_txn" => {
             let id = s.alloc_id();
-            Some(vec![vec![P::I(id), P::I(own(rng, s.orders))], vec![P::I(id)]])
+            Some(vec![
+                vec![P::I(id), P::I(own(rng, s.orders))],
+                vec![P::I(id)],
+            ])
         }
         _ => None,
     }

@@ -43,6 +43,14 @@ pub trait Target: Send + Sync {
     }
     /// A client's session.
     fn session(&self) -> anyhow::Result<Box<dyn Session>>;
+    /// Maximum concurrent sessions this target's internal pool supports, if bounded.
+    fn max_sessions(&self) -> Option<usize> {
+        None
+    }
+    /// Optional weak probe to the underlying engine instance, returning `true` once torn down.
+    fn instance_dropped_probe(&self) -> Option<Box<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
     /// What the database says of itself after the runs.
     fn stats(&self) -> serde_json::Value {
         serde_json::Value::Null
@@ -114,28 +122,52 @@ pub fn open(
     clients: usize,
     reuse: bool,
 ) -> anyhow::Result<Arc<dyn Target>> {
+    open_with_pg_schema(target, dir, dsn, clients, reuse, None)
+}
+
+/// Opens a target for `--gauntlet`. On PostgreSQL-protocol servers, isolates tables inside
+/// `pg_schema` (one schema per shard, with `public` excluded from `search_path`) so gauntlet runs
+/// never touch tables in `public` or collide across parallel shard loaders.
+pub fn open_gauntlet(
+    target: &str,
+    dir: &str,
+    dsn: Option<&str>,
+    clients: usize,
+    reuse: bool,
+    pg_schema: &str,
+) -> anyhow::Result<Arc<dyn Target>> {
+    open_with_pg_schema(target, dir, dsn, clients, reuse, Some(pg_schema))
+}
+
+fn open_with_pg_schema(
+    target: &str,
+    dir: &str,
+    dsn: Option<&str>,
+    clients: usize,
+    reuse: bool,
+    pg_schema: Option<&str>,
+) -> anyhow::Result<Arc<dyn Target>> {
     let dsn = |local: &str| dsn.unwrap_or(local).to_owned();
-    anyhow::ensure!(
-        !reuse || matches!(target, "amphora" | "amphora-pg" | "turso" | "sqlite"),
-        "--reuse opens a file database a run left behind: amphora, amphora-pg, turso or sqlite, not {target}"
-    );
     Ok(match target {
         "amphora" => Arc::new(Amphora::open(dir, clients, reuse)?),
         "amphora-pg" => Arc::new(Amphora::open_postgres(dir, clients, reuse)?),
         "turso" => Arc::new(Turso::open(dir, reuse)?),
-        "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir)?),
+        "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir, reuse)?),
         "sqlite" => Arc::new(Sqlite::open(dir, reuse)?),
         "postgres" => Arc::new(Pg::open(
             &dsn("postgres://postgres@127.0.0.1:55432/postgres"),
             PgKind::Postgres,
+            pg_schema,
         )?),
         "orioledb" => Arc::new(Pg::open(
             &dsn("postgres://postgres@127.0.0.1:55433/postgres"),
             PgKind::Orioledb,
+            pg_schema,
         )?),
         "cedardb" => Arc::new(Pg::open(
             &dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"),
             PgKind::Cedardb,
+            pg_schema,
         )?),
         "mysql" => Arc::new(MySql::open(
             &dsn("mysql://root@127.0.0.1:33306/convo"),
@@ -151,10 +183,31 @@ pub fn open(
     })
 }
 
+/// Exact database and engine sidecar filenames owned by a suite/gauntlet fixture in `--dir`.
+const SUITE_DB_FILES: &[&str] = &[
+    "suite.db",
+    "suite.db-wal",
+    "suite.db-wal2",
+    "suite.db-shm",
+    "suite.db-tshm",
+    "suite.db-journal",
+    "suite.db-log",
+    "suite.retired",
+];
+
 fn fresh(dir: &str) -> anyhow::Result<PathBuf> {
     let dir = Path::new(dir);
-    let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
+    // Remove ONLY this fixture's exact database and sidecar files; never delete directories or
+    // unrelated files (such as `suite.db.backup/` or `suite.db.notes`) that may live in `--dir`.
+    for name in SUITE_DB_FILES {
+        let path = dir.join(name);
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && !meta.is_dir()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     Ok(dir.join("suite.db"))
 }
 
@@ -410,6 +463,9 @@ mod amphora_target {
         retired: PathBuf,
         /// The pages its connections share, if they do: their counts go into the run's stats.
         pool: Option<Arc<amphora::db::SharedPages>>,
+        /// Weak handle to the underlying engine `Database` so cold-reopen oracles can verify full
+        /// teardown before reopening from disk.
+        db_weak: std::sync::Weak<amphora_engine::Database>,
     }
 
     fn leak(cache: &Mutex<HashMap<String, &'static str>>, s: &str) -> anyhow::Result<&'static str> {
@@ -468,6 +524,7 @@ mod amphora_target {
                 .ok()
                 .and_then(|v| v.parse().ok());
             let retired = path.with_file_name("suite.retired");
+            let db_weak = db.database_weak();
             Ok(Self {
                 dialect,
                 loader: Mutex::new(Some(db)),
@@ -478,6 +535,7 @@ mod amphora_target {
                 commit_rows,
                 retired,
                 pool,
+                db_weak,
             })
         }
     }
@@ -562,6 +620,11 @@ mod amphora_target {
                 sql: self.sql.clone(),
                 known: HashMap::new(),
             }))
+        }
+
+        fn instance_dropped_probe(&self) -> Option<Box<dyn Fn() -> bool + Send + Sync>> {
+            let weak = self.db_weak.clone();
+            Some(Box::new(move || weak.upgrade().is_none()))
         }
 
         fn stats(&self) -> serde_json::Value {
@@ -753,8 +816,8 @@ mod mvcc_target {
     }
 
     impl Mvcc {
-        pub fn open(dir: &str) -> anyhow::Result<Self> {
-            let path = fresh(dir)?;
+        pub fn open(dir: &str, reuse: bool) -> anyhow::Result<Self> {
+            let path = suite_db(dir, reuse)?;
             let name = path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
@@ -966,6 +1029,74 @@ mod mvcc_target {
         }
     }
 
+    fn cell(v: &Value) -> Option<String> {
+        match v {
+            Value::Null => Cell::Null,
+            Value::Numeric(amphora_engine::Numeric::Integer(i)) => Cell::Int(*i),
+            Value::Numeric(amphora_engine::Numeric::Float(f)) => Cell::Real(f64::from(*f)),
+            Value::Text(t) => Cell::Text(t.as_str()),
+            Value::Blob(b) => Cell::Blob(b),
+        }
+        .text()
+    }
+
+    impl MvccSession {
+        fn step_collect(
+            &mut self,
+            sql: &str,
+            params: &[P],
+            out: &mut Vec<Vec<Option<String>>>,
+        ) -> anyhow::Result<Result<(), Retry>> {
+            if !self.stmts.contains_key(sql) {
+                let stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+                self.stmts.insert(sql.to_owned(), stmt);
+            }
+            let io = self.io.clone();
+            let stmt = self
+                .stmts
+                .get_mut(sql)
+                .ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
+            stmt.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
+            for (i, p) in params.iter().enumerate() {
+                stmt.bind_at(
+                    NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                    value(p),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            let waker = crate::unpark_waker();
+            loop {
+                match stmt.step_with_waker(&waker) {
+                    Ok(StepResult::Row) => {
+                        if let Some(r) = stmt.row() {
+                            out.push(r.get_values().map(cell).collect());
+                        }
+                    }
+                    Ok(StepResult::Done) => return Ok(Ok(())),
+                    Ok(StepResult::IO | StepResult::Yield) => {
+                        io.step().map_err(|e| anyhow::anyhow!("{e}"))?
+                    }
+                    Ok(StepResult::Sleep { duration }) => {
+                        std::thread::park_timeout(duration);
+                        io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    Ok(StepResult::Busy) => return Ok(Err(Retry)),
+                    Err(
+                        LimboError::Busy
+                        | LimboError::BusySnapshot
+                        | LimboError::WriteWriteConflict
+                        | LimboError::CommitDependencyAborted
+                        | LimboError::TxTerminated,
+                    ) => {
+                        return Ok(Err(Retry));
+                    }
+                    Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
+                    Err(e) => return Err(anyhow::anyhow!("{e}")),
+                }
+            }
+        }
+    }
+
     impl Session for MvccSession {
         fn run(
             &mut self,
@@ -993,6 +1124,26 @@ mod mvcc_target {
                         return Ok(rows);
                     }
                 }
+            }
+        }
+
+        fn answer(
+            &mut self,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            let began = Instant::now();
+            'again: loop {
+                let mut out = Vec::new();
+                for (s, p) in stmts.iter().zip(params) {
+                    if let Err(Retry) = self.step_collect(s, p, &mut out)? {
+                        if began.elapsed() > WAIT {
+                            anyhow::bail!("the database stayed busy");
+                        }
+                        continue 'again;
+                    }
+                }
+                return Ok(out);
             }
         }
     }
@@ -1417,6 +1568,7 @@ enum PgKind {
 struct Pg {
     dsn: String,
     kind: PgKind,
+    schema: Option<String>,
 }
 
 /// A column's bytes as the server sent them: every column taken, whatever its type.
@@ -1540,6 +1692,27 @@ fn numeric_text(raw: &[u8]) -> Option<String> {
     Some(s)
 }
 
+/// Type-agnostic SQL `NULL` parameter for `rust-postgres`, accepting any target column type
+/// (`BIGINT`, `DOUBLE PRECISION`, `TEXT`, `BYTEA`, `JSONB`, `BOOLEAN`, ...).
+#[derive(Debug)]
+struct PgNull;
+
+impl postgres::types::ToSql for PgNull {
+    fn to_sql(
+        &self,
+        _ty: &postgres::types::Type,
+        _out: &mut postgres::types::private::BytesMut,
+    ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(postgres::types::IsNull::Yes)
+    }
+
+    fn accepts(_ty: &postgres::types::Type) -> bool {
+        true
+    }
+
+    postgres::types::to_sql_checked!();
+}
+
 fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
     params
         .iter()
@@ -1550,25 +1723,29 @@ fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
                 P::T(s) => Box::new(s.clone()),
                 P::B(b) => Box::new(b.clone()),
                 P::Z(z) => Box::new(*z),
-                P::N => Box::new(None::<String>),
+                P::N => Box::new(PgNull),
             }
         })
         .collect()
 }
 
+fn pg_search_path_sql(schema: &str) -> String {
+    // Exclude `public` so `--reuse` reads and unqualified writes can never silently hit or mutate
+    // user tables in `public`.
+    format!("SET search_path TO {schema}")
+}
+
 impl Pg {
-    fn open(dsn: &str, kind: PgKind) -> anyhow::Result<Self> {
+    fn open(dsn: &str, kind: PgKind, schema: Option<&str>) -> anyhow::Result<Self> {
         let pg = Self {
             dsn: dsn.to_owned(),
             kind,
+            schema: schema.map(str::to_owned),
         };
         let mut c = pg.client()?;
         if kind == PgKind::Orioledb {
             c.batch_execute("CREATE EXTENSION IF NOT EXISTS orioledb")?;
         }
-        c.batch_execute(
-            "DROP TABLE IF EXISTS items; DROP TABLE IF EXISTS owners; DROP TABLE IF EXISTS regions",
-        )?;
         Ok(pg)
     }
 
@@ -1577,8 +1754,15 @@ impl Pg {
         if self.kind == PgKind::Cedardb {
             c.batch_execute("SET async_commit = off")?;
         }
+        if let Some(schema) = &self.schema {
+            c.batch_execute(&pg_search_path_sql(schema))?;
+        }
         Ok(c)
     }
+}
+
+fn pg_runs_outside_tx(sql: &str, params: &[P]) -> bool {
+    params.is_empty() && sql.trim_start().to_ascii_uppercase().starts_with("VACUUM")
 }
 
 impl Target for Pg {
@@ -1588,30 +1772,32 @@ impl Target for Pg {
 
     fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
         let mut c = self.client()?;
-        // VACUUM runs outside a transaction.
-        if let [(s, p)] = stmts
-            && p.is_empty()
-            && s.starts_with("VACUUM")
-        {
-            c.batch_execute(s)?;
-            return Ok(());
+        let mut idx = 0usize;
+        while idx < stmts.len() {
+            if pg_runs_outside_tx(&stmts[idx].0, &stmts[idx].1) {
+                c.batch_execute(&stmts[idx].0)?;
+                idx += 1;
+                continue;
+            }
+            let mut tx = c.transaction()?;
+            while idx < stmts.len() && !pg_runs_outside_tx(&stmts[idx].0, &stmts[idx].1) {
+                let (s, p) = &stmts[idx];
+                let s = if self.kind == PgKind::Orioledb && s.starts_with("CREATE TABLE") {
+                    format!("{s} USING orioledb")
+                } else {
+                    s.clone()
+                };
+                let s = crate::suite::placeholders(Dialect::Postgres, &s);
+                let owned = pg_params(p);
+                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    owned.iter().map(|b| b.as_ref()).collect();
+                tx.execute(s.as_str(), &refs).map_err(|e| {
+                    anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>())
+                })?;
+                idx += 1;
+            }
+            tx.commit()?;
         }
-        let mut tx = c.transaction()?;
-        for (s, p) in stmts {
-            let s = if self.kind == PgKind::Orioledb && s.starts_with("CREATE TABLE") {
-                format!("{s} USING orioledb")
-            } else {
-                s.clone()
-            };
-            let s = crate::suite::placeholders(Dialect::Postgres, &s);
-            let owned = pg_params(p);
-            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
-                owned.iter().map(|b| b.as_ref()).collect();
-            tx.execute(s.as_str(), &refs).map_err(|e| {
-                anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>())
-            })?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -1635,11 +1821,12 @@ struct PgSession {
 
 impl PgSession {
     fn statement(&mut self, sql: &str) -> anyhow::Result<postgres::Statement> {
-        if let Some(s) = self.stmts.get(sql) {
+        let translated = crate::suite::placeholders(Dialect::Postgres, sql);
+        if let Some(s) = self.stmts.get(&translated) {
             return Ok(s.clone());
         }
-        let s = self.c.prepare(sql)?;
-        self.stmts.insert(sql.to_owned(), s.clone());
+        let s = self.c.prepare(&translated)?;
+        self.stmts.insert(translated, s.clone());
         Ok(s)
     }
 }
@@ -1678,10 +1865,13 @@ impl Session for PgSession {
     }
 
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let translated = crate::suite::placeholders(Dialect::Postgres, sql);
         let owned = pg_params(params);
         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
             owned.iter().map(|b| b.as_ref()).collect();
-        let rows = self.c.query(format!("EXPLAIN {sql}").as_str(), &refs)?;
+        let rows = self
+            .c
+            .query(format!("EXPLAIN {translated}").as_str(), &refs)?;
         rows.iter()
             .map(|r| r.try_get::<_, String>(0).map_err(Into::into))
             .collect()
@@ -1691,10 +1881,11 @@ impl Session for PgSession {
         if kind == Kind::Ddl {
             let mut tx = self.c.transaction()?;
             for (s, p) in stmts.iter().zip(params) {
+                let translated = crate::suite::placeholders(Dialect::Postgres, s);
                 let owned = pg_params(p);
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     owned.iter().map(|b| b.as_ref()).collect();
-                pg_rows(&tx.query(s.as_str(), &refs)?)?;
+                pg_rows(&tx.query(translated.as_str(), &refs)?)?;
             }
             tx.commit()?;
             return Ok(0);
@@ -1730,6 +1921,7 @@ impl Session for PgSession {
 
 struct MySql {
     pool: mysql::Pool,
+    max_connections: usize,
 }
 
 fn mysql_params(params: &[P]) -> mysql::Params {
@@ -1771,17 +1963,17 @@ fn mysql_rows(
 
 impl MySql {
     fn open(dsn: &str, connections: usize) -> anyhow::Result<Self> {
-        use mysql::prelude::Queryable;
-        let constraints = mysql::PoolConstraints::new(1, connections.max(2))
+        let max_connections = connections.max(2);
+        let constraints = mysql::PoolConstraints::new(1, max_connections)
             .ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
         let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(dsn)?)
             .pool_opts(mysql::PoolOpts::default().with_constraints(constraints));
         let pool = mysql::Pool::new(opts)?;
-        let mut c = pool.get_conn()?;
-        for t in ["items", "owners", "regions"] {
-            c.query_drop(format!("DROP TABLE IF EXISTS {t}"))?;
-        }
-        Ok(Self { pool })
+        let _ = pool.get_conn()?;
+        Ok(Self {
+            pool,
+            max_connections,
+        })
     }
 }
 
@@ -1806,6 +1998,10 @@ impl Target for MySql {
         Ok(Box::new(MySqlSession {
             c: self.pool.get_conn()?,
         }))
+    }
+
+    fn max_sessions(&self) -> Option<usize> {
+        Some(self.max_connections)
     }
 }
 
@@ -1903,9 +2099,6 @@ impl ClickHouse {
             agent,
             url: format!("{}/", url.trim_end_matches('/')),
         };
-        for t in ["items", "owners", "regions"] {
-            ch.post(&format!("DROP TABLE IF EXISTS {t} SYNC"))?;
-        }
         Ok(ch)
     }
 
@@ -2010,5 +2203,110 @@ mod tests {
         let raw = [0, 0, 0, 0, 0, 0, 0, 2];
         assert_eq!(numeric_text(&raw).as_deref(), Some("0.00"));
         assert_eq!(numeric_text(&[0, 1, 0, 0]), None);
+    }
+
+    #[test]
+    fn review_p1_fresh_preserves_unrelated_files_in_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("keep_me.txt");
+        let backup_dir = dir.path().join("suite.db.backup");
+        let backup_file = backup_dir.join("snapshot.bin");
+        let notes = dir.path().join("suite.db.notes");
+        let old_db = dir.path().join("suite.db");
+        let old_wal = dir.path().join("suite.db-wal");
+        let old_wal2 = dir.path().join("suite.db-wal2");
+        let old_log = dir.path().join("suite.db-log");
+        let old_retired = dir.path().join("suite.retired");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(&backup_file, b"keep backup").unwrap();
+        std::fs::write(&notes, b"keep notes").unwrap();
+        std::fs::write(&sentinel, b"do not delete").unwrap();
+        std::fs::write(&old_db, b"old db").unwrap();
+        std::fs::write(&old_wal, b"old wal").unwrap();
+        std::fs::write(&old_wal2, b"old wal2").unwrap();
+        std::fs::write(&old_log, b"old log").unwrap();
+        std::fs::write(&old_retired, b"old retired").unwrap();
+
+        let path = super::fresh(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(path, old_db);
+        assert!(
+            sentinel.exists(),
+            "fresh() must never delete unrelated files"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not delete");
+        assert!(
+            backup_file.exists(),
+            "fresh() must never delete suite.db.backup/ directory"
+        );
+        assert_eq!(std::fs::read(&backup_file).unwrap(), b"keep backup");
+        assert!(
+            notes.exists(),
+            "fresh() must never delete suite.db.notes file"
+        );
+        assert_eq!(std::fs::read(&notes).unwrap(), b"keep notes");
+        assert!(!old_db.exists());
+        assert!(!old_wal.exists());
+        assert!(!old_wal2.exists());
+        assert!(!old_log.exists());
+        assert!(!old_retired.exists());
+    }
+
+    #[test]
+    fn review_p1_mvcc_reuse_preserves_loaded_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        {
+            let target = super::open("mvcc", dir_str, None, 1, false).unwrap();
+            let mut stmts = vec![(
+                "CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+                vec![],
+            )];
+            for i in 1..=50i64 {
+                stmts.push((
+                    "INSERT INTO tool_calls (id, name) VALUES (?, ?)".into(),
+                    vec![super::P::I(i), super::P::T(format!("call-{i}"))],
+                ));
+            }
+            target.setup(&stmts).unwrap();
+            target.settle().unwrap();
+            target.ready().unwrap();
+        }
+        let reused = super::open("mvcc", dir_str, None, 1, true).unwrap();
+        reused.ready().unwrap();
+        let mut sess = reused.session().unwrap();
+        let rows = sess
+            .answer(&["SELECT COUNT(*) FROM tool_calls".into()], &[vec![]])
+            .unwrap();
+        assert_eq!(rows, vec![vec![Some("50".to_owned())]]);
+    }
+
+    #[test]
+    fn review_p1_pg_search_path_excludes_public() {
+        let sql = super::pg_search_path_sql("amphora_gauntlet_s001");
+        assert_eq!(sql, "SET search_path TO amphora_gauntlet_s001");
+        assert!(
+            !sql.contains("public"),
+            "gauntlet search_path must not fall through to public: {sql}"
+        );
+    }
+
+    #[test]
+    fn review_p1_pg_null_accepts_all_postgres_column_types() {
+        use postgres::types::{ToSql, Type};
+        for ty in [
+            Type::INT8,
+            Type::INT4,
+            Type::FLOAT8,
+            Type::TEXT,
+            Type::BYTEA,
+            Type::JSONB,
+            Type::BOOL,
+            Type::NUMERIC,
+        ] {
+            assert!(
+                <super::PgNull as ToSql>::accepts(&ty),
+                "PgNull must accept Postgres type {ty:?}"
+            );
+        }
     }
 }

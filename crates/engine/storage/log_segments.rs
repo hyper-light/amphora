@@ -496,6 +496,93 @@ impl SegmentsCell {
         Self::assemble(word, first, second)
     }
 
+    /// Applies signed per-segment read-count deltas from [`Self::update`] without overwriting
+    /// concurrent `begin_read`/`end_read` shard updates. Positive deltas land on shard 0 (matching
+    /// the `ReadSpan { shard: 0, .. }` returned by [`Segments::begin_read`]), and negative deltas
+    /// drain across shards via CAS loops. Returns `false` with no shard modified if a positive
+    /// delta would exceed `READS`.
+    fn apply_update_read_deltas(&self, passed: (u64, u64), after: (u64, u64)) -> bool {
+        let add_first = after.0.saturating_sub(passed.0);
+        let add_second = after.1.saturating_sub(passed.1);
+        let sub_first = passed.0.saturating_sub(after.0);
+        let sub_second = passed.1.saturating_sub(after.1);
+
+        if add_first > 0 || add_second > 0 {
+            let (live_first, live_second) = self.sum_reads();
+            if live_first.saturating_add(add_first) > READS
+                || live_second.saturating_add(add_second) > READS
+            {
+                return false;
+            }
+            let Some(slot0) = self.shards.first() else {
+                return false;
+            };
+            loop {
+                let cur = slot0.load(Ordering::SeqCst);
+                let sr = SlotReads(cur);
+                let Some(next_first) = sr
+                    .on(SegmentId::First)
+                    .checked_add(add_first)
+                    .filter(|&v| v <= READS)
+                else {
+                    return false;
+                };
+                let Some(next_second) = sr
+                    .on(SegmentId::Second)
+                    .checked_add(add_second)
+                    .filter(|&v| v <= READS)
+                else {
+                    return false;
+                };
+                let packed = (next_first & SlotReads::COUNT)
+                    | (next_second & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
+                if slot0
+                    .compare_exchange(cur, packed, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+
+        for (seg, mut rem) in [
+            (SegmentId::First, sub_first),
+            (SegmentId::Second, sub_second),
+        ] {
+            if rem == 0 {
+                continue;
+            }
+            for shard in self.shards.iter() {
+                if rem == 0 {
+                    break;
+                }
+                loop {
+                    let cur = shard.load(Ordering::SeqCst);
+                    let sr = SlotReads(cur);
+                    let avail = sr.on(seg);
+                    if avail == 0 {
+                        break;
+                    }
+                    let take = avail.min(rem);
+                    let (next_first, next_second) = match seg {
+                        SegmentId::First => (avail - take, sr.on(SegmentId::Second)),
+                        SegmentId::Second => (sr.on(SegmentId::First), avail - take),
+                    };
+                    let packed = (next_first & SlotReads::COUNT)
+                        | (next_second & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
+                    if shard
+                        .compare_exchange(cur, packed, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        rem -= take;
+                        break;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Applies `step` to the state as one change, and gives back what it returned. None, with
     /// nothing changed, when the step would count more reads on a segment than its 30 bits hold.
     pub fn update<T>(&self, mut step: impl FnMut(&mut Segments) -> T) -> Option<T> {
@@ -515,19 +602,26 @@ impl SegmentsCell {
             return None;
         }
         let (after_first, after_second) = Self::reads_by_segment(&segments);
-        // Production `update()` transitions (`switch`, `copied`, `shipped`) never mutate active
-        // reader counts across shards; only `begin_read`/`end_read` modify shard counters.
-        // Keeping shard writes out of `update()` prevents concurrent readers from losing decrements
-        // and sticking a closing segment.
-        if (after_first, after_second) != (passed_first, passed_second) {
+        let reads_changed = (after_first, after_second) != (passed_first, passed_second);
+        if reads_changed
+            && !self.apply_update_read_deltas(
+                (passed_first, passed_second),
+                (after_first, after_second),
+            )
+        {
             return None;
         }
+        let (sat_first, sat_second) = if reads_changed {
+            self.sum_reads()
+        } else {
+            (after_first, after_second)
+        };
         // If `step` cleared a previously uncopied closing segment using the pre-publication read
         // count, publish `COPIED | SHIPPED` first (SeqCst) and recount all shards (SeqCst) before
         // deciding whether the closing segment is actually free. Otherwise a reader that validated
         // the old `!COPIED` state before our store could still depend on the closing segment.
         if was_closing_uncopied && segments.other.is_none() && segments.current == prev_current {
-            let saturated = after_first >= READS || after_second >= READS;
+            let saturated = sat_first >= READS || sat_second >= READS;
             let interim_ver = word.wrapping_add(1) & VERSION_MASK;
             let interim = ((word | Self::READY_TO_RESET) & !SATURATED & !VERSION_MASK)
                 | if saturated { SATURATED } else { 0 }
@@ -555,7 +649,7 @@ impl SegmentsCell {
             self.state.store(cleared, Ordering::SeqCst);
             return Some(out);
         }
-        let saturated = after_first >= READS || after_second >= READS;
+        let saturated = sat_first >= READS || sat_second >= READS;
         let next_ver = word.wrapping_add(1) & VERSION_MASK;
         let next_word = segments.pack() | if saturated { SATURATED } else { 0 } | next_ver;
         self.state.store(next_word, Ordering::SeqCst);
@@ -570,8 +664,10 @@ impl SegmentsCell {
                 SegmentId::Second => s,
             };
             if rem == 0 {
-                let mut ready = Self::assemble(next_word, f, s);
-                out = step(&mut ready);
+                if !reads_changed {
+                    let mut ready = Self::assemble(next_word, f, s);
+                    out = step(&mut ready);
+                }
                 let cleared = (next_word & !(CLOSING | COPIED | SHIPPED)) & !VERSION_MASK
                     | (next_word.wrapping_add(1) & VERSION_MASK);
                 self.state.store(cleared, Ordering::SeqCst);
@@ -725,6 +821,70 @@ impl SegmentsCell {
         Some(closing_id)
     }
 
+    /// Fast-path atomic decrement of `span` on its home shard `shard_idx`, verifying that each
+    /// segment lane on that shard holds at least 1 so mixed `update(|s| s.end_read(...))` and
+    /// direct `end_read(span)` calls can never underflow a shard counter.
+    #[inline]
+    fn try_dec_span_on_shard(
+        &self,
+        shard_idx: usize,
+        current: SegmentId,
+        closing: Option<SegmentId>,
+    ) -> bool {
+        let Some(shard) = self.shards.get(shard_idx) else {
+            return false;
+        };
+        let delta = Self::span_delta(current, closing);
+        loop {
+            let cur = shard.load(Ordering::SeqCst);
+            let sr = SlotReads(cur);
+            if sr.on(current) == 0 || closing.is_some_and(|c| sr.on(c) == 0) {
+                return false;
+            }
+            let next = cur.wrapping_sub(delta);
+            if shard
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Cold fallback when `shard_idx` was already drained by an earlier `update()` decrement:
+    /// serializes with `update()` under `self.transition` and decrements 1 from whichever shard
+    /// holds the remaining count for each segment in `span`.
+    #[cold]
+    #[inline(never)]
+    fn dec_span_fallback(&self, current: SegmentId, closing: Option<SegmentId>) {
+        let _guard = self.transition.lock();
+        for seg in [Some(current), closing].into_iter().flatten() {
+            let one = SlotReads::one(seg);
+            'find_shard: for shard in self.shards.iter() {
+                loop {
+                    let cur = shard.load(Ordering::SeqCst);
+                    if SlotReads(cur).on(seg) == 0 {
+                        break;
+                    }
+                    let next = cur.wrapping_sub(one);
+                    if shard
+                        .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        break 'find_shard;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn dec_span(&self, shard_idx: usize, current: SegmentId, closing: Option<SegmentId>) {
+        if !self.try_dec_span_on_shard(shard_idx, current, closing) {
+            self.dec_span_fallback(current, closing);
+        }
+    }
+
     /// [`Segments::begin_read`]. None when a segment already counts as many reads as its bits
     /// hold: the read is refused and tried again.
     #[inline]
@@ -749,7 +909,7 @@ impl SegmentsCell {
                 || (closing == Some(SegmentId::First) && prev.on(SegmentId::First) >= READS)
                 || (closing == Some(SegmentId::Second) && prev.on(SegmentId::Second) >= READS);
             if overflow {
-                shard.fetch_sub(delta, Ordering::SeqCst);
+                self.dec_span(shard_idx, current, closing);
                 return self.begin_read_saturated(shard_idx);
             }
             let w2 = self.state.load(Ordering::SeqCst);
@@ -760,7 +920,7 @@ impl SegmentsCell {
                     shard: u16::try_from(shard_idx).unwrap_or(0),
                 });
             }
-            shard.fetch_sub(delta, Ordering::SeqCst);
+            self.dec_span(shard_idx, current, closing);
             let w3 = self.state.load(Ordering::SeqCst);
             if (w3 & Self::READY_TO_RESET) == Self::READY_TO_RESET {
                 let _ = self.try_reset_closing();
@@ -773,10 +933,7 @@ impl SegmentsCell {
     #[inline]
     pub fn end_read(&self, span: ReadSpan) -> Option<SegmentId> {
         let shard_idx = usize::from(span.shard) & self.mask;
-        let delta = Self::span_delta(span.current, span.closing);
-        if let Some(shard) = self.shards.get(shard_idx) {
-            shard.fetch_sub(delta, Ordering::SeqCst);
-        }
+        self.dec_span(shard_idx, span.current, span.closing);
         let word = self.state.load(Ordering::SeqCst);
         if (word & Self::READY_TO_RESET) != Self::READY_TO_RESET && (word & SATURATED) == 0 {
             return None;
@@ -1420,5 +1577,94 @@ mod tests {
                 "round {round}: read counts leaked after all readers exited"
             );
         }
+    }
+
+    /// Review Standards P3 regression: `SegmentsCell::update(Segments::begin_read)` must succeed
+    /// on an empty segment and pair cleanly with both `end_read` and `update(|s| s.end_read(span))`.
+    #[test]
+    fn review_p3_segments_cell_update_supports_begin_and_end_read() {
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        let span = cell
+            .update(Segments::begin_read)
+            .expect("update(Segments::begin_read) must accept a read on an empty segment");
+        assert_eq!(cell.sum_reads(), (1, 0));
+        assert_eq!(cell.load().reads, 1);
+        assert_eq!(cell.end_read(span), None);
+        assert_eq!(cell.sum_reads(), (0, 0));
+
+        // Pair `update(begin_read)` with `update(|s| s.end_read(span))` across a closing segment.
+        let span2 = cell
+            .update(Segments::begin_read)
+            .expect("second update(begin_read) must succeed");
+        assert_eq!(
+            cell.update(|s| s.switch(false)).flatten(),
+            Some(SegmentId::Second)
+        );
+        assert_eq!(cell.copied(), None);
+        let mut pending = Some(span2);
+        assert_eq!(
+            cell.update(|s| {
+                if let Some(sp) = pending.take() {
+                    s.end_read(sp)
+                } else {
+                    s.reset_if_done()
+                }
+            })
+            .flatten(),
+            Some(SegmentId::First),
+            "update(|s| s.end_read(span)) must release the closing segment once copied & shipped"
+        );
+        assert_eq!(cell.sum_reads(), (0, 0));
+        assert_eq!(cell.load().closing(), None);
+    }
+
+    /// Review Round 5 Standards P2 regression: mixing direct `begin_read`/`end_read` with generic
+    /// `update(Segments::begin_read)` / `update(|s| s.end_read(span))` across distinct shards must
+    /// never underflow a shard counter to `u32::MAX` (`4_294_967_296`) or block subsequent switches.
+    #[test]
+    fn review_p2_mixing_generic_update_and_direct_end_read_never_corrupts_reader_count() {
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        // Acquire one direct read on a non-zero shard (when available) and one via `update` on shard 0.
+        let span_direct = std::thread::scope(|s| {
+            let mut acquired = None;
+            for _ in 0..8 {
+                let candidate = s.spawn(|| cell.begin_read().unwrap()).join().unwrap();
+                if candidate.shard != 0 || cell.shards.len() == 1 {
+                    acquired = Some(candidate);
+                    break;
+                }
+                cell.end_read(candidate);
+            }
+            acquired.unwrap_or_else(|| cell.begin_read().unwrap())
+        });
+        let span_generic = cell.update(Segments::begin_read).unwrap();
+        assert_eq!(cell.load().reads, 2);
+
+        // Release the direct span through generic `update`, which drains the first occupied shard
+        // (shard 0), then release the shard-0 generic span through direct `end_read`.
+        let mut pending = Some(span_direct);
+        let _ = cell.update(|s| {
+            if let Some(sp) = pending.take() {
+                s.end_read(sp)
+            } else {
+                s.reset_if_done()
+            }
+        });
+        assert_eq!(cell.load().reads, 1);
+        assert_eq!(cell.end_read(span_generic), None);
+        assert_eq!(
+            cell.sum_reads(),
+            (0, 0),
+            "mixed generic/direct releases must return exact (0, 0), never underflow"
+        );
+        assert_eq!(cell.load().reads, 0);
+
+        // Next segment switch + copy must succeed cleanly.
+        assert_eq!(
+            cell.update(|s| s.switch(false)).flatten(),
+            Some(SegmentId::Second)
+        );
+        assert_eq!(cell.copied(), Some(SegmentId::First));
+        assert_eq!(cell.load().closing(), None);
     }
 }

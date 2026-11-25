@@ -602,7 +602,7 @@ impl Machine {
         replicated: bool,
     ) -> Result<Self, Refusal> {
         Self::open_db(
-            |_| Db::open_with(path, io).map_err(unavailable),
+            |_| Db::open_existing_with(path, io).map_err(unavailable),
             initial,
             owner,
             node_id,
@@ -684,7 +684,7 @@ impl Machine {
                 "complete the pinned restore before replicated startup",
             ));
         }
-        db.exec(META).map_err(unavailable)?;
+        db.exec_internal(META).map_err(unavailable)?;
         let mut state = None;
         db.query(
             "SELECT applied, term, configuration FROM __amphora_replica WHERE id = 1",
@@ -1306,7 +1306,7 @@ impl StateMachine for Machine {
                 .baseline
                 .apply_seed(&mut self.db, data, |db| {
                     crate::database::bootstrap_db(db)?;
-                    db.exec(META)?;
+                    db.exec_internal(META)?;
                     marker(db, at, &self.configuration)?;
                     // The seed's last chunk installs an image from before any time: its table is
                     // made again whatever the machine held.
@@ -1499,7 +1499,7 @@ impl StateMachine for Machine {
             .apply_pages(&pages, |db| {
                 // Inside the image's transaction: a refusal rolls it back before its marker.
                 unproven_floor(db)?;
-                db.exec(META)?;
+                db.exec_internal(META)?;
                 marker(db, at, configuration)?;
                 self.baseline.completed_marker(db)
             })

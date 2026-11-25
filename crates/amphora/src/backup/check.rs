@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
-use amphora_engine_parser::ast::{Cmd, CreateTableBody, Stmt};
-use amphora_engine_parser::parser::Parser;
+use amphora_engine_parser::ast::{CreateTableBody, Stmt};
 use sha2::{Digest as _, Sha256};
 
 use super::drill::{Pace, Unpaced};
@@ -37,7 +36,7 @@ pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
 pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<RowDigest> {
     let mut tables = Vec::new();
     db.query(
-        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
         [],
         |r| {
             let name = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -51,11 +50,11 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
     pace.ready()?;
     for (table, sql) in tables {
         let quoted = table.replace('"', "\"\"");
-        let order = row_order(&table, &sql)?;
+        let (select_list, order) = row_query(db, &table, &sql)?;
         let mut hash = Sha256::new();
         let mut rows = 0u64;
         db.query_owned(
-            &format!("SELECT * FROM \"{quoted}\" ORDER BY {order}"),
+            &format!("SELECT {select_list} FROM \"{quoted}\" ORDER BY {order}"),
             [],
             |r| {
                 let values: Vec<_> = r.get_values().collect();
@@ -77,30 +76,37 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
     Ok(RowDigest(out))
 }
 
-/// The order a digest reads `table`'s rows in, from its `CREATE TABLE` text `sql`: its rowid's; a
-/// WITHOUT ROWID table has none (the tables of transactions across groups are such, made in every
-/// database), so its every column in turn, a whole order since its primary key makes each row
-/// distinct (T-T1.12.C1).
-fn row_order(table: &str, sql: &str) -> anyhow::Result<String> {
-    let mut parser = Parser::new(sql.as_bytes());
-    let Some(Cmd::Stmt(Stmt::CreateTable {
+/// The SELECT list and ORDER BY clause a digest reads `table`'s rows with, from its `CREATE TABLE`
+/// text `sql`. For rowid tables, includes the first unshadowed SQLite rowid alias (`rowid`,
+/// `_rowid_`, or `oid`) in both SELECT and ORDER BY so tables with identical visible columns at
+/// different rowids produce distinct digests; for WITHOUT ROWID tables (or tables shadowing all
+/// three rowid aliases), reads `*` ordered by every column in turn (T-T1.12.C1).
+fn row_query(db: &Db, table: &str, sql: &str) -> anyhow::Result<(String, String)> {
+    let Stmt::CreateTable {
         body: CreateTableBody::ColumnsAndConstraints {
             columns, options, ..
         },
         ..
-    })) = parser
-        .next_cmd()
+    } = db
+        .parse_table_sql_ast(sql)
         .map_err(|e| anyhow::anyhow!("table {table}: {e}"))?
     else {
         return Err(anyhow::anyhow!("table {table} is not a table of columns"));
     };
-    if !options.contains_without_rowid() {
-        return Ok("rowid".to_owned());
+    if !options.contains_without_rowid()
+        && let Some(alias) = ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
+            !columns
+                .iter()
+                .any(|col| col.col_name.as_str().eq_ignore_ascii_case(candidate))
+        })
+    {
+        return Ok((format!("{alias}, *"), alias.to_owned()));
     }
-    Ok((1..=columns.len())
+    let all_cols = (1..=columns.len())
         .map(|column| column.to_string())
         .collect::<Vec<_>>()
-        .join(", "))
+        .join(", ");
+    Ok(("*".to_owned(), all_cols))
 }
 
 /// The bytes of rows a paced digest reads a step: as many as one object of the store holds, the
@@ -301,7 +307,7 @@ fn check_second(
             });
         }
     };
-    let db = Db::open_sharing(scratch, &crate::db::Sharing::Off)?;
+    let db = Db::open_existing_sharing(scratch, &crate::db::Sharing::Off)?;
     db.disable_inline_reads();
     let mut integrity = Vec::new();
     // The engine's check runs as one statement; each of its waits on the device is a step's end,

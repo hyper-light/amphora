@@ -166,7 +166,7 @@ pub(super) fn recorded(db: &Db) -> anyhow::Result<Option<Durability>> {
 
 /// Records `durability` as the group's class, in the transaction under way.
 pub(super) fn record(db: &mut Db, durability: &Durability) -> anyhow::Result<()> {
-    db.exec(TABLE)?;
+    db.exec_internal(TABLE)?;
     let bytes = postcard::to_allocvec(&canonical(durability))?;
     db.query(
         "INSERT INTO __amphora_class(id, class) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET class = excluded.class",
