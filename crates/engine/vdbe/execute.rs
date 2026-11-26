@@ -8518,6 +8518,19 @@ pub(crate) fn update_agg_payload(
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
+    update_agg_payload_tracked(func, arg, maybe_arg2, payload, collation, comparator, None)
+}
+
+#[amphora_engine_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::AggAccumulate)]
+fn update_agg_payload_tracked(
+    func: &AggFunc,
+    arg: &Value,                // first argument
+    maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
+    payload: &mut crate::alloc::Vec<Value>,
+    collation: CollationSeq,
+    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
+    updated: Option<&mut bool>,
+) -> Result<()> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -8672,6 +8685,9 @@ pub(crate) fn update_agg_payload(
             }
             if matches!(payload[0], Value::Null) {
                 payload[0].try_clone_from(arg)?;
+                if let Some(flag) = updated {
+                    *flag = true;
+                }
                 return Ok(());
             }
             use std::cmp::Ordering;
@@ -8691,6 +8707,9 @@ pub(crate) fn update_agg_payload(
             };
             if should_update {
                 payload[0].try_clone_from(arg)?;
+                if let Some(flag) = updated {
+                    *flag = true;
+                }
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
@@ -10201,7 +10220,9 @@ pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut 
                 }
             }
             AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
+                if data.updated_reg.is_none()
+                    && data.comparator.is_none()
+                    && data.collation.is_none_or(|c| !c.is_custom()) =>
             {
                 if let Some(Numeric::Integer(arg)) = arg {
                     match &mut *acc {
@@ -10254,6 +10275,7 @@ pub(crate) fn op_agg_step_slow(
         func,
         comparator,
         collation,
+        updated_reg,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -10349,8 +10371,13 @@ pub(crate) fn op_agg_step_slow(
                 if comparator.is_none() && collation.is_none_or(|c| !c.is_custom()) =>
             {
                 if let Register::Value(v) = &state.registers[*col] {
+                    let is_winner = !matches!(v, Value::Null);
                     state.registers[*acc_reg] =
                         Register::Aggregate(AggContext::MinMax(v.try_clone()?));
+                    if let Some(flag_reg) = *updated_reg {
+                        state.registers[flag_reg] =
+                            Register::Value(Value::from_i64(i64::from(is_winner)));
+                    }
                     state.pc = state.pc.checked_add(1).or_overflow()?;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -10395,6 +10422,9 @@ pub(crate) fn op_agg_step_slow(
                 | AggFunc::Min
                 | AggFunc::Max,
             ) => {
+                if let Some(flag_reg) = *updated_reg {
+                    state.registers[flag_reg] = Register::Value(Value::from_i64(0));
+                }
                 state.pc = state.pc.checked_add(1).or_overflow()?;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -10461,14 +10491,19 @@ pub(crate) fn op_agg_step_slow(
                 .into());
             };
             let payload = agg.materialize_builtin(&mut state.spare_agg_payloads)?;
-            update_agg_payload(
+            let mut is_winner = false;
+            update_agg_payload_tracked(
                 func,
                 arg,
                 maybe_arg2.as_ref(),
                 payload,
                 current_collation,
                 comparator_factory,
+                updated_reg.map(|_| &mut is_winner),
             )?;
+            if let Some(flag_reg) = *updated_reg {
+                state.registers[flag_reg] = Register::Value(Value::from_i64(i64::from(is_winner)));
+            }
         }
     };
 

@@ -456,19 +456,49 @@ const UNSETTLED: u64 = 0;
 /// A batch whose commit failed.
 const FAILED: u64 = u64::MAX;
 
+/// Maximum number of empty-batch completion callbacks queued for `amphora-notify` before
+/// backpressure / [`Refused::Full`] applies.
+const IMMEDIATE_NOTICE_LIMIT: usize = 4096;
+
+/// Memory budget charge (MB.1, `Use::Queues`) per queued empty-batch callback until `amphora-notify`
+/// drains and executes it.
+fn immediate_notice_bytes() -> u64 {
+    u64::try_from(std::mem::size_of::<Fate>().saturating_add(std::mem::size_of::<Arc<Fate>>()))
+        .unwrap_or(128)
+}
+
 /// The batches whose senders are told once they are durable ([`Store::put_then`]), for the
 /// notifier.
-#[derive(Default)]
 struct Notices {
     /// Committed, in commit order: told once a flush covers their commit.
     awaiting: VecDeque<(u64, Arc<Fate>)>,
-    /// Empty batches already durable with no write or flush: told at once on `amphora-notify`.
-    immediate: VecDeque<Arc<Fate>>,
+    /// Empty batches already durable with no write or flush: bounded queue of callbacks told on
+    /// `amphora-notify`, holding their `Use::Queues` charge until drained.
+    immediate: VecDeque<(Arc<Fate>, Option<Charge>)>,
+    /// Hard slot capacity of `immediate` (defaults to [`IMMEDIATE_NOTICE_LIMIT`]).
+    immediate_cap: usize,
     /// Refused: told at once.
     refused: Vec<(Arc<Fate>, Refused)>,
     /// Commits durable.
     durable: u64,
     disk_failed: bool,
+    /// Set under `notices` lock when the writer stops, preventing any empty-batch callback from
+    /// being enqueued after `notifier` decides to exit.
+    stopped: bool,
+}
+
+impl Default for Notices {
+    fn default() -> Self {
+        Self {
+            awaiting: VecDeque::new(),
+            immediate: VecDeque::new(),
+            immediate_cap: IMMEDIATE_NOTICE_LIMIT,
+            refused: Vec::new(),
+            durable: 0,
+            disk_failed: false,
+            stopped: false,
+        }
+    }
 }
 
 /// Batches settled (committed, failed or let go) and commits made, counted together.
@@ -570,6 +600,9 @@ struct Sends {
     notices_awaiting: AtomicUsize,
     notices: Mutex<Notices>,
     noticed: Condvar,
+    /// Woken whenever `notifier` drains `notices.immediate` or shutdown/failure occurs so
+    /// [`Sends::try_tell_immediate`] waiters can make progress or exit promptly.
+    immediate_room: Condvar,
 }
 
 /// The flushes begun ([`flusher`]): a flush's target is made durable only once it and every flush
@@ -648,6 +681,7 @@ impl Default for Sends {
             notices_awaiting: AtomicUsize::new(0),
             notices: Mutex::default(),
             noticed: Condvar::new(),
+            immediate_room: Condvar::new(),
         }
     }
 }
@@ -872,15 +906,45 @@ impl Sends {
         self.noticed.notify_all();
     }
 
-    /// An empty batch that needs no commit or flush: deliver `Ok(())` asynchronously on
-    /// `amphora-notify` so callers (including `Groups::put_then` while holding its route read lock)
-    /// never execute user callbacks inline on the submitting thread.
-    fn tell_immediate(&self, fate: Arc<Fate>) {
+    /// Enqueues an empty batch's completion callback for asynchronous delivery on `amphora-notify`
+    /// while checking shutdown (`notices.stopped`) and bounded queue capacity (`immediate_cap`)
+    /// atomically under the `notices` mutex so no accepted empty write can lose its callback
+    /// during writer shutdown and callbacks cannot accumulate unboundedly behind a slow notifier.
+    fn try_tell_immediate(
+        &self,
+        fate: Arc<Fate>,
+        queued: Option<Charge>,
+        until: Option<Instant>,
+    ) -> Result<(), Refused> {
         {
             let mut notices = locked(&self.notices);
-            notices.immediate.push_back(fate);
+            loop {
+                if notices.disk_failed || self.disk_failed.load(Ordering::SeqCst) {
+                    return Err(Refused::Disk);
+                }
+                if notices.stopped || self.stopping.load(Ordering::SeqCst) {
+                    return Err(Refused::Stopped);
+                }
+                if notices.immediate.len() < notices.immediate_cap {
+                    break;
+                }
+                let Some(deadline) = until else {
+                    return Err(Refused::Full);
+                };
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Refused::Full);
+                }
+                notices = self
+                    .immediate_room
+                    .wait_timeout(notices, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            notices.immediate.push_back((fate, queued));
         }
         self.noticed.notify_all();
+        Ok(())
     }
 
     /// Waits until as many batches are durable as had been handed over when it was asked, up to
@@ -1103,8 +1167,12 @@ impl Sends {
         drop(locked(&self.durable));
         self.flushed.notify_all();
         self.unpark_all_ticket_waiters();
-        drop(locked(&self.notices));
+        {
+            let mut notices = locked(&self.notices);
+            notices.stopped = true;
+        }
         self.noticed.notify_all();
+        self.immediate_room.notify_all();
     }
 
     /// A flush failed: whoever waits for a commit or a flush is told.
@@ -1120,6 +1188,7 @@ impl Sends {
             notices.disk_failed = true;
         }
         self.noticed.notify_all();
+        self.immediate_room.notify_all();
     }
 }
 
@@ -1128,7 +1197,7 @@ impl Sends {
 /// stopped and no one is left to tell.
 fn notifier(sends: &Sends) {
     loop {
-        let (ready, refused) = {
+        let (immediate_ready, ready, refused) = {
             let mut notices = locked(&sends.notices);
             loop {
                 let durable = notices.durable;
@@ -1143,7 +1212,7 @@ fn notifier(sends: &Sends) {
                 if notices.awaiting.is_empty()
                     && notices.immediate.is_empty()
                     && notices.refused.is_empty()
-                    && sends.stopping.load(Ordering::Relaxed)
+                    && notices.stopped
                 {
                     return;
                 }
@@ -1157,7 +1226,9 @@ fn notifier(sends: &Sends) {
                 .durable
                 .max(sends.durable_commits.load(Ordering::SeqCst));
             notices.durable = durable;
-            let mut ready: Vec<Arc<Fate>> = notices.immediate.drain(..).collect();
+            let immediate_ready: Vec<(Arc<Fate>, Option<Charge>)> =
+                notices.immediate.drain(..).collect();
+            let mut ready: Vec<Arc<Fate>> = Vec::new();
             while notices.awaiting.front().is_some_and(|(c, _)| *c <= durable) {
                 if let Some((_, fate)) = notices.awaiting.pop_front() {
                     ready.push(fate);
@@ -1176,8 +1247,11 @@ fn notifier(sends: &Sends) {
             sends
                 .notices_awaiting
                 .store(notices.awaiting.len(), Ordering::SeqCst);
-            (ready, refused)
+            (immediate_ready, ready, refused)
         };
+        if !immediate_ready.is_empty() {
+            sends.immediate_room.notify_all();
+        }
         let tell = |fate: &Fate, answer: Result<(), Refused>| {
             if let Some(then) = locked(&fate.then).take()
                 && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| then(answer))).is_err()
@@ -1189,6 +1263,9 @@ fn notifier(sends: &Sends) {
                 );
             }
         };
+        for (fate, _charge) in immediate_ready {
+            tell(&fate, Ok(()));
+        }
         for fate in &ready {
             tell(fate, Ok(()));
         }
@@ -1808,16 +1885,26 @@ impl<E: Engine> Store<E> {
             return Err(Refused::Disk);
         }
         if rows.is_empty() {
-            if self.sends.stopping.load(Ordering::SeqCst) {
-                return Err(Refused::Stopped);
-            }
             if let Some(then) = then {
+                let queued = self
+                    .charge_bytes(immediate_notice_bytes(), until)
+                    .inspect_err(|_| {
+                        self.meter.dropped();
+                    })?;
                 let fate = Arc::new(Fate {
                     state: AtomicU64::new(UNSETTLED),
                     has_then: true,
                     then: Mutex::new(Some(then)),
                 });
-                self.sends.tell_immediate(fate);
+                self.sends
+                    .try_tell_immediate(fate, queued, until)
+                    .inspect_err(|err| {
+                        if matches!(err, Refused::Full) {
+                            self.meter.dropped();
+                        }
+                    })?;
+            } else if self.sends.stopping.load(Ordering::SeqCst) {
+                return Err(Refused::Stopped);
             }
             return Ok(Ticket(None));
         }
@@ -1862,6 +1949,10 @@ impl<E: Engine> Store<E> {
         let bytes = rows.iter().fold(0u64, |n, row| {
             n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
         });
+        self.charge_bytes(bytes, until)
+    }
+
+    fn charge_bytes(&self, bytes: u64, until: Option<Instant>) -> Result<Option<Charge>, Refused> {
         if bytes == 0 {
             return Ok(None);
         }
@@ -3031,6 +3122,121 @@ mod tests {
                 );
                 assert!(!ran.load(Ordering::SeqCst));
             }
+        }
+    }
+
+    /// Review Round 9 Spec P2 + Standards P2 regression:
+    /// 1. Empty-write callbacks enter a bounded queue with explicit overflow refusal (`Refused::Full`)
+    ///    and `meter.dropped()` accounting when the notifier is stalled.
+    /// 2. Checking shutdown atomically under `notices` lock prevents any accepted empty write
+    ///    from losing its callback when the store shuts down.
+    #[test]
+    fn review_r9_p2_empty_write_callback_queue_is_bounded_and_never_drops_on_shutdown() {
+        struct NoopEngine;
+        impl Engine for NoopEngine {
+            type Row = i64;
+            type Reader = ();
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+        }
+
+        // Part 1: bounded queue overflow behind a stalled notifier returns Refused::Full.
+        let store = Store::start(NoopEngine, Config::default()).unwrap();
+        locked(&store.sends.notices).immediate_cap = 2;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let far = Instant::now() + Duration::from_secs(5);
+
+        // First empty write blocks the notifier thread inside its callback.
+        store
+            .put_then(Vec::new(), far, move |_| {
+                let _ = entered_tx.send(());
+                let _ = locked(&release_rx).recv();
+            })
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Fill the remaining 2 slots of the bounded `immediate` queue while notifier is stalled.
+        let delivered = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let d = Arc::clone(&delivered);
+            store
+                .put_then(Vec::new(), far, move |res| {
+                    assert_eq!(res, Ok(()));
+                    d.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        // Queue is now full (`len == immediate_cap == 2`): a short-deadline empty write must be
+        // refused with `Refused::Full` and counted in `dropped`.
+        let overflow_cb_ran = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&overflow_cb_ran);
+        let overflow = store.put_then(
+            Vec::new(),
+            Instant::now() + Duration::from_millis(15),
+            move |_| {
+                ran.store(true, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(overflow.err(), Some(Refused::Full));
+        assert!(store.counters().dropped >= 1);
+        assert!(!overflow_cb_ran.load(Ordering::SeqCst));
+
+        // Release stalled notifier and confirm both accepted queued callbacks run.
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(delivered.load(Ordering::SeqCst), 2);
+        drop(store);
+
+        // Part 2: concurrent empty `put_then` racing writer shutdown must either be accepted AND
+        // deliver its callback, or be refused with `Refused::Stopped` (never accepted & lost).
+        for _ in 0..25 {
+            let store = Store::start(NoopEngine, Config::default()).unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let called = Arc::new(AtomicUsize::new(0));
+            let s_sub = store.clone();
+            let acc = Arc::clone(&accepted);
+            let cal = Arc::clone(&called);
+            let sub = std::thread::spawn(move || {
+                for _ in 0..128 {
+                    let c = Arc::clone(&cal);
+                    match s_sub.put_then(
+                        Vec::new(),
+                        Instant::now() + Duration::from_secs(2),
+                        move |res| {
+                            assert_eq!(res, Ok(()));
+                            c.fetch_add(1, Ordering::SeqCst);
+                        },
+                    ) {
+                        Ok(_) => {
+                            acc.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(Refused::Stopped) => break,
+                        Err(other) => panic!("unexpected refusal during shutdown race: {other:?}"),
+                    }
+                }
+            });
+            // Trigger abnormal writer shutdown while empty writes are arriving.
+            store.sends.stop();
+            sub.join().unwrap();
+            drop(store);
+            assert_eq!(
+                called.load(Ordering::SeqCst),
+                accepted.load(Ordering::SeqCst),
+                "every accepted empty write must deliver its callback before notifier exits"
+            );
         }
     }
 }

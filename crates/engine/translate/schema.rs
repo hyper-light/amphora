@@ -1356,7 +1356,16 @@ pub fn translate_create_table(
     };
     // Amphora: a dialect with OIDs stores the next one in this transaction, beside the table
     // (docs/design/postgres.md section 7), as PostgreSQL's XLOG_NEXTOID precedes every use of an OID.
-    if let Some(next_oid) = target_dialect.next_oid_after(&sql)? {
+    // Amphora owner-internal metadata tables (`__amphora_*`) consume no OID and stay out of
+    // `pg_class`, but still persist the current non-zero `pg_next_oid` dialect marker on page 1.
+    let next_oid = match target_dialect.next_oid_after(&sql)? {
+        Some(oid) => Some(oid),
+        None if crate::schema::is_amphora_internal_table(tbl_name.name.as_str()) => {
+            target_dialect.current_next_oid()
+        }
+        None => None,
+    };
+    if let Some(next_oid) = next_oid {
         program.emit_insn(Insn::SetCookie {
             db: database_id,
             cookie: Cookie::PgNextOid,

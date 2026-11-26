@@ -7478,4 +7478,57 @@ mod database_tests {
             .unwrap();
         assert_eq!(rows, vec![vec![crate::Value::from_i64(26)]]);
     }
+
+    /// Review Round 9 Spec P2 regression: a late `publish_schema_after_wal_apply(false)` whose
+    /// connection holds an older `schema_version` must NEVER overwrite a newer shared schema
+    /// committed by another connection on the same `Database`, and must adopt the newer schema.
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn review_r9_p2_late_raw_wal_publisher_never_regresses_newer_shared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late_wal_schema_publish.db");
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(crate::SqliteDialect))
+            .unwrap();
+
+        let late_pub = db.connect(ConnectOpts::new()).unwrap();
+        late_pub
+            .execute("CREATE TABLE v1 (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let v1_version = late_pub.schema.read().schema_version;
+
+        // Another writer commits newer DDL (`v2`), advancing `db.schema.schema_version`.
+        let newer_writer = db.connect(ConnectOpts::new()).unwrap();
+        newer_writer
+            .execute("CREATE TABLE v2 (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let v2_version = db.schema.lock().schema_version;
+        assert!(v2_version > v1_version);
+        assert!(late_pub.schema.read().schema_version == v1_version);
+
+        // Late raw-WAL publish with older local schema must NOT overwrite `db.schema`.
+        late_pub.publish_schema_after_wal_apply(false).unwrap();
+        assert_eq!(
+            db.schema.lock().schema_version,
+            v2_version,
+            "late raw-WAL publisher must not regress shared schema_version"
+        );
+        assert!(
+            db.schema.lock().get_btree_table("v2").is_some(),
+            "shared schema must retain committed table v2"
+        );
+        assert!(
+            late_pub.schema.read().get_btree_table("v2").is_some(),
+            "late publisher connection must adopt newer shared schema"
+        );
+
+        // Fresh reader must immediately see `v2`.
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        let rows = reader
+            .prepare("SELECT COUNT(*) FROM v2")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(0)]]);
+    }
 }

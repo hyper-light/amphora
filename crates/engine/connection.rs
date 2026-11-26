@@ -3782,10 +3782,24 @@ impl Connection {
                 .store(published_restore_epoch, Ordering::Release);
             drop(local);
         } else {
-            let mut db_schema = self.db.schema.lock();
-            if db_schema.schema_version != schema.schema_version {
-                *db_schema = Arc::new(schema.as_ref().try_clone()?);
-                self.db.bump_schema_epoch();
+            let adopted_newer = {
+                let mut db_schema = self.db.schema.lock();
+                if schema.schema_version > db_schema.schema_version {
+                    *db_schema = Arc::new(schema.as_ref().try_clone()?);
+                    self.db.bump_schema_epoch();
+                    None
+                } else if db_schema.schema_version > schema.schema_version {
+                    Some(Arc::clone(&db_schema))
+                } else {
+                    None
+                }
+            };
+            if let Some(newer) = adopted_newer {
+                let mut local = self.schema.write();
+                if newer.schema_version > local.schema_version {
+                    *local = newer;
+                    self.bump_prepare_context_generation();
+                }
             }
         }
         Ok(())

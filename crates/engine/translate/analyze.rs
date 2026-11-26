@@ -565,6 +565,7 @@ fn emit_column_stats(
                 func: AccumulatorFunc::Agg(sketch.clone()),
                 comparator: None,
                 collation: None,
+                updated_reg: None,
             }),
         });
     }
@@ -583,6 +584,7 @@ fn emit_column_stats(
             func: AccumulatorFunc::Agg(sample.clone()),
             comparator: None,
             collation: None,
+            updated_reg: None,
         }),
     });
     program.emit_insn(Insn::Next {

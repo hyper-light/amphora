@@ -659,6 +659,38 @@ pub fn oracle_spill_and_cold_reopen(
             "SELECT DISTINCT status, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY status, priority",
             vec![P::I(slice_hi)],
         ),
+        // Round 8 P2 regression: spilled pagination without secondary tie-breaker must keep exact
+        // warm arrival order on tied keys (no tie reversal on spill).
+        (
+            "tied_pagination_arrival_order",
+            "SELECT id, priority FROM issues WHERE id BETWEEN 1 AND ? ORDER BY priority ASC LIMIT 25 OFFSET 50",
+            vec![P::I(slice_hi)],
+        ),
+        // Round 7 P2 + Round 4 P1: spilled wide-accumulator hash GROUP BY must charge wide text
+        // accumulators and never emit duplicate groups.
+        (
+            "wide_accum_groupby",
+            "SELECT project_id, COUNT(*), MIN(description), MAX(description) FROM issues WHERE id BETWEEN 1 AND ? GROUP BY project_id ORDER BY project_id LIMIT 50",
+            vec![P::I(slice_hi)],
+        ),
+        // Round 6 P2 + Round 8 P3: bounded top-K large LIMIT/OFFSET over wide rows.
+        (
+            "large_limit_wide_topk",
+            "SELECT id, priority, title, description FROM issues WHERE id BETWEEN 1 AND ? ORDER BY priority DESC, id DESC LIMIT 200 OFFSET 100",
+            vec![P::I(slice_hi)],
+        ),
+        // Round 5 P1: unbounded ORDER BY without LIMIT over wide rows (linear multi-pass merge).
+        (
+            "unbounded_wide_sort",
+            "SELECT id, priority, title, description FROM issues WHERE id BETWEEN 1 AND ? ORDER BY updated_at ASC, id ASC",
+            vec![P::I(slice_hi.min(1_200))],
+        ),
+        // Round 2: LEFT JOIN hash probe with interleaved NULL and non-NULL join keys.
+        (
+            "hash_join_nullable_due",
+            "SELECT COUNT(*), COUNT(i2.id) FROM issues i1 LEFT JOIN issues i2 ON i1.due_at = i2.due_at AND i2.id BETWEEN 1 AND ? WHERE i1.id BETWEEN 1 AND ?",
+            vec![P::I(slice_hi.min(400)), P::I(slice_hi.min(400))],
+        ),
     ];
 
     let mut spill_failures = Vec::new();
@@ -769,7 +801,160 @@ pub fn oracle_spill_and_cold_reopen(
                         reopen_failures.push(format!("cold reopen integrity_check err: {e:#}"))
                     }
                 }
+                // Round 9 P2 #4: whole-table COUNT(expr) whose NOT NULL arithmetic overflows to
+                // NaN/NULL must return 0 on both SQLite and PostgreSQL dialects.
+                match direct_query_amphora(
+                    &mut warm,
+                    "SELECT COUNT(((price_cents * 1.0 + 1e308) * 2.0) - ((price_cents * 1.0 + 1e308) * 2.0)) FROM products",
+                    &[],
+                ) {
+                    Ok(rows)
+                        if rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|c| c.as_deref())
+                            == Some("0") => {}
+                    Ok(rows) => reopen_failures.push(format!(
+                        "COUNT(NaN overflow expr) returned {rows:?}, expected [[\"0\"]]"
+                    )),
+                    Err(e) => reopen_failures.push(format!("COUNT(NaN overflow expr) err: {e:#}")),
+                }
+                // Round 9 P2 #5: backup::digest must ignore shadowing TEMP tables on both dialects.
+                {
+                    let digest_check = (|| -> anyhow::Result<()> {
+                        let d_before = amphora::backup::digest(&warm)?;
+                        warm.exec(
+                            "CREATE TEMP TABLE products (id INTEGER PRIMARY KEY, category_id BIGINT, price_cents BIGINT)",
+                        )?;
+                        warm.exec("INSERT INTO temp.products (id, category_id, price_cents) VALUES (999999, 1, 12345)")?;
+                        let d_shadowed = amphora::backup::digest(&warm)?;
+                        warm.exec("DROP TABLE temp.products")?;
+                        if d_before != d_shadowed {
+                            anyhow::bail!(
+                                "backup::digest changed under shadowing temp table: {d_before:?} != {d_shadowed:?}"
+                            );
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = digest_check {
+                        reopen_failures.push(format!("backup::digest temp shadow check: {e:#}"));
+                    }
+                }
+                if !is_pg {
+                    // Round 9 P1 #2 (SQLite): grouped MAX with bare columns must match the winning row.
+                    let bare_check = (|| -> anyhow::Result<()> {
+                        let got = direct_query_amphora(
+                            &mut warm,
+                            "SELECT category_id, id, price_cents, MAX(price_cents * 1000000000.0 + id) FROM products GROUP BY category_id ORDER BY category_id LIMIT 20",
+                            &[],
+                        )?;
+                        let expected = direct_query_amphora(
+                            &mut warm,
+                            "SELECT p.category_id, p.id, p.price_cents, p.price_cents * 1000000000.0 + p.id FROM products p WHERE (p.price_cents * 1000000000.0 + p.id) = (SELECT MAX(p2.price_cents * 1000000000.0 + p2.id) FROM products p2 WHERE p2.category_id = p.category_id) ORDER BY p.category_id LIMIT 20",
+                            &[],
+                        )?;
+                        if got != expected {
+                            anyhow::bail!(
+                                "SQLite grouped MAX bare columns diverged: got={got:?} expected={expected:?}"
+                            );
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = bare_check {
+                        reopen_failures.push(format!("SQLite grouped MAX bare check: {e:#}"));
+                    }
+                    // Round 9 P1 #1 (SQLite): a view returning literal 'pg_class' must reopen cleanly as SQLite.
+                    let view_lit_check = (|| -> anyhow::Result<()> {
+                        warm.exec("DROP VIEW IF EXISTS __oracle_pg_lit_v")?;
+                        warm.exec("CREATE VIEW __oracle_pg_lit_v AS SELECT 'pg_class' AS tag")?;
+                        let rows = direct_query_amphora(
+                            &mut warm,
+                            "SELECT tag FROM __oracle_pg_lit_v",
+                            &[],
+                        )?;
+                        if rows != vec![vec![Some("pg_class".to_owned())]] {
+                            anyhow::bail!("unexpected view literal rows: {rows:?}");
+                        }
+                        warm.exec("DROP VIEW __oracle_pg_lit_v")?;
+                        Ok(())
+                    })();
+                    if let Err(e) = view_lit_check {
+                        reopen_failures.push(format!("SQLite pg_class literal view check: {e:#}"));
+                    }
+                }
                 if is_pg {
+                    // Round 9 P1 #2 (Postgres): ungrouped bare non-aggregate columns must be rejected.
+                    if direct_query_amphora(
+                        &mut warm,
+                        "SELECT category_id, price_cents, MAX(id) FROM products GROUP BY category_id",
+                        &[],
+                    )
+                    .is_ok()
+                    {
+                        reopen_failures.push(
+                            "amphora-pg unexpectedly accepted ungrouped bare column in GROUP BY"
+                                .into(),
+                        );
+                    }
+                    // Round 9 P2 #6 (Postgres): internal __amphora_* tables must never appear in pg_class.
+                    match direct_query_amphora(
+                        &mut warm,
+                        "SELECT relname FROM pg_class WHERE relname LIKE '__amphora_%'",
+                        &[],
+                    ) {
+                        Ok(rows) if rows.is_empty() => {}
+                        Ok(rows) => reopen_failures.push(format!(
+                            "amphora-pg leaked internal __amphora_* tables into pg_class: {rows:?}"
+                        )),
+                        Err(e) => {
+                            reopen_failures.push(format!("pg_class internal leak check err: {e:#}"))
+                        }
+                    }
+                    // Round 8 P2 (Postgres): two TEMP tables in one session must receive distinct OIDs.
+                    let temp_oid_check = (|| -> anyhow::Result<()> {
+                        warm.exec(
+                            "CREATE TEMP TABLE __oracle_tmp_a (id INTEGER PRIMARY KEY, v BIGINT)",
+                        )?;
+                        warm.exec(
+                            "CREATE TEMP TABLE __oracle_tmp_b (id INTEGER PRIMARY KEY, v BIGINT)",
+                        )?;
+                        warm.exec("INSERT INTO __oracle_tmp_a VALUES (1, 11)")?;
+                        warm.exec("INSERT INTO __oracle_tmp_b VALUES (1, 22)")?;
+                        let sqls = direct_query_amphora(
+                            &mut warm,
+                            "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'table' AND name IN ('__oracle_tmp_a', '__oracle_tmp_b') ORDER BY name",
+                            &[],
+                        )?;
+                        let vals = direct_query_amphora(
+                            &mut warm,
+                            "SELECT (SELECT v FROM __oracle_tmp_a WHERE id = 1), (SELECT v FROM __oracle_tmp_b WHERE id = 1)",
+                            &[],
+                        )?;
+                        warm.exec("DROP TABLE __oracle_tmp_b")?;
+                        warm.exec("DROP TABLE __oracle_tmp_a")?;
+                        if vals != vec![vec![Some("11".to_owned()), Some("22".to_owned())]] {
+                            anyhow::bail!("temp table values collided: {vals:?}");
+                        }
+                        if sqls.len() == 2 {
+                            let s0 = sqls[0].get(1).and_then(|v| v.as_deref()).unwrap_or("");
+                            let s1 = sqls[1].get(1).and_then(|v| v.as_deref()).unwrap_or("");
+                            fn parse_oid(s: &str) -> Option<&str> {
+                                s.split("pg_class.oid ")
+                                    .nth(1)
+                                    .and_then(|rest| rest.split_whitespace().next())
+                            }
+                            let (oid0, oid1) = (parse_oid(s0), parse_oid(s1));
+                            if oid0.is_none() || oid1.is_none() || oid0 == oid1 {
+                                anyhow::bail!(
+                                    "temp tables did not receive distinct pg_class.oid markers: {s0:?} vs {s1:?}"
+                                );
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = temp_oid_check {
+                        reopen_failures.push(format!("amphora-pg temp table OID check: {e:#}"));
+                    }
                     let oid_before = direct_query_amphora(
                         &mut warm,
                         "SELECT oid, relname FROM pg_class WHERE relname = 'issues'",

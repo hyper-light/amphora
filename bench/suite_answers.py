@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""The suite's answer check: every value of every read's answer in each target's record
-(src/suite.rs `answers`, written by suite.sh), held to the reference target's (SQLite's by default).
+"""The suite's answer check: every value of every read/DDL answer in each target's record
+(src/suite.rs `answers`, written by suite.sh / comprehensive.sh), held to the reference target's
+(SQLite's by default).
+
+Dialect-specific catalog ops (e.g. `catalog_introspect`) are cross-checked against a same-dialect
+reference whenever one is present in the JSONL (e.g. `amphora-pg` vs `postgres`), and never
+silently skipped without verifying non-empty error-free answers.
 
 Values are compared as text, except that numbers compare by value across dialects
 ("49.5000" from PostgreSQL's NUMERIC is SQLite's 49.5). Between two SQLite-dialect targets every
@@ -9,15 +14,21 @@ value must match exactly. Rows of a statement with no ORDER BY compare as a mult
 A mismatch prints the statement, its parameters and both answers; an answer that failed prints its
 error. Exit status 1 if anything differed or failed, 0 otherwise.
 
-usage: suite_answers.py RECORDS.jsonl [REFERENCE]
+usage: suite_answers.py RECORDS.jsonl [REFERENCE] [--require-pg-ref]
 """
 import json
 import re
 import sys
 from decimal import Decimal, InvalidOperation
 
-SQLITE_DIALECT = {"amphora", "amphora-pg", "turso", "sqlite", "mvcc"}
-DIALECT_SPECIFIC_OPS = {"catalog_introspect"}
+SQLITE_NUM_FORMAT = {"amphora", "amphora-pg", "turso", "sqlite", "mvcc"}
+PG_CATALOG_DIALECT = {"amphora-pg", "postgres", "orioledb", "cedardb"}
+SQLITE_CATALOG_DIALECT = {"amphora", "turso", "sqlite", "mvcc"}
+DIALECT_SPECIFIC_OPS = {
+    "catalog_introspect",
+    "catalog_public_relations",
+    "agg_ordered_set_stats",
+}
 
 
 def number(v):
@@ -43,18 +54,59 @@ def ordered(sql):
     return "ORDER BY" in re.sub(r"OVER\s*\([^)]*\)", "", sql.upper())
 
 
+def any_ordered(stmts):
+    return any(ordered(s) for s in stmts)
+
+
 def show(rows):
     cut = lambda v: v if v is None or len(v) <= 120 else f"{v[:120]}...({len(v)} chars)"
     return json.dumps([[cut(v) for v in r] for r in rows])
 
 
+def same_catalog_dialect(a, b):
+    if a in PG_CATALOG_DIALECT and b in PG_CATALOG_DIALECT:
+        return True
+    if a in SQLITE_CATALOG_DIALECT and b in SQLITE_CATALOG_DIALECT:
+        return True
+    return a == b
+
+
+def compare_answer(name, ref_name, a, r, cross):
+    mine, theirs = a["answer"], r["answer"]
+    if "error" in mine or "error" in theirs:
+        print(
+            f"ERROR {name} vs {ref_name}: {a['op']} {a['sql']} params {a['params']}: "
+            f"{name}: {mine.get('error', 'answered')} | {ref_name}: {theirs.get('error', 'answered')}"
+        )
+        return False
+    x, y = mine["rows"], theirs["rows"]
+    if not any_ordered(a.get("sql", [])):
+        key = lambda row: json.dumps(row)
+        x, y = sorted(x, key=key), sorted(y, key=key)
+    if len(x) == len(y) and all(
+        len(p) == len(q) and all(same(u, v, cross) for u, v in zip(p, q))
+        for p, q in zip(x, y)
+    ):
+        return True
+    print(f"DIFFERS {name} vs {ref_name}: {a['op']} (client {a['client']})")
+    print(f"  {name} sql: {' ; '.join(a['sql'])}")
+    print(f"  {ref_name} sql: {' ; '.join(r['sql'])}")
+    print(f"  params: {json.dumps(a['params'])}")
+    print(f"  {name} ({len(x)} rows): {show(x)}")
+    print(f"  {ref_name} ({len(y)} rows): {show(y)}")
+    return False
+
+
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if a != "--require-pg-ref"]
+    require_pg_ref = "--require-pg-ref" in sys.argv[1:]
+    if len(args) < 1:
         print(__doc__)
         return 2
-    ref_name = sys.argv[2] if len(sys.argv) > 2 else "sqlite"
+    path = args[0]
+    ref_name = args[1] if len(args) > 1 else "sqlite"
     reports = {}
-    for line in open(sys.argv[1]):
+    for line in open(path):
         try:
             r = json.loads(line)
         except ValueError:
@@ -65,18 +117,40 @@ def main():
     if ref_name not in reports:
         print(f"no answers from the reference {ref_name} (targets with answers: {sorted(reports)})")
         return 2
+    if require_pg_ref and "postgres" not in reports:
+        print(f"--require-pg-ref set but no postgres reference found (targets: {sorted(reports)})")
+        return 2
     ref_rep = reports[ref_name]
     ref = {(a["op"], json.dumps(a["params"])): a for a in ref_rep["answers"]}
+    pg_ref = (
+        {(a["op"], json.dumps(a["params"])): a for a in reports["postgres"]["answers"]}
+        if "postgres" in reports
+        else None
+    )
+    sqlite_ref = (
+        {(a["op"], json.dumps(a["params"])): a for a in reports["sqlite"]["answers"]}
+        if "sqlite" in reports
+        else None
+    )
     ref_results = {
         (r.get("op"), r.get("clients")): r
         for r in ref_rep.get("results", [])
         if isinstance(r, dict) and not r.get("unsupported")
     }
+    pg_results = (
+        {
+            (r.get("op"), r.get("clients")): r
+            for r in reports["postgres"].get("results", [])
+            if isinstance(r, dict) and not r.get("unsupported")
+        }
+        if "postgres" in reports
+        else {}
+    )
     bad = 0
     for name, rep in sorted(reports.items()):
         if name == ref_name:
             continue
-        cross = (name in SQLITE_DIALECT) != (ref_name in SQLITE_DIALECT)
+        cross = (name in SQLITE_NUM_FORMAT) != (ref_name in SQLITE_NUM_FORMAT)
         compared = differ = 0
         unsupported_ops = {
             r.get("op")
@@ -84,48 +158,66 @@ def main():
             if isinstance(r, dict) and r.get("unsupported")
         }
         seen_keys = set()
+        seen_pg_dialect_keys = set()
         for a in rep["answers"]:
-            if a["op"] in DIALECT_SPECIFIC_OPS and name != ref_name:
-                # Catalog views intentionally differ between sqlite_schema and pg_catalog.
-                if (name in {"amphora-pg", "postgres", "orioledb", "cedardb"}) != (
-                    ref_name in {"amphora-pg", "postgres", "orioledb", "cedardb"}
-                ):
-                    continue
             key_pair = (a["op"], json.dumps(a["params"]))
+            if a["op"] in DIALECT_SPECIFIC_OPS and not same_catalog_dialect(name, ref_name):
+                # Prefer comparing PostgreSQL catalog answers directly against stock `postgres`
+                # whenever present, and SQLite catalog answers against stock `sqlite`.
+                if name in PG_CATALOG_DIALECT and pg_ref is not None and name != "postgres":
+                    seen_pg_dialect_keys.add(key_pair)
+                    r = pg_ref.get(key_pair)
+                    if r is None:
+                        differ += 1
+                        print(f"MISSING_PG_REF {name} vs postgres: {a['op']} params {a['params']}: postgres produced no answer")
+                        continue
+                    compared += 1
+                    pg_cross = (name in SQLITE_NUM_FORMAT) != ("postgres" in SQLITE_NUM_FORMAT)
+                    if not compare_answer(name, "postgres", a, r, pg_cross):
+                        differ += 1
+                    continue
+                if name in SQLITE_CATALOG_DIALECT and sqlite_ref is not None and name != "sqlite":
+                    r = sqlite_ref.get(key_pair)
+                    if r is not None:
+                        compared += 1
+                        sq_cross = (name in SQLITE_NUM_FORMAT) != ("sqlite" in SQLITE_NUM_FORMAT)
+                        if not compare_answer(name, "sqlite", a, r, sq_cross):
+                            differ += 1
+                        continue
+                # No same-dialect reference present (or this target IS the alternate reference):
+                # still validate error-free, non-empty catalog answers.
+                compared += 1
+                mine = a["answer"]
+                if "error" in mine or not mine.get("rows"):
+                    differ += 1
+                    print(
+                        f"INVALID_CATALOG {name}: {a['op']} returned "
+                        f"{mine.get('error', 'empty rows')} with no same-dialect reference"
+                    )
+                continue
             seen_keys.add(key_pair)
             r = ref.get(key_pair)
             if r is None:
                 continue
             compared += 1
-            mine, theirs = a["answer"], r["answer"]
-            if "error" in mine or "error" in theirs:
+            if not compare_answer(name, ref_name, a, r, cross):
                 differ += 1
-                print(f"ERROR {name} vs {ref_name}: {a['op']} {a['sql']} params {a['params']}: {name}: {mine.get('error', 'answered')} | {ref_name}: {theirs.get('error', 'answered')}")
-                continue
-            x, y = mine["rows"], theirs["rows"]
-            if not ordered(a["sql"][0] if a["sql"] else ""):
-                key = lambda row: json.dumps(row)
-                x, y = sorted(x, key=key), sorted(y, key=key)
-            if len(x) == len(y) and all(len(p) == len(q) and all(same(u, v, cross) for u, v in zip(p, q)) for p, q in zip(x, y)):
-                continue
-            differ += 1
-            print(f"DIFFERS {name} vs {ref_name}: {a['op']} (client {a['client']})")
-            print(f"  {name} sql: {' ; '.join(a['sql'])}")
-            print(f"  {ref_name} sql: {' ; '.join(r['sql'])}")
-            print(f"  params: {json.dumps(a['params'])}")
-            print(f"  {name} ({len(x)} rows): {show(x)}")
-            print(f"  {ref_name} ({len(y)} rows): {show(y)}")
         for (op, params_json), r in ref.items():
             if (op, params_json) in seen_keys or op in unsupported_ops:
                 continue
-            if op in DIALECT_SPECIFIC_OPS and name != ref_name:
-                if (name in {"amphora-pg", "postgres", "orioledb", "cedardb"}) != (
-                    ref_name in {"amphora-pg", "postgres", "orioledb", "cedardb"}
-                ):
-                    continue
+            if op in DIALECT_SPECIFIC_OPS and not same_catalog_dialect(name, ref_name):
+                continue
             compared += 1
             differ += 1
             print(f"MISSING {name} vs {ref_name}: {op} params {params_json}: {name} produced no answer")
+        if name in PG_CATALOG_DIALECT and pg_ref is not None and name != "postgres":
+            for (op, params_json), _ in pg_ref.items():
+                if op not in DIALECT_SPECIFIC_OPS or op in unsupported_ops:
+                    continue
+                if (op, params_json) not in seen_pg_dialect_keys:
+                    compared += 1
+                    differ += 1
+                    print(f"MISSING {name} vs postgres: {op} params {params_json}: {name} produced no answer")
 
         # Also validate timed results (writes, DDL, reads): errors, 0-op stalls, or missing ops fail.
         cand_results = {
@@ -145,11 +237,13 @@ def main():
                 )
                 continue
             rr = ref_results.get((op, clients))
+            if rr is None and name in PG_CATALOG_DIALECT and name != "postgres":
+                rr = pg_results.get((op, clients))
             if rr and rr.get("errors", 0) == 0 and rr.get("ops_per_s", 0) > 0 and cr.get("ops_per_s", 0) <= 0:
                 result_errors += 1
                 print(
                     f"RESULT_ZERO_OPS {name} vs {ref_name}: {op} (clients={clients}): "
-                    f"{name} completed 0 ops/s while {ref_name} completed {rr.get('ops_per_s')} ops/s"
+                    f"{name} completed 0 ops/s while reference completed {rr.get('ops_per_s')} ops/s"
                 )
         for (op, clients), rr in sorted(ref_results.items()):
             if (op, clients) not in cand_results and op not in unsupported_ops:

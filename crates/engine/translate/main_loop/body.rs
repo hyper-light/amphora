@@ -387,6 +387,7 @@ fn emit_loop_source<'a>(
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                         comparator,
                         collation: Some(arg_collation),
+                        updated_reg: None,
                     }),
                 });
                 program.emit_insn(Insn::Goto {
@@ -397,6 +398,19 @@ fn emit_loop_source<'a>(
                     program.preassign_label_to_next_insn(label_on_null);
                 }
                 return Ok(());
+            }
+
+            let min_max_tracking = if t_ctx.reg_nonagg_emit_once_flag.is_some() {
+                crate::translate::group_by::single_min_max_agg_index(&plan.aggregates)
+                    .map(|idx| (idx, program.alloc_register()))
+            } else {
+                None
+            };
+            if let Some((_, updated_reg)) = min_max_tracking {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: updated_reg,
+                });
             }
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
@@ -427,13 +441,15 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                translate_aggregation_step(
+                let updated_reg = min_max_tracking.and_then(|(idx, reg)| (idx == i).then_some(reg));
+                crate::translate::aggregation::translate_aggregation_step_with_updated(
                     program,
                     &plan.table_references,
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    updated_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -449,11 +465,26 @@ fn emit_loop_source<'a>(
 
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
                 let if_label = program.allocate_label();
-                program.emit_insn(Insn::If {
-                    reg: flag,
-                    target_pc: if_label,
-                    jump_if_null: false,
-                });
+                if let Some((_, updated_reg)) = min_max_tracking {
+                    let capture_label = program.allocate_label();
+                    program.emit_insn(Insn::IfNot {
+                        reg: flag,
+                        target_pc: capture_label,
+                        jump_if_null: true,
+                    });
+                    program.emit_insn(Insn::IfNot {
+                        reg: updated_reg,
+                        target_pc: if_label,
+                        jump_if_null: true,
+                    });
+                    program.preassign_label_to_next_insn(capture_label);
+                } else {
+                    program.emit_insn(Insn::If {
+                        reg: flag,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                }
                 Some(if_label)
             } else {
                 None

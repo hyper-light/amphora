@@ -665,6 +665,18 @@ pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
 /// Internal table prefixes that should be protected from CREATE/DROP
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
+/// Prefix for Amphora owner/replication internal metadata tables (`__amphora_*`).
+/// Unlike user PostgreSQL relations, these live outside `pg_class`/`pg_attribute` and consume
+/// no PostgreSQL OIDs.
+pub const AMPHORA_INTERNAL_PREFIX: &str = "__amphora_";
+
+/// Check if a table name refers to an Amphora owner-internal metadata table (`__amphora_*`).
+pub fn is_amphora_internal_table(table_name: &str) -> bool {
+    table_name
+        .get(..AMPHORA_INTERNAL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AMPHORA_INTERNAL_PREFIX))
+}
+
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     RESERVED_TABLE_PREFIXES

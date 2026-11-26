@@ -36,7 +36,7 @@ pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
 pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<RowDigest> {
     let mut tables = Vec::new();
     db.query(
-        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND (name NOT LIKE 'sqlite!_%' ESCAPE '!' OR name = 'sqlite_sequence') ORDER BY name",
+        "SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND (name NOT LIKE 'sqlite!_%' ESCAPE '!' OR name = 'sqlite_sequence') ORDER BY name",
         [],
         |r| {
             let name = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -64,7 +64,7 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
             // `sqlite_sequence` carries SQLite AUTOINCREMENT next-ID watermarks; digest in
             // deterministic `(name, seq)` order.
             db.query_owned(
-                "SELECT name, seq FROM \"sqlite_sequence\" ORDER BY name, seq",
+                "SELECT name, seq FROM main.\"sqlite_sequence\" ORDER BY name, seq",
                 [],
                 |r| {
                     let values: Vec<_> = r.get_values().collect();
@@ -87,7 +87,7 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
             RowScanMode::Sql { select_list, order } => {
                 let quoted = table.replace('"', "\"\"");
                 db.query_owned(
-                    &format!("SELECT {select_list} FROM \"{quoted}\" ORDER BY {order}"),
+                    &format!("SELECT {select_list} FROM main.\"{quoted}\" ORDER BY {order}"),
                     [],
                     |r| {
                         let values: Vec<_> = r.get_values().collect();

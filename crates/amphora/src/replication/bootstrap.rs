@@ -165,13 +165,15 @@ fn identity(image: &[u8]) -> [u8; 32] {
     Sha256::digest(image).into()
 }
 fn capture(db: &mut Db) -> Result<Vec<u8>, Refusal> {
-    let pages = db.image_pages(super::image_room()?).map_err(unavailable)?;
+    let room = super::image_room()?;
+    let pages = db.image_pages(room).map_err(unavailable)?;
     if pages.is_empty() {
         return Err(api::invalid(
             "baseline source",
             "source has no database image; fresh empty groups use no bootstrap declaration",
         ));
     }
+    super::validate_pages(&pages, room)?;
     let image = postcard::to_allocvec(&pages).map_err(unavailable)?;
     api::bound("baseline image", image.len(), image_bytes()?)?;
     Ok(image)
@@ -733,5 +735,61 @@ mod tests {
                 .is_err()
         );
         assert_eq!(unrelated.durable().index, 0);
+    }
+
+    /// Review Round 9 Spec P1 regression: `inspect_source` and `Baseline::open` must reject
+    /// populated databases whose page size is not 4096 bytes (e.g. 8 KiB) on both SQLite and
+    /// PostgreSQL BEFORE approving a declaration or persisting any `__amphora_baseline` marker.
+    #[test]
+    fn review_r9_p1_inspect_source_and_baseline_reject_non_4k_pages_before_marker() {
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(if is_pg { "pg8k.db" } else { "sqlite8k.db" });
+            {
+                let mut db = if is_pg {
+                    Db::open_postgres_sharing(&path, &crate::db::Sharing::Off).unwrap()
+                } else {
+                    Db::open_sharing(&path, &crate::db::Sharing::Off).unwrap()
+                };
+                db.exec("PRAGMA page_size = 8192").unwrap();
+                if is_pg {
+                    db.exec("CREATE TABLE t (id int4); INSERT INTO t VALUES (1)")
+                        .unwrap();
+                } else {
+                    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1)")
+                        .unwrap();
+                }
+                db.flusher()().unwrap();
+                let _ = db.checkpoint().unwrap();
+            }
+
+            let err = inspect_source(&path, 1).unwrap_err();
+            assert!(
+                matches!(err, Refusal::Invalid { .. }),
+                "is_pg={is_pg}: inspect_source must reject 8 KiB source with Invalid, got: {err:?}"
+            );
+
+            // `Baseline::open` must also reject before writing `__amphora_baseline`.
+            let mut db = if is_pg {
+                Db::open_postgres_sharing(&path, &crate::db::Sharing::Off).unwrap()
+            } else {
+                Db::open_sharing(&path, &crate::db::Sharing::Off).unwrap()
+            };
+            let fake_decl = Bootstrap {
+                source_node: 1,
+                source_id: [7u8; 32],
+            };
+            let open_err = Baseline::open(&mut db, 1, Some(fake_decl), false).unwrap_err();
+            assert!(
+                matches!(open_err, Refusal::Invalid { .. }),
+                "is_pg={is_pg}: Baseline::open must reject 8 KiB source with Invalid, got: {open_err:?}"
+            );
+            assert!(
+                !table_exists(&db).unwrap(),
+                "is_pg={is_pg}: rejected Baseline::open must not persist __amphora_baseline marker"
+            );
+        }
     }
 }

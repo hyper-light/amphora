@@ -228,6 +228,9 @@ fn user_tables(conn: &Arc<Connection>) -> Result<Vec<UserTable>> {
             _ => 0,
         };
         let table = BTreeTable::from_sql(definition, root_page)?;
+        if crate::schema::is_amphora_internal_table(&table.name) {
+            continue;
+        }
         // PostgreSQL indexes every primary key, and implements foreign keys as triggers.
         let has_index = owns("index", &table.name) || !table.primary_key_columns.is_empty();
         let has_trigger = owns("trigger", &table.name) || !table.foreign_keys.is_empty();

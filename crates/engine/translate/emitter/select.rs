@@ -139,11 +139,11 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
+    // For non-grouped aggregation queries that also have non-aggregate columns (including
+    // `HAVING` without `GROUP BY`), we track whether we've already captured them so they are
+    // evaluated once (or re-captured on a new winning MIN/MAX row).
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
+        && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
         && plan.result_columns.iter().any(|c| !c.contains_aggregates);
 
     if has_ungrouped_nonagg_cols {

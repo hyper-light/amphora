@@ -491,6 +491,9 @@ pub struct AggStepData {
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
+    /// Optional register set to `1` when a MIN/MAX step adopts a new winning row (and `0`
+    /// otherwise), so bare columns in SQLite aggregate queries track the winning MIN/MAX row.
+    pub updated_reg: Option<usize>,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).

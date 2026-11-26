@@ -3283,6 +3283,7 @@ fn emit_function_step(
                         func: AccumulatorFunc::Window(win_func.clone()),
                         comparator: None,
                         collation: None,
+                        updated_reg: None,
                     }),
                 });
             }

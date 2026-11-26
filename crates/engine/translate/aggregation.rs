@@ -369,6 +369,29 @@ pub fn translate_aggregation_step(
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
 ) -> Result<usize> {
+    translate_aggregation_step_with_updated(
+        program,
+        referenced_tables,
+        agg_arg_source,
+        target_register,
+        resolver,
+        fraction_reg,
+        None,
+    )
+}
+
+/// Like [`translate_aggregation_step`], optionally recording into `updated_reg` whether a
+/// `MIN`/`MAX` aggregate adopted a new winning row so bare columns in SQLite aggregate queries
+/// stay synchronized with the winning row.
+pub fn translate_aggregation_step_with_updated(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    agg_arg_source: AggArgumentSource,
+    target_register: usize,
+    resolver: &Resolver,
+    fraction_reg: Option<usize>,
+    updated_reg: Option<usize>,
+) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
     let dest = match func {
@@ -386,6 +409,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -402,6 +426,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -420,6 +445,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Count),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -448,6 +474,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
 
@@ -471,6 +498,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Max),
                     comparator,
                     collation: Some(arg_collation),
+                    updated_reg,
                 }),
             });
             target_register
@@ -493,6 +521,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Min),
                     comparator,
                     collation: Some(arg_collation),
+                    updated_reg,
                 }),
             });
             target_register
@@ -514,6 +543,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -533,6 +563,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -554,6 +585,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
 
@@ -573,6 +605,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -591,6 +624,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Total),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -610,6 +644,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -631,6 +666,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
                     comparator: None,
                     collation: Some(arg_collation),
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -656,6 +692,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
                     collation: Some(arg_collation),
+                    updated_reg: None,
                 }),
             });
             target_register
@@ -698,6 +735,7 @@ pub fn translate_aggregation_step(
                     })),
                     comparator: None,
                     collation: None,
+                    updated_reg: None,
                 }),
             });
             target_register

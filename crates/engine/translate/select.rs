@@ -830,6 +830,13 @@ fn prepare_one_select_plan(
             }
             plan.order_by = key;
 
+            // Validate strict GROUP BY rules (e.g. PostgreSQL) BEFORE clearing ORDER BY on
+            // single-row aggregate queries so `SELECT COUNT(*) FROM t ORDER BY ungrouped_col` is
+            // also rejected on PostgreSQL.
+            if !connection.dialect().allows_ungrouped_columns() {
+                validate_dialect_group_by(&plan)?;
+            }
+
             // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
             // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
             // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
@@ -879,6 +886,9 @@ fn prepare_one_select_plan(
             {
                 trace_stack!("validate_plan");
                 validate_group_by_outer_scope_refs(&plan)?;
+                if !connection.dialect().allows_ungrouped_columns() {
+                    validate_dialect_group_by(&plan)?;
+                }
 
                 validate_expr_correct_column_counts(&plan)?;
             }
@@ -1106,6 +1116,139 @@ fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
             &plan.non_from_clause_subqueries,
         )?;
     }
+    Ok(())
+}
+
+/// Strict GROUP BY validation for dialects (such as PostgreSQL) that reject ungrouped
+/// non-aggregate column references in SELECT, HAVING, and ORDER BY clauses.
+fn validate_dialect_group_by(plan: &SelectPlan) -> Result<()> {
+    let is_grouped_or_agg = plan.group_by.is_some() || !plan.aggregates.is_empty();
+    if !is_grouped_or_agg {
+        return Ok(());
+    }
+    let empty_group_by: &[Expr] = &[];
+    let group_by_exprs: &[Expr] = plan
+        .group_by
+        .as_ref()
+        .map_or(empty_group_by, |gb| gb.exprs.as_slice());
+
+    for rc in &plan.result_columns {
+        check_expr_grouped(&rc.expr, plan, group_by_exprs)?;
+    }
+    if let Some(group_by) = &plan.group_by {
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                check_expr_grouped(expr, plan, group_by_exprs)?;
+            }
+        }
+        for expr in &group_by.carried {
+            check_expr_grouped(expr, plan, group_by_exprs)?;
+        }
+    }
+    for (expr, _, _) in &plan.order_by {
+        check_expr_grouped(expr, plan, group_by_exprs)?;
+    }
+    Ok(())
+}
+
+fn table_pk_is_in_group_by(
+    table_id: ast::TableInternalId,
+    table_ref: &crate::translate::plan::JoinedTable,
+    group_by_exprs: &[Expr],
+    table_references: &TableReferences,
+) -> bool {
+    if group_by_exprs.is_empty() || table_references.outer_join_may_null_extend(table_id) {
+        return false;
+    }
+    let Table::BTree(btree) = &table_ref.table else {
+        return false;
+    };
+    let pk_cols: Vec<(usize, bool)> = btree
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| col.primary_key().then_some((idx, col.is_rowid_alias())))
+        .collect();
+    if pk_cols.is_empty() {
+        return false;
+    }
+    pk_cols.iter().all(|&(pk_idx, is_rowid_alias)| {
+        group_by_exprs.iter().any(|ge| match ge {
+            Expr::Column { table, column, .. } => *table == table_id && *column == pk_idx,
+            Expr::RowId { table, .. } => is_rowid_alias && *table == table_id,
+            _ => false,
+        })
+    })
+}
+
+fn check_expr_grouped(root: &Expr, plan: &SelectPlan, group_by_exprs: &[Expr]) -> Result<()> {
+    walk_expr(root, &mut |node: &Expr| -> Result<WalkControl> {
+        if plan
+            .aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, node))
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if group_by_exprs
+            .iter()
+            .any(|ge| exprs_are_equivalent(ge, node))
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match node {
+            Expr::Column { table, column, .. } => {
+                let Some(table_ref) = plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                else {
+                    return Ok(WalkControl::SkipChildren);
+                };
+                if table_pk_is_in_group_by(
+                    *table,
+                    table_ref,
+                    group_by_exprs,
+                    &plan.table_references,
+                ) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                let col_name = table_ref
+                    .columns()
+                    .get(*column)
+                    .and_then(|c| c.name.as_deref())
+                    .unwrap_or("?");
+                crate::bail_parse_error!(
+                    "column \"{col_name}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                );
+            }
+            Expr::RowId { table, .. } => {
+                let Some(table_ref) = plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                else {
+                    return Ok(WalkControl::SkipChildren);
+                };
+                if table_pk_is_in_group_by(
+                    *table,
+                    table_ref,
+                    group_by_exprs,
+                    &plan.table_references,
+                ) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                crate::bail_parse_error!(
+                    "column \"rowid\" must appear in the GROUP BY clause or be used in an aggregate function"
+                );
+            }
+            Expr::SubqueryResult { lhs, .. } => {
+                if let Some(lhs) = lhs {
+                    check_expr_grouped(lhs, plan, group_by_exprs)?;
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    })?;
     Ok(())
 }
 

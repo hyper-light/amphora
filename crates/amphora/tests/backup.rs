@@ -2679,3 +2679,46 @@ fn review_p2_digest_detects_autoincrement_shadowed_rowids_and_postgres_oids() {
         "PostgreSQL databases with different durable pg_next_oid must have distinct digests"
     );
 }
+
+/// Review Round 9 Spec P2 regression: `backup::digest` must always read from `main.*`, never
+/// letting a same-named temporary table on the connection shadow durable rows on either SQLite
+/// or PostgreSQL.
+#[test]
+fn review_r9_p2_backup_digest_ignores_shadowing_temp_table_on_both_dialects() {
+    for is_pg in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = if is_pg {
+            Db::open_postgres_sharing(&dir.path().join("a.db"), &amphora::db::Sharing::Off).unwrap()
+        } else {
+            Db::open(&dir.path().join("a.db")).unwrap()
+        };
+        let b = if is_pg {
+            Db::open_postgres_sharing(&dir.path().join("b.db"), &amphora::db::Sharing::Off).unwrap()
+        } else {
+            Db::open(&dir.path().join("b.db")).unwrap()
+        };
+        let ddl = if is_pg {
+            "CREATE TABLE sales (units int4)"
+        } else {
+            "CREATE TABLE sales (units INTEGER)"
+        };
+        let temp_ddl = if is_pg {
+            "CREATE TEMP TABLE sales (units int4); INSERT INTO temp.sales VALUES (999)"
+        } else {
+            "CREATE TEMP TABLE sales (units INTEGER); INSERT INTO temp.sales VALUES (999)"
+        };
+        a.exec(ddl).unwrap();
+        b.exec(ddl).unwrap();
+        a.exec("INSERT INTO main.sales VALUES (41)").unwrap();
+        b.exec("INSERT INTO main.sales VALUES (20)").unwrap();
+        // Shadow `main.sales` on both connections with identical temporary `sales` tables.
+        a.exec(temp_ddl).unwrap();
+        b.exec(temp_ddl).unwrap();
+
+        assert_ne!(
+            backup::digest(&a).unwrap(),
+            backup::digest(&b).unwrap(),
+            "is_pg={is_pg}: backup::digest must distinguish main.sales (41 vs 20) despite identical temp.sales"
+        );
+    }
+}

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::function::{AccumulatorFunc, AggFunc};
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{translate_aggregation_step_with_updated, AggArgumentSource},
     expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
@@ -733,6 +733,21 @@ fn has_min_max(plan: &SelectPlan) -> bool {
         .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
 }
 
+/// Returns the aggregate index when a query contains a single `MIN(...)` or `MAX(...)` aggregate
+/// (the SQLite bare-column rule: non-grouped columns must come from the winning MIN/MAX row).
+pub(crate) fn single_min_max_agg_index(aggregates: &[Aggregate]) -> Option<usize> {
+    let mut found = None;
+    for (idx, agg) in aggregates.iter().enumerate() {
+        if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(idx);
+        }
+    }
+    found
+}
+
 /// Amphora: whether `plan`'s GROUP BY would group in a hash table were its rows not read in its
 /// order, as far as the planner can tell before it chooses how to read them (`docs/design/
 /// planner.md` decision 7): `hash_groups_eligible`'s test on what the plan says, with a result
@@ -743,13 +758,26 @@ pub(crate) fn groups_may_hash(plan: &SelectPlan) -> bool {
     let Some(group_by) = plan.group_by.as_ref() else {
         return false;
     };
-    let bare_columns = plan.result_columns.iter().any(|column| {
-        !column.contains_aggregates
-            && !group_by
-                .exprs
-                .iter()
-                .any(|expr| exprs_are_equivalent(expr, &column.expr))
-    });
+    let mut non_agg = Vec::new();
+    let collect_ok = collect_non_aggregate_expressions(
+        &mut non_agg,
+        group_by,
+        plan,
+        &plan.result_columns,
+        &plan.order_by,
+    )
+    .is_ok();
+    let bare_columns = if collect_ok {
+        non_agg.len() > group_by.exprs.len()
+    } else {
+        plan.result_columns.iter().any(|column| {
+            !column.contains_aggregates
+                && !group_by
+                    .exprs
+                    .iter()
+                    .any(|expr| exprs_are_equivalent(expr, &column.expr))
+        })
+    };
     plan.window.is_none()
         && aggregates_keep_small_states(plan)
         && !(has_min_max(plan) && bare_columns)
@@ -976,6 +1004,22 @@ pub fn group_by_process_single_group(
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
 
+    // SQLite bare-column rule: when a grouped query has a single MIN() or MAX() aggregate and
+    // bare (ungrouped) non-aggregate columns, re-capture non-aggregate columns whenever that
+    // MIN/MAX aggregate adopts a new winning row instead of sticking with the group's first row.
+    let has_bare_columns = t_ctx.non_aggregate_expressions.len() > group_by.exprs.len();
+    let min_max_tracking = if has_bare_columns {
+        single_min_max_agg_index(&plan.aggregates).map(|idx| (idx, program.alloc_register()))
+    } else {
+        None
+    };
+    if let Some((_, updated_reg)) = min_max_tracking {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: updated_reg,
+        });
+    }
+
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
             // Read leaf columns from the pseudo cursor and cache them so that
@@ -1027,13 +1071,15 @@ pub fn group_by_process_single_group(
 
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
-                translate_aggregation_step(
+                let updated_reg = min_max_tracking.and_then(|(idx, reg)| (idx == i).then_some(reg));
+                translate_aggregation_step_with_updated(
                     program,
                     &plan.table_references,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    updated_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1082,13 +1128,15 @@ pub fn group_by_process_single_group(
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
-                translate_aggregation_step(
+                let updated_reg = min_max_tracking.and_then(|(idx, reg)| (idx == i).then_some(reg));
+                translate_aggregation_step_with_updated(
                     program,
                     &plan.table_references,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    updated_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1106,17 +1154,32 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
+    // We only need to store non-aggregate columns once per group, unless a single MIN/MAX
+    // aggregate just adopted a new winning row for bare columns.
     program.add_comment(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
-    program.emit_insn(Insn::If {
-        target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
-        jump_if_null: false,
-    });
+    if let Some((_, updated_reg)) = min_max_tracking {
+        let label_capture_nonagg = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: registers.reg_data_in_acc_flag,
+            target_pc: label_capture_nonagg,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::IfNot {
+            reg: updated_reg,
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            jump_if_null: true,
+        });
+        program.preassign_label_to_next_insn(label_capture_nonagg);
+    } else {
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+    }
 
     // Read non-aggregate columns from the current row
     match row_source {

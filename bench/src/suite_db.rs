@@ -72,6 +72,15 @@ pub trait Session: Send {
         let _ = (stmts, params);
         anyhow::bail!("no answer check here")
     }
+    /// Runs a self-cleaning DDL workload in a transaction and returns every row produced by its
+    /// verification queries (e.g. `ddl_analyze_stats`'s `SELECT COUNT(*) FROM regions`).
+    fn answer_ddl(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        self.answer(stmts, params)
+    }
     /// The plan the database makes for `sql` with `params` (its EXPLAIN), a line a step.
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let _ = (sql, params);
@@ -235,10 +244,15 @@ mod amphora_target {
     use amphora::store::{Checkpointed, Config, Engine, Flush, Opener};
     use amphora_engine::Value;
 
+    type AnswerRows = Vec<Vec<Option<String>>>;
+    type AnswerSlot = Arc<Mutex<Option<AnswerRows>>>;
+
     /// A write: its statements and their parameters, applied in the writer's transaction.
     pub struct SqlRow {
         stmts: Arc<Vec<&'static str>>,
         params: Vec<Vec<P>>,
+        rows_read: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        answer_rows: Option<AnswerSlot>,
     }
 
     const HOLDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS __suite_holding(one INTEGER PRIMARY KEY, holding BLOB NOT NULL)";
@@ -371,7 +385,17 @@ mod amphora_target {
         fn apply(&mut self, rows: &[SqlRow]) -> anyhow::Result<usize> {
             self.db.transaction(|db| {
                 for row in rows {
-                    read_all(db, &row.stmts, &row.params)?;
+                    if let Some(slot) = &row.answer_rows {
+                        let out = answer_all(db, &row.stmts, &row.params)?;
+                        if let Ok(mut guard) = slot.lock() {
+                            *guard = Some(out);
+                        }
+                    } else {
+                        let n = read_all(db, &row.stmts, &row.params)?;
+                        if let Some(counter) = &row.rows_read {
+                            counter.store(n, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                 }
                 Ok(rows.len())
             })
@@ -392,7 +416,17 @@ mod amphora_target {
             let mut written = 0;
             let committed = self.db.transaction_while_room(batches, |db, batch| {
                 for row in batch {
-                    read_all(db, &row.stmts, &row.params)?;
+                    if let Some(slot) = &row.answer_rows {
+                        let out = answer_all(db, &row.stmts, &row.params)?;
+                        if let Ok(mut guard) = slot.lock() {
+                            *guard = Some(out);
+                        }
+                    } else {
+                        let n = read_all(db, &row.stmts, &row.params)?;
+                        if let Some(counter) = &row.rows_read {
+                            counter.store(n, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                 }
                 written += batch.len();
                 Ok(())
@@ -690,16 +724,32 @@ mod amphora_target {
                         move |e: &mut SqlEngine| read_all(&mut e.db, &s2, &p2),
                     )
                 }
-                Kind::Write | Kind::Ddl => {
+                Kind::Write => {
                     let ticket = self.groups.put_wait(
                         vec![SqlRow {
                             stmts: leaked,
                             params: params.to_vec(),
+                            rows_read: None,
+                            answer_rows: None,
                         }],
                         until,
                     )?;
                     self.groups.durable(&ticket, until)?;
                     Ok(0)
+                }
+                Kind::Ddl => {
+                    let rows_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let ticket = self.groups.put_wait(
+                        vec![SqlRow {
+                            stmts: leaked,
+                            params: params.to_vec(),
+                            rows_read: Some(Arc::clone(&rows_read)),
+                            answer_rows: None,
+                        }],
+                        until,
+                    )?;
+                    self.groups.durable(&ticket, until)?;
+                    Ok(rows_read.load(std::sync::atomic::Ordering::Acquire))
                 }
             }
         }
@@ -723,6 +773,35 @@ mod amphora_target {
                 move |db| answer_all(db, &s1, &p1),
                 move |e: &mut SqlEngine| answer_all(&mut e.db, &s2, &p2),
             )
+        }
+
+        fn answer_ddl(
+            &mut self,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            let leaked = Arc::new(
+                stmts
+                    .iter()
+                    .map(|s| leak(&self.sql, s))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+            let until = Instant::now() + WAIT;
+            let slot = Arc::new(Mutex::new(None));
+            let ticket = self.groups.put_wait(
+                vec![SqlRow {
+                    stmts: leaked,
+                    params: params.to_vec(),
+                    rows_read: None,
+                    answer_rows: Some(Arc::clone(&slot)),
+                }],
+                until,
+            )?;
+            self.groups.durable(&ticket, until)?;
+            slot.lock()
+                .map_err(|_| anyhow::anyhow!("answer slot poisoned"))?
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("DDL answer was not recorded"))
         }
 
         fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
@@ -1105,9 +1184,13 @@ mod mvcc_target {
             params: &[Vec<P>],
         ) -> anyhow::Result<usize> {
             match kind {
-                Kind::Write | Kind::Ddl => {
+                Kind::Write => {
                     self.transaction("BEGIN CONCURRENT", stmts, params)?;
                     Ok(0)
+                }
+                Kind::Ddl => {
+                    let out = self.answer_ddl(stmts, params)?;
+                    Ok(out.len())
                 }
                 _ => {
                     let began = Instant::now();
@@ -1122,6 +1205,80 @@ mod mvcc_target {
                             }
                         }
                         return Ok(rows);
+                    }
+                }
+            }
+        }
+
+        fn answer_ddl(
+            &mut self,
+            stmts: &[String],
+            params: &[Vec<P>],
+        ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            let began = Instant::now();
+            loop {
+                let mut rows = 0;
+                let mut out = Vec::new();
+                let attempt = (|| -> anyhow::Result<Result<(), Retry>> {
+                    if let Err(r) = self.step("BEGIN CONCURRENT", &[], &mut rows)? {
+                        return Ok(Err(r));
+                    }
+                    for (s, p) in stmts.iter().zip(params) {
+                        let mut stmt = self.conn.prepare(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        for (i, param) in p.iter().enumerate() {
+                            stmt.bind_at(
+                                NonZero::new(i + 1)
+                                    .ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                                value(param),
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        }
+                        let waker = crate::unpark_waker();
+                        loop {
+                            match stmt.step_with_waker(&waker) {
+                                Ok(StepResult::Row) => {
+                                    if let Some(r) = stmt.row() {
+                                        out.push(r.get_values().map(cell).collect());
+                                    }
+                                }
+                                Ok(StepResult::Done) => break,
+                                Ok(StepResult::IO | StepResult::Yield) => {
+                                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                                }
+                                Ok(StepResult::Sleep { duration }) => {
+                                    std::thread::park_timeout(duration);
+                                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                                }
+                                Ok(StepResult::Busy) => return Ok(Err(Retry)),
+                                Err(
+                                    LimboError::Busy
+                                    | LimboError::BusySnapshot
+                                    | LimboError::WriteWriteConflict
+                                    | LimboError::CommitDependencyAborted
+                                    | LimboError::TxTerminated,
+                                ) => return Ok(Err(Retry)),
+                                Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
+                                Err(e) => return Err(anyhow::anyhow!("{e}")),
+                            }
+                        }
+                    }
+                    self.step("COMMIT", &[], &mut rows)
+                })();
+                match attempt {
+                    Ok(Ok(())) => return Ok(out),
+                    Ok(Err(Retry)) => {
+                        if !self.conn.get_auto_commit() {
+                            let _ = self.step("ROLLBACK", &[], &mut rows);
+                        }
+                        if began.elapsed() > WAIT {
+                            anyhow::bail!("the transaction kept meeting other writers");
+                        }
+                    }
+                    Err(e) => {
+                        if !self.conn.get_auto_commit() {
+                            let _ = self.step("ROLLBACK", &[], &mut rows);
+                        }
+                        return Err(e);
                     }
                 }
             }
@@ -1369,9 +1526,28 @@ impl Session for TursoSession {
         }
     }
 
+    fn answer_ddl(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut dummy = 0;
+        let done = (|| -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            self.step("BEGIN IMMEDIATE", &[], &mut dummy)?;
+            let out = self.answer(stmts, params)?;
+            self.step("COMMIT", &[], &mut dummy)?;
+            Ok(out)
+        })();
+        if done.is_err() {
+            let _ = self.step("ROLLBACK", &[], &mut dummy);
+        }
+        done
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         match (kind, stmts) {
-            (Kind::Write | Kind::Ddl, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
+            (Kind::Write, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
+            (Kind::Ddl, _) => self.answer_ddl(stmts, params).map(|rows| rows.len()),
             _ => {
                 let mut rows = 0;
                 for (s, p) in stmts.iter().zip(params) {
@@ -1494,6 +1670,41 @@ impl Session for SqliteSession {
         Ok(out)
     }
 
+    fn answer_ddl(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        use rusqlite::types::ValueRef;
+        let mut out = Vec::new();
+        let tx = self
+            .c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (sql, ps) in stmts.iter().zip(params) {
+            let mut stmt = tx.prepare(sql)?;
+            let columns = stmt.column_count();
+            let mut rows = stmt.query(rusqlite::params_from_iter(ps.iter().map(sqlite_value)))?;
+            while let Some(r) = rows.next()? {
+                let mut row = Vec::with_capacity(columns);
+                for col in 0..columns {
+                    row.push(
+                        match r.get_ref(col)? {
+                            ValueRef::Null => Cell::Null,
+                            ValueRef::Integer(i) => Cell::Int(i),
+                            ValueRef::Real(f) => Cell::Real(f),
+                            ValueRef::Text(t) => Cell::Text(std::str::from_utf8(t)?),
+                            ValueRef::Blob(b) => Cell::Blob(b),
+                        }
+                        .text(),
+                    );
+                }
+                out.push(row);
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_value)))?;
@@ -1506,6 +1717,7 @@ impl Session for SqliteSession {
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if kind == Kind::Ddl {
+            let mut n = 0usize;
             if stmts.len() > 1 {
                 let tx = self
                     .c
@@ -1519,6 +1731,7 @@ impl Session for SqliteSession {
                         for i in 0..columns {
                             std::hint::black_box(r.get_ref(i)?);
                         }
+                        n += 1;
                     }
                 }
                 tx.commit()?;
@@ -1532,10 +1745,11 @@ impl Session for SqliteSession {
                         for i in 0..columns {
                             std::hint::black_box(r.get_ref(i)?);
                         }
+                        n += 1;
                     }
                 }
             }
-            return Ok(0);
+            return Ok(n);
         }
         if kind == Kind::Write && stmts.len() > 1 {
             let tx = self
@@ -1713,12 +1927,43 @@ impl postgres::types::ToSql for PgNull {
     postgres::types::to_sql_checked!();
 }
 
+/// Integer parameter for `rust-postgres` accepting `INT2`, `INT4`, and `INT8` columns/literals
+/// (so `SELECT 1` in recursive CTEs and `INTEGER PRIMARY KEY` scratch DDL tables serialize cleanly
+/// alongside `BIGINT` columns).
+#[derive(Debug)]
+struct PgInt(i64);
+
+impl postgres::types::ToSql for PgInt {
+    fn to_sql(
+        &self,
+        ty: &postgres::types::Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use postgres::types::Type;
+        match *ty {
+            Type::INT2 => i16::try_from(self.0)?.to_sql(ty, out),
+            Type::INT4 => i32::try_from(self.0)?.to_sql(ty, out),
+            Type::INT8 => self.0.to_sql(ty, out),
+            _ => Err(format!("cannot convert PgInt to Postgres type {ty}").into()),
+        }
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(
+            *ty,
+            postgres::types::Type::INT2 | postgres::types::Type::INT4 | postgres::types::Type::INT8
+        )
+    }
+
+    postgres::types::to_sql_checked!();
+}
+
 fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
     params
         .iter()
         .map(|p| -> Box<dyn postgres::types::ToSql + Sync> {
             match p {
-                P::I(i) => Box::new(*i),
+                P::I(i) => Box::new(PgInt(*i)),
                 P::F(f) => Box::new(*f),
                 P::T(s) => Box::new(s.clone()),
                 P::B(b) => Box::new(b.clone()),
@@ -1841,6 +2086,13 @@ fn pg_rows(rows: &[postgres::Row]) -> anyhow::Result<usize> {
     Ok(rows.len())
 }
 
+fn pg_is_savepoint_control(sql: &str) -> bool {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    upper.starts_with("SAVEPOINT ")
+        || upper.starts_with("ROLLBACK TO ")
+        || upper.starts_with("RELEASE ")
+}
+
 impl Session for PgSession {
     fn answer(
         &mut self,
@@ -1864,6 +2116,34 @@ impl Session for PgSession {
         Ok(out)
     }
 
+    fn answer_ddl(
+        &mut self,
+        stmts: &[String],
+        params: &[Vec<P>],
+    ) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut out = Vec::new();
+        let mut tx = self.c.transaction()?;
+        for (sql, ps) in stmts.iter().zip(params) {
+            if ps.is_empty() && pg_is_savepoint_control(sql) {
+                tx.batch_execute(sql)?;
+                continue;
+            }
+            let translated = crate::suite::placeholders(Dialect::Postgres, sql);
+            let owned = pg_params(ps);
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                owned.iter().map(|b| b.as_ref()).collect();
+            for r in tx.query(translated.as_str(), &refs)? {
+                out.push(
+                    (0..r.len())
+                        .map(|i| r.try_get::<_, PgCell>(i).map(|c| c.0))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let translated = crate::suite::placeholders(Dialect::Postgres, sql);
         let owned = pg_params(params);
@@ -1879,13 +2159,46 @@ impl Session for PgSession {
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if kind == Kind::Ddl {
+            let mut n = 0usize;
             let mut tx = self.c.transaction()?;
             for (s, p) in stmts.iter().zip(params) {
+                if p.is_empty() && pg_is_savepoint_control(s) {
+                    tx.batch_execute(s)?;
+                    continue;
+                }
                 let translated = crate::suite::placeholders(Dialect::Postgres, s);
                 let owned = pg_params(p);
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     owned.iter().map(|b| b.as_ref()).collect();
-                pg_rows(&tx.query(translated.as_str(), &refs)?)?;
+                n += pg_rows(&tx.query(translated.as_str(), &refs)?)?;
+            }
+            tx.commit()?;
+            return Ok(n);
+        }
+        if kind == Kind::Write && stmts.len() > 1 {
+            let prepared: Vec<Option<postgres::Statement>> = stmts
+                .iter()
+                .map(|s| {
+                    if pg_is_savepoint_control(s) {
+                        Ok(None)
+                    } else {
+                        self.statement(s).map(Some)
+                    }
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let mut tx = self.c.transaction()?;
+            for ((raw, stmt), p) in stmts.iter().zip(&prepared).zip(params) {
+                match stmt {
+                    Some(s) => {
+                        let owned = pg_params(p);
+                        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                            owned.iter().map(|b| b.as_ref()).collect();
+                        pg_rows(&tx.query(s, &refs)?)?;
+                    }
+                    None => {
+                        tx.batch_execute(raw)?;
+                    }
+                }
             }
             tx.commit()?;
             return Ok(0);
@@ -1894,17 +2207,6 @@ impl Session for PgSession {
             .iter()
             .map(|s| self.statement(s))
             .collect::<anyhow::Result<_>>()?;
-        if kind == Kind::Write && stmts.len() > 1 {
-            let mut tx = self.c.transaction()?;
-            for (s, p) in prepared.iter().zip(params) {
-                let owned = pg_params(p);
-                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
-                    owned.iter().map(|b| b.as_ref()).collect();
-                pg_rows(&tx.query(s, &refs)?)?;
-            }
-            tx.commit()?;
-            return Ok(0);
-        }
         let mut n = 0;
         for (s, p) in prepared.iter().zip(params) {
             let owned = pg_params(p);
@@ -2023,12 +2325,13 @@ impl Session for MySqlSession {
 
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if matches!(kind, Kind::Write | Kind::Ddl) && stmts.len() > 1 {
+            let mut n = 0;
             let mut tx = self.c.start_transaction(mysql::TxOpts::default())?;
             for (s, p) in stmts.iter().zip(params) {
-                mysql_rows(&mut tx, s, p)?;
+                n += mysql_rows(&mut tx, s, p)?;
             }
             tx.commit()?;
-            return Ok(0);
+            return Ok(if kind == Kind::Ddl { n } else { 0 });
         }
         let mut n = 0;
         for (s, p) in stmts.iter().zip(params) {
@@ -2308,5 +2611,257 @@ mod tests {
                 "PgNull must accept Postgres type {ty:?}"
             );
         }
+    }
+
+    /// Review Round 9 Standards P2 regression: on a 20-item table with 4 clients,
+    /// `delete_range_insert` and `delete_filtered_reinsert` must delete and reinsert the same 5
+    /// owned IDs per transaction without padding with fresh IDs or growing the table.
+    #[test]
+    fn review_r9_delete_reinsert_does_not_grow_small_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let shape = crate::suite::Shape::new(20);
+        let clients = 4usize;
+        assert_eq!(crate::suite::delete_reinsert_batch(shape.items, clients), 5);
+
+        let target =
+            super::open("sqlite", dir.path().to_str().unwrap(), None, clients, false).unwrap();
+        let d = target.dialect();
+        target
+            .setup(
+                &crate::suite::tables(d, false)
+                    .into_iter()
+                    .map(|s| (s, vec![]))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        crate::suite::load(d, &shape, 100, |txn| target.setup(&txn)).unwrap();
+        target.ready().unwrap();
+
+        let mut session = target.session().unwrap();
+        for op in ["delete_range_insert", "delete_filtered_reinsert"] {
+            let stmts: Vec<String> = crate::suite::statements_for(op, d, &shape, clients)
+                .unwrap()
+                .into_iter()
+                .map(|s| crate::suite::placeholders(d, &s))
+                .collect();
+            for c in 0..clients {
+                let mut rng = crate::Rng(0x1234_5678 + c as u64);
+                for _ in 0..5 {
+                    let p = crate::suite::params(op, &mut rng, &shape, (c, clients), d);
+                    session.run(crate::suite::Kind::Write, &stmts, &p).unwrap();
+                }
+            }
+            let count = session
+                .answer(&["SELECT COUNT(*) FROM items".into()], &[vec![]])
+                .unwrap();
+            assert_eq!(
+                count,
+                vec![vec![Some("20".to_owned())]],
+                "{op} grew the table instead of keeping 20 items"
+            );
+        }
+    }
+
+    /// Review Round 9 Standards P2 regression: `ddl_analyze_stats` must return the verified
+    /// region count in `answer_ddl` and count the returned row in `run()` on Amphora (SQLite & PG)
+    /// and stock SQLite.
+    #[test]
+    fn review_r9_ddl_analyze_stats_returns_and_verifies_region_count() {
+        let shape = crate::suite::Shape::new(40);
+        for target_name in ["amphora", "amphora-pg", "sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target =
+                super::open(target_name, dir.path().to_str().unwrap(), None, 1, false).unwrap();
+            let d = target.dialect();
+            target
+                .setup(
+                    &crate::suite::tables(d, false)
+                        .into_iter()
+                        .map(|s| (s, vec![]))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            crate::suite::load(d, &shape, 100, |txn| target.setup(&txn)).unwrap();
+            target.ready().unwrap();
+
+            let mut session = target.session().unwrap();
+            let stmts: Vec<String> =
+                crate::suite::statements_for("ddl_analyze_stats", d, &shape, 1)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| crate::suite::placeholders(d, &s))
+                    .collect();
+            let p = vec![vec![], vec![]];
+            let ans = session.answer_ddl(&stmts, &p).unwrap();
+            assert_eq!(
+                ans,
+                vec![vec![Some(shape.regions.to_string())]],
+                "{target_name}: ddl_analyze_stats answer_ddl must return exact regions count"
+            );
+            let rows = session.run(crate::suite::Kind::Ddl, &stmts, &p).unwrap();
+            assert_eq!(
+                rows, 1,
+                "{target_name}: ddl_analyze_stats run() must not discard the returned count row"
+            );
+        }
+    }
+
+    /// Regression coverage test: every Round 1-9 regression workload added to `suite::OPS`
+    /// executes without error across `amphora`, `amphora-pg`, and `sqlite`, and all shared
+    /// read/DDL answers match stock SQLite exactly.
+    #[test]
+    fn review_r9_all_regression_suite_ops_match_sqlite() {
+        let shape = crate::suite::Shape::new(250);
+        let regression_ops = [
+            "group_min_bare",
+            "group_max_bare",
+            "group_pk_functional_dep",
+            "count_expr_overflow_null",
+            "count_expr_nullable_mix",
+            "group_by_wide_accum",
+            "order_by_tied_limit_offset",
+            "order_by_wide_large_limit",
+            "order_by_full_wide_sort",
+            "agg_ordered_set_stats",
+            "hash_join_nullable_key",
+            "distinct_multi_col_nulls",
+            "catalog_public_relations",
+            "write_empty_noop",
+            "write_savepoint_rollback_commit",
+            "ddl_view_pg_class_literal",
+            "ddl_temp_tables_multi",
+            "ddl_drop_recreate_table",
+            "ddl_savepoint_rollback",
+        ];
+
+        let mut answers: std::collections::HashMap<(&str, &str), Vec<Vec<Option<String>>>> =
+            std::collections::HashMap::new();
+        for target_name in ["sqlite", "amphora", "amphora-pg"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target =
+                super::open(target_name, dir.path().to_str().unwrap(), None, 1, false).unwrap();
+            let d = target.dialect();
+            target
+                .setup(
+                    &crate::suite::tables(d, false)
+                        .into_iter()
+                        .map(|s| (s, vec![]))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            crate::suite::load(d, &shape, 100, |txn| target.setup(&txn)).unwrap();
+            for idx in crate::suite::indexes(d) {
+                target.setup(&[(idx, vec![])]).unwrap();
+            }
+            target.ready().unwrap();
+            let mut session = target.session().unwrap();
+
+            for op_name in regression_ops {
+                let op = crate::suite::OPS
+                    .iter()
+                    .find(|o| o.name == op_name)
+                    .unwrap_or_else(|| panic!("missing op {op_name}"));
+                let Some(stmts) = crate::suite::statements_for(op_name, d, &shape, 1) else {
+                    continue;
+                };
+                let stmts: Vec<String> = stmts
+                    .into_iter()
+                    .map(|s| crate::suite::placeholders(d, &s))
+                    .collect();
+                let mut rng = crate::Rng(0xCAFE_BABE_1234_5678);
+                let p = crate::suite::params(op_name, &mut rng, &shape, (0, 1), d);
+                match op.kind {
+                    crate::suite::Kind::Read => {
+                        let ans = session.answer(&stmts, &p).unwrap_or_else(|e| {
+                            panic!("{target_name} read {op_name} failed: {e:#}")
+                        });
+                        assert!(
+                            !ans.is_empty(),
+                            "{target_name} read {op_name} must return at least 1 row"
+                        );
+                        answers.insert((target_name, op_name), ans);
+                    }
+                    crate::suite::Kind::Ddl => {
+                        let ans = session.answer_ddl(&stmts, &p).unwrap_or_else(|e| {
+                            panic!("{target_name} ddl {op_name} failed: {e:#}")
+                        });
+                        assert!(
+                            !ans.is_empty(),
+                            "{target_name} ddl {op_name} must return verification rows"
+                        );
+                        // Run twice to ensure DDL cleanup and statement invalidation hold across iterations.
+                        let _ = session
+                            .run(crate::suite::Kind::Ddl, &stmts, &p)
+                            .unwrap_or_else(|e| {
+                                panic!("{target_name} ddl second run {op_name} failed: {e:#}")
+                            });
+                        answers.insert((target_name, op_name), ans);
+                    }
+                    crate::suite::Kind::Write => {
+                        session
+                            .run(crate::suite::Kind::Write, &stmts, &p)
+                            .unwrap_or_else(|e| {
+                                panic!("{target_name} write {op_name} failed: {e:#}")
+                            });
+                    }
+                }
+            }
+        }
+
+        // Verify exact answer parity against stock SQLite for every shared op.
+        for op_name in regression_ops {
+            if matches!(
+                op_name,
+                "agg_ordered_set_stats" | "catalog_public_relations"
+            ) {
+                continue;
+            }
+            if let Some(ref_ans) = answers.get(&("sqlite", op_name)) {
+                if let Some(amp_ans) = answers.get(&("amphora", op_name)) {
+                    assert_eq!(
+                        amp_ans, ref_ans,
+                        "amphora diverged from sqlite on regression op {op_name}"
+                    );
+                }
+                if let Some(pg_ans) = answers.get(&("amphora-pg", op_name)) {
+                    assert_eq!(
+                        pg_ans, ref_ans,
+                        "amphora-pg diverged from sqlite on regression op {op_name}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            answers.get(&("amphora", "count_expr_overflow_null")),
+            Some(&vec![vec![Some("0".to_owned())]]),
+        );
+        assert_eq!(
+            answers.get(&("amphora-pg", "count_expr_overflow_null")),
+            Some(&vec![vec![Some("0".to_owned())]]),
+        );
+        assert_eq!(
+            answers.get(&("amphora-pg", "catalog_public_relations")),
+            Some(&vec![
+                vec![Some("items".to_owned()), Some("r".to_owned())],
+                vec![Some("owners".to_owned()), Some("r".to_owned())],
+                vec![Some("regions".to_owned()), Some("r".to_owned())],
+            ]),
+        );
+    }
+
+    #[test]
+    fn review_r9_pg_int_accepts_int2_int4_int8() {
+        use super::PgInt;
+        use postgres::types::{ToSql, Type};
+        for ty in [Type::INT2, Type::INT4, Type::INT8] {
+            assert!(
+                <PgInt as ToSql>::accepts(&ty),
+                "PgInt must accept Postgres integer type {ty:?}"
+            );
+            let mut buf = postgres::types::private::BytesMut::new();
+            PgInt(42).to_sql(&ty, &mut buf).unwrap();
+            assert!(!buf.is_empty());
+        }
+        assert!(!<PgInt as ToSql>::accepts(&Type::TEXT));
     }
 }

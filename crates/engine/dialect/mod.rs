@@ -176,6 +176,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// transactions on this live database.
     fn advance_next_oid(&self, _stored: u32) {}
 
+    /// Whether SELECT queries with aggregates or GROUP BY permit ungrouped bare column references
+    /// in SELECT/HAVING/ORDER BY (SQLite permits them, choosing values from the MIN/MAX row when
+    /// applicable; PostgreSQL rejects ungrouped non-aggregate columns).
+    fn allows_ungrouped_columns(&self) -> bool {
+        true
+    }
+
     /// Current durable next OID marker for a dialect with OIDs (`None` for dialects without OIDs).
     /// Used when persisting non-table DDL (such as a first `CREATE VIEW`) and for rolling back
     /// failed raw-page commits.

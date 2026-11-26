@@ -314,14 +314,211 @@ impl Db {
     }
 
     fn sql_references_postgres_catalog(sql: &str) -> bool {
-        sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|token| {
-                token.eq_ignore_ascii_case("pg_catalog")
-                    || token.eq_ignore_ascii_case("pg_class")
-                    || token.eq_ignore_ascii_case("pg_attribute")
-                    || token.eq_ignore_ascii_case("pg_type")
-                    || token.eq_ignore_ascii_case("pg_namespace")
-            })
+        use amphora_engine_parser::ast::{
+            Cmd, Expr, FromClause, JoinConstraint, OneSelect, QualifiedName, ResultColumn, Select,
+            SelectTable, Stmt,
+        };
+        use amphora_engine_parser::parser::Parser;
+
+        fn is_pg_catalog_table(name: &QualifiedName, ctes: &[String]) -> bool {
+            let table_name = name.name.as_str();
+            if let Some(db) = &name.db_name {
+                return db.as_str().eq_ignore_ascii_case("pg_catalog");
+            }
+            if ctes.iter().any(|cte| cte.eq_ignore_ascii_case(table_name)) {
+                return false;
+            }
+            table_name.eq_ignore_ascii_case("pg_class")
+                || table_name.eq_ignore_ascii_case("pg_attribute")
+                || table_name.eq_ignore_ascii_case("pg_type")
+                || table_name.eq_ignore_ascii_case("pg_namespace")
+        }
+
+        fn walk_expr(expr: &Expr, ctes: &[String]) -> bool {
+            match expr {
+                Expr::Subquery(select) | Expr::Exists(select) => walk_select(select, ctes),
+                Expr::InSelect { lhs, rhs, .. } => walk_expr(lhs, ctes) || walk_select(rhs, ctes),
+                Expr::InTable { lhs, rhs, args, .. } => {
+                    is_pg_catalog_table(rhs, ctes)
+                        || walk_expr(lhs, ctes)
+                        || args.iter().any(|a| walk_expr(a, ctes))
+                }
+                Expr::Between {
+                    lhs, start, end, ..
+                } => walk_expr(lhs, ctes) || walk_expr(start, ctes) || walk_expr(end, ctes),
+                Expr::Binary(lhs, _, rhs) => walk_expr(lhs, ctes) || walk_expr(rhs, ctes),
+                Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    base.as_deref().is_some_and(|e| walk_expr(e, ctes))
+                        || when_then_pairs
+                            .iter()
+                            .any(|(w, t)| walk_expr(w, ctes) || walk_expr(t, ctes))
+                        || else_expr.as_deref().is_some_and(|e| walk_expr(e, ctes))
+                }
+                Expr::Cast { expr, .. }
+                | Expr::Collate(expr, _)
+                | Expr::FieldAccess { base: expr, .. }
+                | Expr::IsNull(expr)
+                | Expr::NotNull(expr)
+                | Expr::Unary(_, expr) => walk_expr(expr, ctes),
+                Expr::FunctionCall {
+                    args,
+                    order_by,
+                    within_group,
+                    filter_over,
+                    ..
+                } => {
+                    args.iter().any(|e| walk_expr(e, ctes))
+                        || order_by.iter().any(|s| walk_expr(&s.expr, ctes))
+                        || within_group.iter().any(|s| walk_expr(&s.expr, ctes))
+                        || filter_over
+                            .filter_clause
+                            .as_deref()
+                            .is_some_and(|e| walk_expr(e, ctes))
+                }
+                Expr::FunctionCallStar { filter_over, .. } => filter_over
+                    .filter_clause
+                    .as_deref()
+                    .is_some_and(|e| walk_expr(e, ctes)),
+                Expr::InList { lhs, rhs, .. } => {
+                    walk_expr(lhs, ctes) || rhs.iter().any(|e| walk_expr(e, ctes))
+                }
+                Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    walk_expr(lhs, ctes)
+                        || walk_expr(rhs, ctes)
+                        || escape.as_deref().is_some_and(|e| walk_expr(e, ctes))
+                }
+                Expr::MergedColumn(exprs) | Expr::Parenthesized(exprs) => {
+                    exprs.iter().any(|e| walk_expr(e, ctes))
+                }
+                Expr::Raise(_, msg) => msg.as_deref().is_some_and(|e| walk_expr(e, ctes)),
+                Expr::SubqueryResult { lhs, .. } => {
+                    lhs.as_deref().is_some_and(|e| walk_expr(e, ctes))
+                }
+                Expr::Array { elements } => elements.iter().any(|e| walk_expr(e, ctes)),
+                Expr::Subscript { base, index } => walk_expr(base, ctes) || walk_expr(index, ctes),
+                Expr::Register(_)
+                | Expr::DoublyQualified(..)
+                | Expr::Id(_)
+                | Expr::Column { .. }
+                | Expr::RowId { .. }
+                | Expr::Literal(_)
+                | Expr::Name(_)
+                | Expr::Qualified(..)
+                | Expr::Variable(_)
+                | Expr::Default => false,
+            }
+        }
+
+        fn walk_select_table(table: &SelectTable, ctes: &[String]) -> bool {
+            match table {
+                SelectTable::Table(name, _, _) => is_pg_catalog_table(name, ctes),
+                SelectTable::TableCall(name, args, _) => {
+                    is_pg_catalog_table(name, ctes) || args.iter().any(|a| walk_expr(a, ctes))
+                }
+                SelectTable::Select { select, .. } => walk_select(select, ctes),
+                SelectTable::Sub(from, _) => walk_from(from, ctes),
+            }
+        }
+
+        fn walk_from(from: &FromClause, ctes: &[String]) -> bool {
+            if walk_select_table(&from.select, ctes) {
+                return true;
+            }
+            for join in &from.joins {
+                if walk_select_table(&join.table, ctes) {
+                    return true;
+                }
+                if let Some(JoinConstraint::On(expr)) = &join.constraint
+                    && walk_expr(expr, ctes)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        fn walk_one_select(one: &OneSelect, ctes: &[String]) -> bool {
+            match one {
+                OneSelect::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    ..
+                } => {
+                    if from.as_ref().is_some_and(|f| walk_from(f, ctes)) {
+                        return true;
+                    }
+                    if columns.iter().any(|col| match col {
+                        ResultColumn::Expr(expr, _) => walk_expr(expr, ctes),
+                        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                    }) {
+                        return true;
+                    }
+                    if where_clause.as_deref().is_some_and(|w| walk_expr(w, ctes)) {
+                        return true;
+                    }
+                    if let Some(gb) = group_by {
+                        if gb.exprs.iter().any(|e| walk_expr(e, ctes)) {
+                            return true;
+                        }
+                        if gb.having.as_deref().is_some_and(|h| walk_expr(h, ctes)) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                OneSelect::Values(rows) => rows
+                    .iter()
+                    .any(|row| row.iter().any(|e| walk_expr(e, ctes))),
+            }
+        }
+
+        fn walk_select(select: &Select, outer_ctes: &[String]) -> bool {
+            let mut ctes = outer_ctes.to_vec();
+            if let Some(with) = &select.with {
+                for cte in &with.ctes {
+                    ctes.push(cte.tbl_name.as_str().to_owned());
+                }
+                for cte in &with.ctes {
+                    if walk_select(&cte.select, &ctes) {
+                        return true;
+                    }
+                }
+            }
+            if walk_one_select(&select.body.select, &ctes) {
+                return true;
+            }
+            for compound in &select.body.compounds {
+                if walk_one_select(&compound.select, &ctes) {
+                    return true;
+                }
+            }
+            if select.order_by.iter().any(|s| walk_expr(&s.expr, &ctes)) {
+                return true;
+            }
+            if let Some(limit) = &select.limit {
+                if walk_expr(&limit.expr, &ctes) {
+                    return true;
+                }
+                if limit.offset.as_deref().is_some_and(|o| walk_expr(o, &ctes)) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateView { select, .. }))) = parser.next_cmd() else {
+            return false;
+        };
+        walk_select(&select, &[])
     }
 
     /// True when an unmarked database (no user tables and `pg_next_oid == 0`) contains a view

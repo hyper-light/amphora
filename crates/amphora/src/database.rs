@@ -6067,4 +6067,169 @@ mod records_reads {
             assert!(pg.is_postgres());
         }
     }
+
+    /// Review Round 9 Spec P1 regression: a SQLite view returning a string literal `'pg_class'`
+    /// must NOT be mistaken for a PostgreSQL catalog reference; ownership must refuse it cleanly
+    /// (unmarked view-only file) without writing PostgreSQL metadata, keeping the file readable
+    /// by native SQLite.
+    #[test]
+    fn review_r9_p1_sqlite_view_returning_pg_class_literal_stays_sqlite_and_unmodified() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("sqlite-pg-literal-view.db");
+        {
+            let mut db = Db::open_sharing(&src, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE VIEW label AS SELECT 'pg_class' AS txt")
+                .unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+        let until = || Instant::now() + Duration::from_secs(30);
+        let err = match Database::open(&src, until()) {
+            Ok(_) => panic!(
+                "unmarked SQLite view returning 'pg_class' must be refused, not converted to PG"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Refusal::Invalid { .. }),
+            "expected Refusal::Invalid for unmarked view-only file, got: {err:?}"
+        );
+        // Native SQLite reopen must still succeed and read 'pg_class'.
+        let reopened = Db::open_sharing(&src, &crate::db::Sharing::Off)
+            .expect("refused open must leave SQLite file readable by native SQLite");
+        assert!(!reopened.is_postgres());
+        let mut got = String::new();
+        reopened
+            .query("SELECT txt FROM label", [], |r| {
+                got = r.get::<String>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(got, "pg_class");
+    }
+
+    /// Review Round 9 Spec P2 regression: standalone and replicated ownership of a PostgreSQL
+    /// database must keep internal `__amphora_*` tables out of `pg_class` (zero public relations
+    /// before application DDL) and spend zero PostgreSQL OIDs so the first application table
+    /// receives OID 16384 just like native PostgreSQL.
+    #[test]
+    fn review_r9_p2_postgres_ownership_hides_internal_tables_from_pg_class_and_keeps_oid_16384() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("pg-view-seed.db");
+        {
+            let mut db = Db::open_postgres_sharing(&seed, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE VIEW answer AS SELECT 73 AS val").unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+
+        let until = || Instant::now() + Duration::from_secs(30);
+
+        // Standalone ownership
+        let standalone = dir.path().join("standalone.db");
+        std::fs::copy(&seed, &standalone).unwrap();
+        {
+            let db = Database::open(&standalone, until()).unwrap();
+            let public_before: i64 = db
+                .query_local(until(), |conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(
+                public_before, 0,
+                "standalone PG ownership must expose 0 public relations before app DDL"
+            );
+            db.execute(
+                vec![Statement {
+                    sql: "CREATE TABLE app_items (id int4)".into(),
+                    params: vec![],
+                }],
+                until(),
+            )
+            .unwrap();
+            let first_oid: i64 = db
+                .query_local(until(), |conn| {
+                    Ok(conn.query_row(
+                        "SELECT oid FROM pg_class WHERE relname = 'app_items'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(
+                first_oid, 16384,
+                "standalone PG ownership must assign OID 16384 to first application table"
+            );
+        }
+
+        // Single-voter replicated ownership
+        let replicated = dir.path().join("replicated.db");
+        let log_path = dir.path().join("replicated.log");
+        std::fs::copy(&seed, &replicated).unwrap();
+        let declaration = crate::replication::bootstrap::inspect_source(&replicated, 1).unwrap();
+        {
+            let config = api::replication::ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: vec![],
+                bootstrap: Some(declaration),
+            };
+            let db = Database::open_replicated(&replicated, &log_path, config, until()).unwrap();
+            let public_before: i64 = db
+                .query(until(), AnswerMax::bytes(1024), |conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(
+                public_before, 0,
+                "replicated PG ownership must expose 0 public relations before app DDL"
+            );
+            db.execute(
+                vec![Statement {
+                    sql: "CREATE TABLE app_items (id int4)".into(),
+                    params: vec![],
+                }],
+                until(),
+            )
+            .unwrap();
+            let first_oid: i64 = db
+                .query(until(), AnswerMax::bytes(1024), |conn| {
+                    Ok(conn.query_row(
+                        "SELECT oid FROM pg_class WHERE relname = 'app_items'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(
+                first_oid, 16384,
+                "replicated PG ownership must assign OID 16384 to first application table"
+            );
+        }
+
+        // Both files must still reject native SQLite open and reopen cleanly under native PG.
+        for path in [&standalone, &replicated] {
+            let pg = Db::open_postgres_sharing(path, &crate::db::Sharing::Off).unwrap();
+            assert!(pg.is_postgres());
+            let mut app_oid = 0i64;
+            pg.query(
+                "SELECT oid FROM pg_class WHERE relname = 'app_items'",
+                [],
+                |r| {
+                    app_oid = r.get::<i64>(0)?;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            assert_eq!(app_oid, 16384);
+        }
+    }
 }

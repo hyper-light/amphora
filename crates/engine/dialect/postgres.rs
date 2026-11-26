@@ -12,7 +12,7 @@
 use crate::function::Func;
 use crate::pg_catalog_vtab::{PgCatalog, PgCatalogTable};
 use crate::schema::{BTreeTable, Schema};
-use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Value};
 use amphora_engine_parser::ast;
@@ -20,6 +20,30 @@ use amphora_engine_parser::ast;
 /// What follows the prefix in a stored definition: `/* pg_class.oid <oid> */ `.
 const OID_OPEN: &str = "/* pg_class.oid ";
 const OID_CLOSE: &str = " */ ";
+
+/// Next OID in the normal PostgreSQL OID ring `[FIRST_NORMAL_OBJECT_ID ..= u32::MAX]`, wrapping
+/// from `u32::MAX` directly back to `FIRST_NORMAL_OBJECT_ID` so the durable header marker is
+/// never cleared to `0` across wraparound.
+fn next_normal_oid(oid: u32) -> u32 {
+    let next = oid.wrapping_add(1);
+    if next < amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID {
+        amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID
+    } else {
+        next
+    }
+}
+
+/// True when `candidate` is strictly ahead of `current` in the circular normal OID ring
+/// `[FIRST_NORMAL_OBJECT_ID ..= u32::MAX]` (forward modular distance in `(0, ring / 2)`),
+/// correctly handling wraparound from `u32::MAX` to `FIRST_NORMAL_OBJECT_ID`.
+fn oid_is_ahead(candidate: u32, current: u32) -> bool {
+    let first = u64::from(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
+    let ring = (u64::from(u32::MAX) - first) + 1;
+    let c = u64::from(candidate.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID)) - first;
+    let cur = u64::from(current.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID)) - first;
+    let dist = (c + ring - cur) % ring;
+    dist > 0 && dist < (ring / 2)
+}
 
 /// The PostgreSQL dialect.
 pub struct PostgresDialect {
@@ -30,6 +54,11 @@ pub struct PostgresDialect {
     /// and an open loads ([`super::Dialect::load_next_oid`]): a reopen continues from it, never
     /// from the OIDs live tables hold (section 7).
     next_oid: AtomicU32,
+    /// True once this database is confirmed PostgreSQL-dialect (fresh PostgreSQL instance or
+    /// non-zero `pg_next_oid` loaded from page 1). False when `load_next_oid(0)` observed an
+    /// unmarked file header, so unprefixed `__amphora_*` tables created by a SQLite owner are
+    /// still rejected on native PostgreSQL open.
+    has_pg_header_marker: AtomicBool,
 }
 
 impl Default for PostgresDialect {
@@ -42,6 +71,7 @@ impl PostgresDialect {
     pub fn new() -> Self {
         Self {
             next_oid: AtomicU32::new(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID),
+            has_pg_header_marker: AtomicBool::new(true),
         }
     }
 
@@ -57,7 +87,7 @@ impl PostgresDialect {
             let oid = match self
                 .next_oid
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                    Some(normal(next).wrapping_add(1))
+                    Some(next_normal_oid(normal(next)))
                 }) {
                 Ok(previous) | Err(previous) => normal(previous),
             };
@@ -73,7 +103,8 @@ impl PostgresDialect {
     /// The table definition in a stored definition.
     ///
     /// Tables without [`super::POSTGRES_TABLE_SQL_PREFIX`] are accepted only when they are
-    /// engine-internal system tables (such as `__turso_internal_*` or `sqlite_*`). User tables
+    /// engine-internal system tables (such as `__turso_internal_*` or `sqlite_*`) or Amphora
+    /// owner-internal metadata tables (`__amphora_*`) on a PostgreSQL-marked database. User tables
     /// created by the SQLite dialect lack the prefix and are rejected so opening a SQLite
     /// database under [`PostgresDialect`] fails cleanly instead of mixing dialects in one file.
     fn definition<'a>(&self, sql: &'a str) -> crate::Result<&'a str> {
@@ -87,7 +118,10 @@ impl PostgresDialect {
                         "persisted table SQL is not CREATE TABLE: {sql}"
                     )));
                 };
-                if crate::schema::is_system_table(tbl_name.name.as_str()) {
+                if crate::schema::is_system_table(tbl_name.name.as_str())
+                    || (crate::schema::is_amphora_internal_table(tbl_name.name.as_str())
+                        && self.has_pg_header_marker.load(Ordering::Relaxed))
+                {
                     Ok(sql)
                 } else {
                     Err(LimboError::Corrupt(format!(
@@ -286,14 +320,18 @@ impl super::Dialect for PostgresDialect {
         body: &ast::CreateTableBody,
     ) -> crate::Result<String> {
         let definition = definition_sql(tbl_name, body)?;
-        // A table the engine makes for itself under a reserved name (the MVCC store's metadata
-        // table, which `PRAGMA journal_mode = mvcc` creates) is no PostgreSQL relation: it has no
-        // row in pg_class and spends no OID, so the first table a client creates takes
-        // FirstNormalObjectId, as PostgreSQL gives it (REL_19_0
+        // Tables the engine or Amphora owner makes for itself under reserved names (`sqlite_*`,
+        // `__turso_internal_*`, `__amphora_*`) are not PostgreSQL public relations: they have no
+        // row in `pg_class` and spend no OID, so the first application table takes
+        // `FirstNormalObjectId` (16384), as PostgreSQL gives it (REL_19_0
         // src/backend/access/transam/varsup.c:578-605, src/backend/catalog/heap.c:1578).
-        if crate::schema::is_system_table(tbl_name.name.as_str()) {
+        if crate::schema::is_system_table(tbl_name.name.as_str())
+            || crate::schema::is_amphora_internal_table(tbl_name.name.as_str())
+        {
+            self.has_pg_header_marker.store(true, Ordering::Relaxed);
             return Ok(definition);
         }
+        self.has_pg_header_marker.store(true, Ordering::Relaxed);
         Ok(stored(
             self.allocate_oid(&live_oids(conn, database_id)?)?,
             &definition,
@@ -304,20 +342,27 @@ impl super::Dialect for PostgresDialect {
         Some(Arc::new(PostgresDialect::new()))
     }
 
+    fn allows_ungrouped_columns(&self) -> bool {
+        false
+    }
+
     fn load_next_oid(&self, stored: u32) {
         self.next_oid.store(stored, Ordering::Relaxed);
+        self.has_pg_header_marker
+            .store(stored != 0, Ordering::Relaxed);
     }
 
     fn advance_next_oid(&self, stored: u32) {
         if stored == 0 {
             return;
         }
+        self.has_pg_header_marker.store(true, Ordering::Relaxed);
         let floor = stored.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
         let _ = self
             .next_oid
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 let normalized = cur.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
-                (floor > normalized).then_some(floor)
+                oid_is_ahead(floor, normalized).then_some(floor)
             });
     }
 
@@ -330,9 +375,10 @@ impl super::Dialect for PostgresDialect {
     }
 
     /// The OID after the table's, as `GetNewObjectId` leaves `nextOid`: past every OID a committed
-    /// table took, so a reopen gives none of them again, dropped ones included.
+    /// table took, so a reopen gives none of them again, dropped ones included. Wraps from
+    /// `u32::MAX` to `FIRST_NORMAL_OBJECT_ID` so page 1 never stores `0`.
     fn next_oid_after(&self, stored_sql: &str) -> crate::Result<Option<u32>> {
-        Ok(split_stored(stored_sql)?.map(|(oid, _)| oid.wrapping_add(1)))
+        Ok(split_stored(stored_sql)?.map(|(oid, _)| next_normal_oid(oid)))
     }
 
     fn format_rewritten_table_sql(
@@ -967,6 +1013,202 @@ mod tests {
         assert_eq!(
             query(&conn, "SELECT id FROM src"),
             vec![vec![Value::from_i64(42)]]
+        );
+    }
+
+    /// Review Round 9 Spec P1 regression:
+    /// - SQLite grouped (sorter and index-ordered) and ungrouped `MIN`/`MAX` with bare columns
+    ///   must return the bare column from the winning `MIN`/`MAX` row.
+    /// - PostgreSQL must reject ungrouped non-aggregate columns in `SELECT`/`HAVING`/`ORDER BY`.
+    #[test]
+    fn review_r9_p1_grouped_min_max_bare_columns_on_sqlite_and_rejected_on_postgres() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // SQLite: sorter GROUP BY, indexed ASC GROUP BY, indexed DESC GROUP BY, and ungrouped.
+        let sq_path = dir.path().join("sqlite_minmax_bare.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let sq_db = Database::open_file(
+            io.clone(),
+            sq_path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let sq = sq_db.connect(ConnectOpts::new()).unwrap();
+        sq.execute("CREATE TABLE t (g INTEGER, label TEXT, v INTEGER)")
+            .unwrap();
+        sq.execute(
+            "INSERT INTO t VALUES (1, 'first', 1), (1, 'winner', 9), (2, 'low', 2), (2, 'high', 8)",
+        )
+        .unwrap();
+
+        assert_eq!(
+            query(&sq, "SELECT label, MAX(v) FROM t GROUP BY g ORDER BY g"),
+            vec![
+                vec![Value::from_text("winner"), Value::from_i64(9)],
+                vec![Value::from_text("high"), Value::from_i64(8)],
+            ]
+        );
+        assert_eq!(
+            query(&sq, "SELECT label, MIN(v) FROM t GROUP BY g ORDER BY g"),
+            vec![
+                vec![Value::from_text("first"), Value::from_i64(1)],
+                vec![Value::from_text("low"), Value::from_i64(2)],
+            ]
+        );
+        assert_eq!(
+            query(&sq, "SELECT label, MAX(v) FROM t"),
+            vec![vec![Value::from_text("winner"), Value::from_i64(9)]]
+        );
+        assert_eq!(
+            query(&sq, "SELECT label, MIN(v) FROM t"),
+            vec![vec![Value::from_text("first"), Value::from_i64(1)]]
+        );
+
+        // With an index on (g, v DESC) so GroupByRowSource::MainLoop reads ('winner', 9) before ('first', 1).
+        sq.execute("CREATE INDEX idx_g_v_desc ON t(g, v DESC)")
+            .unwrap();
+        assert_eq!(
+            query(&sq, "SELECT label, MIN(v) FROM t GROUP BY g ORDER BY g"),
+            vec![
+                vec![Value::from_text("first"), Value::from_i64(1)],
+                vec![Value::from_text("low"), Value::from_i64(2)],
+            ]
+        );
+        assert_eq!(
+            query(&sq, "SELECT label, MAX(v) FROM t GROUP BY g ORDER BY g"),
+            vec![
+                vec![Value::from_text("winner"), Value::from_i64(9)],
+                vec![Value::from_text("high"), Value::from_i64(8)],
+            ]
+        );
+
+        // PostgreSQL: ungrouped non-aggregate columns must be rejected.
+        let pg_path = dir.path().join("pg_strict_groupby.db");
+        let (_pg_db, pg) = open(pg_path.to_str().unwrap());
+        pg.execute("CREATE TABLE t (g int4, label text, v int4)")
+            .unwrap();
+        pg.execute("INSERT INTO t VALUES (1, 'first', 1), (1, 'winner', 9)")
+            .unwrap();
+        for bad_sql in [
+            "SELECT label, MAX(v) FROM t GROUP BY g",
+            "SELECT label, MAX(v) FROM t",
+            "SELECT g, MAX(v) FROM t GROUP BY g ORDER BY label",
+            "SELECT g, MAX(v) FROM t GROUP BY g HAVING label = 'winner'",
+            "SELECT COUNT(*) FROM t ORDER BY label",
+        ] {
+            let err = pg.prepare(bad_sql).unwrap_err();
+            assert!(
+                err.to_string().contains("GROUP BY"),
+                "PostgreSQL must reject ungrouped column in `{bad_sql}`, got: {err:?}"
+            );
+        }
+        // Valid grouped query and primary-key functionally dependent query still succeed.
+        assert_eq!(
+            query(&pg, "SELECT g, MAX(v) FROM t GROUP BY g"),
+            vec![vec![Value::from_i64(1), Value::from_i64(9)]]
+        );
+        pg.execute("CREATE TABLE pk_t (id int4 PRIMARY KEY, label text, v int4)")
+            .unwrap();
+        pg.execute("INSERT INTO pk_t VALUES (1, 'ok', 5)").unwrap();
+        assert_eq!(
+            query(&pg, "SELECT id, label, MAX(v) FROM pk_t GROUP BY id"),
+            vec![vec![
+                Value::from_i64(1),
+                Value::from_text("ok"),
+                Value::from_i64(5)
+            ]]
+        );
+    }
+
+    /// Review Round 9 Spec P2 regression: `COUNT(expr)` must not treat arithmetic on NOT NULL
+    /// operands as guaranteed non-NULL, because IEEE-754 overflow (`1e308 * 1e308 = +Inf`,
+    /// `(+Inf) - (+Inf) = NaN`) evaluates to `NULL` and must return `0`.
+    #[test]
+    fn review_r9_p2_count_expression_nan_overflow_returns_zero_on_both_dialects() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let sq_db = Database::open_file(
+            io.clone(),
+            dir.path().join("sq_nan.db").to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let sq = sq_db.connect(ConnectOpts::new()).unwrap();
+        sq.execute("CREATE TABLE t (x REAL NOT NULL); INSERT INTO t VALUES (1e308)")
+            .unwrap();
+
+        let (_pg_db, pg) = open(dir.path().join("pg_nan.db").to_str().unwrap());
+        pg.execute("CREATE TABLE t (x float8 NOT NULL); INSERT INTO t VALUES (1e308)")
+            .unwrap();
+
+        for (label, conn) in [("sqlite", &sq), ("postgres", &pg)] {
+            assert_eq!(
+                query(conn, "SELECT COUNT((x * x) - (x * x)) FROM t"),
+                vec![vec![Value::from_i64(0)]],
+                "{label}: COUNT((x*x)-(x*x)) on 1e308 must return 0"
+            );
+            assert_eq!(
+                query(conn, "SELECT COUNT((x * x) - (x * x)), COUNT(*) FROM t"),
+                vec![vec![Value::from_i64(0), Value::from_i64(1)]],
+                "{label}: COUNT((x*x)-(x*x)), COUNT(*) must agree"
+            );
+            assert_eq!(
+                query(conn, "SELECT COUNT((x * x) + (-(x * x))) FROM t"),
+                vec![vec![Value::from_i64(0)]],
+                "{label}: COUNT(+Inf + -Inf) must return 0"
+            );
+            assert_eq!(
+                query(conn, "SELECT COUNT((x * x) * 0.0) FROM t"),
+                vec![vec![Value::from_i64(0)]],
+                "{label}: COUNT(+Inf * 0.0) must return 0"
+            );
+        }
+    }
+
+    /// Review Round 9 Spec P3 regression: `PostgresDialect::advance_next_oid` must advance across
+    /// `u32::MAX` wraparound (e.g. `4294967294 -> 16386`), reject stale pre-wrap frontiers after
+    /// wraparound, and `next_oid_after` at `u32::MAX` must wrap to `FIRST_NORMAL_OBJECT_ID`
+    /// (`16384`) rather than persisting `0`.
+    #[test]
+    fn review_r9_p3_postgres_oid_advance_and_persistence_across_u32_wraparound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg_oid_wrap.db");
+        let dialect = Arc::new(PostgresDialect::new());
+        let (_db, conn) = open_with(path.to_str().unwrap(), dialect.clone());
+
+        // Initialize near u32::MAX, then advance across wraparound to 16386.
+        dialect.load_next_oid(u32::MAX - 1); // 4294967294
+        dialect.advance_next_oid(16386);
+        assert_eq!(dialect.current_next_oid(), Some(16386));
+
+        // Stale pre-wrap frontier must NOT rewind the post-wrap counter.
+        dialect.advance_next_oid(u32::MAX - 1);
+        assert_eq!(dialect.current_next_oid(), Some(16386));
+
+        conn.execute("CREATE TABLE wrapped (id int4)").unwrap();
+        assert_eq!(
+            oid(&conn, "wrapped"),
+            16386,
+            "table created after wraparound sync must receive OID 16386, not 4294967294"
+        );
+
+        // Creating a table at u32::MAX must persist next_oid = 16384 (never 0).
+        dialect.load_next_oid(u32::MAX);
+        conn.execute("CREATE TABLE at_max (id int4)").unwrap();
+        assert_eq!(oid(&conn, "at_max"), i64::from(u32::MAX));
+        assert_eq!(dialect.current_next_oid(), Some(16384));
+        conn.checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+        drop(conn);
+        drop(_db);
+        let page1 = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::header_pg_next_oid(&page1),
+            Some(16384),
+            "wrapping past u32::MAX must persist pg_next_oid=16384 on page 1, never 0"
         );
     }
 }
