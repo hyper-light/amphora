@@ -102,6 +102,10 @@ pub(crate) struct TempDbContext {
     /// Per-connection temp database (`TEMP_DB_ID`/schema `temp`).
     /// Lazily initialized on first temp DDL.
     pub(crate) database: RwLock<Option<TempDatabase>>,
+    /// Dedicated dialect instance for `temp` created lazily on first `temp` DDL compilation and
+    /// reused when `create_temp_database()` materializes `database`, keeping `temp`'s OID
+    /// allocator isolated from `main` even before the temp database exists.
+    pub(crate) dialect: RwLock<Option<Arc<dyn crate::Dialect>>>,
     /// Last committed snapshot of `database.read().as_ref().unwrap().db.schema`.
     /// Updated on successful commit and consulted on full-txn rollback
     /// to restore the in-memory temp schema (there is no shared
@@ -120,6 +124,7 @@ impl TempDbContext {
     pub(crate) fn new() -> Self {
         Self {
             database: RwLock::new(None),
+            dialect: RwLock::new(None),
             committed_schema: RwLock::new(None),
             schema_did_change: AtomicBool::new(false),
         }
@@ -1093,11 +1098,25 @@ impl Connection {
         }
     }
 
+    /// Dedicated dialect instance for `temp`, shared between pre-initialization temp DDL
+    /// compilation and `create_temp_database()` so the first temp table never allocates from
+    /// `main`'s OID counter and subsequent temp tables continue from the same allocator.
+    fn temp_dialect(&self) -> Arc<dyn crate::Dialect> {
+        if let Some(existing) = self.temp.dialect.read().as_ref() {
+            return existing.clone();
+        }
+        let mut guard = self.temp.dialect.write();
+        guard
+            .get_or_insert_with(|| self.db.dialect_for_child())
+            .clone()
+    }
+
     #[cfg(feature = "fs")]
     fn create_temp_database(&self) -> Result<TempDatabase> {
         let temp_store = self.effective_temp_store();
         let db_opts = self.make_temp_database_opts();
         let page_size = self.get_page_size();
+        let temp_dialect = self.temp_dialect();
 
         if matches!(temp_store, crate::TempStore::Memory) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1107,7 +1126,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
-                self.db.dialect(),
+                temp_dialect,
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -1138,7 +1157,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
-                self.db.dialect(),
+                temp_dialect,
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -1158,7 +1177,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
-                self.db.dialect(),
+                temp_dialect,
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -1175,7 +1194,7 @@ impl Connection {
             OpenFlags::Create,
             self.make_temp_database_opts(),
             None,
-            self.db.dialect(),
+            self.temp_dialect(),
         )?;
         let pager = Arc::new(db._init(None, None)?);
         pager.set_initial_page_size(self.get_page_size())?;
@@ -1215,6 +1234,7 @@ impl Connection {
         if let Some(temp_db) = self.temp.database.write().take() {
             temp_db.pager.rollback_attached();
         }
+        *self.temp.dialect.write() = None;
         *self.temp.committed_schema.write() = None;
         self.temp.schema_did_change.store(false, Ordering::Release);
     }
@@ -2264,6 +2284,56 @@ impl Connection {
         ))
     }
 
+    /// Amphora: prepares a full B-tree scan of rowid table `table_name` yielding
+    /// `(rowid, col_0, ...)` in rowid order, reading the true B-tree rowid even when user columns
+    /// shadow `rowid`, `_rowid_`, and `oid`.
+    pub fn prepare_table_rowid_scan(self: &Arc<Connection>, table_name: &str) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        self.maybe_update_schema();
+        let pager = self.pager.load().clone();
+        let (schema, prepare_context) = self.snapshot_schema_and_prepare_context();
+        let input = format!("AMPHORA ROWID SCAN {table_name}");
+        let program = translate::translate_table_rowid_scan(
+            &schema,
+            self.clone(),
+            &input,
+            table_name,
+            prepare_context,
+        )?;
+        Ok(Statement::new_with_origin(
+            program,
+            pager,
+            QueryMode::Normal,
+            input.len(),
+            StatementOrigin::Root,
+            false,
+        ))
+    }
+
+    /// Amphora: prepares a read statement yielding the main database header's persisted
+    /// `Cookie::PgNextOid` (u32 encoded as i64).
+    pub fn prepare_read_pg_next_oid(self: &Arc<Connection>) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        self.maybe_update_schema();
+        let pager = self.pager.load().clone();
+        let (schema, prepare_context) = self.snapshot_schema_and_prepare_context();
+        let input = "AMPHORA READ PG_NEXT_OID";
+        let program =
+            translate::translate_read_pg_next_oid(&schema, self.clone(), input, prepare_context)?;
+        Ok(Statement::new_with_origin(
+            program,
+            pager,
+            QueryMode::Normal,
+            input.len(),
+            StatementOrigin::Root,
+            false,
+        ))
+    }
+
     fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
@@ -3181,7 +3251,7 @@ impl Connection {
         }
     }
 
-    fn has_no_open_transaction_state(&self) -> bool {
+    pub(crate) fn has_no_open_transaction_state(&self) -> bool {
         matches!(self.get_tx_state(), TransactionState::None)
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()
@@ -3236,6 +3306,12 @@ impl Connection {
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        // Inside an open transaction the connection's WAL/MVCC snapshot is pinned to the schema
+        // that existed when the transaction began; adopting a newer foreign schema would hide
+        // columns still present in the pinned snapshot and disagree with its page 1 header.
+        if !self.has_no_open_transaction_state() {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let (mut schema, epoch, restore_epoch) = {
             let guard = self.db.schema.lock();
@@ -3248,9 +3324,7 @@ impl Connection {
         let restore_changed = self.last_restore_epoch.load(Ordering::Acquire) != restore_epoch;
         if restore_changed
             || current_schema.schema_version < schema.schema_version
-            || (self.has_no_open_transaction_state()
-                && self
-                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
+            || self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
         {
             if restore_changed {
                 let mv_store_guard = self.db.get_mv_store();
@@ -3456,58 +3530,69 @@ impl Connection {
         Ok(())
     }
 
+    /// Finish WAL session by committing or rolling back while still holding the WAL write lock,
+    /// then ending the read+write transaction taken in [`Self::wal_insert_begin`]. Does not start
+    /// a post-commit read transaction to reparse the schema, so callers that already hold the
+    /// committed schema in memory cannot observe a spurious post-commit `Busy` error under
+    /// concurrent maintenance.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_insert_end_commit_only(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
+        use crate::{return_if_io, types::IOResult};
+
+        let pager = self.pager.load();
+
+        let Some(wal) = pager.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "wal_insert_end called without a wal".to_string(),
+            ));
+        };
+
+        let commit_err = if force_commit {
+            pager
+                .io
+                .block(|| {
+                    return_if_io!(pager.commit_wal(
+                        WalAutoActions::empty(),
+                        self.get_wal_autocheckpoint(),
+                        self.get_sync_mode(),
+                        self.get_data_sync_retry(),
+                    ));
+                    pager.commit_wal_end();
+                    Ok(IOResult::Done(()))
+                })
+                .err()
+        } else {
+            None
+        };
+
+        // Roll back uncommitted WAL frames and pager state WHILE STILL HOLDING THE WAL WRITE
+        // LOCK so a concurrent writer cannot acquire the write lock and commit frames that our
+        // rollback would then truncate from the shared frame index.
+        if !force_commit || commit_err.is_some() {
+            if let Some(mv_store) = self.mv_store().as_ref() {
+                if let Some(tx_id) = self.get_mv_tx_id() {
+                    mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                }
+            }
+            pager.rollback(false, self, true);
+        }
+
+        self.auto_commit.store(true, Ordering::SeqCst);
+        self.set_tx_state(TransactionState::None);
+        wal.end_write_tx();
+        wal.end_read_tx();
+
+        if let Some(err) = commit_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Finish WAL session by ending read+write transaction taken in the [Self::wal_insert_begin] method
     /// All frames written after last commit frame (db_size > 0) within the session will be rolled back
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
-        use crate::{return_if_io, types::IOResult};
-
-        {
-            let pager = self.pager.load();
-
-            let Some(wal) = pager.wal.as_ref() else {
-                return Err(LimboError::InternalError(
-                    "wal_insert_end called without a wal".to_string(),
-                ));
-            };
-
-            let commit_err = if force_commit {
-                pager
-                    .io
-                    .block(|| {
-                        return_if_io!(pager.commit_wal(
-                            WalAutoActions::empty(),
-                            self.get_wal_autocheckpoint(),
-                            self.get_sync_mode(),
-                            self.get_data_sync_retry(),
-                        ));
-                        pager.commit_wal_end();
-                        Ok(IOResult::Done(()))
-                    })
-                    .err()
-            } else {
-                None
-            };
-
-            self.auto_commit.store(true, Ordering::SeqCst);
-            self.set_tx_state(TransactionState::None);
-            wal.end_write_tx();
-            wal.end_read_tx();
-
-            if !force_commit {
-                // remove all non-commited changes in case if WAL session left some suffix without commit frame
-                if let Some(mv_store) = self.mv_store().as_ref() {
-                    if let Some(tx_id) = self.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
-                    }
-                }
-                pager.rollback(false, self, true);
-            }
-            if let Some(err) = commit_err {
-                return Err(err);
-            }
-        }
-
+        self.wal_insert_end_commit_only(force_commit)?;
         // let's re-parse schema from scratch if schema cookie changed compared to the our in-memory view of schema
         self.maybe_reparse_schema()?;
         Ok(())
@@ -3665,14 +3750,17 @@ impl Connection {
         self.db.update_schema_if_newer(schema);
     }
 
-    /// Publish the connection's current schema snapshot after pages were
-    /// replaced outside normal SQL commit ordering.
+    /// Publishes this connection's parsed schema into `db.schema` after raw WAL page application.
     ///
-    /// External restore paths can move the schema cookie backwards. In that
-    /// case the shared schema cache must be replaced rather than updated
-    /// monotonically, otherwise new connections can re-adopt stale metadata.
+    /// - When `catalog_replaced` is `true` (full snapshot / seed / external restore image),
+    ///   unconditionally publishes the schema and bumps `shared_wal.restore_epoch` so idle
+    ///   connections invalidate stale plans even when the replacement carries an equal or older
+    ///   schema cookie.
+    /// - When `catalog_replaced` is `false` (ordinary replicated WAL delta), updates `db.schema`
+    ///   only when `schema_version` advanced and never bumps `restore_epoch`, so concurrent open
+    ///   read snapshots are never invalidated by routine replicated writes.
     #[cfg(feature = "conn_raw_api")]
-    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+    pub fn publish_schema_after_wal_apply(&self, catalog_replaced: bool) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -3681,18 +3769,31 @@ impl Connection {
         }
 
         let schema = self.schema.read().clone();
-        let published_restore_epoch = {
+        if catalog_replaced {
+            let published_restore_epoch = {
+                let mut db_schema = self.db.schema.lock();
+                *db_schema = Arc::new(schema.as_ref().try_clone()?);
+                self.db.bump_schema_epoch();
+                self.db.shared_wal.bump_restore_epoch()
+            };
+            let local = self.schema.write();
+            self.bump_prepare_context_generation();
+            self.last_restore_epoch
+                .store(published_restore_epoch, Ordering::Release);
+            drop(local);
+        } else {
             let mut db_schema = self.db.schema.lock();
-            *db_schema = Arc::new(schema.as_ref().try_clone()?);
-            self.db.bump_schema_epoch();
-            self.db.shared_wal.bump_restore_epoch()
-        };
-        let local = self.schema.write();
-        self.bump_prepare_context_generation();
-        self.last_restore_epoch
-            .store(published_restore_epoch, Ordering::Release);
-        drop(local);
+            if db_schema.schema_version != schema.schema_version {
+                *db_schema = Arc::new(schema.as_ref().try_clone()?);
+                self.db.bump_schema_epoch();
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        self.publish_schema_after_wal_apply(true)
     }
 
     /// Roll back the main-database MVCC transaction while keeping the
@@ -4187,6 +4288,24 @@ impl Connection {
         self.db.dialect()
     }
 
+    /// The SQL dialect of database `database_id` (`main`, `temp`, or an attached database),
+    /// keeping per-database mutable dialect state (such as `PostgresDialect`'s `next_oid`
+    /// allocator) isolated across attachments.
+    pub(crate) fn dialect_for_db(&self, database_id: usize) -> Arc<dyn crate::Dialect> {
+        if database_id == MAIN_DB_ID {
+            return self.db.dialect();
+        }
+        if database_id == crate::TEMP_DB_ID {
+            return self.temp_dialect();
+        }
+        self.attached_databases
+            .read()
+            .index_to_data
+            .get(&database_id)
+            .map(|entry| entry.db.dialect())
+            .unwrap_or_else(|| self.db.dialect())
+    }
+
     pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,
@@ -4291,7 +4410,12 @@ impl Connection {
     /// replaced or mutated in place. Lock-free and avoids cloning the shared `Arc<Schema>`.
     #[inline]
     pub fn schema_identity(&self) -> u64 {
-        let restore_epoch = self.db.shared_wal.restore_epoch();
+        let idle = self.has_no_open_transaction_state();
+        let restore_epoch = if idle {
+            self.db.shared_wal.restore_epoch()
+        } else {
+            self.last_restore_epoch.load(Ordering::Acquire)
+        };
         let mut id = if restore_epoch == 0 {
             self.schema.identity()
         } else {
@@ -4300,16 +4424,20 @@ impl Connection {
                 .wrapping_add(restore_epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15))
         };
         if self.has_non_main_pagers.load(Ordering::Acquire) {
-            id = self.fold_attached_restore_epochs(id);
+            id = self.fold_attached_restore_epochs(id, idle);
         }
         id
     }
 
     #[inline(never)]
-    fn fold_attached_restore_epochs(&self, mut id: u64) -> u64 {
+    fn fold_attached_restore_epochs(&self, mut id: u64, idle: bool) -> u64 {
         let attached = self.attached_databases.read();
         for (&db_id, entry) in &attached.index_to_data {
-            let epoch = entry.db.shared_wal.restore_epoch();
+            let epoch = if idle {
+                entry.db.shared_wal.restore_epoch()
+            } else {
+                entry.last_restore_epoch.load(Ordering::Acquire)
+            };
             if epoch != 0 {
                 let mix = (db_id as u64)
                     .wrapping_add(1)
@@ -4898,7 +5026,7 @@ impl Connection {
                         db_opts,
                         main_db_flags,
                         io,
-                        self.db.dialect(),
+                        self.db.dialect_for_child(),
                     )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {

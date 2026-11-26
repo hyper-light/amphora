@@ -589,6 +589,7 @@ impl SegmentsCell {
         let _guard = self.transition.lock();
         let word = self.state.load(Ordering::SeqCst);
         let was_closing_uncopied = (word & CLOSING) != 0 && (word & COPIED) == 0;
+        let was_ready_to_reset = (word & Self::READY_TO_RESET) == Self::READY_TO_RESET;
         let prev_current = Segments::unpack(word).current();
         let (before_first, before_second) = self.sum_reads();
         let mut segments = Self::assemble(word, before_first, before_second);
@@ -602,6 +603,8 @@ impl SegmentsCell {
             return None;
         }
         let (after_first, after_second) = Self::reads_by_segment(&segments);
+        let sub_first = passed_first.saturating_sub(after_first);
+        let sub_second = passed_second.saturating_sub(after_second);
         let reads_changed = (after_first, after_second) != (passed_first, passed_second);
         if reads_changed
             && !self.apply_update_read_deltas(
@@ -635,7 +638,55 @@ impl SegmentsCell {
             };
             if rem != 0 {
                 let mut active = Self::assemble(interim, f, s);
+                let (a_before_f, a_before_s) = Self::reads_by_segment(&active);
                 out = step(&mut active);
+                let active_closing_reads = active.other.map_or(0, |c| c.reads);
+                if active.reads > READS || active_closing_reads > READS {
+                    if reads_changed {
+                        let _ = self.apply_update_read_deltas(
+                            (after_first, after_second),
+                            (passed_first, passed_second),
+                        );
+                    }
+                    return None;
+                }
+                let (a_after_f, a_after_s) = Self::reads_by_segment(&active);
+                // Reconcile shards from `delta1` (already applied from the first `step` run) to
+                // `delta2` (produced by the replayed `step(&mut active)`), so a replayed `step`
+                // that acquires a `ReadSpan` never leaves the reader uncounted.
+                let net_f = (a_after_f as i128 - a_before_f as i128)
+                    - (after_first as i128 - passed_first as i128);
+                let net_s = (a_after_s as i128 - a_before_s as i128)
+                    - (after_second as i128 - passed_second as i128);
+                if net_f != 0 || net_s != 0 {
+                    let from_f = u64::try_from((-net_f).max(0)).unwrap_or(0);
+                    let to_f = u64::try_from(net_f.max(0)).unwrap_or(0);
+                    let from_s = u64::try_from((-net_s).max(0)).unwrap_or(0);
+                    let to_s = u64::try_from(net_s.max(0)).unwrap_or(0);
+                    if !self.apply_update_read_deltas((from_f, from_s), (to_f, to_s)) {
+                        if reads_changed {
+                            let _ = self.apply_update_read_deltas(
+                                (after_first, after_second),
+                                (passed_first, passed_second),
+                            );
+                        }
+                        return None;
+                    }
+                    let (rf, rs) = self.sum_reads();
+                    let active_ver = interim.wrapping_add(1) & VERSION_MASK;
+                    let active_word = active.pack()
+                        | if rf >= READS || rs >= READS {
+                            SATURATED
+                        } else {
+                            0
+                        }
+                        | active_ver;
+                    self.state.store(active_word, Ordering::SeqCst);
+                } else if active.pack() != (interim & !(SATURATED | VERSION_MASK)) {
+                    let active_ver = interim.wrapping_add(1) & VERSION_MASK;
+                    let active_word = active.pack() | (interim & SATURATED) | active_ver;
+                    self.state.store(active_word, Ordering::SeqCst);
+                }
                 return Some(out);
             }
             let cleared_ver = interim.wrapping_add(1) & VERSION_MASK;
@@ -655,7 +706,10 @@ impl SegmentsCell {
         self.state.store(next_word, Ordering::SeqCst);
 
         // Dekker re-check: if a concurrent reader finished between our first sum and publishing
-        // COPIED|SHIPPED, free the closing segment now and reflect that reset in `out`.
+        // `next_word`, free the closing segment only when this `update` either published
+        // `READY_TO_RESET` or decremented the closing segment's reader count, re-evaluating `step`
+        // with the concurrent decrements linearized ahead of it so `out` carries `Some(closing_id)`
+        // and never drops the reset notification between `update` and direct `end_read`.
         if (next_word & Self::READY_TO_RESET) == Self::READY_TO_RESET {
             let closing_id = Segments::unpack(next_word).current().other();
             let (f, s) = self.sum_reads();
@@ -663,14 +717,56 @@ impl SegmentsCell {
                 SegmentId::First => f,
                 SegmentId::Second => s,
             };
-            if rem == 0 {
-                if !reads_changed {
-                    let mut ready = Self::assemble(next_word, f, s);
-                    out = step(&mut ready);
+            let sub_closing = match closing_id {
+                SegmentId::First => sub_first,
+                SegmentId::Second => sub_second,
+            };
+            if rem == 0 && (!was_ready_to_reset || sub_closing > 0) {
+                let mut ready = Self::assemble(next_word, f, s);
+                let (r_before_f, r_before_s) = Self::reads_by_segment(&ready);
+                let re_out = step(&mut ready);
+                if ready.other.is_none() && ready.reads <= READS {
+                    let (r_after_f, r_after_s) = Self::reads_by_segment(&ready);
+                    // Apply any net read change on the non-closing segment produced by the
+                    // replayed `step` relative to what the initial run already applied.
+                    let (net_f, net_s) = match closing_id {
+                        SegmentId::First => (
+                            0i128,
+                            (r_after_s as i128 - r_before_s as i128)
+                                - (after_second as i128 - passed_second as i128),
+                        ),
+                        SegmentId::Second => (
+                            (r_after_f as i128 - r_before_f as i128)
+                                - (after_first as i128 - passed_first as i128),
+                            0i128,
+                        ),
+                    };
+                    let ok = if net_f != 0 || net_s != 0 {
+                        let from_f = u64::try_from((-net_f).max(0)).unwrap_or(0);
+                        let to_f = u64::try_from(net_f.max(0)).unwrap_or(0);
+                        let from_s = u64::try_from((-net_s).max(0)).unwrap_or(0);
+                        let to_s = u64::try_from(net_s.max(0)).unwrap_or(0);
+                        self.apply_update_read_deltas((from_f, from_s), (to_f, to_s))
+                    } else {
+                        true
+                    };
+                    if ok {
+                        out = re_out;
+                        let (rf, rs) = if net_f != 0 || net_s != 0 {
+                            self.sum_reads()
+                        } else {
+                            (f, s)
+                        };
+                        let cleared = ready.pack()
+                            | if rf >= READS || rs >= READS {
+                                SATURATED
+                            } else {
+                                0
+                            }
+                            | (next_word.wrapping_add(1) & VERSION_MASK);
+                        self.state.store(cleared, Ordering::SeqCst);
+                    }
                 }
-                let cleared = (next_word & !(CLOSING | COPIED | SHIPPED)) & !VERSION_MASK
-                    | (next_word.wrapping_add(1) & VERSION_MASK);
-                self.state.store(cleared, Ordering::SeqCst);
             }
         }
         Some(out)
@@ -1666,5 +1762,131 @@ mod tests {
         );
         assert_eq!(cell.copied(), Some(SegmentId::First));
         assert_eq!(cell.load().closing(), None);
+    }
+
+    /// Review Standards P3 regression: releasing the final two readers on a copied+shipped closing
+    /// segment concurrently—one via generic `update(|s| s.end_read(span))` and one via direct
+    /// `end_read(span)`—must free the closing segment AND deliver `Some(SegmentId::First)` to
+    /// exactly one caller on every iteration (never both `None`).
+    #[test]
+    fn review_p3_concurrent_update_and_direct_end_read_never_lose_reset_notification() {
+        use std::sync::{Arc, Barrier};
+
+        for iter in 0..500usize {
+            let cell = Arc::new(SegmentsCell::new(Segments::new(SegmentId::First)));
+            let span_a = cell.begin_read().unwrap();
+            let span_b = cell.begin_read().unwrap();
+            assert_eq!(
+                cell.update(|s| s.switch(false)).flatten(),
+                Some(SegmentId::Second)
+            );
+            assert_eq!(cell.copied(), None);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let cell_a = Arc::clone(&cell);
+            let barrier_a = Arc::clone(&barrier);
+
+            let (res_a, res_b) = std::thread::scope(|s| {
+                let h = s.spawn(move || {
+                    barrier_a.wait();
+                    let mut pending = Some(span_a);
+                    cell_a
+                        .update(|seg| {
+                            if let Some(sp) = pending.take() {
+                                seg.end_read(sp)
+                            } else {
+                                seg.reset_if_done()
+                            }
+                        })
+                        .flatten()
+                });
+                barrier.wait();
+                let b = cell.end_read(span_b);
+                let a = h.join().unwrap();
+                (a, b)
+            });
+
+            assert_eq!(
+                cell.load().closing(),
+                None,
+                "iter {iter}: closing segment must become Free"
+            );
+            let winners = usize::from(res_a == Some(SegmentId::First))
+                + usize::from(res_b == Some(SegmentId::First));
+            assert_eq!(
+                winners, 1,
+                "iter {iter}: exactly one caller must observe Some(First), got a={res_a:?}, b={res_b:?}"
+            );
+        }
+    }
+
+    /// Review Round 7 Standards P2 regression: when `SegmentsCell::update` replays `step(&mut active)`
+    /// after a concurrent `begin_read` lands on an uncopied closing segment, any `ReadSpan` acquired
+    /// by the replayed `step` must be counted in `self.shards` before returning.
+    #[test]
+    fn review_p2_update_transition_replay_counts_returned_read_span() {
+        use std::sync::{Arc, Barrier};
+
+        for iter in 0..500usize {
+            let cell = Arc::new(SegmentsCell::new(Segments::new(SegmentId::First)));
+            assert_eq!(
+                cell.update(|s| s.switch(false)).flatten(),
+                Some(SegmentId::Second)
+            );
+            // `First` is closing (`!COPIED`, `SHIPPED`, 0 reads).
+            let barrier = Arc::new(Barrier::new(2));
+            let cell_a = Arc::clone(&cell);
+            let barrier_a = Arc::clone(&barrier);
+
+            let (a_span, b_span) = std::thread::scope(|s| {
+                let h = s.spawn(move || {
+                    barrier_a.wait();
+                    // On 0-read closing `First`, `s.copied()` succeeds and frees `First` (returning
+                    // `None`). If replayed after `b_span` lands on `First`, `s.copied()` returns
+                    // `None`, so the closure acquires and returns a `ReadSpan`.
+                    cell_a
+                        .update(|seg| {
+                            if seg.copied().is_some() {
+                                None
+                            } else {
+                                Some(seg.begin_read())
+                            }
+                        })
+                        .flatten()
+                });
+                barrier.wait();
+                let b = cell.begin_read().unwrap();
+                let a = h.join().unwrap();
+                (a, b)
+            });
+
+            // Every returned span MUST be counted in `self.shards` before release.
+            let expected_second = 1u64 + u64::from(a_span.is_some());
+            let expected_first = u64::from(b_span.closing == Some(SegmentId::First))
+                + u64::from(
+                    a_span
+                        .as_ref()
+                        .is_some_and(|sp| sp.closing == Some(SegmentId::First)),
+                );
+            let (first_reads, second_reads) = cell.sum_reads();
+            assert_eq!(
+                (first_reads, second_reads),
+                (expected_first, expected_second),
+                "iter {iter}: returned span(s) not counted in shards (a={a_span:?}, b={b_span:?})"
+            );
+            assert_eq!(
+                cell.load().reads,
+                expected_second,
+                "iter {iter}: load().reads disagrees with returned spans"
+            );
+
+            if let Some(a) = a_span {
+                let _ = cell.end_read(a);
+            }
+            let _ = cell.end_read(b_span);
+            let _ = cell.copied();
+            assert_eq!(cell.sum_reads(), (0, 0));
+            assert_eq!(cell.load().closing(), None);
+        }
     }
 }

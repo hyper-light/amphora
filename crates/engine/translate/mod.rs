@@ -327,6 +327,110 @@ pub(crate) fn translate_index_backfill(
     program.build_with_context(connection, prepare_context, false, input)
 }
 
+/// Amphora: scans a rowid table in B-tree rowid order emitting `(rowid, col_0, ...)` via
+/// `Insn::RowId` + `emit_column_or_rowid`, so backup verification reads true B-tree rowids even
+/// when user columns shadow all three SQL aliases (`rowid`, `_rowid_`, `oid`).
+pub(crate) fn translate_table_rowid_scan(
+    schema: &Schema,
+    connection: Arc<Connection>,
+    input: &str,
+    table_name: &str,
+    prepare_context: crate::vdbe::PrepareContext,
+) -> Result<Program> {
+    let normalized = crate::util::normalize_ident(table_name);
+    let Some(tbl) = schema.get_btree_table(&normalized) else {
+        bail_parse_error!("no such table: {table_name}");
+    };
+    if !tbl.has_rowid {
+        bail_parse_error!("table {table_name} has no rowid");
+    }
+    let non_virtual_cols: Vec<usize> = tbl
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| (!col.is_virtual_generated()).then_some(idx))
+        .collect();
+    let result_count = non_virtual_cols
+        .len()
+        .checked_add(1)
+        .ok_or(crate::LimboError::IntegerOverflow)?;
+
+    let mut program = Box::new(ProgramBuilder::new(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts::new(1, 16 + result_count, 2),
+    ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.prologue();
+    program.begin_read_on_database(crate::MAIN_DB_ID, schema.schema_version)?;
+
+    let cursor_id =
+        program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(tbl.clone()));
+    program.emit_insn(crate::vdbe::insn::Insn::OpenRead {
+        cursor_id,
+        root_page: tbl.root_page,
+        db: crate::MAIN_DB_ID,
+    });
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(crate::vdbe::insn::Insn::Rewind {
+        cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    let start_reg = program.alloc_registers(result_count);
+    program.emit_insn(crate::vdbe::insn::Insn::RowId {
+        cursor_id,
+        dest: start_reg,
+    });
+    for (offset, col_idx) in non_virtual_cols.into_iter().enumerate() {
+        let dest = start_reg
+            .checked_add(1)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(crate::LimboError::IntegerOverflow)?;
+        program.emit_column_or_rowid(cursor_id, col_idx, dest);
+    }
+    program.emit_result_row(start_reg, result_count);
+    program.emit_insn(crate::vdbe::insn::Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: true,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+    program.emit_insn(crate::vdbe::insn::Insn::Close { cursor_id });
+    program.epilogue(schema);
+    program.build_with_context(connection, prepare_context, false, input)
+}
+
+/// Amphora: reads the main database header's persisted `Cookie::PgNextOid` through the VDBE read
+/// transaction path so backup verification sees the exact snapshot's durable PostgreSQL OID
+/// watermark in WAL and MVCC modes.
+pub(crate) fn translate_read_pg_next_oid(
+    schema: &Schema,
+    connection: Arc<Connection>,
+    input: &str,
+    prepare_context: crate::vdbe::PrepareContext,
+) -> Result<Program> {
+    let mut program = Box::new(ProgramBuilder::new(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts::new(0, 8, 0),
+    ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.prologue();
+    program.begin_read_on_database(crate::MAIN_DB_ID, schema.schema_version)?;
+    let dest = program.alloc_register();
+    program.emit_insn(crate::vdbe::insn::Insn::ReadCookie {
+        db: crate::MAIN_DB_ID,
+        dest,
+        cookie: crate::vdbe::insn::Cookie::PgNextOid,
+    });
+    program.emit_result_row(dest, 1);
+    program.epilogue(schema);
+    program.build_with_context(connection, prepare_context, false, input)
+}
+
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
@@ -476,6 +580,7 @@ pub fn translate_inner(
             temporary,
             if_not_exists,
             program,
+            connection,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

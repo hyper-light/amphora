@@ -1074,11 +1074,14 @@ pub(crate) fn exclusive_file_of(path: &Path, owner: &Owned) -> Result<File, Refu
 
 /// The database at `path` for `owner`, as [`exclusive_file_of`] makes its directories.
 pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
-    if !owner.guarded() {
-        return Db::open_existing_sharing(path, &crate::db::Sharing::Off).map_err(unavailable);
-    }
-    let path = existing_path(path)?;
-    Db::open_existing_made(&path, &crate::db::Sharing::Process).map_err(unavailable)
+    let db = if !owner.guarded() {
+        Db::open_existing_sharing(path, &crate::db::Sharing::Off).map_err(unavailable)?
+    } else {
+        let path = existing_path(path)?;
+        Db::open_existing_made(&path, &crate::db::Sharing::Process).map_err(unavailable)?
+    };
+    db.reject_ambiguous_ownership_dialect()?;
+    Ok(db)
 }
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
@@ -5757,5 +5760,311 @@ mod records_reads {
         assert_eq!(label, "live-pg");
         drop(db);
         drop(live);
+    }
+
+    /// Review Spec P2 regression: opening a view-only PostgreSQL database (no tables created yet)
+    /// through standalone or replicated product ownership must detect PostgreSQL via its persisted
+    /// `pg_next_oid` marker, keep `pg_class` intact, and allow subsequent native PostgreSQL opens.
+    #[test]
+    fn review_p2_view_only_postgres_file_preserves_postgres_dialect_under_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let view_only_path = dir.path().join("pg-view-only.db");
+        {
+            let mut db =
+                Db::open_postgres_sharing(&view_only_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE VIEW answer AS SELECT 73 AS val").unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+
+        // Control: fresh native process sees both the view and pg_class.
+        let control = dir.path().join("control-view.db");
+        std::fs::copy(&view_only_path, &control).unwrap();
+        {
+            let pg = Db::open_postgres_sharing(&control, &crate::db::Sharing::Off).unwrap();
+            let mut val = 0i64;
+            pg.query("SELECT val FROM answer", [], |r| {
+                val = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(val, 73);
+            let mut count = 0i64;
+            pg.query("SELECT COUNT(*) FROM pg_class", [], |r| {
+                count = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert!(count > 0);
+        }
+
+        // Standalone adoption preserves PostgreSQL dialect and pg_class.
+        let until = || Instant::now() + Duration::from_secs(30);
+        let standalone = dir.path().join("standalone-view.db");
+        std::fs::copy(&view_only_path, &standalone).unwrap();
+        {
+            let db = Database::open(&standalone, until()).unwrap();
+            let (val, pg_class_count): (i64, i64) = db
+                .query_local(until(), |conn| {
+                    let v: i64 = conn.query_row("SELECT val FROM answer", [], |r| r.get(0))?;
+                    let c: i64 =
+                        conn.query_row("SELECT COUNT(*) FROM pg_class", [], |r| r.get(0))?;
+                    Ok((v, c))
+                })
+                .unwrap();
+            assert_eq!(val, 73);
+            assert!(pg_class_count > 0);
+        }
+        {
+            let pg = Db::open_postgres_sharing(&standalone, &crate::db::Sharing::Off).expect(
+                "native PostgreSQL reopen must succeed after standalone view-only adoption",
+            );
+            assert!(pg.is_postgres());
+        }
+
+        // Replicated adoption preserves PostgreSQL dialect and pg_class.
+        let replicated = dir.path().join("replicated-view.db");
+        let log_path = dir.path().join("replicated-view.log");
+        std::fs::copy(&view_only_path, &replicated).unwrap();
+        let declaration = crate::replication::bootstrap::inspect_source(&replicated, 1).unwrap();
+        {
+            let config = api::replication::ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: vec![],
+                bootstrap: Some(declaration),
+            };
+            let db = Database::open_replicated(&replicated, &log_path, config, until()).unwrap();
+            let (val, pg_class_count): (i64, i64) = db
+                .query(until(), AnswerMax::bytes(1024), |conn| {
+                    let v: i64 = conn.query_row("SELECT val FROM answer", [], |r| r.get(0))?;
+                    let c: i64 =
+                        conn.query_row("SELECT COUNT(*) FROM pg_class", [], |r| r.get(0))?;
+                    Ok((v, c))
+                })
+                .unwrap();
+            assert_eq!(val, 73);
+            assert!(pg_class_count > 0);
+        }
+        {
+            let pg = Db::open_postgres_sharing(&replicated, &crate::db::Sharing::Off).expect(
+                "native PostgreSQL reopen must succeed after replicated view-only adoption",
+            );
+            assert!(pg.is_postgres());
+        }
+    }
+
+    /// Review Round 7 Spec P1 regression: creating a view in an attached PostgreSQL database must
+    /// persist the `pg_next_oid` dialect marker on the attached file's page 1 so taking standalone
+    /// ownership detects PostgreSQL, keeps `pg_class` intact, and leaves the file readable by a
+    /// subsequent native PostgreSQL open.
+    #[test]
+    fn review_p1_attached_postgres_view_only_file_preserves_postgres_dialect_under_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("pg-main.db");
+        let attached_path = dir.path().join("pg-attached-view-only.db");
+        let uncheckpointed_path = dir.path().join("pg-attached-wal-view-only.db");
+
+        {
+            let io: Arc<dyn amphora_engine::IO> =
+                Arc::new(amphora_engine::PlatformIO::new().unwrap());
+            let db = amphora_engine::Database::open_file_with_flags(
+                io,
+                main_path.to_str().unwrap(),
+                amphora_engine::OpenFlags::default(),
+                amphora_engine::DatabaseOpts::new().with_attach(true),
+                None,
+                Arc::new(amphora_engine::PostgresDialect::new()),
+            )
+            .unwrap();
+            let conn = db.connect(amphora_engine::ConnectOpts::new()).unwrap();
+            conn.execute(format!(
+                "ATTACH '{}' AS att",
+                attached_path.to_str().unwrap()
+            ))
+            .unwrap();
+            conn.execute("CREATE VIEW att.answer AS SELECT 73 AS val")
+                .unwrap();
+            conn.execute("PRAGMA att.wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("DETACH att").unwrap();
+
+            conn.execute(format!(
+                "ATTACH '{}' AS att_wal",
+                uncheckpointed_path.to_str().unwrap()
+            ))
+            .unwrap();
+            conn.execute("CREATE VIEW att_wal.answer AS SELECT 73 AS val")
+                .unwrap();
+            conn.execute("DETACH att_wal").unwrap();
+            conn.close().unwrap();
+        }
+
+        // Control: native PostgreSQL opens the checkpointed attached view-only file cleanly.
+        let control = dir.path().join("control-attached.db");
+        std::fs::copy(&attached_path, &control).unwrap();
+        {
+            let pg = Db::open_postgres_sharing(&control, &crate::db::Sharing::Off).unwrap();
+            let mut val = 0i64;
+            pg.query("SELECT val FROM answer", [], |r| {
+                val = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(val, 73);
+        }
+
+        // Standalone ownership must open both checkpointed and uncheckpointed attached view-only
+        // PostgreSQL files as PostgreSQL (not SQLite) and write PostgreSQL-compatible metadata.
+        let until = || Instant::now() + Duration::from_secs(30);
+        for candidate in [&attached_path, &uncheckpointed_path] {
+            {
+                let db = Database::open(candidate, until()).unwrap();
+                let (val, pg_class_count): (i64, i64) = db
+                    .query_local(until(), |conn| {
+                        let v: i64 = conn.query_row("SELECT val FROM answer", [], |r| r.get(0))?;
+                        let c: i64 =
+                            conn.query_row("SELECT COUNT(*) FROM pg_class", [], |r| r.get(0))?;
+                        Ok((v, c))
+                    })
+                    .unwrap();
+                assert_eq!(val, 73);
+                assert!(pg_class_count > 0);
+            }
+
+            // Subsequent native PostgreSQL open must still succeed after ownership adoption.
+            {
+                let pg = Db::open_postgres_sharing(candidate, &crate::db::Sharing::Off).expect(
+                    "native PostgreSQL reopen must succeed after adopting attached view-only file",
+                );
+                assert!(pg.is_postgres());
+                let mut val = 0i64;
+                pg.query("SELECT val FROM answer", [], |r| {
+                    val = r.get::<i64>(0)?;
+                    Ok(false)
+                })
+                .unwrap();
+                assert_eq!(val, 73);
+            }
+        }
+    }
+
+    /// Review Round 8 P1 regression: a legacy view-only PostgreSQL file created before view
+    /// dialect marking (`pg_next_oid == 0`, zero tables, only a view) must never be silently
+    /// initialized with SQLite owner metadata that makes it unreadable by native PostgreSQL.
+    /// Plain unmarked view-only files fail closed untouched; views referencing `pg_class`/
+    /// `pg_catalog` are detected and opened as PostgreSQL.
+    #[test]
+    fn review_p1_legacy_unmarked_view_only_postgres_file_is_not_corrupted_by_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Part A: simulate a legacy `9974c5e1` view-only PostgreSQL file (`pg_next_oid == 0`,
+        // zero tables, plain view `CREATE VIEW answer AS SELECT 73 AS val`).
+        let legacy_path = dir.path().join("legacy-pg-view-only.db");
+        {
+            let mut db = Db::open_sharing(&legacy_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE VIEW answer AS SELECT 73 AS val").unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+        // Control: untouched legacy file opens cleanly under native PostgreSQL and serves both
+        // the view and `pg_class`.
+        let untouched = dir.path().join("legacy-untouched.db");
+        std::fs::copy(&legacy_path, &untouched).unwrap();
+        {
+            let pg = Db::open_postgres_sharing(&untouched, &crate::db::Sharing::Off).unwrap();
+            let mut val = 0i64;
+            pg.query("SELECT val FROM answer", [], |r| {
+                val = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(val, 73);
+            let mut count = 0i64;
+            pg.query("SELECT COUNT(*) FROM pg_class", [], |r| {
+                count = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert!(count > 0);
+        }
+
+        // Standalone ownership must refuse rather than write SQLite `__amphora_*` metadata,
+        // leaving the file readable by a subsequent native PostgreSQL open.
+        let until = || Instant::now() + Duration::from_secs(30);
+        let standalone = dir.path().join("legacy-standalone.db");
+        std::fs::copy(&legacy_path, &standalone).unwrap();
+        let err = match Database::open(&standalone, until()) {
+            Ok(_) => panic!("standalone owner must refuse unmarked view-only file"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Refusal::Invalid { .. }),
+            "standalone owner must refuse unmarked view-only file with Invalid, got: {err:?}"
+        );
+        {
+            let pg = Db::open_postgres_sharing(&standalone, &crate::db::Sharing::Off).expect(
+                "refused standalone open must leave legacy PG file readable by native PostgreSQL",
+            );
+            assert!(pg.is_postgres());
+            let mut val = 0i64;
+            pg.query("SELECT val FROM answer", [], |r| {
+                val = r.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(val, 73);
+        }
+
+        // Single-voter Raft ownership must also refuse without mutating the file.
+        let replicated = dir.path().join("legacy-replicated.db");
+        let log_path = dir.path().join("legacy-replicated.log");
+        std::fs::copy(&legacy_path, &replicated).unwrap();
+        let declaration = crate::replication::bootstrap::inspect_source(&replicated, 1).unwrap();
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: Some(declaration),
+        };
+        let err = match Database::open_replicated(&replicated, &log_path, config, until()) {
+            Ok(_) => panic!("replicated owner must refuse unmarked view-only file"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Refusal::Invalid { .. }),
+            "replicated owner must refuse unmarked view-only file with Invalid, got: {err:?}"
+        );
+        {
+            let pg = Db::open_postgres_sharing(&replicated, &crate::db::Sharing::Off).expect(
+                "refused replicated open must leave legacy PG file readable by native PostgreSQL",
+            );
+            assert!(pg.is_postgres());
+        }
+
+        // Part B: legacy unmarked view referencing `pg_class` is detected as PostgreSQL by both
+        // standalone and single-voter Raft owners.
+        let pg_view_path = dir.path().join("legacy-pg-catalog-view.db");
+        {
+            let mut db = Db::open_sharing(&pg_view_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE VIEW catalog_count AS SELECT COUNT(*) AS n FROM pg_class")
+                .unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+        let pg_standalone = dir.path().join("legacy-pg-catalog-standalone.db");
+        std::fs::copy(&pg_view_path, &pg_standalone).unwrap();
+        {
+            let db = Database::open(&pg_standalone, until()).unwrap();
+            let n: i64 = db
+                .query_local(until(), |conn| {
+                    Ok(conn.query_row("SELECT n FROM catalog_count", [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert!(n > 0);
+        }
+        {
+            let pg = Db::open_postgres_sharing(&pg_standalone, &crate::db::Sharing::Off).unwrap();
+            assert!(pg.is_postgres());
+        }
     }
 }

@@ -1520,4 +1520,97 @@ mod tests {
             );
         }
     }
+
+    /// Review Round 8 P1 regression: an empty grouped write (`Groups::put_then(vec![], ...)`)
+    /// must deliver its completion callback asynchronously on `amphora-notify` rather than inline
+    /// while `Groups::routed_write` still holds the routing read lock, so a callback that calls
+    /// `Groups::route(...)` (acquiring the routing write lock) never self-deadlocks—tested on
+    /// both SQLite and PostgreSQL backends.
+    #[test]
+    fn review_p1_empty_grouped_write_callback_runs_on_notifier_without_route_deadlock() {
+        use crate::db::{Db, Sharing};
+        use std::sync::mpsc;
+
+        struct GroupDbEngine {
+            db: Db,
+            holding: Option<Vec<u8>>,
+        }
+        impl Engine for GroupDbEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                8
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+            fn opener(&self) -> Option<crate::store::Opener<Db>> {
+                Some(self.db.opener())
+            }
+            fn flusher(&self) -> Option<crate::store::Flush> {
+                Some(self.db.flusher())
+            }
+            fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.holding.clone())
+            }
+            fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+                self.holding = Some(holding.to_vec());
+                Ok(())
+            }
+        }
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let retired = dir.path().join("retired.bin");
+            let db_path = dir.path().join(if is_pg { "pg.db" } else { "sqlite.db" });
+            let groups = Groups::start(1, Config::default(), &retired, |_| {
+                let db = if is_pg {
+                    Db::open_postgres_sharing(&db_path, &Sharing::Off)?
+                } else {
+                    Db::open_sharing(&db_path, &Sharing::Off)?
+                };
+                Ok(GroupDbEngine { db, holding: None })
+            })
+            .unwrap();
+
+            let directory = even(NodeId(0), 1).unwrap();
+            let caller_id = std::thread::current().id();
+            let (tx, rx) = mpsc::channel();
+            let groups_cb = groups.clone();
+            let ticket = groups
+                .put_then(
+                    Vec::new(),
+                    Instant::now() + Duration::from_secs(5),
+                    move |res| {
+                        let thread = std::thread::current();
+                        let on_notifier =
+                            thread.id() != caller_id && thread.name() == Some("amphora-notify");
+                        // Acquires `self.route.write_all(...)`—would self-deadlock if invoked
+                        // inline while `Groups::routed_write` still holds `self.route.read()`.
+                        let routed = groups_cb.route(&directory);
+                        let _ = tx.send((res, on_notifier, routed));
+                    },
+                )
+                .unwrap();
+
+            groups
+                .durable(&ticket, Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            let (res, on_notifier, routed) = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("empty grouped write callback deadlocked or never fired");
+            assert_eq!(res, Ok(()), "is_pg={is_pg}: empty batch must succeed");
+            assert!(
+                on_notifier,
+                "is_pg={is_pg}: empty grouped write callback must run on amphora-notify, not caller thread"
+            );
+            assert!(
+                routed.is_ok(),
+                "is_pg={is_pg}: Groups::route inside empty-batch callback failed: {routed:?}"
+            );
+        }
+    }
 }

@@ -427,11 +427,19 @@ impl Baseline {
         } else {
             Vec::new()
         };
-        db.apply_pages(&pages, |db| {
-            finish(db)?;
-            self.write_marker(db, complete, end, total, if complete { &[] } else { image })
-        })
-        .map_err(unavailable)?;
+        if complete {
+            db.apply_image(&pages, |db| {
+                finish(db)?;
+                self.write_marker(db, true, end, total, &[])
+            })
+            .map_err(unavailable)?;
+        } else {
+            db.apply_pages(&pages, |db| {
+                finish(db)?;
+                self.write_marker(db, false, end, total, image)
+            })
+            .map_err(unavailable)?;
+        }
         db.flusher()().map_err(unavailable)?;
         self.received = end;
         self.total = total;

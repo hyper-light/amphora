@@ -31,13 +31,40 @@ const GROUP_OVERHEAD: usize = 96;
 /// Sentinel marking an empty slot in the open-addressed index table.
 const EMPTY_SLOT: u32 = u32::MAX;
 
-fn value_bytes(v: &Value) -> usize {
-    let held = match v.as_ref() {
+fn value_heap_bytes(v: &Value) -> usize {
+    match v.as_ref() {
         ValueRef::Text(t) => t.as_str().len(),
         ValueRef::Blob(b) => b.len(),
         ValueRef::Null | ValueRef::Numeric(_) => 0,
-    };
-    held.saturating_add(std::mem::size_of::<Value>())
+    }
+}
+
+fn value_bytes(v: &Value) -> usize {
+    value_heap_bytes(v).saturating_add(std::mem::size_of::<Value>())
+}
+
+fn register_heap_bytes(reg: &Register) -> usize {
+    match reg {
+        Register::Value(v) => value_heap_bytes(v),
+        Register::Aggregate(agg) => match agg {
+            crate::types::AggContext::MinMax(v) => value_heap_bytes(v),
+            crate::types::AggContext::Builtin(payload) => payload
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(
+                    payload
+                        .iter()
+                        .map(value_heap_bytes)
+                        .fold(0usize, usize::saturating_add),
+                ),
+            crate::types::AggContext::Count(_)
+            | crate::types::AggContext::SumInt { .. }
+            | crate::types::AggContext::Avg { .. }
+            | crate::types::AggContext::External(_)
+            | crate::types::AggContext::Native(_) => 0,
+        },
+        Register::Record(r) => r.as_blob().capacity(),
+    }
 }
 
 /// The groups of `num_values` values that are neither text nor blob and `num_accs` accumulators a
@@ -72,6 +99,9 @@ pub struct GroupTable {
     all_values: Vec<Value>,
     /// Flat slab of group accumulators: group `g` owns `g * num_accs .. (g + 1) * num_accs`.
     all_accs: Vec<Register>,
+    /// Heap bytes owned by each group's saved accumulators, parallel to `0..num_groups`, so wide
+    /// aggregate states (such as `MAX(wide_blob)` or `GROUP_CONCAT`) are charged to `budget`.
+    acc_bytes: Vec<usize>,
     /// Precomputed 64-bit key hash per group, parallel to `0..num_groups`.
     hashes: Vec<u64>,
     /// Power-of-two open-addressed linear-probing table mapping `hash & mask -> group id`.
@@ -100,6 +130,7 @@ impl GroupTable {
             collations,
             all_values: Vec::new(),
             all_accs: Vec::new(),
+            acc_bytes: Vec::new(),
             hashes: Vec::new(),
             slots: Vec::new(),
             bytes: 0,
@@ -122,6 +153,7 @@ impl GroupTable {
         self.collations.extend_from_slice(collations);
         self.all_values.clear();
         self.all_accs.clear();
+        self.acc_bytes.clear();
         self.hashes.clear();
         if !self.slots.is_empty() {
             self.slots.fill(EMPTY_SLOT);
@@ -143,6 +175,11 @@ impl GroupTable {
                 self.all_accs
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Register>()),
+            )
+            .saturating_add(
+                self.acc_bytes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
             )
             .saturating_add(
                 self.hashes
@@ -175,6 +212,7 @@ impl GroupTable {
         self.num_groups = 0;
         self.all_values.clear();
         self.all_accs.clear();
+        self.acc_bytes.clear();
         self.hashes.clear();
         if !self.slots.is_empty() {
             self.slots.fill(EMPTY_SLOT);
@@ -383,6 +421,7 @@ impl GroupTable {
         let g = u32::try_from(self.num_groups).map_err(|_| LimboError::IntegerOverflow)?;
         self.all_values.try_reserve(regs.len())?;
         self.all_accs.try_reserve(num_accs)?;
+        self.acc_bytes.try_reserve(1)?;
         self.hashes.try_reserve(1)?;
         for r in regs {
             self.all_values.push(r.get_value().try_clone()?);
@@ -390,6 +429,7 @@ impl GroupTable {
         for _ in 0..num_accs {
             self.all_accs.push(Register::Value(Value::Null));
         }
+        self.acc_bytes.push(0);
         self.hashes.push(hash);
         self.insert_slot(hash, g)?;
         self.num_groups = self.num_groups.saturating_add(1);
@@ -447,6 +487,7 @@ impl GroupTable {
         let g = u32::try_from(self.num_groups).map_err(|_| LimboError::IntegerOverflow)?;
         self.all_values.try_reserve(values.len())?;
         self.all_accs.try_reserve(num_accs)?;
+        self.acc_bytes.try_reserve(1)?;
         self.hashes.try_reserve(1)?;
         for v in values {
             self.all_values.push(v.try_clone()?);
@@ -454,6 +495,7 @@ impl GroupTable {
         for _ in 0..num_accs {
             self.all_accs.push(Register::Value(Value::Null));
         }
+        self.acc_bytes.push(0);
         self.hashes.push(hash);
         self.insert_slot(hash, g)?;
         self.num_groups = self.num_groups.saturating_add(1);
@@ -476,6 +518,47 @@ impl GroupTable {
         self.all_accs
             .get_mut(start..end)
             .ok_or_else(|| missing("the current group is gone"))
+    }
+
+    /// Saves the updated accumulator registers back into the current group, updating `self.bytes`
+    /// for heap payloads owned by those accumulators (e.g. wide `MAX`/`MIN` values or buffered
+    /// `AggContext::Builtin` vectors) and marking `self.spilled` if the table now exceeds `budget`.
+    #[inline]
+    pub fn save_current_accumulators(&mut self, regs: &mut [Register]) -> Result<()> {
+        let g = self.current.ok_or_else(|| missing("no current group"))?;
+        let gi = usize::try_from(g).map_err(|_| missing("the current group is gone"))?;
+        let start = gi
+            .checked_mul(self.num_accs)
+            .ok_or_else(|| missing("accumulator offset overflow"))?;
+        let end = start
+            .checked_add(self.num_accs)
+            .ok_or_else(|| missing("accumulator end overflow"))?;
+        let accs = self
+            .all_accs
+            .get_mut(start..end)
+            .ok_or_else(|| missing("the current group is gone"))?;
+        if regs.len() != accs.len() {
+            return Err(missing("accumulator count mismatch"));
+        }
+        let mut new_bytes = 0usize;
+        for (reg, slot) in regs.iter_mut().zip(accs.iter_mut()) {
+            std::mem::swap(reg, slot);
+            new_bytes = new_bytes.saturating_add(register_heap_bytes(slot));
+        }
+        let prev_slot = self
+            .acc_bytes
+            .get_mut(gi)
+            .ok_or_else(|| missing("the current group accumulator bytes are gone"))?;
+        let old_bytes = *prev_slot;
+        *prev_slot = new_bytes;
+        self.bytes = self
+            .bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        if self.bytes > self.budget {
+            self.spilled = true;
+        }
+        Ok(())
     }
 
     /// Puts the groups in the order `key_info` gives their keys, a sorter's order, to be drained.
@@ -750,5 +833,105 @@ mod tests {
         );
         assert_eq!(wide_counts[0][0], Value::from_i64(1));
         assert_eq!(wide_counts[0][1], Value::from_i64(2));
+    }
+
+    /// Review Round 8 P2 regression: hash GROUP BY must charge heap payloads owned by saved
+    /// accumulator registers (such as wide `MAX(blob)` values) against `GroupTable::budget` so
+    /// exceeding the statement budget spills subsequent groups to the GROUP BY sorter instead of
+    /// retaining all groups in memory.
+    #[test]
+    fn review_p2_hash_group_by_charges_wide_accumulator_values_to_budget() {
+        use crate::sync::Arc;
+        use crate::types::AggContext;
+        use crate::{ConnectOpts, Database, Dialect, PostgresDialect, SqliteDialect, IO};
+
+        // 1. Direct `GroupTable` accounting check: 100 KiB budget with 16 KiB MAX values.
+        let mut table = GroupTable::new(1, vec![CollationSeq::Binary], 100 * 1024);
+        let wide = vec![b'w'; 16 * 1024];
+        let mut admitted = 0usize;
+        for g in 0..24i64 {
+            let key = int(g);
+            if table.find_or_insert(&[&key], 1).unwrap().is_some() {
+                admitted += 1;
+                let mut regs = [Register::Aggregate(AggContext::MinMax(Value::Blob(
+                    wide.clone(),
+                )))];
+                table.save_current_accumulators(&mut regs).unwrap();
+            }
+        }
+        assert!(
+            admitted <= 8,
+            "100 KiB budget must spill before admitting 24 x 16 KiB MAX accumulators (admitted {admitted}, bytes={})",
+            table.bytes
+        );
+        assert!(
+            table.spilled,
+            "table must mark spilled once wide MAX values exceed budget"
+        );
+
+        // 2. End-to-end SQL check on both SQLite and PostgreSQL matching the exact reproducer:
+        // 24 winning 16 KiB `MAX(v)` values under a 100 KiB statement budget (`page_size = 512`,
+        // `cache_size = 200` -> `statement_memory_budget() == 102,400`).
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(if is_pg { "pg_max.db" } else { "sq_max.db" });
+            let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+            let dialect: Arc<dyn Dialect> = if is_pg {
+                Arc::new(PostgresDialect::new())
+            } else {
+                Arc::new(SqliteDialect)
+            };
+            let db = Database::open_file(io.clone(), path.to_str().unwrap(), dialect).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("PRAGMA page_size = 512").unwrap();
+            conn.execute("PRAGMA cache_size = 200").unwrap();
+            if is_pg {
+                conn.execute("CREATE TABLE wide_max (g int4, v bytea)")
+                    .unwrap();
+            } else {
+                conn.execute("CREATE TABLE wide_max (g INTEGER, v BLOB)")
+                    .unwrap();
+            }
+            assert_eq!(
+                conn.get_pager().statement_memory_budget(),
+                100 * 1024,
+                "is_pg={is_pg}: statement memory budget must be 100 KiB"
+            );
+            let mut ins = conn
+                .prepare("INSERT INTO wide_max (g, v) VALUES (?, ?)")
+                .unwrap();
+            for g in 0..24i64 {
+                let mut payload = vec![b'a' + (g as u8); 16 * 1024];
+                payload[0] = b'z';
+                ins.reset().unwrap();
+                ins.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(g))
+                    .unwrap();
+                ins.bind_at(std::num::NonZero::new(2).unwrap(), Value::Blob(payload))
+                    .unwrap();
+                while !matches!(ins.step().unwrap(), crate::StepResult::Done) {
+                    io.step().unwrap();
+                }
+            }
+            let mut stmt = conn
+                .prepare("SELECT g, length(MAX(v)) FROM wide_max GROUP BY g ORDER BY g")
+                .unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(
+                rows.len(),
+                24,
+                "is_pg={is_pg}: all 24 groups must be emitted"
+            );
+            for (idx, row) in rows.iter().enumerate() {
+                assert_eq!(row[0], Value::from_i64(idx as i64));
+                assert_eq!(row[1], Value::from_i64(16 * 1024));
+            }
+            assert!(
+                stmt.metrics().sort_operations > 0,
+                "is_pg={is_pg}: 24 x 16 KiB MAX values under 100 KiB budget must spill to GROUP BY sorter (sort_operations={})",
+                stmt.metrics().sort_operations
+            );
+        }
     }
 }

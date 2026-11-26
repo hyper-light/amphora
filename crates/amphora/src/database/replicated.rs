@@ -16819,6 +16819,290 @@ mod tests {
         pump.finish();
     }
 
+    /// Review Spec P1 regression: a valid SQLite baseline seed must bootstrap cleanly onto empty
+    /// followers whose pre-existing files had a native PostgreSQL table created and dropped
+    /// (`pg_next_oid != 0`, zero user tables), switching both followers to SQLite without fencing.
+    #[test]
+    fn review_p1_sqlite_seed_bootstraps_empty_dropped_table_postgres_followers() {
+        let dir = tempfile::tempdir().unwrap();
+        for follower in [1u64, 2] {
+            let follower_path = dir.path().join(format!("state-{follower}.db"));
+            let mut db =
+                Db::open_postgres_sharing(&follower_path, &crate::db::Sharing::Off).unwrap();
+            db.exec("CREATE TABLE gone(id int4); DROP TABLE gone")
+                .unwrap();
+            db.flusher()().unwrap();
+            let _ = db.checkpoint().unwrap();
+        }
+        let source = dir.path().join("state-3.db");
+        {
+            let db = Db::open(&source).unwrap();
+            db.exec(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+                 INSERT INTO items VALUES(1, 'sqlite-seed')",
+            )
+            .unwrap();
+            db.flusher()().unwrap();
+        }
+        let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
+        let read_items = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
+            let mut out = String::new();
+            db.query("SELECT id, label FROM items ORDER BY id", [], |row| {
+                let id = row
+                    .get_value(0)
+                    .as_int()
+                    .ok_or_else(|| anyhow::anyhow!("expected integer id"))?;
+                let label = row
+                    .get_value(1)
+                    .to_text()
+                    .ok_or_else(|| anyhow::anyhow!("expected text label"))?;
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                out.push_str(&format!("{id}:{label}"));
+                Ok(true)
+            })?;
+            Ok(out.into_bytes())
+        };
+
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 0);
+
+        for (idx, client) in clients.iter().enumerate() {
+            let got = driven
+                .call(&mut pump, client, read_items)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "member {} failed initial read after sqlite seed: {e:?}",
+                        idx + 1
+                    )
+                });
+            assert_eq!(String::from_utf8(got).unwrap(), "1:sqlite-seed");
+            let status = client.handle().status().unwrap();
+            assert!(
+                status.fenced.is_none(),
+                "member {} fenced on sqlite seed over empty pg follower: {:?}",
+                idx + 1,
+                status.fenced
+            );
+            assert!(!status.bootstrapping);
+            let is_pg = driven
+                .call(&mut pump, client, |db| Ok(vec![u8::from(db.is_postgres())]))
+                .unwrap();
+            assert_eq!(
+                is_pg,
+                vec![0],
+                "member {} must adopt SQLite dialect",
+                idx + 1
+            );
+        }
+
+        driven.follow(&mut pump, &clients, 0);
+        driven
+            .call(&mut pump, clients.get(1).unwrap(), |db| {
+                db.exec("INSERT INTO items VALUES(2, 'sqlite-delta')")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        for client in &clients {
+            let got = driven.call(&mut pump, client, read_items).unwrap();
+            assert_eq!(
+                String::from_utf8(got).unwrap(),
+                "1:sqlite-seed,2:sqlite-delta"
+            );
+        }
+
+        for owner in 0..3 {
+            driven.advance(owner, past_quiet(&driven, owner));
+        }
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        // Full restart of all 3 members confirms all reopen cleanly as SQLite.
+        let mut driven = Driven::new();
+        let reopened: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&reopened);
+        driven.elect(&mut pump, &reopened, 0, 0);
+        for (idx, client) in reopened.iter().enumerate() {
+            let status = client.handle().status().unwrap();
+            assert!(
+                status.fenced.is_none(),
+                "reopened member {} fenced",
+                idx + 1
+            );
+            assert!(!status.bootstrapping);
+            let rows = driven.call(&mut pump, client, read_items).unwrap();
+            assert_eq!(
+                String::from_utf8(rows).unwrap(),
+                "1:sqlite-seed,2:sqlite-delta"
+            );
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Review Spec P1 regression: an ordinary replicated write (value UPDATE or column RENAME)
+    /// applied on a follower must not invalidate an already-open `query_local` read session on
+    /// either SQLite or PostgreSQL, nor hide the old column name inside that open snapshot.
+    #[test]
+    fn review_p1_replicated_write_and_column_rename_preserve_open_follower_read_snapshot() {
+        use std::sync::{Arc, mpsc};
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let leader_path = dir.path().join("leader.db");
+            let follower_path = dir.path().join("follower.db");
+            let log_path = dir.path().join("follower.log");
+
+            // Create initial leader + identical follower file.
+            {
+                let mut leader = if is_pg {
+                    Db::open_postgres_sharing(&leader_path, &crate::db::Sharing::Off).unwrap()
+                } else {
+                    Db::open_sharing(&leader_path, &crate::db::Sharing::Off).unwrap()
+                };
+                if is_pg {
+                    leader
+                        .exec("CREATE TABLE items(id int4 PRIMARY KEY, v int4); INSERT INTO items VALUES (1, 73)")
+                        .unwrap();
+                } else {
+                    leader
+                        .exec("CREATE TABLE items(id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO items VALUES (1, 73)")
+                        .unwrap();
+                }
+                leader.flusher()().unwrap();
+                let _ = leader.checkpoint().unwrap();
+            }
+            std::fs::copy(&leader_path, &follower_path).unwrap();
+
+            let until = || Instant::now() + Duration::from_secs(30);
+            let declaration =
+                crate::replication::bootstrap::inspect_source(&follower_path, 1).unwrap();
+            let config = api::replication::ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: vec![],
+                bootstrap: Some(declaration),
+            };
+            let db = Arc::new(
+                Database::open_replicated(&follower_path, &log_path, config, until()).unwrap(),
+            );
+            // Wait for the replicated node to finish bootstrapping before calling `query_local`.
+            let initial: i64 = db
+                .query(until(), AnswerMax::bytes(256), |conn| {
+                    Ok(conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(initial, 73);
+
+            // Part 1: ordinary replicated UPDATE (73 -> 99) while a `query_local` session is open.
+            let (opened_tx, opened_rx) = mpsc::channel::<()>();
+            let (updated_tx, updated_rx) = mpsc::channel::<()>();
+            let db_r = Arc::clone(&db);
+            let reader_thread = std::thread::spawn(move || {
+                db_r.query_local(until(), move |conn| {
+                    let first: i64 =
+                        conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?;
+                    assert_eq!(first, 73);
+                    let _ = opened_tx.send(());
+                    updated_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| anyhow::anyhow!("timed out waiting for update: {e}"))?;
+                    // Identical SELECT in the same open session must still see 73 (not SchemaUpdated).
+                    let second: i64 =
+                        conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?;
+                    Ok(second)
+                })
+            });
+
+            opened_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("query_local session must open and read 73");
+            db.execute(
+                vec![api::Statement {
+                    sql: "UPDATE items SET v = 99 WHERE id = 1".into(),
+                    params: Vec::new(),
+                }],
+                until(),
+            )
+            .unwrap();
+            let _ = updated_tx.send(());
+
+            let in_session = reader_thread.join().unwrap().unwrap_or_else(|e| {
+                panic!(
+                    "is_pg={is_pg}: open query_local session failed after replicated update: {e:?}"
+                )
+            });
+            assert_eq!(in_session, 73, "is_pg={is_pg}: open snapshot must keep 73");
+
+            let fresh: i64 = db
+                .query_local(until(), |conn| {
+                    Ok(conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(fresh, 99, "is_pg={is_pg}: fresh session must read 99");
+
+            // Part 2: replicated ALTER TABLE RENAME COLUMN v TO v2 while `query_local` is open.
+            let (opened2_tx, opened2_rx) = mpsc::channel::<()>();
+            let (renamed2_tx, renamed2_rx) = mpsc::channel::<()>();
+            let db_r2 = Arc::clone(&db);
+            let rename_reader = std::thread::spawn(move || {
+                db_r2.query_local(until(), move |conn| {
+                    let first: i64 =
+                        conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?;
+                    assert_eq!(first, 99);
+                    let _ = opened2_tx.send(());
+                    renamed2_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| anyhow::anyhow!("timed out waiting for rename: {e}"))?;
+                    // Both repeating the same SQL and preparing a new SQL referencing old column `v`
+                    // must continue to see `v` inside this open snapshot.
+                    let again: i64 =
+                        conn.query_row("SELECT v FROM items WHERE id = 1", [], |r| r.get(0))?;
+                    let plus_one: i64 =
+                        conn.query_row("SELECT v + 1 FROM items WHERE id = 1", [], |r| r.get(0))?;
+                    Ok((again, plus_one))
+                })
+            });
+
+            opened2_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second query_local session must open and read 99");
+            db.execute(
+                vec![api::Statement {
+                    sql: "ALTER TABLE items RENAME COLUMN v TO v2".into(),
+                    params: Vec::new(),
+                }],
+                until(),
+            )
+            .unwrap();
+            let _ = renamed2_tx.send(());
+
+            let (again, plus_one) = rename_reader.join().unwrap().unwrap_or_else(|e| {
+                panic!("is_pg={is_pg}: open query_local session broke after column rename: {e:?}")
+            });
+            assert_eq!((again, plus_one), (99, 100));
+
+            let fresh_v2: i64 = db
+                .query_local(until(), |conn| {
+                    Ok(conn.query_row("SELECT v2 FROM items WHERE id = 1", [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(fresh_v2, 99);
+        }
+    }
+
     /// U15/CP-T1.8 under a nemesis (replication.md, "The owner's time"): the seeded group with
     /// the lead moved while the delta's call is in flight, while a replica reads the seed's image,
     /// and while the reopened group's reads are. The seed's own transfer to its source is its

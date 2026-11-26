@@ -308,6 +308,88 @@ impl Db {
         Self::is_postgres_dialect_error_msg(&err.to_string())
     }
 
+    fn is_sqlite_dialect_error(err: &LimboError) -> bool {
+        err.to_string()
+            .contains("table was created by the sqlite frontend")
+    }
+
+    fn sql_references_postgres_catalog(sql: &str) -> bool {
+        sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| {
+                token.eq_ignore_ascii_case("pg_catalog")
+                    || token.eq_ignore_ascii_case("pg_class")
+                    || token.eq_ignore_ascii_case("pg_attribute")
+                    || token.eq_ignore_ascii_case("pg_type")
+                    || token.eq_ignore_ascii_case("pg_namespace")
+            })
+    }
+
+    /// True when an unmarked database (no user tables and `pg_next_oid == 0`) contains a view
+    /// referencing PostgreSQL system catalogs (`pg_catalog`, `pg_class`, etc.), identifying a
+    /// legacy PostgreSQL view-only file created before view dialect marking.
+    fn has_postgres_catalog_view(&self) -> anyhow::Result<bool> {
+        let mut has_table = false;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' LIMIT 1",
+            )
+            .map_err(fail)?;
+        step(self.io.as_ref(), &mut stmt, [], |_| {
+            has_table = true;
+            Ok(false)
+        })?;
+        if has_table {
+            return Ok(false);
+        }
+        let mut has_pg_view = false;
+        let mut vstmt = self
+            .conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'view' AND sql IS NOT NULL")
+            .map_err(fail)?;
+        step(self.io.as_ref(), &mut vstmt, [], |row| {
+            let sql = row.get::<String>(0).map_err(fail)?;
+            if Self::sql_references_postgres_catalog(&sql) {
+                has_pg_view = true;
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(has_pg_view)
+    }
+
+    /// Fails closed before owner metadata initialization when an existing file has non-table
+    /// schema objects (such as views from a legacy PostgreSQL file created before view dialect
+    /// marking) with zero tables and no dialect marker, preventing silent SQLite conversion that
+    /// would make the file unreadable by native PostgreSQL.
+    pub(crate) fn reject_ambiguous_ownership_dialect(&self) -> Result<(), amphora_api::Refusal> {
+        if self.is_postgres() {
+            return Ok(());
+        }
+        let mut has_table = false;
+        let mut has_non_table = false;
+        self.query("SELECT type, name FROM sqlite_schema", [], |row| {
+            let kind = row.get::<String>(0).map_err(fail)?;
+            let name = row.get::<String>(1).map_err(fail)?;
+            if kind == "table" {
+                if !name.starts_with("sqlite_") {
+                    has_table = true;
+                }
+            } else {
+                has_non_table = true;
+            }
+            Ok(true)
+        })
+        .map_err(|e| crate::database::refused(&e))?;
+        if !has_table && has_non_table {
+            return Err(amphora_api::invalid(
+                "database dialect",
+                "existing view-only database has no dialect marker; refusing to initialize SQLite owner metadata on an unmarked schema",
+            ));
+        }
+        Ok(())
+    }
+
     /// Read-only source inspection. This opens no directories, creates no database, and executes
     /// no writable connection PRAGMAs. Supports both SQLite-dialect and PostgreSQL-dialect source
     /// databases. The caller owns the product's external lease.
@@ -326,26 +408,37 @@ impl Db {
                     .db_opts(DatabaseOpts::new().with_without_rowid(true)),
             )
         };
-        let db = match open_with(Arc::new(SqliteDialect)) {
-            Ok(db) => db,
+        let build = |db: Arc<Database>| -> anyhow::Result<Self> {
+            let conn = connect(&db).map_err(fail)?;
+            conn.set_statement_journals(false);
+            Ok(Self {
+                io: Arc::clone(&io),
+                db,
+                conn,
+                path: path.to_path_buf(),
+                statements: cache::Cache::default(),
+                owner: None,
+                fenced: Arc::new(AtomicBool::new(false)),
+                log_kept: log_kept(),
+                backup: None,
+            })
+        };
+        let opened = match open_with(Arc::new(SqliteDialect)) {
+            Ok(db) => {
+                let candidate = build(db)?;
+                if candidate.has_postgres_catalog_view()? {
+                    drop(candidate);
+                    build(open_with(Arc::new(PostgresDialect::new())).map_err(fail)?)?
+                } else {
+                    candidate
+                }
+            }
             Err(err) if Self::is_postgres_dialect_error(&err) => {
-                open_with(Arc::new(PostgresDialect::new())).map_err(fail)?
+                build(open_with(Arc::new(PostgresDialect::new())).map_err(fail)?)?
             }
             Err(err) => return Err(fail(err)),
         };
-        let conn = connect(&db).map_err(fail)?;
-        conn.set_statement_journals(false);
-        Ok(Self {
-            io,
-            db,
-            conn,
-            path: path.to_path_buf(),
-            statements: cache::Cache::default(),
-            owner: None,
-            fenced: Arc::new(AtomicBool::new(false)),
-            log_kept: log_kept(),
-            backup: None,
-        })
+        Ok(opened)
     }
 
     /// Opens an existing database file without requiring the caller to know beforehand whether its
@@ -353,7 +446,14 @@ impl Db {
     /// ownership, backup replay, and restore-and-check verification).
     pub(crate) fn open_existing_sharing(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         match Self::open_sharing(path, sharing) {
-            Ok(db) => Ok(db),
+            Ok(db) => {
+                if db.has_postgres_catalog_view()? {
+                    drop(db);
+                    Self::open_postgres_sharing(path, sharing)
+                } else {
+                    Ok(db)
+                }
+            }
             Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
                 Self::open_postgres_sharing(path, sharing)
             }
@@ -366,7 +466,14 @@ impl Db {
     /// PostgreSQL-dialect database files.
     pub(crate) fn open_existing_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         match Self::open_made(path, sharing) {
-            Ok(db) => Ok(db),
+            Ok(db) => {
+                if db.has_postgres_catalog_view()? {
+                    drop(db);
+                    Self::open_postgres_made(path, sharing)
+                } else {
+                    Ok(db)
+                }
+            }
             Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
                 Self::open_postgres_made(path, sharing)
             }
@@ -384,7 +491,19 @@ impl Db {
             &Sharing::Off,
             Arc::new(SqliteDialect),
         ) {
-            Ok(db) => Ok(db),
+            Ok(db) => {
+                if db.has_postgres_catalog_view()? {
+                    drop(db);
+                    Self::open_with_dialect(
+                        path,
+                        io,
+                        &Sharing::Off,
+                        Arc::new(PostgresDialect::new()),
+                    )
+                } else {
+                    Ok(db)
+                }
+            }
             Err(err) if Self::is_postgres_dialect_error_msg(&err.to_string()) => {
                 Self::open_with_dialect(path, io, &Sharing::Off, Arc::new(PostgresDialect::new()))
             }
@@ -859,6 +978,19 @@ impl Db {
         )
     }
 
+    /// The header of the current segment's file of the log (decision 45); None when there is no
+    /// such file or it is empty (a freshly switched or truncated segment whose header has not yet
+    /// been written by a first commit).
+    pub(crate) fn read_log_header(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let len = usize::try_from(LOG_HEADER_BYTES)?;
+        self.read_at_inner(
+            &segment_path(&self.path, self.db.wal_segment()),
+            0,
+            len,
+            true,
+        )
+    }
+
     /// `len` bytes of the database's file from `offset`.
     pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(&self.path.display().to_string(), offset, len)?
@@ -875,6 +1007,16 @@ impl Db {
     }
 
     fn read_at(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_at_inner(path, offset, len, false)
+    }
+
+    fn read_at_inner(
+        &self,
+        path: &str,
+        offset: u64,
+        len: usize,
+        empty_is_none: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let file = match self.io.open_file(path, OpenFlags::NoLock, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -905,6 +1047,9 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("a read's lock was poisoned"))?
             .take()
             .ok_or_else(|| anyhow::anyhow!("reading {path} failed"))?;
+        if bytes.is_empty() && empty_is_none {
+            return Ok(None);
+        }
         if bytes.len() != len {
             anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
         }
@@ -953,6 +1098,32 @@ impl Db {
         self.ensure_unfenced()?;
         let mut stmt = self.conn.prepare(sql).map_err(fail)?;
         step_between(self.io.as_ref(), &mut stmt, [], each, between)
+    }
+
+    /// Scans rowid table `table` in B-tree rowid order, yielding `(rowid, non_virtual_cols...)`
+    /// even when user columns shadow all three SQL aliases (`rowid`, `_rowid_`, `oid`).
+    pub(crate) fn query_table_with_rowid(
+        &self,
+        table: &str,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        let mut stmt = self.conn.prepare_table_rowid_scan(table).map_err(fail)?;
+        step(self.io.as_ref(), &mut stmt, [], each)
+    }
+
+    /// Reads the main database header's persisted `pg_next_oid` counter (`Cookie::PgNextOid`)
+    /// through the connection's active snapshot.
+    pub(crate) fn pg_next_oid(&self) -> anyhow::Result<u32> {
+        self.ensure_unfenced()?;
+        let mut stmt = self.conn.prepare_read_pg_next_oid().map_err(fail)?;
+        let mut oid = 0u32;
+        step(self.io.as_ref(), &mut stmt, [], |row| {
+            let raw = row.get::<i64>(0).map_err(fail)?;
+            oid = u32::try_from(raw).unwrap_or(0);
+            Ok(false)
+        })?;
+        Ok(oid)
     }
 
     /// The frames the log's current segment holds now, from the log's shared state. This
@@ -1418,17 +1589,42 @@ impl Db {
         result
     }
 
-    /// Applies resolved pages and the caller's applied-index update in one WAL transaction.
-    /// Raw pages have no commit marker; only the final SQL marker update publishes the batch.
+    /// Applies resolved pages from an ordinary replicated delta and the caller's applied-index
+    /// update in one WAL transaction. Never switches dialect or bumps `restore_epoch`, so
+    /// concurrent open follower read snapshots are preserved across routine replicated writes.
     pub(crate) fn apply_pages<R>(
         &mut self,
         pages: &[(u32, Vec<u8>)],
         finish: impl FnOnce(&mut Self) -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
+        self.apply_raw_pages(pages, false, finish)
+    }
+
+    /// Installs a full database image (baseline seed or snapshot) and the caller's marker update
+    /// in one WAL transaction. Aligns the live engine's dialect (SQLite <-> PostgreSQL) and
+    /// `pg_next_oid` with the incoming image, publishes the replaced catalog with a bumped
+    /// `restore_epoch`, and restores the previous dialect/OID state on **any** apply or commit
+    /// error.
+    pub(crate) fn apply_image<R>(
+        &mut self,
+        pages: &[(u32, Vec<u8>)],
+        finish: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        self.apply_raw_pages(pages, true, finish)
+    }
+
+    fn apply_raw_pages<R>(
+        &mut self,
+        pages: &[(u32, Vec<u8>)],
+        replace_image: bool,
+        finish: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
         self.statements.clear()?;
         self.ensure_unfenced()?;
         let prev_dialect = self.db.dialect();
-        let mut switched_dialect = false;
+        let prev_next_oid = prev_dialect.current_next_oid();
+        let mut dialect_touched = false;
+        let mut page1_pg_next_oid = None;
         self.conn.wal_insert_begin().map_err(fail)?;
         let result = (|| {
             let mut frame_no = self.conn.wal_state().map_err(fail)?.max_frame;
@@ -1450,48 +1646,89 @@ impl Db {
                 frame.extend_from_slice(bytes);
                 self.conn.wal_insert_frame(frame_no, &frame).map_err(fail)?;
             }
-            // When installing a raw image (baseline seed or snapshot) whose page 1 carries a
-            // persisted PostgreSQL OID counter, switch an empty SQLite follower to PostgreSQL
-            // before reparsing the catalog and creating internal `__amphora_*` tables.
-            if let Some((_, page1)) = pages.iter().find(|(pgno, _)| *pgno == 1) {
-                let pg_next_oid = amphora_engine::header_pg_next_oid(page1).unwrap_or(0);
-                if pg_next_oid != 0 {
-                    let pg = Arc::new(PostgresDialect::new());
-                    pg.load_next_oid(pg_next_oid);
-                    self.db.set_dialect(pg);
-                    switched_dialect = true;
+            page1_pg_next_oid = pages
+                .iter()
+                .find(|(pgno, _)| *pgno == 1)
+                .and_then(|(_, page1)| amphora_engine::header_pg_next_oid(page1));
+            if replace_image {
+                // Installing a full image (baseline seed or snapshot) can move an empty follower
+                // between SQLite and PostgreSQL in either direction. Inspect page 1's persisted
+                // `pg_next_oid` first, then fall back on DDL markers during schema reparse.
+                if let Some(pg_next_oid) = page1_pg_next_oid {
+                    if pg_next_oid != 0 {
+                        let pg = Arc::new(PostgresDialect::new());
+                        pg.load_next_oid(pg_next_oid);
+                        self.db.set_dialect(pg);
+                        dialect_touched = true;
+                    } else if self.db.dialect().name() == "postgres" {
+                        self.db.set_dialect(Arc::new(SqliteDialect));
+                        dialect_touched = true;
+                    }
                 }
-            }
-            match self.conn.reparse_unpublished_schema() {
-                Ok(()) => {}
-                Err(ref err) if !switched_dialect && Self::is_postgres_dialect_error(err) => {
-                    self.db.set_dialect(Arc::new(PostgresDialect::new()));
-                    switched_dialect = true;
-                    self.conn.reparse_unpublished_schema().map_err(fail)?;
+                match self.conn.reparse_unpublished_schema() {
+                    Ok(()) => {}
+                    Err(ref err)
+                        if self.db.dialect().name() == "sqlite"
+                            && Self::is_postgres_dialect_error(err) =>
+                    {
+                        self.db.set_dialect(Arc::new(PostgresDialect::new()));
+                        dialect_touched = true;
+                        self.conn.reparse_unpublished_schema().map_err(fail)?;
+                    }
+                    Err(ref err)
+                        if self.db.dialect().name() == "postgres"
+                            && Self::is_sqlite_dialect_error(err) =>
+                    {
+                        self.db.set_dialect(Arc::new(SqliteDialect));
+                        dialect_touched = true;
+                        self.conn.reparse_unpublished_schema().map_err(fail)?;
+                    }
+                    Err(err) => return Err(fail(err)),
                 }
-                Err(err) => return Err(fail(err)),
+            } else {
+                // Ordinary replicated delta: keep the active dialect (never rewind a live OID
+                // allocator before commit; advance monotonically once commit succeeds).
+                self.conn.reparse_unpublished_schema().map_err(fail)?;
             }
             finish(self)
         })();
+        let rollback_dialect_and_schema = |this: &mut Self| {
+            if dialect_touched {
+                this.db.set_dialect(prev_dialect);
+                if let Some(oid) = prev_next_oid {
+                    this.db.dialect().load_next_oid(oid);
+                }
+            }
+            let _ = this.conn.force_reparse_schema();
+            let _ = this.statements.clear();
+        };
         match result {
             Ok(answer) => {
-                self.conn.wal_insert_end(true).map_err(fail)?;
-                self.marked()?;
-                // An installed image can replace a catalog at an equal or older schema cookie.
-                // Publish that exact committed schema so readers cannot re-adopt the old one.
+                // Commit without launching a post-commit read transaction (`maybe_reparse_schema`),
+                // which could fail with `Busy` under concurrent maintenance after commit has
+                // already landed. The committed schema is already parsed in `self.conn.schema`.
+                if let Err(error) = self.conn.wal_insert_end_commit_only(true).map_err(fail) {
+                    rollback_dialect_and_schema(self);
+                    return Err(error);
+                }
+                // From this point on, the WAL transaction IS durably committed: never revert
+                // `prev_dialect` or `prev_next_oid` even if post-commit bookkeeping fails.
+                if !replace_image
+                    && let Some(pg_next_oid) = page1_pg_next_oid.filter(|&oid| oid != 0)
+                    && self.db.dialect().name() == "postgres"
+                {
+                    self.db.dialect().advance_next_oid(pg_next_oid);
+                }
                 self.conn
-                    .publish_schema_after_external_restore()
+                    .publish_schema_after_wal_apply(replace_image)
                     .map_err(fail)?;
                 self.statements.clear()?;
+                self.marked()?;
                 Ok(answer)
             }
             Err(error) => {
-                self.conn.wal_insert_end(false).map_err(fail)?;
-                if switched_dialect {
-                    self.db.set_dialect(prev_dialect);
-                }
-                self.conn.force_reparse_schema().map_err(fail)?;
-                self.statements.clear()?;
+                let _ = self.conn.wal_insert_end_commit_only(false);
+                rollback_dialect_and_schema(self);
                 Err(error)
             }
         }
@@ -1973,7 +2210,7 @@ mod tests {
             .exec("CREATE TABLE original(value TEXT); INSERT INTO original VALUES ('retained'); CREATE TABLE discarded_one(n); CREATE TABLE discarded_two(n)")
             .unwrap();
         target.flusher()().unwrap();
-        let failed: anyhow::Result<()> = target.apply_pages(&image, |db| {
+        let failed: anyhow::Result<()> = target.apply_image(&image, |db| {
             db.query("SELECT value FROM replacement", [], |row| {
                 assert_eq!(row.get::<String>(0).unwrap(), "seed");
                 Ok(false)
@@ -1993,7 +2230,7 @@ mod tests {
                 .is_err()
         );
         target
-            .apply_pages(&image, |db| {
+            .apply_image(&image, |db| {
                 db.exec("INSERT INTO replacement VALUES ('committed')")
             })
             .unwrap();
@@ -2278,5 +2515,323 @@ mod tests {
         check_reader(&mut reader);
         let mut opened = (db.opener())().unwrap();
         check_reader(&mut opened);
+    }
+
+    /// Review Spec P2 regression: a failed WAL commit write while installing a PostgreSQL snapshot
+    /// image into a SQLite database must restore the live engine's dialect to SQLite, keep the
+    /// original SQLite row readable, and allow an explicit SQLite reopen while the live handle
+    /// stays open.
+    #[test]
+    fn review_p2_failed_snapshot_commit_restores_live_engine_dialect() {
+        use amphora_engine::{Buffer, Completion, CompletionError, File};
+
+        struct FaultingWalFile {
+            inner: Arc<dyn File>,
+            fail_writes: Arc<AtomicBool>,
+        }
+
+        impl File for FaultingWalFile {
+            fn lock_file(&self, exclusive: bool) -> amphora_engine::Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> amphora_engine::Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> amphora_engine::Result<Completion> {
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(
+                &self,
+                pos: u64,
+                buffer: Arc<Buffer>,
+                c: Completion,
+            ) -> amphora_engine::Result<Completion> {
+                if self.fail_writes.load(Ordering::SeqCst) {
+                    return Err(LimboError::CompletionError(CompletionError::IOError(
+                        std::io::ErrorKind::WriteZero,
+                        "injected wal commit failure",
+                    )));
+                }
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(
+                &self,
+                c: Completion,
+                sync_type: FileSyncType,
+            ) -> amphora_engine::Result<Completion> {
+                self.inner.sync(c, sync_type)
+            }
+            fn size(&self) -> amphora_engine::Result<u64> {
+                self.inner.size()
+            }
+            fn truncate(&self, len: u64, c: Completion) -> amphora_engine::Result<Completion> {
+                self.inner.truncate(len, c)
+            }
+        }
+
+        struct FaultingWalIO {
+            inner: Arc<PlatformIO>,
+            fail_wal_writes: Arc<AtomicBool>,
+        }
+
+        impl amphora_engine::Clock for FaultingWalIO {
+            fn current_time_monotonic(&self) -> amphora_engine::MonotonicInstant {
+                self.inner.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> amphora_engine::WallClockInstant {
+                self.inner.current_time_wall_clock()
+            }
+        }
+
+        impl IO for FaultingWalIO {
+            fn open_file(
+                &self,
+                path: &str,
+                flags: OpenFlags,
+                direct: bool,
+            ) -> amphora_engine::Result<Arc<dyn File>> {
+                let file = self.inner.open_file(path, flags, direct)?;
+                if path.ends_with("-wal") || path.ends_with("-wal2") {
+                    return Ok(Arc::new(FaultingWalFile {
+                        inner: file,
+                        fail_writes: Arc::clone(&self.fail_wal_writes),
+                    }));
+                }
+                Ok(file)
+            }
+            fn remove_file(&self, path: &str) -> amphora_engine::Result<()> {
+                self.inner.remove_file(path)
+            }
+            fn step(&self) -> amphora_engine::Result<()> {
+                self.inner.step()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pg_src_path = dir.path().join("pg_source.db");
+        let pg_image = {
+            let mut pg = Db::open_postgres_sharing(&pg_src_path, &Sharing::Off).unwrap();
+            pg.exec("CREATE TABLE pg_t(id int4); INSERT INTO pg_t VALUES (99)")
+                .unwrap();
+            pg.flusher()().unwrap();
+            pg.image_pages(1 << 20).unwrap()
+        };
+
+        let target_path = dir.path().join("sqlite_target.db");
+        let fail_wal_writes = Arc::new(AtomicBool::new(false));
+        let io: Arc<dyn IO> = Arc::new(FaultingWalIO {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            fail_wal_writes: Arc::clone(&fail_wal_writes),
+        });
+        let mut target = Db::open_existing_with(&target_path, io).unwrap();
+        target
+            .exec("CREATE TABLE orig(v INTEGER); INSERT INTO orig VALUES (73)")
+            .unwrap();
+        target.flusher()().unwrap();
+        assert!(!target.is_postgres());
+
+        // Arm WAL write failure inside `finish` right before `wal_insert_end(true)` commits!
+        let arm = Arc::clone(&fail_wal_writes);
+        let err = target.apply_image(&pg_image, |db| {
+            db.exec("INSERT INTO pg_t VALUES (100)")?;
+            arm.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        fail_wal_writes.store(false, Ordering::SeqCst);
+        assert!(err.is_err(), "injected WAL commit write failure must error");
+
+        // Live engine must have restored its SQLite dialect and original catalog.
+        assert!(
+            !target.is_postgres(),
+            "failed snapshot commit left live engine on PostgresDialect"
+        );
+        let mut got = 0i64;
+        target
+            .query("SELECT v FROM orig", [], |row| {
+                got = row.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(got, 73);
+
+        // An explicit SQLite reopen on the same path while `target` is alive must succeed too.
+        let live_reopen = Db::open_sharing(&target_path, &Sharing::Off)
+            .expect("explicit SQLite reopen must succeed after failed PG snapshot commit");
+        assert!(!live_reopen.is_postgres());
+        let mut reopened_got = 0i64;
+        live_reopen
+            .query("SELECT v FROM orig", [], |row| {
+                reopened_got = row.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(reopened_got, 73);
+    }
+
+    /// Review Round 7 Spec P1 regression: snapshot installation (`Db::apply_image`) must succeed
+    /// under concurrent checkpoint/reader maintenance (never triggering a spurious post-commit
+    /// `Busy` error from `maybe_reparse_schema`), and if post-commit bookkeeping fails AFTER the
+    /// WAL transaction commits, the live engine must retain the committed dialect and catalog
+    /// instead of reverting to the previous dialect.
+    #[test]
+    fn review_p1_snapshot_apply_succeeds_under_concurrent_maintenance_and_keeps_committed_dialect()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let pg_src_path = dir.path().join("pg_snap_src.db");
+        let pg_image = {
+            let mut pg = Db::open_postgres_sharing(&pg_src_path, &Sharing::Off).unwrap();
+            pg.exec("CREATE TABLE pg_t(id int4); INSERT INTO pg_t VALUES (99)")
+                .unwrap();
+            pg.flusher()().unwrap();
+            pg.image_pages(1 << 20).unwrap()
+        };
+
+        // Part A: concurrent maintenance (passive checkpoints + schema reads) during snapshot
+        // installation must not cause post-commit failure.
+        let target_a_path = dir.path().join("target_a.db");
+        let mut target_a = Db::open_sharing(&target_a_path, &Sharing::Off).unwrap();
+        target_a
+            .exec("CREATE TABLE orig(v INTEGER); INSERT INTO orig VALUES (73)")
+            .unwrap();
+        target_a.flusher()().unwrap();
+        assert!(!target_a.is_postgres());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let mut maint = target_a.reader().unwrap();
+        let maint_thread = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Relaxed) {
+                let _ = maint.checkpoint();
+                let _ = maint.query("PRAGMA schema_version", [], |_| Ok(false));
+                std::thread::yield_now();
+            }
+        });
+
+        for round in 0..8i64 {
+            target_a
+                .apply_image(&pg_image, |db| {
+                    db.exec(&format!("INSERT INTO pg_t VALUES ({})", 100 + round))
+                })
+                .unwrap_or_else(|e| {
+                    panic!("round {round}: apply_image failed under maintenance: {e:#}")
+                });
+            assert!(target_a.is_postgres());
+        }
+        stop.store(true, Ordering::Relaxed);
+        maint_thread.join().unwrap();
+
+        let mut count_a = 0i64;
+        target_a
+            .query("SELECT COUNT(*) FROM pg_t", [], |row| {
+                count_a = row.get::<i64>(0)?;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(count_a, 2);
+
+        // Part B: an error from post-commit bookkeeping (`marked()`) after WAL commit succeeded
+        // must NOT revert the live engine back to SQLite.
+        let target_b_path = dir.path().join("target_b.db");
+        let mut target_b = Db::open_sharing(&target_b_path, &Sharing::Off).unwrap();
+        target_b
+            .exec("CREATE TABLE orig(v INTEGER); INSERT INTO orig VALUES (73)")
+            .unwrap();
+        target_b.flusher()().unwrap();
+        assert!(!target_b.is_postgres());
+
+        // Poison a backup `Hooks::marks` lock so `self.marked()` fails post-commit.
+        let hooks =
+            crate::backup::Hooks::new(Arc::new(|| panic!("injected post-commit mark poison")), 16);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = hooks.marks.committed(1, 1);
+        }));
+        target_b.back_up(hooks);
+
+        let err = target_b.apply_image(&pg_image, |db| db.exec("INSERT INTO pg_t VALUES (200)"));
+        assert!(
+            err.is_err(),
+            "post-commit mark error must propagate to caller"
+        );
+        // Because WAL commit already landed, live dialect must stay PostgreSQL (not SQLite!),
+        // and both a live reader on `target_b` and `target_b` itself must see the committed rows.
+        assert!(
+            target_b.is_postgres(),
+            "post-commit error must not revert committed PostgreSQL dialect back to SQLite"
+        );
+        let live_reader = target_b.reader().unwrap();
+        let mut reader_vals = Vec::new();
+        live_reader
+            .query("SELECT id FROM pg_t ORDER BY id", [], |row| {
+                reader_vals.push(row.get::<i64>(0)?);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(reader_vals, vec![99, 200]);
+
+        target_b.backup = None;
+        let mut vals = Vec::new();
+        target_b
+            .query("SELECT id FROM pg_t ORDER BY id", [], |row| {
+                vals.push(row.get::<i64>(0)?);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(vals, vec![99, 200]);
+
+        drop(target_b);
+        let cold = Db::open_postgres_sharing(&target_b_path, &Sharing::Off).unwrap();
+        let mut cold_vals = Vec::new();
+        cold.query("SELECT id FROM pg_t ORDER BY id", [], |row| {
+            cold_vals.push(row.get::<i64>(0)?);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(cold_vals, vec![99, 200]);
+    }
+
+    /// Review Round 7 Spec P2 regression: applying an ordinary replicated delta whose page 1
+    /// carries an older `pg_next_oid` must advance the live PostgreSQL OID counter monotonically
+    /// and never rewind it across an OID already spent by a rolled-back transaction.
+    #[test]
+    fn review_p2_replicated_delta_does_not_rewind_rolled_back_postgres_oid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg_oid_delta.db");
+        let mut db = Db::open_postgres_sharing(&path, &Sharing::Off).unwrap();
+        db.exec("CREATE TABLE base(id int4)").unwrap();
+        db.flusher()().unwrap();
+
+        // Snapshot page 1 while `pg_next_oid == 16385` (only `base` with OID 16384 exists).
+        let pages = db.image_pages(1 << 20).unwrap();
+        let page1 = pages
+            .into_iter()
+            .find(|(pgno, _)| *pgno == 1)
+            .expect("page 1 must exist")
+            .1;
+        assert_eq!(amphora_engine::header_pg_next_oid(&page1), Some(16385));
+
+        // Spend OID 16385 in an aborted transaction (live counter advances to 16386).
+        db.exec("BEGIN").unwrap();
+        db.exec("CREATE TABLE aborted(id int4)").unwrap();
+        db.exec("ROLLBACK").unwrap();
+
+        // Apply an ordinary replicated delta carrying the older `pg_next_oid = 16385`.
+        db.apply_pages(&[(1, page1)], |_| Ok(())).unwrap();
+
+        // Next committed table without reopening must get OID 16386, never rolled-back 16385.
+        db.exec("CREATE TABLE committed(id int4)").unwrap();
+        let mut oid = 0i64;
+        db.query(
+            "SELECT oid FROM pg_class WHERE relname = 'committed'",
+            [],
+            |row| {
+                oid = row.get::<i64>(0)?;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            oid, 16386,
+            "ordinary replicated delta must not rewind live PostgresDialect next_oid past rolled-back OID 16385"
+        );
     }
 }

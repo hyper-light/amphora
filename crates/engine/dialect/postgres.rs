@@ -118,13 +118,30 @@ pub(crate) fn split_stored(sql: &str) -> crate::Result<Option<(u32, &str)>> {
     Ok(Some((oid, definition)))
 }
 
-/// The `pg_class` OIDs of the tables `conn`'s transaction sees, sorted: read from `sqlite_schema`,
-/// which `pg_class` is served from ([`crate::pg_catalog_vtab`]), as GetNewOidWithIndex reads
-/// `pg_class`. CREATE TABLE asks while it is translated, before any statement of its own runs, so
-/// the read is a statement of its own that ends its transaction unless the caller's is open (an
-/// internal statement would leave it open, as it runs inside another's).
-fn live_oids(conn: &Arc<Connection>) -> crate::Result<Vec<u32>> {
-    let mut stmt = conn.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table'")?;
+/// The `pg_class` OIDs of the tables `conn`'s transaction sees in `database_id`, sorted: read from
+/// that database's `sqlite_schema` (which `pg_class` is served from, [`crate::pg_catalog_vtab`]),
+/// as GetNewOidWithIndex reads `pg_class`. CREATE TABLE asks while it is translated, before any
+/// statement of its own runs, so the read is a statement of its own that ends its transaction
+/// unless the caller's is open (an internal statement would leave it open, as it runs inside
+/// another's).
+fn live_oids(conn: &Arc<Connection>, database_id: usize) -> crate::Result<Vec<u32>> {
+    let query = match database_id {
+        crate::MAIN_DB_ID => "SELECT sql FROM main.sqlite_schema WHERE type = 'table'".to_string(),
+        crate::TEMP_DB_ID => {
+            if !conn.has_temp_database() {
+                return Ok(Vec::new());
+            }
+            "SELECT sql FROM temp.sqlite_schema WHERE type = 'table'".to_string()
+        }
+        other => {
+            let Some(name) = conn.get_database_name_by_index(other) else {
+                return Ok(Vec::new());
+            };
+            let escaped = name.replace('"', "\"\"");
+            format!("SELECT sql FROM \"{escaped}\".sqlite_schema WHERE type = 'table'")
+        }
+    };
+    let mut stmt = conn.prepare(&query)?;
     let mut oids = Vec::new();
     for row in stmt.run_collect_rows()? {
         if let Some(Value::Text(sql)) = row.first() {
@@ -254,9 +271,16 @@ impl super::Dialect for PostgresDialect {
         ))
     }
 
+    fn check_create_table_as_select(&self) -> crate::Result<()> {
+        Err(LimboError::SqlError(
+            "CREATE TABLE AS SELECT is not supported".to_string(),
+        ))
+    }
+
     fn format_created_table_sql(
         &self,
         conn: &Arc<Connection>,
+        database_id: usize,
         _input: &str,
         tbl_name: &ast::QualifiedName,
         body: &ast::CreateTableBody,
@@ -270,11 +294,39 @@ impl super::Dialect for PostgresDialect {
         if crate::schema::is_system_table(tbl_name.name.as_str()) {
             return Ok(definition);
         }
-        Ok(stored(self.allocate_oid(&live_oids(conn)?)?, &definition))
+        Ok(stored(
+            self.allocate_oid(&live_oids(conn, database_id)?)?,
+            &definition,
+        ))
+    }
+
+    fn fresh_instance(&self) -> Option<Arc<dyn super::Dialect>> {
+        Some(Arc::new(PostgresDialect::new()))
     }
 
     fn load_next_oid(&self, stored: u32) {
         self.next_oid.store(stored, Ordering::Relaxed);
+    }
+
+    fn advance_next_oid(&self, stored: u32) {
+        if stored == 0 {
+            return;
+        }
+        let floor = stored.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
+        let _ = self
+            .next_oid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let normalized = cur.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
+                (floor > normalized).then_some(floor)
+            });
+    }
+
+    fn current_next_oid(&self) -> Option<u32> {
+        Some(
+            self.next_oid
+                .load(Ordering::Relaxed)
+                .max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID),
+        )
     }
 
     /// The OID after the table's, as `GetNewObjectId` leaves `nextOid`: past every OID a committed
@@ -729,6 +781,192 @@ mod tests {
                 Value::from_i64(1),
                 Value::from_text("hello".to_string())
             ]]
+        );
+    }
+
+    /// Review Round 7 Spec P2 regression: attaching another PostgreSQL database must give the
+    /// attached database its own `PostgresDialect` instance so opening a lower-OID attached file
+    /// never rewinds `main`'s live or durable `pg_next_oid` counter.
+    #[test]
+    fn review_p2_attach_does_not_rewind_main_postgres_next_oid() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let other_path = dir.path().join("other.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::PlatformIO::new().unwrap());
+
+        // Seed `main.db` by creating and dropping a table (advancing pg_next_oid to 16385).
+        // Attach a fresh PostgreSQL file `other.db` (pg_next_oid = 16384), then create a main view
+        // (persisting main's current_next_oid) and an attached view (persisting other's marker).
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                main_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_attach(true),
+                None,
+                Arc::new(PostgresDialect::new()),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE gone(id int4)").unwrap();
+            conn.execute("DROP TABLE gone").unwrap();
+            conn.execute(format!(
+                "ATTACH '{}' AS other",
+                other_path.to_str().unwrap()
+            ))
+            .unwrap();
+            conn.execute("CREATE VIEW main_v AS SELECT 1 AS v").unwrap();
+            conn.execute("CREATE VIEW other.att_v AS SELECT 73 AS val")
+                .unwrap();
+            conn.execute("DETACH other").unwrap();
+            conn.close().unwrap();
+        }
+
+        // Reopen `main.db` cold: creating a new table must receive OID 16385, never dropped 16384.
+        {
+            let reopened = Database::open_file(
+                io.clone(),
+                main_path.to_str().unwrap(),
+                Arc::new(PostgresDialect::new()),
+            )
+            .unwrap();
+            let conn = reopened.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE after_view(id int4)").unwrap();
+            let rows = query(
+                &conn,
+                "SELECT oid FROM pg_class WHERE relname = 'after_view'",
+            );
+            assert_eq!(
+                rows,
+                vec![vec![Value::from_i64(16385)]],
+                "ATTACH must not rewind main's durable pg_next_oid back to dropped OID 16384"
+            );
+            conn.close().unwrap();
+        }
+
+        // `other.db` (view-only created through ATTACH) must carry its persisted pg_next_oid
+        // marker (including in WAL before checkpoint) so SqliteDialect rejects it and
+        // PostgresDialect opens it cleanly.
+        let err = match Database::open_file(
+            io.clone(),
+            other_path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        ) {
+            Ok(_) => panic!("SqliteDialect must reject attached view-only PostgreSQL database"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("postgres"),
+            "expected PostgreSQL dialect error for attached view-only file, got: {err}"
+        );
+        let other_pg = Database::open_file(
+            io,
+            other_path.to_str().unwrap(),
+            Arc::new(PostgresDialect::new()),
+        )
+        .unwrap();
+        let other_conn = other_pg.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            query(&other_conn, "SELECT val FROM att_v"),
+            vec![vec![Value::from_i64(73)]]
+        );
+        other_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        other_conn.close().unwrap();
+        let mut page1 = [0u8; 4096];
+        let mut f = std::fs::File::open(&other_path).unwrap();
+        std::io::Read::read_exact(&mut f, &mut page1).unwrap();
+        assert_eq!(
+            crate::header_pg_next_oid(&page1),
+            Some(16384),
+            "CREATE VIEW on attached PostgreSQL database must persist pg_next_oid on page 1"
+        );
+    }
+
+    /// Review Round 8 P2 regression: distinct PostgreSQL temporary tables must receive distinct
+    /// OIDs (both under `PRAGMA temp_store = MEMORY` and `FILE`) without spending `main`'s OID
+    /// allocator on the first temporary table.
+    #[test]
+    fn review_p2_postgres_temp_tables_receive_distinct_oids_without_touching_main() {
+        for temp_store in ["MEMORY", "FILE"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("temp_oid_{temp_store}.db"));
+            let (_db, conn) = open(path.to_str().unwrap());
+            conn.execute(format!("PRAGMA temp_store = {temp_store}"))
+                .unwrap();
+            conn.execute("CREATE TEMP TABLE t1 (id int4)").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (10)").unwrap();
+            conn.execute("CREATE TEMP TABLE t2 (id int4)").unwrap();
+            conn.execute("INSERT INTO t2 VALUES (20)").unwrap();
+
+            let rows = query(
+                &conn,
+                "SELECT name, sql FROM temp.sqlite_schema WHERE type = 'table' ORDER BY name",
+            );
+            assert_eq!(
+                rows.len(),
+                2,
+                "temp_store={temp_store}: expected 2 temp tables"
+            );
+            let oid1 = super::split_stored(&text(&rows[0][1]))
+                .unwrap()
+                .expect("t1 must carry a PostgreSQL OID")
+                .0;
+            let oid2 = super::split_stored(&text(&rows[1][1]))
+                .unwrap()
+                .expect("t2 must carry a PostgreSQL OID")
+                .0;
+            assert_eq!(oid1, 16384, "temp_store={temp_store}: first temp table OID");
+            assert_eq!(
+                oid2, 16385,
+                "temp_store={temp_store}: second temp table must get distinct OID 16385, not duplicate 16384"
+            );
+            assert_eq!(
+                query(&conn, "SELECT id FROM t1"),
+                vec![vec![Value::from_i64(10)]]
+            );
+            assert_eq!(
+                query(&conn, "SELECT id FROM t2"),
+                vec![vec![Value::from_i64(20)]]
+            );
+
+            // Main database's allocator must remain untouched at 16384.
+            conn.execute("CREATE TABLE main_t (id int4)").unwrap();
+            assert_eq!(
+                oid(&conn, "main_t"),
+                16384,
+                "temp_store={temp_store}: creating temp tables must not consume main's first OID"
+            );
+        }
+    }
+
+    /// Review Round 8 P3 regression: unsupported PostgreSQL `CREATE TABLE AS SELECT` must return
+    /// a clean `SqlError` (not `Corrupt("malformed database schema...")`), leaving the database
+    /// healthy and the target table absent.
+    #[test]
+    fn review_p3_postgres_ctas_returns_sql_error_not_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg_ctas.db");
+        let (_db, conn) = open(path.to_str().unwrap());
+        conn.execute("CREATE TABLE src (id int4)").unwrap();
+        conn.execute("INSERT INTO src VALUES (42)").unwrap();
+
+        let err = conn
+            .execute("CREATE TABLE dst AS SELECT id FROM src")
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::LimboError::SqlError(ref msg) if msg.contains("CREATE TABLE AS SELECT is not supported")),
+            "PostgreSQL CTAS must return SqlError('CREATE TABLE AS SELECT is not supported'), got: {err:?}"
+        );
+        let tables = query(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'dst'",
+        );
+        assert!(tables.is_empty(), "failed CTAS must not create table dst");
+        assert_eq!(
+            query(&conn, "SELECT id FROM src"),
+            vec![vec![Value::from_i64(42)]]
         );
     }
 }

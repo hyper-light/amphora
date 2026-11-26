@@ -36,7 +36,7 @@ pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
 pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<RowDigest> {
     let mut tables = Vec::new();
     db.query(
-        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND (name NOT LIKE 'sqlite!_%' ESCAPE '!' OR name = 'sqlite_sequence') ORDER BY name",
         [],
         |r| {
             let name = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -45,43 +45,112 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
             Ok(true)
         },
     )?;
-    let mut out = Vec::with_capacity(tables.len());
+    let is_postgres = db.is_postgres();
+    let mut out = Vec::with_capacity(tables.len().saturating_add(usize::from(is_postgres)));
     let mut read = 0u64;
     pace.ready()?;
     for (table, sql) in tables {
-        let quoted = table.replace('"', "\"\"");
-        let (select_list, order) = row_query(db, &table, &sql)?;
         let mut hash = Sha256::new();
+        // On PostgreSQL databases, include the persisted table definition (which embeds
+        // `pg_class.oid`) so tables with identical rows but different PostgreSQL OIDs never
+        // produce equal digests.
+        if is_postgres {
+            hash.update(b"sql:");
+            hash.update(sql.as_bytes());
+            hash.update(b"\n");
+        }
         let mut rows = 0u64;
-        db.query_owned(
-            &format!("SELECT {select_list} FROM \"{quoted}\" ORDER BY {order}"),
-            [],
-            |r| {
-                let values: Vec<_> = r.get_values().collect();
-                let line = format!("{values:?}\n");
-                hash.update(line.as_bytes());
-                rows = rows.saturating_add(1);
-                read = read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
-                if read >= step {
-                    pace.done(None, read)?;
-                    read = 0;
-                    pace.ready()?;
-                }
-                Ok(true)
-            },
-        )?;
+        if table.eq_ignore_ascii_case("sqlite_sequence") {
+            // `sqlite_sequence` carries SQLite AUTOINCREMENT next-ID watermarks; digest in
+            // deterministic `(name, seq)` order.
+            db.query_owned(
+                "SELECT name, seq FROM \"sqlite_sequence\" ORDER BY name, seq",
+                [],
+                |r| {
+                    let values: Vec<_> = r.get_values().collect();
+                    let line = format!("{values:?}\n");
+                    hash.update(line.as_bytes());
+                    rows = rows.saturating_add(1);
+                    read = read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                    if read >= step {
+                        pace.done(None, read)?;
+                        read = 0;
+                        pace.ready()?;
+                    }
+                    Ok(true)
+                },
+            )?;
+            out.push((table, rows, hash.finalize().into()));
+            continue;
+        }
+        match row_scan_mode(db, &table, &sql)? {
+            RowScanMode::Sql { select_list, order } => {
+                let quoted = table.replace('"', "\"\"");
+                db.query_owned(
+                    &format!("SELECT {select_list} FROM \"{quoted}\" ORDER BY {order}"),
+                    [],
+                    |r| {
+                        let values: Vec<_> = r.get_values().collect();
+                        let line = format!("{values:?}\n");
+                        hash.update(line.as_bytes());
+                        rows = rows.saturating_add(1);
+                        read = read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                        if read >= step {
+                            pace.done(None, read)?;
+                            read = 0;
+                            pace.ready()?;
+                        }
+                        Ok(true)
+                    },
+                )?;
+            }
+            RowScanMode::HiddenRowidScan => {
+                // All three SQL rowid aliases (`rowid`, `_rowid_`, `oid`) are shadowed by user
+                // columns on a rowid table: scan the B-tree directly via `Insn::RowId` so hidden
+                // rowid differences (which affect subsequent auto-generated rowids) are captured.
+                db.query_table_with_rowid(&table, |r| {
+                    let values: Vec<_> = r.get_values().collect();
+                    let line = format!("{values:?}\n");
+                    hash.update(line.as_bytes());
+                    rows = rows.saturating_add(1);
+                    read = read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                    if read >= step {
+                        pace.done(None, read)?;
+                        read = 0;
+                        pace.ready()?;
+                    }
+                    Ok(true)
+                })?;
+            }
+        }
         out.push((table, rows, hash.finalize().into()));
+    }
+    if is_postgres {
+        let next_oid = db.pg_next_oid()?;
+        let mut oid_hash = Sha256::new();
+        oid_hash.update(b"pg_next_oid:");
+        oid_hash.update(next_oid.to_be_bytes());
+        out.push((
+            "__pg_next_oid".to_owned(),
+            u64::from(next_oid),
+            oid_hash.finalize().into(),
+        ));
     }
     pace.done(None, read)?;
     Ok(RowDigest(out))
 }
 
-/// The SELECT list and ORDER BY clause a digest reads `table`'s rows with, from its `CREATE TABLE`
-/// text `sql`. For rowid tables, includes the first unshadowed SQLite rowid alias (`rowid`,
-/// `_rowid_`, or `oid`) in both SELECT and ORDER BY so tables with identical visible columns at
-/// different rowids produce distinct digests; for WITHOUT ROWID tables (or tables shadowing all
-/// three rowid aliases), reads `*` ordered by every column in turn (T-T1.12.C1).
-fn row_query(db: &Db, table: &str, sql: &str) -> anyhow::Result<(String, String)> {
+enum RowScanMode {
+    Sql { select_list: String, order: String },
+    HiddenRowidScan,
+}
+
+/// Chooses how `digest_paced` scans `table`'s rows from its `CREATE TABLE` text `sql`. For rowid
+/// tables with an unshadowed SQLite rowid alias (`rowid`, `_rowid_`, or `oid`), selects and orders
+/// by that alias; when all three aliases are shadowed on a rowid table, uses a direct B-tree rowid
+/// scan so hidden rowids still enter the digest; for WITHOUT ROWID tables, reads `*` ordered by
+/// every column in turn (T-T1.12.C1).
+fn row_scan_mode(db: &Db, table: &str, sql: &str) -> anyhow::Result<RowScanMode> {
     let Stmt::CreateTable {
         body: CreateTableBody::ColumnsAndConstraints {
             columns, options, ..
@@ -93,20 +162,27 @@ fn row_query(db: &Db, table: &str, sql: &str) -> anyhow::Result<(String, String)
     else {
         return Err(anyhow::anyhow!("table {table} is not a table of columns"));
     };
-    if !options.contains_without_rowid()
-        && let Some(alias) = ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
+    if !options.contains_without_rowid() {
+        if let Some(alias) = ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
             !columns
                 .iter()
                 .any(|col| col.col_name.as_str().eq_ignore_ascii_case(candidate))
-        })
-    {
-        return Ok((format!("{alias}, *"), alias.to_owned()));
+        }) {
+            return Ok(RowScanMode::Sql {
+                select_list: format!("{alias}, *"),
+                order: alias.to_owned(),
+            });
+        }
+        return Ok(RowScanMode::HiddenRowidScan);
     }
     let all_cols = (1..=columns.len())
         .map(|column| column.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(("*".to_owned(), all_cols))
+    Ok(RowScanMode::Sql {
+        select_list: "*".to_owned(),
+        order: all_cols,
+    })
 }
 
 /// The bytes of rows a paced digest reads a step: as many as one object of the store holds, the

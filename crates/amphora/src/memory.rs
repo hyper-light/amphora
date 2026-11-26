@@ -1361,10 +1361,11 @@ impl Budget {
 
     /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
     /// each charge given back anywhere in the budget ([`Budget::give`]), never by a timer, and
-    /// `waits` told (under the budget's lock) each time it waits. Refused [`Refusal::Full`], with
-    /// the room it last saw, once `until` has passed. Refused at once, never waited on: bytes past
-    /// the whole limit, [`Refusal::TooLarge`] naming it (no charge given back makes room for them;
-    /// lane perf-A19), and a refusal other than no room.
+    /// `waits` told (outside the budget's lock, so releasing a charge inside `waits` cannot
+    /// deadlock) each time it waits. Refused [`Refusal::Full`], with the room it last saw, once
+    /// `until` has passed. Refused at once, never waited on: bytes past the whole limit,
+    /// [`Refusal::TooLarge`] naming it (no charge given back makes room for them; lane perf-A19),
+    /// and a refusal other than no room.
     pub fn take_until(
         self: &Arc<Self>,
         used: Use,
@@ -1392,14 +1393,22 @@ impl Budget {
             Err((Refusal::TooLarge { .. }, _)) => {}
             Err((other, _)) => return Err(other),
         }
-        let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
-        self.waiting.fetch_add(1, Ordering::Relaxed);
-        // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
-        // [atomics.order], the single total order; Linux's include/linux/wait.h, `waitqueue_active`):
-        // either this look for room sees bytes given back, or their giver sees this holder waiting.
+        struct WaitingGuard<'a>(&'a AtomicU64);
+        impl Drop for WaitingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        // Register as waiting before reading `given` and before sampling `readings`: pairs with
+        // `give`'s `SeqCst` fence + `waiting` check so a concurrent release either becomes visible
+        // to `hold_with_limit_until` or advances `*given` past `seen`. Never hold `self.given.0`
+        // across `hold_with_limit_until` so a waiter with a long deadline cannot stall a shorter-
+        // deadline waiter from reaching its timed wait.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = WaitingGuard(&self.waiting);
         fence(Ordering::SeqCst);
         let held = 'look: loop {
-            let seen = *given;
+            let seen = *self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
             let (room, whole_limit) = match self.hold_with_limit_until(used, bytes, Some(until)) {
                 Ok(()) => break Ok(()),
                 Err((Refusal::TooLarge { limit, .. }, whole_limit)) => (limit, whole_limit),
@@ -1413,11 +1422,25 @@ impl Budget {
                 });
             }
             let refused = Refusal::Full { limit: room };
-            let mut left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if until.saturating_duration_since(Instant::now()).is_zero() {
                 break Err(refused);
             }
+            let given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if *given != seen {
+                drop(given);
+                continue 'look;
+            }
+            if until.saturating_duration_since(Instant::now()).is_zero() {
+                break Err(refused);
+            }
+            // Invoke `waits` outside `self.given.0` so a callback that drops a `Charge` (calling
+            // `Budget::give`) cannot self-deadlock on the wait mutex. Because `seen` was captured
+            // before `hold_with_limit_until`, any charge released during `waits` advances `*given`
+            // past `seen` and wakes us immediately when we reacquire the lock below.
+            drop(given);
             waits();
+            let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut left = until.saturating_duration_since(Instant::now());
             while *given == seen {
                 if left.is_zero() {
                     break 'look Err(refused);
@@ -1431,8 +1454,7 @@ impl Budget {
                 left = until.saturating_duration_since(Instant::now());
             }
         };
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        drop(given);
+        drop(_waiting);
         held.map(|()| Charge {
             budget: Arc::clone(self),
             used,
@@ -2736,5 +2758,152 @@ pub(crate) mod tests {
             "normal request with expired deadline must return Full, got {:?}",
             expired_small.err()
         );
+    }
+
+    /// Review Standards P2 regression: a waiter with a long deadline performing a slow measurement
+    /// sample inside `Budget::take_until` must not hold the admission mutex and block a shorter-
+    /// deadline waiter past its own deadline.
+    #[test]
+    fn review_p2_take_until_short_waiter_is_not_blocked_by_long_waiter_sampling() {
+        use std::sync::{Condvar, Mutex};
+
+        struct SlowSecondSample {
+            calls: AtomicU64,
+            entered_slow: (Mutex<bool>, Condvar),
+            delay: std::time::Duration,
+        }
+
+        impl Readings for SlowSecondSample {
+            fn read(&self) -> Reading {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n >= 2 {
+                    {
+                        let mut entered = self.entered_slow.0.lock().unwrap();
+                        *entered = true;
+                        self.entered_slow.1.notify_all();
+                    }
+                    // Park on condvar (no `std::thread::sleep` in crates/amphora) to simulate a
+                    // slow 260 ms kernel reading.
+                    let g = self.entered_slow.0.lock().unwrap();
+                    let _ = self.entered_slow.1.wait_timeout(g, self.delay);
+                }
+                Reading {
+                    limit: Some(100),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let slow = Arc::new(SlowSecondSample {
+            calls: AtomicU64::new(0),
+            entered_slow: (Mutex::new(false), Condvar::new()),
+            delay: std::time::Duration::from_millis(260),
+        });
+        struct ArcReadings(Arc<SlowSecondSample>);
+        impl Readings for ArcReadings {
+            fn read(&self) -> Reading {
+                self.0.read()
+            }
+        }
+
+        let single_flight = SingleFlight::new(ArcReadings(Arc::clone(&slow)));
+        let budget = Budget::new(Box::new(single_flight));
+
+        // Fill the 100-byte budget so both waiters enter the waiting loop.
+        let held = budget.take(Use::Caches, 100).unwrap();
+
+        // Waiter A has a long (5 s) deadline and triggers the slow 260 ms sample on its second read
+        // (after entering the waiting loop).
+        let budget_a = Arc::clone(&budget);
+        let waiter_a = std::thread::spawn(move || {
+            budget_a.take_until(
+                Use::Queues,
+                50,
+                Instant::now() + std::time::Duration::from_secs(5),
+                || {},
+            )
+        });
+
+        // Wait until Waiter A is inside the slow sample.
+        let mut entered = slow.entered_slow.0.lock().unwrap();
+        while !*entered {
+            entered = slow.entered_slow.1.wait(entered).unwrap();
+        }
+        drop(entered);
+
+        // Waiter B has a short 45 ms deadline: it must NOT block on `self.given.0` for Waiter A's
+        // 260 ms measurement.
+        let started = Instant::now();
+        let res_b = budget.take_until(
+            Use::Queues,
+            50,
+            Instant::now() + std::time::Duration::from_millis(45),
+            || {},
+        );
+        let elapsed_b = started.elapsed();
+
+        assert!(
+            matches!(res_b, Err(Refusal::Full { .. })),
+            "short waiter must return Refusal::Full on timeout, got {:?}",
+            res_b.err()
+        );
+        assert!(
+            elapsed_b < std::time::Duration::from_millis(140),
+            "short 45 ms waiter took {elapsed_b:?} (blocked behind long waiter's 260 ms sample)"
+        );
+
+        // Release budget so Waiter A finishes promptly.
+        drop(held);
+        let charge_a = waiter_a.join().unwrap().unwrap();
+        drop(charge_a);
+    }
+
+    /// Review Round 7 Standards P2 regression: `Budget::take_until` must invoke its `waits`
+    /// callback outside `self.given.0` so a callback that releases a held `Charge` (calling
+    /// `Budget::give`) succeeds promptly without self-deadlocking.
+    #[test]
+    fn review_p2_take_until_wait_callback_can_release_charge_without_deadlock() {
+        struct Fixed100;
+        impl Readings for Fixed100 {
+            fn read(&self) -> Reading {
+                Reading {
+                    limit: Some(100),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let budget = Budget::new(Box::new(Fixed100));
+        let mut held = Some(budget.take(Use::Caches, 100).unwrap());
+        let mut wait_calls = 0usize;
+
+        let started = Instant::now();
+        let charge = budget
+            .take_until(
+                Use::Queues,
+                50,
+                Instant::now() + std::time::Duration::from_secs(2),
+                || {
+                    wait_calls = wait_calls.saturating_add(1);
+                    drop(held.take());
+                },
+            )
+            .expect("dropping a Charge inside take_until's waits callback must succeed without deadlock");
+        let elapsed = started.elapsed();
+
+        assert!(
+            held.is_none(),
+            "waits callback must have dropped the held charge"
+        );
+        assert_eq!(
+            wait_calls, 1,
+            "waits callback should fire once before admission succeeds"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "take_until took {elapsed:?} after callback freed room"
+        );
+        drop(charge);
+        assert_eq!(budget.total_held.load(Ordering::SeqCst), 0);
     }
 }

@@ -1347,6 +1347,7 @@ impl ProgramState {
         self.spare_sorters.clear();
         self.spare_hash_tables.clear();
         self.spare_group_tables.clear();
+        self.spare_agg_payloads.clear();
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         for (cursor_id, (cursor, context)) in self
             .cursors
@@ -2218,21 +2219,35 @@ impl PrepareContext {
 
     #[inline]
     pub fn matches_connection(&self, connection: &Connection) -> bool {
+        let idle = connection.has_no_open_transaction_state();
+        let expected_restore_epoch = if idle {
+            connection.db.shared_wal.restore_epoch()
+        } else {
+            connection
+                .last_restore_epoch
+                .load(crate::sync::atomic::Ordering::Acquire)
+        };
         self.database_ptr == connection.database_ptr()
             && self.generation == connection.prepare_context_generation()
-            && self.restore_epoch == connection.db.shared_wal.restore_epoch()
+            && self.restore_epoch == expected_restore_epoch
             && (self.attached_restore_epochs.is_empty()
-                || self.attached_restore_epochs_match(connection))
+                || self.attached_restore_epochs_match(connection, idle))
     }
 
     #[inline(never)]
-    fn attached_restore_epochs_match(&self, connection: &Connection) -> bool {
+    fn attached_restore_epochs_match(&self, connection: &Connection, idle: bool) -> bool {
         let attached = connection.attached_databases().read();
         self.attached_restore_epochs.iter().all(|&(db_id, epoch)| {
-            attached
-                .index_to_data
-                .get(&db_id)
-                .is_some_and(|entry| entry.db.shared_wal.restore_epoch() == epoch)
+            attached.index_to_data.get(&db_id).is_some_and(|entry| {
+                let current = if idle {
+                    entry.db.shared_wal.restore_epoch()
+                } else {
+                    entry
+                        .last_restore_epoch
+                        .load(crate::sync::atomic::Ordering::Acquire)
+                };
+                current == epoch
+            })
         })
     }
 }
@@ -2318,7 +2333,9 @@ impl Program {
         if let QueryMode::Normal = query_mode {
             return self.normal_step(state, pager, waker).into();
         }
-        state.execution_state = ProgramExecutionState::Running;
+        if !state.is_interrupted() {
+            state.execution_state = ProgramExecutionState::Running;
+        }
         let result = self.explain_step_for_mode(state, pager, query_mode);
         match &result {
             Ok(StepResult::Done) => {
@@ -2592,7 +2609,9 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
-        state.execution_state = ProgramExecutionState::Running;
+        if !state.is_interrupted() {
+            state.execution_state = ProgramExecutionState::Running;
+        }
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let entered = state.rows_timed.is_some().then(std::time::Instant::now);
@@ -2653,6 +2672,17 @@ impl Program {
             // instruction completed its IO inline; the inner loop dispatches
             // instructions without re-inspecting the completion slot every time.
             'io_check: loop {
+                if state.is_interrupted()
+                    || program.connection.is_interrupted()
+                    || state
+                        .query_deadline
+                        .is_some_and(|deadline| pager.io.current_time_monotonic() >= deadline)
+                {
+                    if let Some(result) = program.periodic_interrupt_checks(state, pager, 0) {
+                        state.io_completions = None;
+                        return result;
+                    }
+                }
                 if state.io_completions.is_some() {
                     if let Some(result) = program.finish_pending_io(state, pager, waker) {
                         return result;
@@ -3020,6 +3050,10 @@ impl Program {
         err: LimboError,
     ) -> Option<ProgramStep> {
         match err {
+            LimboError::Interrupt => {
+                state.interrupt();
+                self.interrupted_during_step(state, pager)
+            }
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
                 if self.connection.transaction_state.get() == TransactionState::None =>

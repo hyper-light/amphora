@@ -4618,6 +4618,14 @@ impl Database {
         self.dialect.read().clone()
     }
 
+    /// Returns an independent dialect instance for an attached or temporary database so per-
+    /// database mutable state (such as `PostgresDialect`'s `next_oid` counter) is never shared
+    /// with or rewound by another file.
+    pub(crate) fn dialect_for_child(&self) -> Arc<dyn Dialect> {
+        let dialect = self.dialect();
+        dialect.fresh_instance().unwrap_or(dialect)
+    }
+
     /// Replaces this database's SQL dialect in place when installing a raw replicated or restored
     /// image whose page-1 header or catalog belongs to another dialect (e.g. an empty follower
     /// receiving a PostgreSQL baseline seed).
@@ -7351,5 +7359,123 @@ mod database_tests {
                 .unwrap();
             assert_eq!(rows, vec![vec![crate::Value::from_i64(22)]]);
         }
+    }
+
+    /// Review Round 7 Spec P1 regression: rolling back a failed raw WAL session must retain the
+    /// WAL write lock through `pager.rollback(...)` so a concurrent SQL writer cannot commit a
+    /// transaction that the failed raw writer subsequently truncates from the shared frame index.
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn review_p1_failed_raw_wal_rollback_retains_write_lock_and_never_hides_committed_write() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_rollback_race.db");
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file(
+            io.clone(),
+            path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+
+        let setup = db.connect(ConnectOpts::new()).unwrap();
+        setup
+            .execute("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES (1)")
+            .unwrap();
+        drop(setup);
+
+        let raw = db.connect(ConnectOpts::new()).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let page_size = raw.get_page_size().get() as usize;
+
+        for expected in 2i64..=26 {
+            // Read current page 1 bytes so our uncommitted raw frame is a valid page image.
+            let mut page1 = vec![0u8; page_size];
+            let mut read_tx_ok = false;
+            raw.wal_insert_begin().unwrap();
+            let wal_state = raw.wal_state().unwrap();
+            if raw
+                .try_wal_watermark_read_page(1, &mut page1, Some(wal_state.max_frame))
+                .unwrap()
+            {
+                read_tx_ok = true;
+            }
+            assert!(read_tx_ok, "expected page 1 to be readable");
+
+            let mut frame = Vec::with_capacity(24 + page_size);
+            frame.extend_from_slice(&1u32.to_be_bytes());
+            frame.extend_from_slice(&[0u8; 20]); // db_size = 0 (uncommitted frame)
+            frame.extend_from_slice(&page1);
+            raw.wal_insert_frame(wal_state.max_frame + 1, &frame)
+                .unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let writer_started = Arc::new(AtomicBool::new(false));
+            let writer_conn = writer.clone();
+            let barrier_w = Arc::clone(&barrier);
+            let started_w = Arc::clone(&writer_started);
+
+            let handle = std::thread::spawn(move || {
+                barrier_w.wait();
+                started_w.store(true, Ordering::Release);
+                let sql = format!("UPDATE t SET v = {expected}");
+                loop {
+                    match writer_conn.execute(&sql) {
+                        Ok(()) => break,
+                        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                            std::thread::yield_now();
+                        }
+                        Err(other) => {
+                            panic!("unexpected writer error on round {expected}: {other}")
+                        }
+                    }
+                }
+            });
+
+            barrier.wait();
+            while !writer_started.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            for _ in 0..32 {
+                std::thread::yield_now();
+            }
+
+            // Abort the raw WAL session: must finish rollback BEFORE releasing the WAL write lock.
+            raw.wal_insert_end_commit_only(false).unwrap();
+            handle.join().unwrap();
+
+            // Fresh connection in the SAME process must see the committed value immediately.
+            let fresh = db.connect(ConnectOpts::new()).unwrap();
+            let rows = fresh
+                .prepare("SELECT v FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![vec![crate::Value::from_i64(expected)]],
+                "round {expected}: fresh in-process connection saw stale value after raw WAL rollback"
+            );
+        }
+
+        drop(raw);
+        drop(writer);
+        drop(db);
+
+        // Cold reopen must agree with the final committed value.
+        let reopened =
+            Database::open_file(io, path.to_str().unwrap(), Arc::new(crate::SqliteDialect))
+                .unwrap();
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        let rows = conn
+            .prepare("SELECT v FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(26)]]);
     }
 }

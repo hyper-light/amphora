@@ -628,6 +628,7 @@ impl Machine {
             ));
         }
         let mut db = open(&owner)?;
+        db.reject_ambiguous_ownership_dialect()?;
         db.hold_owner(owner.clone());
         // Check before retaining a baseline image or writing a replica marker.
         unproven_floor(&db).map_err(|e| crate::database::refused(&e))?;
@@ -1496,7 +1497,7 @@ impl StateMachine for Machine {
             return Err(failed("snapshot lacks its database header"));
         }
         self.db
-            .apply_pages(&pages, |db| {
+            .apply_image(&pages, |db| {
                 // Inside the image's transaction: a refusal rolls it back before its marker.
                 unproven_floor(db)?;
                 db.exec_internal(META)?;

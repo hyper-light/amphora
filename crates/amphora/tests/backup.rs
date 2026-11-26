@@ -2597,3 +2597,85 @@ fn review_p2_digest_includes_sqlite_prefix_tables_and_rowids() {
         "table shadowing rowid column must still distinguish hidden _rowid_ values"
     );
 }
+
+/// Review Round 8 P2 regression: backup verification digests must distinguish SQL-visible identity
+/// differences across (1) SQLite `AUTOINCREMENT` sequence watermarks (`sqlite_sequence`),
+/// (2) rowid tables shadowing all three SQL aliases (`rowid`, `_rowid_`, `oid`), and
+/// (3) PostgreSQL table `pg_class` OIDs and durable `pg_next_oid`.
+#[test]
+fn review_p2_digest_detects_autoincrement_shadowed_rowids_and_postgres_oids() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. SQLite AUTOINCREMENT next IDs (2 vs 29) with identical visible rows.
+    let ai1 = Db::open(&dir.path().join("ai_a.db")).unwrap();
+    let ai2 = Db::open(&dir.path().join("ai_b.db")).unwrap();
+    ai1.exec("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    ai2.exec("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    ai1.exec("INSERT INTO items (id, v) VALUES (1, 'same')")
+        .unwrap();
+    ai2.exec("INSERT INTO items (id, v) VALUES (1, 'same')")
+        .unwrap();
+    ai2.exec("INSERT INTO items (id, v) VALUES (28, 'gone')")
+        .unwrap();
+    ai2.exec("DELETE FROM items WHERE id = 28").unwrap();
+    assert_ne!(
+        backup::digest(&ai1).unwrap(),
+        backup::digest(&ai2).unwrap(),
+        "databases with different AUTOINCREMENT next IDs (2 vs 29) must have distinct digests"
+    );
+
+    // 2. Rowid table shadowing all three SQL aliases (`rowid`, `_rowid_`, `oid`): hidden rowid 1
+    // vs hidden rowid 2 (next generated rowid 2 vs 3).
+    let sh1 = Db::open(&dir.path().join("shadow_all_a.db")).unwrap();
+    let sh2 = Db::open(&dir.path().join("shadow_all_b.db")).unwrap();
+    let ddl = "CREATE TABLE shadow_all (rowid TEXT, _rowid_ TEXT, oid TEXT, v TEXT)";
+    sh1.exec(ddl).unwrap();
+    sh2.exec(ddl).unwrap();
+    sh1.exec("INSERT INTO shadow_all VALUES ('a', 'b', 'c', 'same')")
+        .unwrap();
+    sh2.exec("INSERT INTO shadow_all VALUES ('d', 'e', 'f', 'drop')")
+        .unwrap();
+    sh2.exec("INSERT INTO shadow_all VALUES ('a', 'b', 'c', 'same')")
+        .unwrap();
+    sh2.exec("DELETE FROM shadow_all WHERE v = 'drop'").unwrap();
+    assert_ne!(
+        backup::digest(&sh1).unwrap(),
+        backup::digest(&sh2).unwrap(),
+        "tables shadowing rowid, _rowid_, and oid must still distinguish hidden B-tree rowids"
+    );
+
+    // 3. PostgreSQL files with identical rows in `inventory` but different `pg_class` OIDs
+    // (16384 vs 16385), and identical `inventory` OID but different durable `pg_next_oid`.
+    let pg1 =
+        Db::open_postgres_sharing(&dir.path().join("pg_oid_a.db"), &amphora::db::Sharing::Off)
+            .unwrap();
+    let pg2 =
+        Db::open_postgres_sharing(&dir.path().join("pg_oid_b.db"), &amphora::db::Sharing::Off)
+            .unwrap();
+    let pg3 =
+        Db::open_postgres_sharing(&dir.path().join("pg_oid_c.db"), &amphora::db::Sharing::Off)
+            .unwrap();
+    pg1.exec("CREATE TABLE inventory (id int4); INSERT INTO inventory VALUES (1)")
+        .unwrap();
+    pg2.exec(
+        "CREATE TABLE prior_tbl (id int4); DROP TABLE prior_tbl; CREATE TABLE inventory (id int4); INSERT INTO inventory VALUES (1)",
+    )
+    .unwrap();
+    pg3.exec(
+        "CREATE TABLE inventory (id int4); INSERT INTO inventory VALUES (1); CREATE TABLE gone (id int4); DROP TABLE gone",
+    )
+    .unwrap();
+    let d1 = backup::digest(&pg1).unwrap();
+    let d2 = backup::digest(&pg2).unwrap();
+    let d3 = backup::digest(&pg3).unwrap();
+    assert_ne!(
+        d1, d2,
+        "PostgreSQL databases with different pg_class OIDs for inventory must have distinct digests"
+    );
+    assert_ne!(
+        d1, d3,
+        "PostgreSQL databases with different durable pg_next_oid must have distinct digests"
+    );
+}

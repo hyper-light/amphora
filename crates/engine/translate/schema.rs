@@ -1144,10 +1144,18 @@ pub fn translate_create_table(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
-    // For CTAS, extract the SELECT, determine column info, and convert to a
+    let database_id = if temporary {
+        crate::TEMP_DB_ID
+    } else {
+        resolver.resolve_database_id(&tbl_name)?
+    };
+    let target_dialect = connection.dialect_for_db(database_id);
+
+    // For CTAS, validate dialect support before schema derivation, then convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
+            target_dialect.check_create_table_as_select()?;
             let (info, col_defs) = derive_ctas_schema(
                 select,
                 &tbl_name.name.as_ident(),
@@ -1163,12 +1171,6 @@ pub fn translate_create_table(
             (body, Some(info))
         }
         other => (other, None),
-    };
-
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
-    } else {
-        resolver.resolve_database_id(&tbl_name)?
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1350,13 +1352,11 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        connection
-            .dialect()
-            .format_created_table_sql(connection, input, &tbl_name, &body)?
+        target_dialect.format_created_table_sql(connection, database_id, input, &tbl_name, &body)?
     };
     // Amphora: a dialect with OIDs stores the next one in this transaction, beside the table
     // (docs/design/postgres.md section 7), as PostgreSQL's XLOG_NEXTOID precedes every use of an OID.
-    if let Some(next_oid) = connection.dialect().next_oid_after(&sql)? {
+    if let Some(next_oid) = target_dialect.next_oid_after(&sql)? {
         program.emit_insn(Insn::SetCookie {
             db: database_id,
             cookie: Cookie::PgNextOid,

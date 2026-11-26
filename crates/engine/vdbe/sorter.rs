@@ -774,10 +774,13 @@ impl SpilledTopK {
     }
 
     /// Returns `[offset, offset + slot_cap)` to `self.free_slots`, coalescing with neighbors and
-    /// trimming the file watermark `self.next_offset` whenever the tail becomes free.
-    fn release_file_slot(&mut self, offset: u64, slot_cap: usize) {
+    /// trimming the file watermark `self.next_offset` whenever the tail becomes free. Returns
+    /// `Err(LimboError::OutOfMemory)` if recording a non-tail, non-coalescing extent requires
+    /// growing `self.free_slots` and that reservation fails, rather than silently leaking disk
+    /// space.
+    fn release_file_slot(&mut self, offset: u64, slot_cap: usize) -> Result<()> {
         if slot_cap == 0 {
-            return;
+            return Ok(());
         }
         let new_off = offset;
         let mut new_cap = slot_cap;
@@ -810,8 +813,16 @@ impl SpilledTopK {
                 }
             }
         }
-        if !merged_prev && self.free_slots.try_reserve(1).is_ok() {
-            self.free_slots.insert(pos, (new_off, new_cap));
+        if !merged_prev {
+            if new_off.checked_add(new_cap as u64) == Some(self.next_offset) {
+                // Directly trim a free tail extent without growing `self.free_slots`.
+                self.next_offset = new_off;
+            } else {
+                self.free_slots
+                    .try_reserve(1)
+                    .map_err(|_| LimboError::OutOfMemory)?;
+                self.free_slots.insert(pos, (new_off, new_cap));
+            }
         }
 
         // Trim any free tail range back off `self.next_offset`.
@@ -823,6 +834,7 @@ impl SpilledTopK {
                 break;
             }
         }
+        Ok(())
     }
 
     fn compare_entries_async(
@@ -1100,8 +1112,9 @@ impl SpilledTopK {
         }
     }
 
-    /// Applies a pre-validated [`HeapPushPlan`] infallibly in memory (zero fallible comparisons).
-    fn apply_heap_push_plan(&mut self, entry: SpilledTopKEntry, plan: HeapPushPlan) {
+    /// Applies a pre-validated [`HeapPushPlan`] after ensuring free-list capacity for any evicted
+    /// or rejected extent so disk space is never silently leaked on OOM.
+    fn apply_heap_push_plan(&mut self, entry: SpilledTopKEntry, plan: HeapPushPlan) -> Result<()> {
         match plan {
             HeapPushPlan::InsertAt(target) => {
                 let added = entry.key_bytes();
@@ -1114,15 +1127,16 @@ impl SpilledTopK {
                     pos = parent;
                 }
                 self.key_bytes = self.key_bytes.saturating_add(added);
+                Ok(())
             }
-            HeapPushPlan::Reject => {
-                self.release_file_slot(entry.offset, entry.slot_cap as usize);
-            }
+            HeapPushPlan::Reject => self.release_file_slot(entry.offset, entry.slot_cap as usize),
             HeapPushPlan::ReplaceRoot { turns, depth } => {
+                self.free_slots
+                    .try_reserve(1)
+                    .map_err(|_| LimboError::OutOfMemory)?;
                 let added = entry.key_bytes();
                 let Some(root) = self.heap.first_mut() else {
-                    self.release_file_slot(entry.offset, entry.slot_cap as usize);
-                    return;
+                    return self.release_file_slot(entry.offset, entry.slot_cap as usize);
                 };
                 let evicted = std::mem::replace(root, entry);
                 SiftDownCursor::apply_swaps(&mut self.heap, turns, depth);
@@ -1130,7 +1144,7 @@ impl SpilledTopK {
                     .key_bytes
                     .saturating_sub(evicted.key_bytes())
                     .saturating_add(added);
-                self.release_file_slot(evicted.offset, evicted.slot_cap as usize);
+                self.release_file_slot(evicted.offset, evicted.slot_cap as usize)
             }
         }
     }
@@ -1143,6 +1157,7 @@ impl SpilledTopK {
         key_len: usize,
         index_key_info: &[KeyInfo],
         comparators: &[Option<SortComparator>],
+        check_interrupt: &mut impl FnMut() -> bool,
     ) -> IOResultOr<()> {
         let mut end = match self.sort_end {
             Some(0) => return Ok(IOResult::Done(())),
@@ -1154,6 +1169,9 @@ impl SpilledTopK {
             }
         };
         while end > 1 {
+            if check_interrupt() {
+                return Err(LimboError::Interrupt.into());
+            }
             let last_idx = end.saturating_sub(1);
             let Some(candidate) = self.heap.get(last_idx) else {
                 break;
@@ -1210,7 +1228,7 @@ impl SpilledTopK {
         }
         if pending.write_err.load(atomic::Ordering::SeqCst) {
             for entry in pending.entries {
-                self.release_file_slot(entry.offset, entry.slot_cap as usize);
+                let _ = self.release_file_slot(entry.offset, entry.slot_cap as usize);
             }
             return Err(CompletionError::IOError(
                 std::io::ErrorKind::WriteZero,
@@ -1226,13 +1244,22 @@ impl SpilledTopK {
                 }
                 Err(err) => {
                     for remaining in pending.entries {
-                        self.release_file_slot(remaining.offset, remaining.slot_cap as usize);
+                        let _ =
+                            self.release_file_slot(remaining.offset, remaining.slot_cap as usize);
                     }
                     return Err(err);
                 }
                 Ok(IOResult::Done(plan)) => {
                     if let Some(entry) = pending.entries.pop_front() {
-                        self.apply_heap_push_plan(entry, plan);
+                        if let Err(err) = self.apply_heap_push_plan(entry, plan) {
+                            for remaining in pending.entries {
+                                let _ = self.release_file_slot(
+                                    remaining.offset,
+                                    remaining.slot_cap as usize,
+                                );
+                            }
+                            return Err(err.into());
+                        }
                     }
                 }
             }
@@ -1311,6 +1338,11 @@ impl SpilledTopK {
                 }
                 evicted_key_bytes = worst.key_bytes();
             }
+            // Pre-reserve free-list space for the evicted slot before submitting disk I/O so
+            // committing the replacement cannot fail or drop the evicted extent on OOM.
+            self.free_slots
+                .try_reserve(1)
+                .map_err(|_| LimboError::OutOfMemory)?;
         } else {
             // Reserve heap capacity before submitting disk I/O so commit cannot OOM.
             self.heap
@@ -1334,13 +1366,13 @@ impl SpilledTopK {
         ) {
             Ok(e) => e,
             Err(err) => {
-                self.release_file_slot(slot_offset, slot_cap);
+                let _ = self.release_file_slot(slot_offset, slot_cap);
                 return Err(err.into());
             }
         };
         let mut entries = VecDeque::new();
         if entries.try_reserve_exact(1).is_err() {
-            self.release_file_slot(slot_offset, slot_cap);
+            let _ = self.release_file_slot(slot_offset, slot_cap);
             return Err(LimboError::OutOfMemory.into());
         }
         entries.push_back(entry);
@@ -1352,7 +1384,7 @@ impl SpilledTopK {
         ) {
             Ok(res) => res,
             Err(err) => {
-                self.release_file_slot(slot_offset, slot_cap);
+                let _ = self.release_file_slot(slot_offset, slot_cap);
                 return Err(err.into());
             }
         };
@@ -1551,14 +1583,24 @@ pub struct Sorter {
     pending_chunk_demote: Option<(Completion, SortedChunk)>,
     /// Optional row cap applied when chunked external merge serves a large-LIMIT query.
     output_limit: Option<usize>,
-    /// Order-preserving normalized-key upper bound computed across spilled chunks when
-    /// `output_limit` is set: any incoming record or spilled chunk with `norm_key > cutoff`
+    /// Order-preserving normalized-key upper bound computed incrementally across spilled chunks
+    /// when `output_limit` is set: any incoming record or spilled chunk with `norm_key > cutoff`
     /// has at least `output_limit` strictly smaller records ahead of it and can never win.
     chunk_norm_cutoff: Option<u64>,
+    /// Max-heap of `(last_norm, Reverse(row_count))` for the lowest-`last_norm` spilled chunks
+    /// whose combined `cutoff_rows >= output_limit`, maintaining `chunk_norm_cutoff` in O(log k)
+    /// per spill instead of copying and re-sorting all preceding runs.
+    cutoff_heap: BinaryHeap<(u64, Reverse<usize>)>,
+    /// Sum of `row_count` across all entries currently retained in `cutoff_heap`.
+    cutoff_rows: usize,
     /// Active bounded-fan-in chunk compaction pass used before `init_chunk_heap` when opening all
     /// surviving chunks at once would exceed `max_buffer_size` (or when `output_limit` can shed
     /// losing rows from oversized runs before streaming the first result).
     compaction: Option<ChunkCompaction>,
+    /// O(1) FIFO (ordinary `ORDER BY`) or O(log k) min-cost (`ORDER BY ... LIMIT`) run queue held
+    /// across `compact_chunks()` so multi-pass scheduling avoids O(k^2) per-merge scans and Vec
+    /// shifts.
+    compaction_queue: Option<CompactionQueue>,
     /// Rows already yielded to the caller from chunked merge sort.
     emitted: usize,
     /// Amphora: whether the first insert has decided `kept`.
@@ -1621,7 +1663,10 @@ impl Sorter {
             pending_chunk_demote: None,
             output_limit: None,
             chunk_norm_cutoff: None,
+            cutoff_heap: TursoAllocExt::new(),
+            cutoff_rows: 0,
             compaction: None,
+            compaction_queue: None,
             emitted: 0,
             limit_decided: false,
             inserted: 0,
@@ -1683,26 +1728,48 @@ impl Sorter {
                     .as_ref()
                     .map_or(0, SpilledTopK::allocated_bytes),
             );
-        let chunk_bytes: usize = self
-            .chunks
-            .iter()
-            .map(|c| {
-                c.buffer
-                    .read()
-                    .capacity()
-                    .saturating_add(c.staged.as_ref().map_or(0, |r| r.as_blob().capacity()))
-            })
-            .sum();
+        let chunk_bytes: usize =
+            self.chunks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SortedChunk>())
+                .saturating_add(
+                    self.chunk_heap
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(
+                            Reverse<Box<BoxedSortableRecord>>,
+                            Reverse<usize>,
+                        )>()),
+                )
+                .saturating_add(
+                    self.chunks
+                        .iter()
+                        .map(|c| {
+                            c.buffer.read().capacity().saturating_add(
+                                c.staged.as_ref().map_or(0, |r| r.as_blob().capacity()),
+                            )
+                        })
+                        .fold(0usize, usize::saturating_add),
+                );
         let compaction_bytes = self
             .compaction
             .as_ref()
-            .map_or(0, ChunkCompaction::allocated_bytes);
+            .map_or(0, ChunkCompaction::allocated_bytes)
+            .saturating_add(
+                self.compaction_queue
+                    .as_ref()
+                    .map_or(0, CompactionQueue::allocated_bytes),
+            );
         self.arena
             .allocated_bytes()
             .saturating_add(
                 self.records
                     .capacity()
                     .saturating_mul(std::mem::size_of::<NonNull<ArenaSortableRecord>>()),
+            )
+            .saturating_add(
+                self.cutoff_heap
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u64, Reverse<usize>)>()),
             )
             .saturating_add(kept_bytes)
             .saturating_add(spilled_top_k_bytes)
@@ -1719,6 +1786,7 @@ impl Sorter {
             && self.pending_demote.is_none()
             && self.pending_chunk_demote.is_none()
             && self.compaction.is_none()
+            && self.compaction_queue.is_none()
             && self.temp_file.is_none()
             && self.compaction_file.is_none()
             && self.pending_completion.is_none()
@@ -1746,7 +1814,10 @@ impl Sorter {
         self.pending_chunk_demote = None;
         self.output_limit = None;
         self.chunk_norm_cutoff = None;
+        self.cutoff_heap.clear();
+        self.cutoff_rows = 0;
         self.compaction = None;
+        self.compaction_queue = None;
         self.compaction_file = None;
         self.emitted = 0;
         self.limit_decided = false;
@@ -1792,6 +1863,8 @@ impl Sorter {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
             && self.chunks.is_empty()
+            && self.compaction.is_none()
+            && self.compaction_queue.is_none()
             && self.pending_demote.is_none()
             && self.pending_chunk_demote.is_none()
             && self
@@ -1873,8 +1946,10 @@ impl Sorter {
             .into());
         }
         let chunk_size = chunk.chunk_size;
+        let last_norm = chunk.last_norm;
+        let row_count = chunk.row_count;
         self.chunks.try_push(chunk)?;
-        self.refresh_chunk_norm_cutoff();
+        self.record_chunk_for_cutoff(last_norm, row_count)?;
         self.next_chunk_offset = self.next_chunk_offset.saturating_add(chunk_size);
         self.kept = None;
         Ok(IOResult::Done(true))
@@ -1897,38 +1972,42 @@ impl Sorter {
         Ok(Some(norm))
     }
 
-    /// Recomputes `chunk_norm_cutoff` across `self.chunks`: the smallest `c = chunk.last_norm`
-    /// such that chunks with `last_norm <= c` already contain at least `output_limit` rows.
-    /// Any record or chunk with `norm > c` has at least `output_limit` strictly smaller records
-    /// ahead of it (`norm_y <= c < norm_x => y < x`) and can never appear in the top `limit`.
-    fn refresh_chunk_norm_cutoff(&mut self) {
+    /// Incrementally updates `chunk_norm_cutoff` in O(log k) when a new spilled chunk arrives
+    /// under `ORDER BY ... LIMIT`, maintaining a max-heap of the lowest-`last_norm` chunks whose
+    /// combined row count covers `output_limit`.
+    fn record_chunk_for_cutoff(&mut self, last_norm: u64, row_count: usize) -> Result<()> {
         let Some(limit) = self.output_limit.filter(|&l| l > 0) else {
-            self.chunk_norm_cutoff = None;
-            return;
+            return Ok(());
         };
-        let mut bounds: Vec<(u64, usize)> = self
-            .chunks
-            .iter()
-            .filter(|c| c.row_count > 0)
-            .map(|c| (c.last_norm, c.row_count))
-            .collect();
-        bounds.sort_unstable_by_key(|&(last, _)| last);
-        let mut seen = 0usize;
-        let mut cutoff = None;
-        for (last, count) in bounds {
-            seen = seen.saturating_add(count);
-            if seen >= limit {
-                cutoff = Some(last);
-                break;
+        if row_count == 0 {
+            return Ok(());
+        }
+        let qualifies = self.cutoff_rows < limit
+            || self
+                .cutoff_heap
+                .peek()
+                .is_some_and(|&(top_norm, _)| last_norm < top_norm);
+        if qualifies {
+            self.cutoff_heap.try_push((last_norm, Reverse(row_count)))?;
+            self.cutoff_rows = self.cutoff_rows.saturating_add(row_count);
+            while let Some(&(_, Reverse(top_rows))) = self.cutoff_heap.peek() {
+                if self.cutoff_rows.saturating_sub(top_rows) >= limit {
+                    let _ = self.cutoff_heap.pop();
+                    self.cutoff_rows = self.cutoff_rows.saturating_sub(top_rows);
+                } else {
+                    break;
+                }
+            }
+            if self.cutoff_rows >= limit {
+                self.chunk_norm_cutoff = self.cutoff_heap.peek().map(|&(norm, _)| norm);
             }
         }
-        self.chunk_norm_cutoff = cutoff;
+        Ok(())
     }
 
     /// Drops spilled chunks whose entire key range lies strictly beyond `chunk_norm_cutoff`.
     /// Preserves the relative order of surviving chunks so equal-key FIFO stability is intact.
     fn prune_losing_chunks(&mut self) {
-        self.refresh_chunk_norm_cutoff();
         if let Some(cutoff) = self.chunk_norm_cutoff {
             self.chunks
                 .retain(|c| c.row_count > 0 && c.first_norm <= cutoff);
@@ -1945,95 +2024,61 @@ impl Sorter {
             .saturating_mul(2)
     }
 
-    fn needs_compaction(&self) -> bool {
-        let min_chunks = if self.output_limit.is_some() { 2 } else { 3 };
-        if self.chunks.len() < min_chunks {
-            return false;
-        }
-        let total_cost = self
-            .chunks
-            .iter()
-            .map(Self::chunk_open_cost)
-            .fold(0usize, usize::saturating_add);
-        total_cost > self.max_buffer_size
-    }
-
-    /// Picks a contiguous range `start..start+len` (`len >= 2`) to merge into one compacted chunk,
-    /// preserving chunk arrival order across `self.chunks`.
-    ///
-    /// - For ordinary `ORDER BY` (`output_limit.is_none()`): selects by `(max_pass, combined_bytes)`
-    ///   so runs merge in a balanced tree pass-by-pass (`O(N log_k N)` total I/O, allowing each
-    ///   completed pass's temp file to unlink immediately so live scratch space stays `O(N)`).
-    /// - For `ORDER BY ... LIMIT` (`output_limit.is_some()`): prioritizes lowest open-buffer cost
-    ///   first so a small winning run absorbs oversized losing runs and sheds losing rows right
-    ///   away, then breaks ties by `(max_pass, combined_bytes)` to avoid quadratic rewrites.
-    fn choose_compaction_range(&self) -> (usize, usize) {
-        let n = self.chunks.len();
-        debug_assert!(n >= 2);
-        let mut best_start = 0usize;
-        let mut best_key = (usize::MAX, u32::MAX, u32::MAX, usize::MAX);
-        for i in 0..n.saturating_sub(1) {
-            let a = &self.chunks[i];
-            let b = &self.chunks[i + 1];
-            let open_cost = if self.output_limit.is_some() {
-                Self::chunk_open_cost(a).saturating_add(Self::chunk_open_cost(b))
-            } else {
-                0
-            };
-            let max_pass = a.pass.max(b.pass);
-            let min_pass = a.pass.min(b.pass);
-            let combined_bytes = a.chunk_size.saturating_add(b.chunk_size);
-            let key = (open_cost, max_pass, min_pass, combined_bytes);
-            if key < best_key {
-                best_key = key;
-                best_start = i;
-            }
-        }
-        let target_pass = best_key.1;
-        let mut len = 2usize;
-        let mut sum_open = Self::chunk_open_cost(&self.chunks[best_start])
-            .saturating_add(Self::chunk_open_cost(&self.chunks[best_start + 1]));
-        while best_start + len < n {
-            let next = &self.chunks[best_start + len];
-            if self.output_limit.is_none() && next.pass > target_pass {
-                break;
-            }
-            let next_cost = Self::chunk_open_cost(next);
-            if sum_open.saturating_add(next_cost) > self.max_buffer_size {
-                break;
-            }
-            sum_open = sum_open.saturating_add(next_cost);
-            len += 1;
-        }
-        (best_start, len)
-    }
-
     /// Runs bounded-fan-in multi-pass chunk compaction until the remaining chunks fit within
     /// `max_buffer_size` (or cannot be reduced further), truncating every compacted run to
     /// `output_limit` so losing rows are shed before `init_chunk_heap` allocates merge buffers.
-    fn compact_chunks(&mut self) -> IOResultOr<()> {
+    ///
+    /// Uses `CompactionQueue` (O(1) FIFO queue for ordinary `ORDER BY`, O(log k) indexed min-heap
+    /// for `ORDER BY ... LIMIT`) so scheduling across `k` spilled runs stays linear / log-linear
+    /// with zero quadratic per-merge scans or `Vec` shifts, and honors `check_interrupt` before
+    /// every merge and compaction write batch.
+    fn compact_chunks(&mut self, check_interrupt: &mut impl FnMut() -> bool) -> IOResultOr<()> {
         // Initial flushing is finished once we enter compaction; drop `self.temp_file` so pass-0's
         // temp file is owned solely by pass-0 chunks and unlinks as soon as pass-0 finishes.
         self.temp_file = None;
         self.next_chunk_offset = 0;
-        loop {
-            if self.compaction.is_none() {
+
+        if self.compaction_queue.is_none() && self.compaction.is_none() {
+            if self.output_limit.is_some() {
                 self.prune_losing_chunks();
-                if !self.needs_compaction() {
+            }
+            let min_chunks = if self.output_limit.is_some() { 2 } else { 3 };
+            let total_cost = self
+                .chunks
+                .iter()
+                .map(Self::chunk_open_cost)
+                .fold(0usize, usize::saturating_add);
+            if self.chunks.len() < min_chunks || total_cost <= self.max_buffer_size {
+                self.compaction_file = None;
+                return Ok(IOResult::Done(()));
+            }
+            let chunks = std::mem::take(&mut self.chunks);
+            let queue = if self.output_limit.is_some() {
+                CompactionQueue::new_min_cost(chunks)?
+            } else {
+                CompactionQueue::new_fifo(chunks, total_cost)
+            };
+            self.compaction_queue = Some(queue);
+        }
+
+        loop {
+            if check_interrupt() {
+                return Err(LimboError::Interrupt.into());
+            }
+            if self.compaction.is_none() {
+                let next_batch = match self.compaction_queue.as_mut() {
+                    Some(queue) => queue.pop_batch(self.max_buffer_size, self.chunk_norm_cutoff)?,
+                    None => None,
+                };
+                let Some((out_pass, inputs)) = next_batch else {
+                    if let Some(queue) = self.compaction_queue.take() {
+                        queue.drain_into(&mut self.chunks, self.chunk_norm_cutoff)?;
+                    }
                     self.compaction_file = None;
                     return Ok(IOResult::Done(()));
-                }
-                let (start, len) = self.choose_compaction_range();
-                let out_pass = self.chunks[start..start + len]
-                    .iter()
-                    .map(|c| c.pass)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
+                };
                 let (out_temp_file, out_offset) = self.open_compaction_file(out_pass)?;
-                let inputs: Vec<SortedChunk> = self.chunks.drain(start..start + len).collect();
                 let mut compaction = ChunkCompaction::new(
-                    start,
                     out_pass,
                     inputs,
                     out_temp_file,
@@ -2077,6 +2122,7 @@ impl Sorter {
                 &self.comparators,
                 self.max_buffer_size,
                 &mut offset_slot,
+                check_interrupt,
             );
             if let Some((_, _, off)) = self.compaction_file.as_mut() {
                 *off = offset_slot;
@@ -2088,12 +2134,27 @@ impl Sorter {
                 }
                 Err(err) => {
                     self.compaction_file = None;
+                    self.compaction_queue = None;
                     return Err(err);
                 }
                 Ok(IOResult::Done(out_chunk)) => {
-                    let insert_at = comp.insert_at.min(self.chunks.len());
                     if out_chunk.row_count > 0 {
-                        self.chunks.insert(insert_at, out_chunk);
+                        if let Some(limit) = self.output_limit.filter(|&l| l > 0) {
+                            if out_chunk.row_count >= limit
+                                && self
+                                    .chunk_norm_cutoff
+                                    .is_none_or(|c| out_chunk.last_norm < c)
+                            {
+                                self.chunk_norm_cutoff = Some(out_chunk.last_norm);
+                            }
+                        }
+                        if let Some(queue) = self.compaction_queue.as_mut() {
+                            queue.push_result(out_chunk)?;
+                        } else {
+                            self.chunks.try_push(out_chunk)?;
+                        }
+                    } else if let Some(queue) = self.compaction_queue.as_mut() {
+                        queue.finish_empty_result()?;
                     }
                 }
             }
@@ -2281,7 +2342,17 @@ impl Sorter {
 
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) -> IOResultOr<()> {
+        self.sort_with_interrupt(&mut || false)
+    }
+
+    pub fn sort_with_interrupt(
+        &mut self,
+        check_interrupt: &mut impl FnMut() -> bool,
+    ) -> IOResultOr<()> {
         loop {
+            if check_interrupt() {
+                return Err(LimboError::Interrupt.into());
+            }
             match self.sort_state {
                 SortState::Start => {
                     let _ = return_if_io!(self.poll_pending_demote());
@@ -2297,6 +2368,7 @@ impl Sorter {
                             self.key_len,
                             &self.index_key_info,
                             &self.comparators,
+                            check_interrupt,
                         ));
                         self.sort_state = SortState::Next;
                     } else if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
@@ -2346,7 +2418,7 @@ impl Sorter {
                         }),
                         "chunks should been written"
                     );
-                    return_if_io!(self.compact_chunks());
+                    return_if_io!(self.compact_chunks(check_interrupt));
                     self.sort_state = SortState::InitHeap;
                 }
                 SortState::InitHeap => {
@@ -2721,9 +2793,11 @@ impl Sorter {
             chunk.first_norm = unsafe { first.as_ref().norm_key };
             chunk.last_norm = unsafe { last.as_ref().norm_key };
         }
+        let last_norm = chunk.last_norm;
+        let row_count = chunk.row_count;
         let c = chunk.write(&self.records, record_size_lengths, chunk_size)?;
         self.chunks.try_push(chunk)?;
-        self.refresh_chunk_norm_cutoff();
+        self.record_chunk_for_cutoff(last_norm, row_count)?;
 
         self.records.clear();
         if self.arena.allocated_bytes() > self.max_buffer_size {
@@ -2782,10 +2856,524 @@ enum NextState {
 /// Incomplete records at the end of the buffer are kept (buffer compacted) until
 /// more data is read to complete them.
 /// Async-IO-driven bounded-fan-in merge of a contiguous slice of `SortedChunk`s into a single
+struct LinkedChunk {
+    chunk: Option<SortedChunk>,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+type AdjacentPairKey = Reverse<(usize, u32, u32, usize, usize, usize)>;
+
+/// Run scheduler for multi-pass chunk compaction:
+/// - `Fifo`: O(1) two-queue (`current_pass` / `next_pass`) pass-by-pass scheduler for ordinary
+///   `ORDER BY`. Every merge combines strictly contiguous chunks in arrival order (folding any
+///   trailing single-chunk pass straggler with `next_pass.pop_back()`), preserving exact equal-key
+///   FIFO stability, unlinking each completed pass's scratch file immediately, and doing O(1) work
+///   per merge with zero linear scans or `Vec` shifts.
+/// - `MinCost`: O(log k) doubly-linked adjacent-pair min-heap ordered by
+///   `(pair_open_cost, max_pass, min_pass, pair_bytes, left_idx, right_idx)` for
+///   `ORDER BY ... LIMIT` so small winning runs absorb adjacent oversized losing runs first while
+///   strictly merging only contiguous arrival-order chains (preserving exact equal-key arrival
+///   order for `LIMIT ... OFFSET ...` pagination with zero quadratic scans).
+enum CompactionQueue {
+    Fifo {
+        current_pass: VecDeque<SortedChunk>,
+        next_pass: VecDeque<SortedChunk>,
+        total_open_cost: usize,
+    },
+    MinCost {
+        head: Option<usize>,
+        slots: Vec<LinkedChunk>,
+        heap: BinaryHeap<AdjacentPairKey>,
+        pending_splice: Option<(Option<usize>, Option<usize>)>,
+        live_count: usize,
+        total_open_cost: usize,
+    },
+}
+
+impl CompactionQueue {
+    fn new_fifo(chunks: Vec<SortedChunk>, total_open_cost: usize) -> Self {
+        Self::Fifo {
+            current_pass: VecDeque::from(chunks),
+            next_pass: VecDeque::new(),
+            total_open_cost,
+        }
+    }
+
+    fn pair_key(slots: &[LinkedChunk], left: usize, right: usize) -> Option<AdjacentPairKey> {
+        let a = slots.get(left)?.chunk.as_ref()?;
+        let b = slots.get(right)?.chunk.as_ref()?;
+        let open_cost = Sorter::chunk_open_cost(a).saturating_add(Sorter::chunk_open_cost(b));
+        let max_pass = a.pass.max(b.pass);
+        let min_pass = a.pass.min(b.pass);
+        let bytes = a.chunk_size.saturating_add(b.chunk_size);
+        Some(Reverse((open_cost, max_pass, min_pass, bytes, left, right)))
+    }
+
+    fn new_min_cost(chunks: Vec<SortedChunk>) -> Result<Self> {
+        let n = chunks.len();
+        let mut slots: Vec<LinkedChunk> = Vec::new();
+        slots
+            .try_reserve_exact(n)
+            .map_err(|_| LimboError::OutOfMemory)?;
+        let mut total_open_cost = 0usize;
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            total_open_cost = total_open_cost.saturating_add(Sorter::chunk_open_cost(&chunk));
+            slots.push(LinkedChunk {
+                chunk: Some(chunk),
+                prev: idx.checked_sub(1),
+                next: (idx + 1 < n).then_some(idx + 1),
+            });
+        }
+        let mut heap: BinaryHeap<AdjacentPairKey> = TursoAllocExt::new();
+        heap.try_reserve(n.saturating_sub(1))?;
+        for idx in 0..n.saturating_sub(1) {
+            if let Some(key) = Self::pair_key(&slots, idx, idx + 1) {
+                heap.try_push(key)?;
+            }
+        }
+        Ok(Self::MinCost {
+            head: (n > 0).then_some(0),
+            slots,
+            heap,
+            pending_splice: None,
+            live_count: n,
+            total_open_cost,
+        })
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        let chunk_mem = |c: &SortedChunk| {
+            c.buffer
+                .read()
+                .capacity()
+                .saturating_add(c.staged.as_ref().map_or(0, |r| r.as_blob().capacity()))
+        };
+        match self {
+            Self::Fifo {
+                current_pass,
+                next_pass,
+                ..
+            } => current_pass
+                .capacity()
+                .saturating_add(next_pass.capacity())
+                .saturating_mul(std::mem::size_of::<SortedChunk>())
+                .saturating_add(
+                    current_pass
+                        .iter()
+                        .chain(next_pass.iter())
+                        .map(chunk_mem)
+                        .fold(0usize, usize::saturating_add),
+                ),
+            Self::MinCost { slots, heap, .. } => slots
+                .capacity()
+                .saturating_mul(std::mem::size_of::<LinkedChunk>())
+                .saturating_add(
+                    heap.capacity()
+                        .saturating_mul(std::mem::size_of::<AdjacentPairKey>()),
+                )
+                .saturating_add(
+                    slots
+                        .iter()
+                        .filter_map(|s| s.chunk.as_ref())
+                        .map(chunk_mem)
+                        .fold(0usize, usize::saturating_add),
+                ),
+        }
+    }
+
+    #[cfg(test)]
+    fn visit_temp_files(&self, mut f: impl FnMut(&Arc<TempFile>)) {
+        match self {
+            Self::Fifo {
+                current_pass,
+                next_pass,
+                ..
+            } => {
+                for chunk in current_pass.iter().chain(next_pass.iter()) {
+                    f(&chunk._temp_file);
+                }
+            }
+            Self::MinCost { slots, .. } => {
+                for chunk in slots.iter().filter_map(|s| s.chunk.as_ref()) {
+                    f(&chunk._temp_file);
+                }
+            }
+        }
+    }
+
+    fn unlink_pruned(
+        head: &mut Option<usize>,
+        slots: &mut [LinkedChunk],
+        heap: &mut BinaryHeap<AdjacentPairKey>,
+        live_count: &mut usize,
+        total_open_cost: &mut usize,
+        idx: usize,
+    ) -> Result<()> {
+        let (prev, next, cost) = {
+            let Some(slot) = slots.get_mut(idx) else {
+                return Ok(());
+            };
+            let Some(chunk) = slot.chunk.take() else {
+                return Ok(());
+            };
+            let cost = Sorter::chunk_open_cost(&chunk);
+            let prev = slot.prev.take();
+            let next = slot.next.take();
+            (prev, next, cost)
+        };
+        *live_count = live_count.saturating_sub(1);
+        *total_open_cost = total_open_cost.saturating_sub(cost);
+        if let Some(p) = prev {
+            if let Some(ps) = slots.get_mut(p) {
+                ps.next = next;
+            }
+        } else {
+            *head = next;
+        }
+        if let Some(n) = next {
+            if let Some(ns) = slots.get_mut(n) {
+                ns.prev = prev;
+            }
+        }
+        if let (Some(p), Some(n)) = (prev, next) {
+            if let Some(key) = Self::pair_key(slots, p, n) {
+                heap.try_push(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pop_batch(
+        &mut self,
+        max_buffer_size: usize,
+        cutoff: Option<u64>,
+    ) -> Result<Option<(u32, Vec<SortedChunk>)>> {
+        match self {
+            Self::Fifo {
+                current_pass,
+                next_pass,
+                total_open_cost,
+            } => {
+                let live = current_pass.len().saturating_add(next_pass.len());
+                if live < 3 || *total_open_cost <= max_buffer_size {
+                    return Ok(None);
+                }
+                if current_pass.is_empty() {
+                    std::mem::swap(current_pass, next_pass);
+                }
+                if current_pass.len() == 1 {
+                    // Fold the single trailing pass-p straggler with the immediately preceding
+                    // contiguous chunk (`next_pass.pop_back()`), preserving strict arrival order
+                    // while retiring pass p's scratch file before pass p+1 begins.
+                    let Some(prev) = next_pass.pop_back() else {
+                        return Ok(None);
+                    };
+                    let Some(tail) = current_pass.pop_front() else {
+                        next_pass.push_back(prev);
+                        return Ok(None);
+                    };
+                    let prev_cost = Sorter::chunk_open_cost(&prev);
+                    let tail_cost = Sorter::chunk_open_cost(&tail);
+                    *total_open_cost = total_open_cost
+                        .saturating_sub(prev_cost)
+                        .saturating_sub(tail_cost);
+                    let out_pass = prev.pass.max(tail.pass).saturating_add(1);
+                    let mut inputs = Vec::new();
+                    inputs.try_reserve(2).map_err(|_| LimboError::OutOfMemory)?;
+                    inputs.push(prev);
+                    inputs.push(tail);
+                    return Ok(Some((out_pass, inputs)));
+                }
+                let Some(first) = current_pass.pop_front() else {
+                    return Ok(None);
+                };
+                let Some(second) = current_pass.pop_front() else {
+                    current_pass.push_front(first);
+                    return Ok(None);
+                };
+                let first_cost = Sorter::chunk_open_cost(&first);
+                let second_cost = Sorter::chunk_open_cost(&second);
+                *total_open_cost = total_open_cost
+                    .saturating_sub(first_cost)
+                    .saturating_sub(second_cost);
+                let target_pass = first.pass.max(second.pass);
+                let mut sum_open = first_cost.saturating_add(second_cost);
+                let mut inputs = Vec::new();
+                inputs.try_reserve(2).map_err(|_| LimboError::OutOfMemory)?;
+                inputs.push(first);
+                inputs.push(second);
+                while let Some(front) = current_pass.front() {
+                    let next_cost = Sorter::chunk_open_cost(front);
+                    if sum_open.saturating_add(next_cost) > max_buffer_size {
+                        break;
+                    }
+                    if let Some(chunk) = current_pass.pop_front() {
+                        *total_open_cost = total_open_cost.saturating_sub(next_cost);
+                        sum_open = sum_open.saturating_add(next_cost);
+                        inputs.try_push(chunk)?;
+                    }
+                }
+                Ok(Some((target_pass.saturating_add(1), inputs)))
+            }
+            Self::MinCost {
+                head,
+                slots,
+                heap,
+                pending_splice,
+                live_count,
+                total_open_cost,
+            } => {
+                while *live_count >= 2 && *total_open_cost > max_buffer_size {
+                    let Some(Reverse((_, _, _, _, left, right))) = heap.pop() else {
+                        return Ok(None);
+                    };
+                    let still_adjacent = slots
+                        .get(left)
+                        .is_some_and(|l| l.chunk.is_some() && l.next == Some(right))
+                        && slots.get(right).is_some_and(|r| r.chunk.is_some());
+                    if !still_adjacent {
+                        continue;
+                    }
+                    // Lazily prune losing chunks past `cutoff` while maintaining adjacency links.
+                    if let Some(c) = cutoff {
+                        let left_loses = slots[left]
+                            .chunk
+                            .as_ref()
+                            .is_some_and(|ch| ch.first_norm > c);
+                        if left_loses {
+                            Self::unlink_pruned(
+                                head,
+                                slots,
+                                heap,
+                                live_count,
+                                total_open_cost,
+                                left,
+                            )?;
+                            continue;
+                        }
+                        let right_loses = slots[right]
+                            .chunk
+                            .as_ref()
+                            .is_some_and(|ch| ch.first_norm > c);
+                        if right_loses {
+                            Self::unlink_pruned(
+                                head,
+                                slots,
+                                heap,
+                                live_count,
+                                total_open_cost,
+                                right,
+                            )?;
+                            continue;
+                        }
+                    }
+
+                    // Detach contiguous chain starting at `left -> right`, extending rightward
+                    // while open costs fit within `max_buffer_size`.
+                    let before = slots[left].prev;
+                    let mut rightmost = right;
+                    let mut inputs = Vec::new();
+                    inputs.try_reserve(2).map_err(|_| LimboError::OutOfMemory)?;
+                    let Some(first) = slots[left].chunk.take() else {
+                        continue;
+                    };
+                    let Some(second) = slots[right].chunk.take() else {
+                        slots[left].chunk = Some(first);
+                        continue;
+                    };
+                    let first_cost = Sorter::chunk_open_cost(&first);
+                    let second_cost = Sorter::chunk_open_cost(&second);
+                    let mut sum_open = first_cost.saturating_add(second_cost);
+                    let mut max_pass = first.pass.max(second.pass);
+                    *live_count = live_count.saturating_sub(2);
+                    *total_open_cost = total_open_cost
+                        .saturating_sub(first_cost)
+                        .saturating_sub(second_cost);
+                    slots[left].prev = None;
+                    slots[left].next = None;
+                    slots[right].prev = None;
+                    inputs.push(first);
+                    inputs.push(second);
+
+                    while let Some(next_idx) = slots[rightmost].next {
+                        if let Some(c) = cutoff {
+                            let next_loses = slots[next_idx]
+                                .chunk
+                                .as_ref()
+                                .is_some_and(|ch| ch.first_norm > c);
+                            if next_loses {
+                                Self::unlink_pruned(
+                                    head,
+                                    slots,
+                                    heap,
+                                    live_count,
+                                    total_open_cost,
+                                    next_idx,
+                                )?;
+                                continue;
+                            }
+                        }
+                        let Some(next_ref) = slots[next_idx].chunk.as_ref() else {
+                            break;
+                        };
+                        let next_cost = Sorter::chunk_open_cost(next_ref);
+                        if sum_open.saturating_add(next_cost) > max_buffer_size {
+                            break;
+                        }
+                        let Some(chunk) = slots[next_idx].chunk.take() else {
+                            break;
+                        };
+                        slots[rightmost].next = None;
+                        slots[next_idx].prev = None;
+                        rightmost = next_idx;
+                        *live_count = live_count.saturating_sub(1);
+                        *total_open_cost = total_open_cost.saturating_sub(next_cost);
+                        sum_open = sum_open.saturating_add(next_cost);
+                        max_pass = max_pass.max(chunk.pass);
+                        inputs.try_push(chunk)?;
+                    }
+                    let after = slots[rightmost].next.take();
+                    *pending_splice = Some((before, after));
+                    return Ok(Some((max_pass.saturating_add(1), inputs)));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn push_result(&mut self, chunk: SortedChunk) -> Result<()> {
+        let cost = Sorter::chunk_open_cost(&chunk);
+        match self {
+            Self::Fifo {
+                next_pass,
+                total_open_cost,
+                ..
+            } => {
+                *total_open_cost = total_open_cost.saturating_add(cost);
+                next_pass
+                    .try_reserve(1)
+                    .map_err(|_| LimboError::OutOfMemory)?;
+                next_pass.push_back(chunk);
+                Ok(())
+            }
+            Self::MinCost {
+                head,
+                slots,
+                heap,
+                pending_splice,
+                live_count,
+                total_open_cost,
+            } => {
+                let (before, after) = pending_splice.take().unwrap_or((None, None));
+                let idx = slots.len();
+                slots.try_push(LinkedChunk {
+                    chunk: Some(chunk),
+                    prev: before,
+                    next: after,
+                })?;
+                if let Some(b) = before {
+                    if let Some(bs) = slots.get_mut(b) {
+                        bs.next = Some(idx);
+                    }
+                } else {
+                    *head = Some(idx);
+                }
+                if let Some(a) = after {
+                    if let Some(aslot) = slots.get_mut(a) {
+                        aslot.prev = Some(idx);
+                    }
+                }
+                *live_count = live_count.saturating_add(1);
+                *total_open_cost = total_open_cost.saturating_add(cost);
+                if let Some(b) = before {
+                    if let Some(key) = Self::pair_key(slots, b, idx) {
+                        heap.try_push(key)?;
+                    }
+                }
+                if let Some(a) = after {
+                    if let Some(key) = Self::pair_key(slots, idx, a) {
+                        heap.try_push(key)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn finish_empty_result(&mut self) -> Result<()> {
+        if let Self::MinCost {
+            head,
+            slots,
+            heap,
+            pending_splice,
+            ..
+        } = self
+        {
+            if let Some((before, after)) = pending_splice.take() {
+                if let Some(b) = before {
+                    if let Some(bs) = slots.get_mut(b) {
+                        bs.next = after;
+                    }
+                } else {
+                    *head = after;
+                }
+                if let Some(a) = after {
+                    if let Some(aslot) = slots.get_mut(a) {
+                        aslot.prev = before;
+                    }
+                }
+                if let (Some(b), Some(a)) = (before, after) {
+                    if let Some(key) = Self::pair_key(slots, b, a) {
+                        heap.try_push(key)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_into(self, dst: &mut Vec<SortedChunk>, cutoff: Option<u64>) -> Result<()> {
+        match self {
+            Self::Fifo {
+                current_pass,
+                next_pass,
+                ..
+            } => {
+                // `next_pass` holds merged earlier intervals from the front of `current_pass`,
+                // followed by any unmerged tail still in `current_pass`.
+                for chunk in next_pass.into_iter().chain(current_pass) {
+                    if cutoff.is_none_or(|c| chunk.first_norm <= c) {
+                        dst.try_push(chunk)?;
+                    }
+                }
+            }
+            Self::MinCost {
+                head, mut slots, ..
+            } => {
+                // Walk the doubly-linked list from `head` to emit surviving runs in strict
+                // arrival order so equal-key ties (and `LIMIT ... OFFSET ...`) remain exact.
+                let mut cur = head;
+                while let Some(idx) = cur {
+                    let Some(slot) = slots.get_mut(idx) else {
+                        break;
+                    };
+                    cur = slot.next;
+                    if let Some(chunk) = slot.chunk.take() {
+                        if cutoff.is_none_or(|c| chunk.first_norm <= c) {
+                            dst.try_push(chunk)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// replacement `SortedChunk` on disk. Streams output in bounded write buffers (`<= max_buffer_size`
 /// unless a single record exceeds `max_buffer_size`) and truncates at `row_limit` when set.
 struct ChunkCompaction {
-    insert_at: usize,
     out_pass: u32,
     inputs: Vec<SortedChunk>,
     heap: BinaryHeap<(Reverse<Box<BoxedSortableRecord>>, Reverse<usize>)>,
@@ -2806,7 +3394,6 @@ struct ChunkCompaction {
 
 impl ChunkCompaction {
     fn new(
-        insert_at: usize,
         out_pass: u32,
         inputs: Vec<SortedChunk>,
         out_temp_file: Arc<TempFile>,
@@ -2817,7 +3404,6 @@ impl ChunkCompaction {
             TursoAllocExt::new();
         heap.try_reserve(inputs.len())?;
         Ok(Self {
-            insert_at,
             out_pass,
             inputs,
             heap,
@@ -2838,17 +3424,36 @@ impl ChunkCompaction {
     }
 
     fn allocated_bytes(&self) -> usize {
-        let input_bytes: usize = self
-            .inputs
-            .iter()
-            .map(|c| {
-                c.buffer
-                    .read()
-                    .capacity()
-                    .saturating_add(c.staged.as_ref().map_or(0, |r| r.as_blob().capacity()))
-            })
-            .sum();
-        input_bytes.saturating_add(self.write_buf.capacity())
+        let input_bytes: usize =
+            self.inputs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SortedChunk>())
+                .saturating_add(
+                    self.inputs
+                        .iter()
+                        .map(|c| {
+                            c.buffer.read().capacity().saturating_add(
+                                c.staged.as_ref().map_or(0, |r| r.as_blob().capacity()),
+                            )
+                        })
+                        .fold(0usize, usize::saturating_add),
+                );
+        let heap_bytes: usize = self
+            .heap
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(
+                Reverse<Box<BoxedSortableRecord>>,
+                Reverse<usize>,
+            )>())
+            .saturating_add(
+                self.heap
+                    .iter()
+                    .map(|(Reverse(rec), _)| rec.record.as_blob().capacity())
+                    .fold(0usize, usize::saturating_add),
+            );
+        input_bytes
+            .saturating_add(heap_bytes)
+            .saturating_add(self.write_buf.capacity())
     }
 
     fn push_input(
@@ -2946,8 +3551,12 @@ impl ChunkCompaction {
         comparators: &Rc<Vec<Option<SortComparator>>>,
         max_buffer_size: usize,
         next_chunk_offset: &mut usize,
+        check_interrupt: &mut impl FnMut() -> bool,
     ) -> IOResultOr<SortedChunk> {
         loop {
+            if check_interrupt() {
+                return Err(LimboError::Interrupt.into());
+            }
             if let Some((completion, write_err)) = self.pending_write.take() {
                 if !completion.succeeded() {
                     self.pending_write = Some((completion.clone(), write_err));
@@ -5701,6 +6310,9 @@ mod tests {
                     account(&chunk._temp_file);
                 }
             }
+            if let Some(queue) = sorter.compaction_queue.as_ref() {
+                queue.visit_temp_files(&mut account);
+            }
             total
         };
 
@@ -5769,5 +6381,563 @@ mod tests {
             let expected: Vec<i64> = (0..row_count as i64).collect();
             assert_eq!(got, expected, "row_count={row_count}: sort order mismatch");
         }
+    }
+
+    /// Review Standards P2 regression: a spilling `ORDER BY` interrupted at its first merge must
+    /// abort immediately with `StepResult::Interrupt` on both SQLite and PostgreSQL dialects
+    /// instead of writing remaining merge passes and returning all rows successfully; and
+    /// `CompactionQueue` scheduling scales cleanly to many spilled runs without quadratic scans.
+    #[test]
+    fn review_p2_spilling_order_by_honors_interrupt_at_first_merge_without_extra_scratch() {
+        use crate::io::{File, OpenFlags};
+        use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+        use crate::{ConnectOpts, Database, Dialect, PostgresDialect, SqliteDialect, StepResult};
+
+        struct InterruptOnMergeFile {
+            inner: Arc<dyn File>,
+            temp_bytes_written: Arc<AtomicUsize>,
+            interrupt_after_bytes: usize,
+            interrupted: Arc<AtomicBool>,
+            on_interrupt: Arc<dyn Fn() + Send + Sync>,
+        }
+
+        impl File for InterruptOnMergeFile {
+            fn lock_file(&self, exclusive: bool) -> Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+                // First merge reads back a spilled chunk: fire interrupt as soon as spill bytes
+                // have been written and compaction begins reading them.
+                if self.temp_bytes_written.load(AtomicOrdering::SeqCst)
+                    >= self.interrupt_after_bytes
+                    && !self.interrupted.swap(true, AtomicOrdering::SeqCst)
+                {
+                    (self.on_interrupt)();
+                }
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+                self.temp_bytes_written
+                    .fetch_add(buffer.len(), AtomicOrdering::SeqCst);
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(
+                &self,
+                c: Completion,
+                sync_type: crate::io::FileSyncType,
+            ) -> Result<Completion> {
+                self.inner.sync(c, sync_type)
+            }
+            fn size(&self) -> Result<u64> {
+                self.inner.size()
+            }
+            fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+                self.inner.truncate(len, c)
+            }
+        }
+
+        type InterruptHook = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+        struct CountingTempIO {
+            inner: Arc<crate::PlatformIO>,
+            temp_bytes_written: Arc<AtomicUsize>,
+            interrupt_after_bytes: usize,
+            interrupted: Arc<AtomicBool>,
+            on_interrupt: InterruptHook,
+        }
+
+        impl crate::io::Clock for CountingTempIO {
+            fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+                self.inner.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+                self.inner.current_time_wall_clock()
+            }
+        }
+
+        impl IO for CountingTempIO {
+            fn open_file(
+                &self,
+                path: &str,
+                flags: OpenFlags,
+                direct: bool,
+            ) -> Result<Arc<dyn File>> {
+                let inner = self.inner.open_file(path, flags, direct)?;
+                if path.contains("turso_temp")
+                    || path.contains("amphora")
+                    || (!path.ends_with(".db") && !path.contains("-wal"))
+                {
+                    if let Some(cb) = self.on_interrupt.read().clone() {
+                        return Ok(Arc::new(InterruptOnMergeFile {
+                            inner,
+                            temp_bytes_written: self.temp_bytes_written.clone(),
+                            interrupt_after_bytes: self.interrupt_after_bytes,
+                            interrupted: self.interrupted.clone(),
+                            on_interrupt: cb,
+                        }));
+                    }
+                }
+                Ok(inner)
+            }
+            fn remove_file(&self, path: &str) -> Result<()> {
+                self.inner.remove_file(path)
+            }
+            fn step(&self) -> Result<()> {
+                self.inner.step()
+            }
+        }
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(if is_pg {
+                "pg_cancel.db"
+            } else {
+                "sqlite_cancel.db"
+            });
+            let temp_bytes = Arc::new(AtomicUsize::new(0));
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let on_interrupt: InterruptHook = Arc::new(RwLock::new(None));
+            let io: Arc<dyn IO> = Arc::new(CountingTempIO {
+                inner: Arc::new(crate::PlatformIO::new().unwrap()),
+                temp_bytes_written: temp_bytes.clone(),
+                interrupt_after_bytes: 12 * 112 * 1024,
+                interrupted: interrupted.clone(),
+                on_interrupt: on_interrupt.clone(),
+            });
+            let dialect: Arc<dyn Dialect> = if is_pg {
+                Arc::new(PostgresDialect::new())
+            } else {
+                Arc::new(SqliteDialect)
+            };
+            let db = Database::open_file(io.clone(), db_path.to_str().unwrap(), dialect).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if is_pg {
+                conn.execute("CREATE TABLE big(k int8, payload bytea)")
+                    .unwrap();
+            } else {
+                conn.execute("CREATE TABLE big(k INTEGER, payload BLOB)")
+                    .unwrap();
+            }
+            let blob = std::vec![b'z'; 112 * 1024];
+            let mut ins = conn
+                .prepare("INSERT INTO big(k, payload) VALUES (?, ?)")
+                .unwrap();
+            for i in (0..12i64).rev() {
+                ins.reset().unwrap();
+                ins.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(i))
+                    .unwrap();
+                ins.bind_at(
+                    std::num::NonZero::new(2).unwrap(),
+                    Value::Blob(blob.clone()),
+                )
+                .unwrap();
+                while !matches!(ins.step().unwrap(), StepResult::Done) {
+                    io.step().unwrap();
+                }
+            }
+            // Force a small sort buffer (100 KiB) so 12 x 112 KiB rows spill and compact.
+            conn.execute("PRAGMA cache_size = -100").unwrap();
+
+            let bytes_at_interrupt = Arc::new(AtomicUsize::new(0));
+            let conn_cb = conn.clone();
+            let temp_bytes_cb = temp_bytes.clone();
+            let bytes_at_interrupt_cb = bytes_at_interrupt.clone();
+            *on_interrupt.write() = Some(Arc::new(move || {
+                bytes_at_interrupt_cb.store(
+                    temp_bytes_cb.load(AtomicOrdering::SeqCst),
+                    AtomicOrdering::SeqCst,
+                );
+                conn_cb.interrupt();
+            }));
+
+            let mut stmt = conn
+                .prepare("SELECT k, payload FROM big ORDER BY k")
+                .unwrap();
+            let mut got_interrupt = false;
+            let mut rows_seen = 0usize;
+            loop {
+                match stmt.step().unwrap() {
+                    StepResult::Interrupt => {
+                        got_interrupt = true;
+                        break;
+                    }
+                    StepResult::Row => {
+                        rows_seen += 1;
+                    }
+                    StepResult::Done => break,
+                    StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                    other => panic!("unexpected step result: {other:?}"),
+                }
+            }
+            assert!(
+                interrupted.load(AtomicOrdering::SeqCst),
+                "is_pg={is_pg}: test must trigger interrupt during first merge"
+            );
+            assert!(
+                got_interrupt,
+                "is_pg={is_pg}: spilling ORDER BY must return Interrupt, not finish with {rows_seen} rows"
+            );
+            assert_eq!(rows_seen, 0);
+            let written_after = temp_bytes
+                .load(AtomicOrdering::SeqCst)
+                .saturating_sub(bytes_at_interrupt.load(AtomicOrdering::SeqCst));
+            assert_eq!(
+                written_after, 0,
+                "is_pg={is_pg}: interrupted sort wrote {written_after} scratch bytes after cancellation"
+            );
+        }
+
+        // Also verify `CompactionQueue` handles 256 spilled runs cleanly without quadratic work.
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            4 * 1024,
+            1024,
+            io.clone(),
+            crate::TempStore::File,
+        )
+        .unwrap();
+        let pad = std::vec![b'm'; 4 * 1024];
+        for i in (0..256i64).rev() {
+            let rec =
+                ImmutableRecord::from_values(&[Value::from_i64(i), Value::Blob(pad.clone())], 2)
+                    .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        io.block(|| sorter.sort()).unwrap();
+        let mut got = Vec::with_capacity(256);
+        while sorter.has_more() {
+            let rec = sorter.record().unwrap();
+            let key = match rec.iter().unwrap().next().unwrap().unwrap() {
+                ValueRef::Numeric(crate::numeric::Numeric::Integer(v)) => v,
+                other => panic!("unexpected key: {other:?}"),
+            };
+            got.push(key);
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(got, (0..256i64).collect::<Vec<_>>());
+    }
+
+    /// Review Standards P3 regression: `SpilledTopK::release_file_slot` trims tail extents
+    /// directly without growing `free_slots`, coalesces adjacent extents, and returns `Result<()>`
+    /// so evicted extents are never silently lost.
+    #[test]
+    fn review_p3_spilled_top_k_release_file_slot_trims_tail_and_reuses_all_extents() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let tf = TempFile::with_temp_store(&io, crate::TempStore::Memory).unwrap();
+        let mut topk = SpilledTopK {
+            limit: 4,
+            max_key_bytes: 1024,
+            heap: Vec::new(),
+            sort_end: None,
+            plan_push_cursor: None,
+            sort_sift_cursor: None,
+            arrived: 0,
+            key_bytes: 0,
+            key_reader: TopKKeyReader::new(tf.file.clone()),
+            next_offset: 0,
+            free_slots: Vec::new(),
+            pending_write: None,
+            pending_read: None,
+        };
+        let (off0, cap0) = topk.reserve_file_slot(4096).unwrap();
+        let (off1, cap1) = topk.reserve_file_slot(4096).unwrap();
+        let (off2, cap2) = topk.reserve_file_slot(4096).unwrap();
+        assert_eq!(topk.next_offset, (cap0 + cap1 + cap2) as u64);
+
+        // Releasing the tail extent must trim `next_offset` without growing `free_slots`.
+        assert_eq!(topk.free_slots.capacity(), 0);
+        topk.release_file_slot(off2, cap2).unwrap();
+        assert_eq!(topk.free_slots.capacity(), 0);
+        assert_eq!(topk.next_offset, (cap0 + cap1) as u64);
+
+        // Releasing a non-tail extent records it in `free_slots`; releasing the new tail coalesces
+        // and trims the entire file watermark back to 0.
+        topk.release_file_slot(off0, cap0).unwrap();
+        assert_eq!(topk.free_slots, std::vec![(off0, cap0)]);
+        topk.release_file_slot(off1, cap1).unwrap();
+        assert!(topk.free_slots.is_empty());
+        assert_eq!(topk.next_offset, 0);
+    }
+
+    /// Review Round 7 Standards P2 regression: spilled pagination (`ORDER BY k LIMIT 65537 OFFSET 1`
+    /// and multi-run `LIMIT ... OFFSET ...`) must merge only contiguous arrival-order runs in
+    /// `CompactionQueue::MinCost` so tied rows keep their exact arrival order across both SQLite
+    /// and PostgreSQL dialects.
+    #[test]
+    fn review_p2_spilled_limit_offset_preserves_tied_arrival_order() {
+        use crate::{ConnectOpts, Database, Dialect, PostgresDialect, SqliteDialect, StepResult};
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(if is_pg {
+                "pg_limit_offset.db"
+            } else {
+                "sqlite_limit_offset.db"
+            });
+            let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+            let dialect: Arc<dyn Dialect> = if is_pg {
+                Arc::new(PostgresDialect::new())
+            } else {
+                Arc::new(SqliteDialect)
+            };
+            let db = Database::open_file(io.clone(), path.to_str().unwrap(), dialect).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if is_pg {
+                conn.execute("CREATE TABLE t(id int8, k int8, pad bytea)")
+                    .unwrap();
+            } else {
+                conn.execute("CREATE TABLE t(id INTEGER, k INTEGER, pad BLOB)")
+                    .unwrap();
+            }
+            let blob = std::vec![b't'; 112 * 1024];
+            let mut ins = conn
+                .prepare("INSERT INTO t(id, k, pad) VALUES (?, ?, ?)")
+                .unwrap();
+            let mut insert_row = |id: i64| {
+                ins.reset().unwrap();
+                ins.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(id))
+                    .unwrap();
+                ins.bind_at(std::num::NonZero::new(2).unwrap(), Value::from_i64(7))
+                    .unwrap();
+                ins.bind_at(
+                    std::num::NonZero::new(3).unwrap(),
+                    Value::Blob(blob.clone()),
+                )
+                .unwrap();
+                while !matches!(ins.step().unwrap(), StepResult::Done) {
+                    io.step().unwrap();
+                }
+            };
+            for id in 1..=3i64 {
+                insert_row(id);
+            }
+            conn.execute("PRAGMA cache_size = -100").unwrap();
+
+            let collect_ids = |sql: &str| -> Vec<i64> {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let mut out = Vec::new();
+                loop {
+                    match stmt.step().unwrap() {
+                        StepResult::Row => {
+                            out.push(stmt.row().unwrap().get::<i64>(0).unwrap());
+                        }
+                        StepResult::Done => break,
+                        StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                        other => panic!("unexpected step result: {other:?}"),
+                    }
+                }
+                out
+            };
+
+            assert_eq!(
+                collect_ids("SELECT id FROM t ORDER BY k"),
+                std::vec![1, 2, 3],
+                "is_pg={is_pg}: base ORDER BY must preserve arrival order"
+            );
+            assert_eq!(
+                collect_ids("SELECT id FROM t ORDER BY k LIMIT 65537 OFFSET 1"),
+                std::vec![2, 3],
+                "is_pg={is_pg}: spilled LIMIT 65537 OFFSET 1 must return [2, 3], not [1, 2]"
+            );
+
+            // Multi-pass compaction with 12 tied runs: OFFSET 3 must return [4..=12].
+            for id in 4..=12i64 {
+                insert_row(id);
+            }
+            assert_eq!(
+                collect_ids("SELECT id FROM t ORDER BY k LIMIT 65537 OFFSET 3"),
+                (4..=12i64).collect::<Vec<_>>(),
+                "is_pg={is_pg}: 12-run spilled LIMIT 65537 OFFSET 3 must preserve exact tied order"
+            );
+        }
+    }
+
+    /// Review Round 7 Standards P3 regression: `Sorter::record_chunk_for_cutoff` must compute the
+    /// exact `output_limit` upper bound incrementally in O(log k) per spill without copying or
+    /// re-sorting all preceding runs, while keeping `cutoff_heap` bounded.
+    #[test]
+    fn review_p3_large_limit_incremental_cutoff_heap_matches_exact_bound() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            4 * 1024,
+            1024,
+            io,
+            crate::TempStore::Memory,
+        )
+        .unwrap();
+        let limit = 100usize;
+        sorter.limit_to(Some(limit));
+
+        // Feed 64 chunks with mixed descending, ascending, and tied `last_norm` bounds.
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        let mut seed = 0x517C_C1B7_2722_0A95_u64;
+        for step in 0..64usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let last_norm = if step % 5 == 0 {
+                500 // frequent ties
+            } else {
+                (seed % 1000) + 1
+            };
+            let rows = ((seed >> 16) % 35) as usize + 1;
+            seen.push((last_norm, rows));
+            sorter.record_chunk_for_cutoff(last_norm, rows).unwrap();
+
+            // Naive reference: sort all seen runs by `last_norm` and find the exact cutoff.
+            let mut sorted = seen.clone();
+            sorted.sort_unstable_by_key(|&(norm, _)| norm);
+            let mut acc = 0usize;
+            let mut expected = None;
+            for (norm, count) in sorted {
+                acc += count;
+                if acc >= limit {
+                    expected = Some(norm);
+                    break;
+                }
+            }
+            assert_eq!(
+                sorter.chunk_norm_cutoff, expected,
+                "step {step}: incremental cutoff disagreed with exact reference"
+            );
+            assert!(
+                sorter.cutoff_heap.len() <= limit,
+                "step {step}: cutoff_heap grew past limit ({})",
+                sorter.cutoff_heap.len()
+            );
+        }
+    }
+
+    /// Review Round 7 Standards P2 regression: sort compaction in `op_sorter_sort` must advance
+    /// the progress step counter on each compaction tick rather than comparing against a fixed
+    /// initial `prev_steps`, so progress-handler invocation counts scale with the configured
+    /// cadence (`8`, `16`, `32`) instead of firing on every tick after the first interval.
+    #[test]
+    fn review_p2_sort_compaction_honors_configured_progress_cadence() {
+        use crate::{ConnectOpts, Database, Dialect, PostgresDialect, SqliteDialect, StepResult};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(if is_pg {
+                "pg_cadence.db"
+            } else {
+                "sqlite_cadence.db"
+            });
+            let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+            let dialect: Arc<dyn Dialect> = if is_pg {
+                Arc::new(PostgresDialect::new())
+            } else {
+                Arc::new(SqliteDialect)
+            };
+            let db = Database::open_file(io.clone(), path.to_str().unwrap(), dialect).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if is_pg {
+                conn.execute("CREATE TABLE big(k int8, pad bytea)").unwrap();
+            } else {
+                conn.execute("CREATE TABLE big(k INTEGER, pad BLOB)")
+                    .unwrap();
+            }
+            let blob = std::vec![b'p'; 112 * 1024];
+            let mut ins = conn
+                .prepare("INSERT INTO big(k, pad) VALUES (?, ?)")
+                .unwrap();
+            for k in (0..32i64).rev() {
+                ins.reset().unwrap();
+                ins.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(k))
+                    .unwrap();
+                ins.bind_at(
+                    std::num::NonZero::new(2).unwrap(),
+                    Value::Blob(blob.clone()),
+                )
+                .unwrap();
+                while !matches!(ins.step().unwrap(), StepResult::Done) {
+                    io.step().unwrap();
+                }
+            }
+            conn.execute("PRAGMA cache_size = -100").unwrap();
+
+            let run_with_cadence = |ops: u64| -> usize {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let calls_cb = Arc::clone(&calls);
+                conn.set_progress_handler(
+                    ops,
+                    Some(Box::new(move || {
+                        calls_cb.fetch_add(1, AtomicOrdering::Relaxed);
+                        false
+                    })),
+                );
+                let mut stmt = conn.prepare("SELECT k, pad FROM big ORDER BY k").unwrap();
+                let mut rows = 0usize;
+                loop {
+                    match stmt.step().unwrap() {
+                        StepResult::Row => rows += 1,
+                        StepResult::Done => break,
+                        StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                        other => panic!("unexpected step result: {other:?}"),
+                    }
+                }
+                conn.set_progress_handler(0, None);
+                assert_eq!(rows, 32);
+                calls.load(AtomicOrdering::Relaxed)
+            };
+
+            let c8 = run_with_cadence(8);
+            let c16 = run_with_cadence(16);
+            let c32 = run_with_cadence(32);
+
+            assert!(
+                c32 >= 1 && c16 > c32 && c8 > c16,
+                "is_pg={is_pg}: progress callbacks must decrease with wider cadence (c8={c8}, c16={c16}, c32={c32})"
+            );
+            // Under the old bug, compaction fired on every tick past the first interval, collapsing
+            // c8/c16/c32 toward 1:1:1. Properly honoring cadence keeps c8 near 2x c16 and 4x c32.
+            assert!(
+                c8 * 2 >= c16 * 3 && c16 * 2 >= c32 * 3,
+                "is_pg={is_pg}: progress callback counts failed to scale with cadence (c8={c8}, c16={c16}, c32={c32})"
+            );
+        }
+    }
+
+    /// Review Round 8 P3 regression: `CompactionQueue::allocated_bytes` must account for its
+    /// queue/slot array and adjacent-pair heap capacities in addition to live chunk buffers.
+    #[test]
+    fn review_p3_compaction_queue_allocated_bytes_includes_slots_and_heap() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let tf = Arc::new(TempFile::with_temp_store(&io, crate::TempStore::Memory).unwrap());
+        let make_chunks = || -> Vec<SortedChunk> {
+            (0..32usize)
+                .map(|i| SortedChunk::new(tf.clone(), i * 64, 64).unwrap())
+                .collect()
+        };
+
+        let min_cost = CompactionQueue::new_min_cost(make_chunks()).unwrap();
+        let min_expected = 32usize
+            .saturating_mul(std::mem::size_of::<LinkedChunk>())
+            .saturating_add(31usize.saturating_mul(std::mem::size_of::<AdjacentPairKey>()));
+        assert!(
+            min_cost.allocated_bytes() >= min_expected,
+            "MinCost CompactionQueue::allocated_bytes() ({}) must include slots + heap (>= {min_expected})",
+            min_cost.allocated_bytes()
+        );
+
+        let fifo = CompactionQueue::new_fifo(make_chunks(), 0);
+        let fifo_expected = 32usize.saturating_mul(std::mem::size_of::<SortedChunk>());
+        assert!(
+            fifo.allocated_bytes() >= fifo_expected,
+            "Fifo CompactionQueue::allocated_bytes() ({}) must include deque capacity (>= {fifo_expected})",
+            fifo.allocated_bytes()
+        );
     }
 }

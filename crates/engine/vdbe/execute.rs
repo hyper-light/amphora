@@ -4692,9 +4692,9 @@ pub fn op_halt_if_null(
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
-    AttachedBeginWriteTx,
-    BeginNamedSavepoints,
-    CheckSchemaCookie,
+    AttachedBeginWriteTx { started_tx: bool },
+    BeginNamedSavepoints { started_tx: bool },
+    CheckSchemaCookie { started_tx: bool },
     BeginStatement,
 }
 
@@ -5352,11 +5352,11 @@ pub fn op_transaction_inner(
                                 && !pager.holds_write_lock()
                             {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::AttachedBeginWriteTx;
+                                    OpTransactionState::AttachedBeginWriteTx { started_tx: false };
                                 continue;
                             }
                             *state.active_op_state.transaction() =
-                                OpTransactionState::CheckSchemaCookie;
+                                OpTransactionState::CheckSchemaCookie { started_tx: false };
                             continue;
                         }
                         // Amphora (lane g7s2-19, `AC-NS.2.1`): the limit of the schema checks
@@ -5372,10 +5372,10 @@ pub fn op_transaction_inner(
                             // on re-entry.
                             if conn.with_named_savepoints(|savepoints| savepoints.is_empty()) {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::AttachedBeginWriteTx;
+                                    OpTransactionState::AttachedBeginWriteTx { started_tx: true };
                             } else {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::BeginNamedSavepoints;
+                                    OpTransactionState::BeginNamedSavepoints { started_tx: true };
                             }
                             continue;
                         }
@@ -5463,6 +5463,11 @@ pub fn op_transaction_inner(
                 }
 
                 // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
+                let started_tx = if is_secondary_db {
+                    started_secondary_tx
+                } else {
+                    updated && matches!(current_state, TransactionState::None)
+                };
                 if updated {
                     conn.set_tx_state(new_transaction_state);
                 }
@@ -5470,24 +5475,27 @@ pub fn op_transaction_inner(
                     && started_secondary_tx
                     && !conn.with_named_savepoints(|s| s.is_empty())
                 {
-                    *state.active_op_state.transaction() = OpTransactionState::BeginNamedSavepoints;
+                    *state.active_op_state.transaction() =
+                        OpTransactionState::BeginNamedSavepoints { started_tx };
                     continue;
                 }
-                *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
+                *state.active_op_state.transaction() =
+                    OpTransactionState::CheckSchemaCookie { started_tx };
                 continue;
             }
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
-            OpTransactionState::AttachedBeginWriteTx => {
+            OpTransactionState::AttachedBeginWriteTx { started_tx } => {
                 let conn = program.connection.clone();
                 let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(state.suspend_on_io(io));
                 }
-                *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
+                *state.active_op_state.transaction() =
+                    OpTransactionState::CheckSchemaCookie { started_tx };
                 continue;
             }
-            OpTransactionState::BeginNamedSavepoints => {
+            OpTransactionState::BeginNamedSavepoints { started_tx } => {
                 match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
                     IOResult::Done(()) => {
                         if is_secondary_db
@@ -5496,10 +5504,10 @@ pub fn op_transaction_inner(
                             && !pager.holds_write_lock()
                         {
                             *state.active_op_state.transaction() =
-                                OpTransactionState::AttachedBeginWriteTx;
+                                OpTransactionState::AttachedBeginWriteTx { started_tx };
                         } else {
                             *state.active_op_state.transaction() =
-                                OpTransactionState::CheckSchemaCookie;
+                                OpTransactionState::CheckSchemaCookie { started_tx };
                         }
                         continue;
                     }
@@ -5509,28 +5517,41 @@ pub fn op_transaction_inner(
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
-            OpTransactionState::CheckSchemaCookie => {
+            OpTransactionState::CheckSchemaCookie { started_tx } => {
                 if is_main_db {
-                    if program.prepare_context.restore_epoch
-                        != program.connection.db.shared_wal.restore_epoch()
-                    {
+                    let adopted_epoch = program
+                        .connection
+                        .last_restore_epoch
+                        .load(Ordering::Acquire);
+                    let stale_restore_epoch = program.prepare_context.restore_epoch
+                        != adopted_epoch
+                        || (started_tx
+                            && program.prepare_context.restore_epoch
+                                != program.connection.db.shared_wal.restore_epoch());
+                    if stale_restore_epoch {
                         program.connection.maybe_update_schema();
                         return Err(LimboError::SchemaUpdated.into());
                     }
                 } else if is_secondary_db {
-                    let live_epoch = program
+                    let current_epoch = program
                         .connection
                         .attached_databases()
                         .read()
                         .index_to_data
                         .get(db)
-                        .map(|entry| entry.db.shared_wal.restore_epoch());
+                        .map(|entry| {
+                            if started_tx {
+                                entry.db.shared_wal.restore_epoch()
+                            } else {
+                                entry.last_restore_epoch.load(Ordering::Acquire)
+                            }
+                        });
                     let prepared_epoch = program
                         .prepare_context
                         .attached_restore_epochs
                         .iter()
                         .find_map(|&(id, epoch)| if id == *db { Some(epoch) } else { None });
-                    if live_epoch != prepared_epoch {
+                    if current_epoch != prepared_epoch {
                         program.connection.sync_attached_restore_epochs();
                         return Err(LimboError::SchemaUpdated.into());
                     }
@@ -8839,6 +8860,11 @@ pub(crate) fn update_agg_payload(
 /// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
 /// strategy, but it works well for now.
 const SPARE_AGG_PAYLOADS: usize = 8;
+/// Maximum `Vec<Value>` capacity recycled into `spare_agg_payloads` after `AggFinal`. Fixed-size
+/// scalar accumulators (`SUM`, `AVG`, `GROUP_CONCAT`) need <= 4 slots; dropping larger buffers
+/// immediately prevents row-buffering aggregates (`MODE`, `PERCENTILE_*`, `ARRAY_AGG`) from
+/// retaining input-sized heap allocations across groups or idle cached statements.
+const SPARE_AGG_PAYLOAD_MAX_CAP: usize = 64;
 
 /// Convert the intermediate aggregate state in `payload` into the final result value.
 ///
@@ -10544,7 +10570,9 @@ pub fn op_agg_final(
                 let accumulator =
                     std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
                 if let Register::Aggregate(AggContext::Builtin(mut payload)) = accumulator {
-                    if state.spare_agg_payloads.len() < SPARE_AGG_PAYLOADS {
+                    if state.spare_agg_payloads.len() < SPARE_AGG_PAYLOADS
+                        && payload.capacity() <= SPARE_AGG_PAYLOAD_MAX_CAP
+                    {
                         payload.clear();
                         state.spare_agg_payloads.push(payload);
                     }
@@ -10778,7 +10806,7 @@ pub fn op_sorter_sort(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         SorterSort {
@@ -10787,15 +10815,41 @@ pub fn op_sorter_sort(
         },
         insn
     );
-    let (is_empty, did_sort, timed) = {
+    if state.is_interrupted() {
+        return Err(LimboError::Interrupt.into());
+    }
+    let deadline = state.query_deadline;
+    let mut cur_steps = state.metrics.vm_steps;
+    let conn = &program.connection;
+    let io_ref = pager.io.as_ref();
+    let (is_empty, sort_res, timed) = {
+        let mut check_interrupt = || {
+            let prev = cur_steps;
+            cur_steps = cur_steps.wrapping_add(1);
+            conn.is_interrupted()
+                || deadline.is_some_and(|d| io_ref.current_time_monotonic() >= d)
+                || conn.should_interrupt_for_progress(prev, cur_steps)
+        };
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
-        if !is_empty {
-            return_if_io!(state, cursor.sort());
-        }
-        (is_empty, !is_empty, cursor.take_in_memory_sort())
+        let sort_res = if !is_empty {
+            Some(cursor.sort_with_interrupt(&mut check_interrupt))
+        } else {
+            None
+        };
+        let timed = if matches!(&sort_res, Some(Ok(IOResult::Done(())))) {
+            cursor.take_in_memory_sort()
+        } else {
+            None
+        };
+        (is_empty, sort_res, timed)
     };
+    state.metrics.vm_steps = cur_steps;
+    if let Some(res) = sort_res {
+        return_if_io!(state, res);
+    }
+    let did_sort = !is_empty;
     // Amphora (QT.5): the sort's time moves the database's learned sort cost, in the planner's
     // unit, rows times log2 rows (`cost::estimate_sort_cpu_cost`).
     if let Some((rows, nanos)) = timed {
@@ -20022,7 +20076,7 @@ pub fn op_group_save(
         .registers
         .get_mut(*acc_start..end)
         .ok_or_else(|| group_error("accumulator registers out of range"))?;
-    swap_accumulators(regs, table.current_accumulators()?)?;
+    table.save_current_accumulators(regs)?;
     state.pc = next_pc(state)?;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -24130,6 +24184,77 @@ mod tests {
         assert!(
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
+        );
+    }
+
+    /// Review Round 8 P2 regression: finalizing row-buffering aggregates (`Mode`, `PercentileCont`,
+    /// `PercentileDisc`) must not stash input-sized `Vec<Value>` capacities into
+    /// `ProgramState::spare_agg_payloads`, and `ProgramState::reset()` must clear all spare
+    /// aggregate payload vectors so idle cached statements retain zero buffered capacity.
+    #[test]
+    fn review_p2_mode_and_percentile_aggregates_release_buffers_after_finalize_and_reset() {
+        use crate::vdbe::insn::Insn;
+        use crate::vdbe::ProgramState;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let stmt = conn.prepare("SELECT 1").unwrap();
+        let pager = conn.get_pager();
+
+        for func in [
+            AggFunc::Mode,
+            AggFunc::PercentileCont,
+            AggFunc::PercentileDisc,
+        ] {
+            let mut state = ProgramState::new(4, 0);
+            let mut payload = crate::alloc::Vec::new();
+            init_agg_payload(&func, &mut payload).unwrap();
+            match func {
+                AggFunc::Mode => {
+                    for i in 0..2_000i64 {
+                        payload.push(Value::from_i64(i % 7));
+                    }
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    payload[0] = Value::from_f64(0.5);
+                    for i in 0..2_000i64 {
+                        payload.push(Value::from_i64(i));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                payload.capacity() > SPARE_AGG_PAYLOAD_MAX_CAP,
+                "test payload must exceed spare cap"
+            );
+            state.registers[0] = Register::Aggregate(AggContext::Builtin(payload));
+            let insn = Insn::AggFinal {
+                register: 0,
+                func: super::AccumulatorFunc::Agg(func.clone()),
+            };
+            op_agg_final(&stmt.program, &mut state, &insn, &pager).unwrap();
+            assert!(
+                state.spare_agg_payloads.is_empty(),
+                "AggFinal({func:?}) must drop oversized input-sized payload instead of caching it in spare_agg_payloads"
+            );
+        }
+
+        // Small recycled payloads must also be cleared on `ProgramState::reset()` so idle cached
+        // statements hold zero spare aggregate vectors.
+        let mut state = ProgramState::new(4, 0);
+        let small = crate::alloc::vec![Value::from_i64(42)];
+        state.registers[0] = Register::Aggregate(AggContext::Builtin(small));
+        let insn = Insn::AggFinal {
+            register: 0,
+            func: super::AccumulatorFunc::Agg(AggFunc::Count),
+        };
+        op_agg_final(&stmt.program, &mut state, &insn, &pager).unwrap();
+        assert_eq!(state.spare_agg_payloads.len(), 1);
+        state.reset(None, None);
+        assert!(
+            state.spare_agg_payloads.is_empty(),
+            "ProgramState::reset() must clear spare_agg_payloads"
         );
     }
 }

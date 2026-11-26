@@ -94,12 +94,20 @@ pub trait Dialect: Send + Sync + 'static {
         body: &amphora_engine_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// Validates whether `CREATE TABLE ... AS SELECT` is supported by this dialect before CTAS
+    /// schema derivation runs.
+    fn check_create_table_as_select(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// The stored SQL of the table a CREATE TABLE makes, with the connection whose transaction it
-    /// runs in, for a dialect that reads what that transaction holds (the PostgreSQL dialect reads
-    /// the OIDs live tables hold): by default [`Dialect::format_table_sql`]'s.
+    /// runs in and the target `database_id` (`main`, `temp`, or an attached database), for a
+    /// dialect that reads what that target database holds (the PostgreSQL dialect reads the OIDs
+    /// live tables hold in `database_id`): by default [`Dialect::format_table_sql`]'s.
     fn format_created_table_sql(
         &self,
         _conn: &crate::sync::Arc<crate::Connection>,
+        _database_id: usize,
         input: &str,
         tbl_name: &amphora_engine_parser::ast::QualifiedName,
         body: &amphora_engine_parser::ast::CreateTableBody,
@@ -151,9 +159,29 @@ pub trait Dialect: Send + Sync + 'static {
         enable_custom_types: bool,
     ) -> crate::Result<()>;
 
+    /// Returns a fresh independent instance of this dialect for an attached or temp database when
+    /// the dialect holds per-database mutable state (such as `PostgresDialect`'s `next_oid`
+    /// allocator). Stateless dialects return `None` to share `Arc<dyn Dialect>`.
+    fn fresh_instance(&self) -> Option<crate::sync::Arc<dyn Dialect>> {
+        None
+    }
+
     /// The next OID the database's header stores (`DatabaseHeader::pg_next_oid`), given as the
-    /// database opens: zero until a CREATE TABLE of a dialect with OIDs has stored one.
+    /// database opens: zero until a CREATE TABLE or CREATE VIEW of a dialect with OIDs has stored
+    /// one.
     fn load_next_oid(&self, _stored: u32) {}
+
+    /// Monotonically advances the live OID allocator to at least `stored` after an ordinary
+    /// replicated delta commits, without ever rewinding past OIDs already allocated by rolled-back
+    /// transactions on this live database.
+    fn advance_next_oid(&self, _stored: u32) {}
+
+    /// Current durable next OID marker for a dialect with OIDs (`None` for dialects without OIDs).
+    /// Used when persisting non-table DDL (such as a first `CREATE VIEW`) and for rolling back
+    /// failed raw-page commits.
+    fn current_next_oid(&self) -> Option<u32> {
+        None
+    }
 
     /// The next OID to store in the header, in the same transaction, with a table whose stored
     /// definition [`Dialect::format_created_table_sql`] made: `None` for a dialect without OIDs.

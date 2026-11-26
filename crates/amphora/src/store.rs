@@ -462,6 +462,8 @@ const FAILED: u64 = u64::MAX;
 struct Notices {
     /// Committed, in commit order: told once a flush covers their commit.
     awaiting: VecDeque<(u64, Arc<Fate>)>,
+    /// Empty batches already durable with no write or flush: told at once on `amphora-notify`.
+    immediate: VecDeque<Arc<Fate>>,
     /// Refused: told at once.
     refused: Vec<(Arc<Fate>, Refused)>,
     /// Commits durable.
@@ -870,6 +872,17 @@ impl Sends {
         self.noticed.notify_all();
     }
 
+    /// An empty batch that needs no commit or flush: deliver `Ok(())` asynchronously on
+    /// `amphora-notify` so callers (including `Groups::put_then` while holding its route read lock)
+    /// never execute user callbacks inline on the submitting thread.
+    fn tell_immediate(&self, fate: Arc<Fate>) {
+        {
+            let mut notices = locked(&self.notices);
+            notices.immediate.push_back(fate);
+        }
+        self.noticed.notify_all();
+    }
+
     /// Waits until as many batches are durable as had been handed over when it was asked, up to
     /// `until`.
     fn wait_durable(&self, until: Instant) -> Result<(), Refused> {
@@ -1121,12 +1134,17 @@ fn notifier(sends: &Sends) {
                 let durable = notices.durable;
                 let due = notices.awaiting.front().is_some_and(|(c, _)| *c <= durable);
                 if due
+                    || !notices.immediate.is_empty()
                     || !notices.refused.is_empty()
                     || (notices.disk_failed && !notices.awaiting.is_empty())
                 {
                     break;
                 }
-                if notices.awaiting.is_empty() && sends.stopping.load(Ordering::Relaxed) {
+                if notices.awaiting.is_empty()
+                    && notices.immediate.is_empty()
+                    && notices.refused.is_empty()
+                    && sends.stopping.load(Ordering::Relaxed)
+                {
                     return;
                 }
                 notices = sends
@@ -1139,7 +1157,7 @@ fn notifier(sends: &Sends) {
                 .durable
                 .max(sends.durable_commits.load(Ordering::SeqCst));
             notices.durable = durable;
-            let mut ready = Vec::new();
+            let mut ready: Vec<Arc<Fate>> = notices.immediate.drain(..).collect();
             while notices.awaiting.front().is_some_and(|(c, _)| *c <= durable) {
                 if let Some((_, fate)) = notices.awaiting.pop_front() {
                     ready.push(fate);
@@ -1161,8 +1179,14 @@ fn notifier(sends: &Sends) {
             (ready, refused)
         };
         let tell = |fate: &Fate, answer: Result<(), Refused>| {
-            if let Some(then) = locked(&fate.then).take() {
-                then(answer);
+            if let Some(then) = locked(&fate.then).take()
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| then(answer))).is_err()
+            {
+                tracing::error!(
+                    target: "amphora.store",
+                    event = "put_then_callback_panicked",
+                    "a put_then callback panicked; continuing to notify remaining commits"
+                );
             }
         };
         for fate in &ready {
@@ -1468,17 +1492,36 @@ impl<R: Send + 'static> Readers<R> {
         let (mut reader, generation) = {
             let mut pool = locked(&self.pool);
             loop {
+                let open = if pool.idle.is_empty() {
+                    Some(locked(&self.open).clone()?)
+                } else {
+                    None
+                };
+                if Instant::now() >= until {
+                    self.meter.timed_out();
+                    return Some(Err(Refused::Timeout.into()));
+                }
                 if let Some(r) = pool.idle.pop() {
                     pool.out = pool.out.saturating_add(1);
                     break (r, pool.generation);
                 }
-                let open = locked(&self.open).clone()?;
+                let open = match open {
+                    Some(open) => open,
+                    None => locked(&self.open).clone()?,
+                };
                 if pool.out < self.most {
                     pool.out = pool.out.saturating_add(1);
                     let generation = pool.generation;
                     drop(pool);
                     match open() {
-                        Ok(r) => break (r, generation),
+                        Ok(r) => {
+                            if Instant::now() >= until {
+                                self.give_back(Some(r), generation);
+                                self.meter.timed_out();
+                                return Some(Err(Refused::Timeout.into()));
+                            }
+                            break (r, generation);
+                        }
                         Err(e) => {
                             self.give_back(None, generation);
                             return Some(Err(e));
@@ -1487,6 +1530,7 @@ impl<R: Send + 'static> Readers<R> {
                 }
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    self.meter.timed_out();
                     return Some(Err(Refused::Timeout.into()));
                 }
                 pool = self
@@ -1528,15 +1572,34 @@ impl<R: Send + 'static> Readers<R> {
         f: impl FnOnce(&mut R) -> anyhow::Result<T>,
     ) -> Option<anyhow::Result<T>> {
         let Some(mut taken) = slots.take(until) else {
+            self.meter.timed_out();
             return Some(Err(Refused::Timeout.into()));
         };
         let slot = taken.reader()?;
         let mut reader = match slot.take() {
-            Some(r) => r,
+            Some(r) => {
+                if Instant::now() >= until {
+                    *slot = Some(r);
+                    self.meter.timed_out();
+                    return Some(Err(Refused::Timeout.into()));
+                }
+                r
+            }
             None => {
                 let open = locked(&self.open).clone()?;
+                if Instant::now() >= until {
+                    self.meter.timed_out();
+                    return Some(Err(Refused::Timeout.into()));
+                }
                 match open() {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        if Instant::now() >= until {
+                            *slot = Some(r);
+                            self.meter.timed_out();
+                            return Some(Err(Refused::Timeout.into()));
+                        }
+                        r
+                    }
                     Err(e) => return Some(Err(e)),
                 }
             }
@@ -1618,13 +1681,51 @@ impl<E: Engine> Store<E> {
 
     /// [`Store::start`], its engine's flusher replaced by `flush` when given (tests).
     pub fn start_with(engine: E, config: Config, flush: Option<Flush>) -> anyhow::Result<Self> {
+        Self::start_with_spawner(engine, config, flush, |name, body| {
+            std::thread::Builder::new().name(name.into()).spawn(body)
+        })
+    }
+
+    fn start_with_spawner(
+        engine: E,
+        config: Config,
+        flush: Option<Flush>,
+        mut spawn: impl FnMut(
+            &str,
+            Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> anyhow::Result<Self> {
+        struct StartupGuard<'a, R: Send + 'static> {
+            sends: &'a Sends,
+            readers: &'a Readers<R>,
+            threads: Vec<std::thread::JoinHandle<()>>,
+            disarmed: bool,
+        }
+        impl<R: Send + 'static> Drop for StartupGuard<'_, R> {
+            fn drop(&mut self) {
+                if self.disarmed {
+                    return;
+                }
+                self.sends.stop();
+                self.readers.release();
+                for handle in self.threads.drain(..) {
+                    let _ = handle.join();
+                }
+            }
+        }
+
         let (tx, rx) = mpsc::channel::<Msg<E>>();
         let meter: Arc<Meter> = Arc::default();
         let watchers: Arc<Mutex<Vec<Watcher>>> = Arc::default();
         let sends: Arc<Sends> = Arc::default();
         let readers: Arc<Readers<E::Reader>> =
             Arc::new(Readers::new(config.readers, meter.clone()));
-        let mut threads = Vec::new();
+        let mut guard = StartupGuard {
+            sends: &sends,
+            readers: &readers,
+            threads: Vec::new(),
+            disarmed: false,
+        };
         if let Some(open) = engine.opener() {
             readers.start(open, Checkpointing::of::<E>(&config), sends.clone());
         }
@@ -1633,32 +1734,31 @@ impl<E: Engine> Store<E> {
                 let flush = Arc::new(flush);
                 for _ in 0..config.flushers.max(1) {
                     let (s, m, f) = (sends.clone(), meter.clone(), flush.clone());
-                    threads.push(
-                        std::thread::Builder::new()
-                            .name("amphora-flush".into())
-                            .spawn(move || flusher(&s, &f, &m))?,
-                    );
+                    guard.threads.push(spawn(
+                        "amphora-flush",
+                        Box::new(move || flusher(&s, &f, &m)),
+                    )?);
                 }
             }
             None => sends.durable_as_committed.store(true, Ordering::Relaxed),
         }
         let told = sends.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name("amphora-notify".into())
-                .spawn(move || notifier(&told))?,
-        );
+        guard
+            .threads
+            .push(spawn("amphora-notify", Box::new(move || notifier(&told)))?);
         let (m, w, s, r) = (
             meter.clone(),
             watchers.clone(),
             sends.clone(),
             readers.clone(),
         );
-        threads.push(
-            std::thread::Builder::new()
-                .name("amphora-writer".into())
-                .spawn(move || writer(engine, &rx, &config, &m, &w, &s, &r))?,
-        );
+        guard.threads.push(spawn(
+            "amphora-writer",
+            Box::new(move || writer(engine, &rx, &config, &m, &w, &s, &r)),
+        )?);
+        guard.disarmed = true;
+        let threads = std::mem::take(&mut guard.threads);
+        drop(guard);
         Ok(Self {
             tx,
             meter,
@@ -1708,8 +1808,16 @@ impl<E: Engine> Store<E> {
             return Err(Refused::Disk);
         }
         if rows.is_empty() {
+            if self.sends.stopping.load(Ordering::SeqCst) {
+                return Err(Refused::Stopped);
+            }
             if let Some(then) = then {
-                then(Ok(()));
+                let fate = Arc::new(Fate {
+                    state: AtomicU64::new(UNSETTLED),
+                    has_then: true,
+                    then: Mutex::new(Some(then)),
+                });
+                self.sends.tell_immediate(fate);
             }
             return Ok(Ticket(None));
         }
@@ -1862,6 +1970,10 @@ impl<E: Engine> Store<E> {
         until: Instant,
         f: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
+        if Instant::now() >= until {
+            self.meter.timed_out();
+            return Err(Refused::Timeout.into());
+        }
         let (rtx, rrx) = mpsc::channel();
         let asked = Instant::now();
         self.tx
@@ -2604,5 +2716,321 @@ mod tests {
             weak.upgrade().is_none(),
             "Database must be released after writer panic and Store drop"
         );
+    }
+
+    /// Review Standards P2 regression: a panicking `Store::put_then` callback must not kill the
+    /// notifier thread or prevent subsequent durable commits from delivering their callbacks.
+    #[test]
+    fn review_p2_panicking_put_then_callback_does_not_disable_later_notifications() {
+        use crate::db::{Db, Sharing};
+
+        struct InsertEngine(Db);
+        impl Engine for InsertEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                std::mem::size_of::<i64>()
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                self.0.transaction(|db| {
+                    for &id in rows {
+                        db.exec(&format!("INSERT INTO items VALUES ({id})"))?;
+                    }
+                    Ok(rows.len())
+                })
+            }
+            fn flusher(&self) -> Option<Flush> {
+                Some(self.0.flusher())
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.0.opener())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify_panic.db");
+        {
+            let db = Db::open_sharing(&path, &Sharing::Off).unwrap();
+            db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            let store = Store::start(InsertEngine(db), Config::default()).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+
+            let (first_started_tx, first_started_rx) = mpsc::channel::<()>();
+            let t1 = store
+                .put_then(vec![1], until, move |_| {
+                    let _ = first_started_tx.send(());
+                    panic!("intentional put_then callback panic");
+                })
+                .unwrap();
+            store.durable(&t1, until).unwrap();
+            first_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first callback must run");
+
+            let (second_tx, second_rx) = mpsc::channel::<Result<(), Refused>>();
+            let t2 = store
+                .put_then(vec![2], until, move |res| {
+                    let _ = second_tx.send(res);
+                })
+                .unwrap();
+            store.durable(&t2, until).unwrap();
+            let second_res = second_rx.recv_timeout(Duration::from_secs(5)).expect(
+                "second put_then callback was never delivered after first callback panicked",
+            );
+            assert_eq!(second_res, Ok(()));
+        }
+
+        // Reopen and verify both writes survived durably.
+        let reopened = Db::open_sharing(&path, &Sharing::Off).unwrap();
+        let mut ids = Vec::new();
+        reopened
+            .query("SELECT id FROM items ORDER BY id", [], |r| {
+                ids.push(r.get::<i64>(0)?);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// Review Standards P2 regression: if worker spawning fails midway through `Store::start`,
+    /// already-started flusher, notifier, and checkpointer workers must be stopped and joined
+    /// before returning `Err` rather than detached and stranded forever.
+    #[test]
+    fn review_p2_partial_store_startup_stops_and_joins_earlier_workers() {
+        use crate::db::{Db, Sharing};
+
+        struct SimpleEngine {
+            db: Db,
+            flush_sentinel: Arc<()>,
+        }
+        impl Engine for SimpleEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+            fn flusher(&self) -> Option<Flush> {
+                let inner = self.db.flusher();
+                let keep = Arc::clone(&self.flush_sentinel);
+                Some(Box::new(move || {
+                    let _ = &keep;
+                    inner()
+                }))
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.db.opener())
+            }
+        }
+
+        for fail_on in ["amphora-notify", "amphora-writer"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("partial_{fail_on}.db"));
+            let db = Db::open_sharing(&path, &Sharing::Off).unwrap();
+            let weak = db.database_weak();
+            let flush_sentinel = Arc::new(());
+            let engine = SimpleEngine {
+                db,
+                flush_sentinel: Arc::clone(&flush_sentinel),
+            };
+            let res = Store::start_with_spawner(engine, Config::default(), None, |name, body| {
+                if name == fail_on {
+                    Err(std::io::Error::other(format!(
+                        "injected spawn failure on {name}"
+                    )))
+                } else {
+                    std::thread::Builder::new().name(name.into()).spawn(body)
+                }
+            });
+            assert!(res.is_err(), "failing spawn on {fail_on} must return Err");
+            // Because StartupGuard stopped & joined all previously spawned flushers/notifier and
+            // released the checkpointer before returning Err, no worker retains `flush_sentinel` or
+            // the `Database` handle.
+            assert_eq!(
+                Arc::strong_count(&flush_sentinel),
+                1,
+                "fail_on={fail_on}: earlier flusher thread was stranded instead of joined"
+            );
+            assert!(
+                weak.upgrade().is_none(),
+                "fail_on={fail_on}: checkpointer or flusher retained Database after failed startup"
+            );
+        }
+    }
+
+    /// Review Round 8 P2 regression: `Store::read_committed` must reject already-expired deadlines
+    /// with `Refused::Timeout` under both `ReadCheckout::Pool` (default) and `ReadCheckout::Slots`,
+    /// both when opening a reader and when reusing an idle reader, on both SQLite and PostgreSQL.
+    #[test]
+    fn review_p2_default_reader_pool_rejects_expired_reads_on_open_and_reuse() {
+        use crate::db::{Db, Sharing};
+
+        struct ReadEngine(Db);
+        impl Engine for ReadEngine {
+            type Row = i64;
+            type Reader = Db;
+            fn key(_: &Self::Row) -> &str {
+                ""
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+            fn opener(&self) -> Option<Opener<Db>> {
+                Some(self.0.opener())
+            }
+        }
+
+        for is_pg in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("expired_{is_pg}.db"));
+            let db = if is_pg {
+                Db::open_postgres_sharing(&path, &Sharing::Off).unwrap()
+            } else {
+                Db::open_sharing(&path, &Sharing::Off).unwrap()
+            };
+            db.exec("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+            db.flusher()().unwrap();
+
+            // 1. Default `Store::start` (`ReadCheckout::Pool` by default): test cold open and
+            // warm idle-reader reuse with an expired deadline.
+            let config = Config {
+                readers: 2,
+                ..Config::default()
+            };
+            let store = Store::start(ReadEngine(db), config).unwrap();
+            let expired = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+
+            let executed = Arc::new(AtomicBool::new(false));
+            let exec_r = Arc::clone(&executed);
+            let exec_w = Arc::clone(&executed);
+            let res = store.read_committed(
+                expired,
+                move |_r| {
+                    exec_r.store(true, Ordering::SeqCst);
+                    Ok(1i64)
+                },
+                move |_w| {
+                    exec_w.store(true, Ordering::SeqCst);
+                    Ok(1i64)
+                },
+            );
+            assert!(
+                matches!(
+                    res.as_ref().err().and_then(|e| e.downcast_ref::<Refused>()),
+                    Some(Refused::Timeout)
+                ),
+                "is_pg={is_pg}: cold expired read on default reader pool must return Timeout, got {res:?}"
+            );
+            assert!(
+                !executed.load(Ordering::SeqCst),
+                "is_pg={is_pg}: cold expired read executed query"
+            );
+
+            // Warm the pool with one valid read so an idle reader sits ready for reuse.
+            let warm = store
+                .read_committed(
+                    Instant::now() + Duration::from_secs(5),
+                    |r| {
+                        let mut v = 0i64;
+                        r.query("SELECT id FROM t", [], |row| {
+                            v = row.get::<i64>(0)?;
+                            Ok(false)
+                        })?;
+                        Ok(v)
+                    },
+                    |_| Ok(0i64),
+                )
+                .unwrap();
+            assert_eq!(warm, 1);
+
+            let exec_r2 = Arc::clone(&executed);
+            let exec_w2 = Arc::clone(&executed);
+            let res2 = store.read_committed(
+                expired,
+                move |_r| {
+                    exec_r2.store(true, Ordering::SeqCst);
+                    Ok(1i64)
+                },
+                move |_w| {
+                    exec_w2.store(true, Ordering::SeqCst);
+                    Ok(1i64)
+                },
+            );
+            assert!(
+                matches!(
+                    res2.as_ref()
+                        .err()
+                        .and_then(|e| e.downcast_ref::<Refused>()),
+                    Some(Refused::Timeout)
+                ),
+                "is_pg={is_pg}: warm expired read on default reader pool must return Timeout, got {res2:?}"
+            );
+            assert!(
+                !executed.load(Ordering::SeqCst),
+                "is_pg={is_pg}: warm expired read executed query"
+            );
+
+            // 2. Also verify `Readers::with_checkout` directly for both `Pool` and `Slots`.
+            drop(store);
+            let db2 = if is_pg {
+                Db::open_postgres_sharing(&path, &Sharing::Off).unwrap()
+            } else {
+                Db::open_sharing(&path, &Sharing::Off).unwrap()
+            };
+            for checkout in [ReadCheckout::Pool, ReadCheckout::Slots] {
+                let meter = Arc::new(Meter::default());
+                let readers = Readers::with_checkout(2, meter, checkout);
+                *locked(&readers.open) = Some(db2.opener());
+                let ran = AtomicBool::new(false);
+                let r1 = readers
+                    .with(expired, |_| {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok(1i64)
+                    })
+                    .unwrap();
+                assert!(
+                    matches!(
+                        r1.as_ref().err().and_then(|e| e.downcast_ref::<Refused>()),
+                        Some(Refused::Timeout)
+                    ),
+                    "is_pg={is_pg}, checkout={checkout:?}: cold expired checkout must return Timeout"
+                );
+                assert!(!ran.load(Ordering::SeqCst));
+                let ok = readers
+                    .with(Instant::now() + Duration::from_secs(5), |_| Ok(7i64))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ok, 7);
+                let r2 = readers
+                    .with(expired, |_| {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok(1i64)
+                    })
+                    .unwrap();
+                assert!(
+                    matches!(
+                        r2.as_ref().err().and_then(|e| e.downcast_ref::<Refused>()),
+                        Some(Refused::Timeout)
+                    ),
+                    "is_pg={is_pg}, checkout={checkout:?}: warm expired checkout must return Timeout"
+                );
+                assert!(!ran.load(Ordering::SeqCst));
+            }
+        }
     }
 }

@@ -451,7 +451,7 @@ impl Shipper {
             )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
-            if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
+            if let Some(head) = db.read_log_header()?
                 && identity_of(&head)? == body.identity
             {
                 shipper.identity = Some(body.identity);
@@ -622,7 +622,7 @@ impl Shipper {
     ) -> anyhow::Result<(Shipped, bool)> {
         let (seq, end) = db.log_end();
         let durable = db.durable_frame().unwrap_or(0).min(end);
-        let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)? else {
+        let Some(head) = db.read_log_header()? else {
             return Ok((Shipped::default(), false));
         };
         let identity = identity_of(&head)?;

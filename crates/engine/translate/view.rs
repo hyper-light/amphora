@@ -313,6 +313,7 @@ fn validate_create_view(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -321,6 +322,7 @@ pub fn translate_create_view(
     temporary: bool,
     if_not_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -419,6 +421,20 @@ pub fn translate_create_view(
         value: (schema_version + 1) as i32,
         p5: 0,
     });
+    // Amphora: persist the target database dialect's non-zero `pg_next_oid` marker on any
+    // persistent (main or attached) view so a view-only PostgreSQL file is unmistakably
+    // identified on cold open even before any table has been created, while keeping attached
+    // databases' OID counters isolated from `main`.
+    if !temporary && database_id != crate::TEMP_DB_ID {
+        if let Some(next_oid) = connection.dialect_for_db(database_id).current_next_oid() {
+            program.emit_insn(Insn::SetCookie {
+                db: database_id,
+                cookie: Cookie::PgNextOid,
+                value: next_oid.cast_signed(),
+                p5: 0,
+            });
+        }
+    }
 
     Ok(())
 }
